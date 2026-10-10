@@ -43,6 +43,12 @@ impl ContainerLogsDialog {
         let auto_scroll = gtk::CheckButton::with_label("Follow");
         auto_scroll.set_active(true);
 
+        // Handle of the in-flight follow-stream worker. Aborted whenever the
+        // dialog reloads (tail change / refresh) or closes, so at most one
+        // stream is attached to the daemon per open dialog.
+        let worker: Rc<std::cell::RefCell<Option<tokio::task::JoinHandle<()>>>> =
+            Rc::new(std::cell::RefCell::new(None));
+
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -73,32 +79,62 @@ impl ContainerLogsDialog {
             let view = view.clone();
             let auto_scroll = auto_scroll.clone();
             let tail_combo = tail_combo.clone();
+            let worker = worker.clone();
             let container_id = container_id.to_string();
             Rc::new(move || {
                 let tail = tail_value(&tail_combo);
+                // Stop any previous stream before starting a new one.
+                if let Some(handle) = worker.borrow_mut().take() {
+                    handle.abort();
+                }
                 buffer.set_text("Loading logs…\n");
                 let follow = auto_scroll.is_active();
                 let buffer = buffer.clone();
                 let view = view.clone();
-                // Widget updates must happen on the main loop: the worker only
-                // hands finished text over this channel.
-                let render = crate::ui::common::main_loop_channel(move |text: String| {
-                    buffer.set_text(&text);
-                    if follow {
-                        let end = buffer.end_iter();
-                        let mark = buffer.create_mark(None, &end, false);
-                        view.scroll_mark_onscreen(&mark);
+                // Incremental appends keep earlier lines on screen while the
+                // follow stream is open (`set_text` would wipe the buffer on
+                // every chunk). The first message clears the loading banner.
+                let append = crate::ui::common::main_loop_channel({
+                    let buffer = buffer.clone();
+                    let view = view.clone();
+                    let first = std::cell::Cell::new(true);
+                    move |text: String| {
+                        if first.take() {
+                            // First chunk replaces the loading banner.
+                            buffer.set_text("");
+                        }
+                        let mut end = buffer.end_iter();
+                        buffer.insert(&mut end, &text);
+                        if follow {
+                            let end = buffer.end_iter();
+                            let mark = buffer.create_mark(None, &end, false);
+                            view.scroll_mark_onscreen(&mark);
+                        }
                     }
                 });
                 let id = container_id.clone();
-                state.with_client(move |client, _tx| async move {
-                    let result = client.container_logs(&id, &tail).await;
-                    let text = match result {
-                        Ok(text) => text,
-                        Err(e) => format!("Failed to load logs: {e}"),
-                    };
-                    let _ = render.send(text).await;
+                let Some(client) = state.client() else {
+                    state.error("Docker daemon is not running");
+                    return;
+                };
+                let tx = state.sender();
+                let append_err = append.clone();
+                let handle = crate::runtime::runtime().spawn(async move {
+                    let result = client
+                        .logs_stream(&id, &tail, follow, move |line| {
+                            let _ = append.send_blocking(line);
+                        })
+                        .await;
+                    if let Err(e) = result {
+                        let _ = append_err.send_blocking(format!("\n[stream ended: {e}]\n"));
+                        let _ = tx
+                            .send(super::app_state::AppEvent::Error(format!(
+                                "container logs: {e}"
+                            )))
+                            .await;
+                    }
                 });
+                *worker.borrow_mut() = Some(handle);
             })
         };
 
@@ -107,6 +143,20 @@ impl ContainerLogsDialog {
 
         let load_for_combo = load.clone();
         tail_combo.connect_selected_notify(move |_| load_for_combo());
+
+        // Toggling Follow restarts the stream: checked means `follow=true`
+        // (live tail), unchecked falls back to a one-shot fetch.
+        let load_for_follow = load.clone();
+        auto_scroll.connect_toggled(move |_| load_for_follow());
+
+        // Abort the stream when the dialog closes so no worker outlives the
+        // buffer it writes to.
+        let worker_for_close = worker.clone();
+        dialog.connect_closed(move |_| {
+            if let Some(handle) = worker_for_close.borrow_mut().take() {
+                handle.abort();
+            }
+        });
 
         load();
         dialog.present(None::<&gtk::Widget>);

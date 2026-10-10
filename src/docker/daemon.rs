@@ -4,7 +4,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use tokio::fs as tfs;
 
-pub use super::models::DaemonState;
+use super::models::DaemonState;
+
+/// A socket path is usable when it exists and accepts a unix connection.
+/// Plain files (e.g. leftover fixtures) must not count as a live daemon.
+fn is_usable_socket(path: &PathBuf) -> bool {
+    path.exists() && std::os::unix::net::UnixStream::connect(path).is_ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonManager {
@@ -33,9 +39,28 @@ impl DaemonManager {
     pub fn detect_sockets(&self) -> Vec<PathBuf> {
         self.socket_candidates
             .iter()
-            .filter(|p| p.exists())
+            .filter(|p| is_usable_socket(p))
             .cloned()
             .collect()
+    }
+
+    /// Validate the configured preferred socket: empty means "auto", otherwise
+    /// it must be an absolute path. Returns the cleaned value or an error
+    /// message for the Preferences dialog.
+    pub fn validate_preferred_socket(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+        if !trimmed.starts_with('/') {
+            return Err("Preferred socket must be an absolute path".into());
+        }
+        Ok(trimmed)
+    }
+
+    /// Socket candidates currently configured (preferred first).
+    pub fn socket_candidates(&self) -> &[PathBuf] {
+        &self.socket_candidates
     }
 
     pub fn active_socket(&self) -> Option<PathBuf> {
@@ -50,29 +75,50 @@ impl DaemonManager {
     }
 
     pub fn try_start_unit(&self) -> io::Result<bool> {
-        let unit = &self.config.daemon_unit;
-        if unit.is_empty() {
+        if self.config.daemon_unit.trim().is_empty() {
             return Ok(false);
         }
-        let status = Command::new("systemctl")
-            .arg("--user")
-            .arg("start")
-            .arg(unit)
-            .status()?;
-        Ok(status.success())
+        for unit in self.unit_candidates() {
+            let status = Command::new("systemctl")
+                .arg("--user")
+                .arg("start")
+                .arg(&unit)
+                .status()?;
+            if status.success() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Units to try when starting/stopping the daemon: the configured unit
+    /// first, then the well-known `docker.service` fallback.
+    fn unit_candidates(&self) -> Vec<String> {
+        let mut units = Vec::new();
+        let configured = self.config.daemon_unit.trim().to_string();
+        if !configured.is_empty() {
+            units.push(configured);
+        }
+        if !units.iter().any(|u| u == "docker.service") {
+            units.push("docker.service".to_string());
+        }
+        units
     }
 
     pub fn try_stop_unit(&self) -> io::Result<bool> {
-        let unit = &self.config.daemon_unit;
-        if unit.is_empty() {
+        if self.config.daemon_unit.trim().is_empty() {
             return Ok(false);
         }
-        let status = Command::new("systemctl")
-            .arg("--user")
-            .arg("stop")
-            .arg(unit)
-            .status()?;
-        Ok(status.success())
+        let mut stopped = false;
+        for unit in self.unit_candidates() {
+            let status = Command::new("systemctl")
+                .arg("--user")
+                .arg("stop")
+                .arg(&unit)
+                .status()?;
+            stopped = stopped || status.success();
+        }
+        Ok(stopped)
     }
 
     pub fn is_unit_active(&self) -> io::Result<bool> {
@@ -115,9 +161,10 @@ mod tests {
     #[test]
     fn preferred_socket_wins_when_present() {
         let dir = std::env::temp_dir().join(format!("dm-sock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let preferred = dir.join("preferred.sock");
-        std::fs::write(&preferred, b"").expect("fixture socket file");
+        let _listener = std::os::unix::net::UnixListener::bind(&preferred).expect("fixture socket");
         let cfg = AppConfig {
             prefer_socket: preferred.to_string_lossy().to_string(),
             ..AppConfig::default()
@@ -126,6 +173,7 @@ mod tests {
         assert_eq!(dm.active_socket(), Some(preferred.clone()));
         assert!(dm.detect_sockets().first() == Some(&preferred));
         assert!(matches!(dm.state_from_socket(), DaemonState::Running));
+        drop(_listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

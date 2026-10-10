@@ -6,7 +6,8 @@ use gtk::{glib, Orientation};
 
 use crate::docker::models::DaemonState;
 use crate::runtime::spawn;
-use crate::ui::app_state::{AppEvent, AppState};
+use crate::ui::app_state::{AppEvent, AppState, RefreshScope};
+use crate::ui::compose_view::ComposeView;
 use crate::ui::containers_view::ContainersView;
 use crate::ui::images_view::ImagesView;
 use crate::ui::networks_view::NetworksView;
@@ -24,10 +25,13 @@ pub struct MainWindow {
     images_view: Rc<ImagesView>,
     volumes_view: Rc<VolumesView>,
     networks_view: Rc<NetworksView>,
+    compose_view: Rc<ComposeView>,
     daemon_badge: gtk::Label,
     daemon_btn: gtk::Button,
+    account_btn: gtk::Button,
     prefs_btn: gtk::Button,
     refresh_btn: gtk::Button,
+    spinner: gtk::Spinner,
 }
 
 impl MainWindow {
@@ -44,6 +48,7 @@ impl MainWindow {
         let images_view = ImagesView::new(state.clone());
         let volumes_view = VolumesView::new(state.clone());
         let networks_view = NetworksView::new(state.clone());
+        let compose_view = ComposeView::new(state.clone());
 
         let stack = adw::ViewStack::new();
         let engine_page = stack.add_titled(system_view.widget(), Some("engine"), "Engine");
@@ -57,6 +62,8 @@ impl MainWindow {
         volumes_page.set_icon_name(Some("drive-harddisk-symbolic"));
         let networks_page = stack.add_titled(networks_view.widget(), Some("networks"), "Networks");
         networks_page.set_icon_name(Some("network-workgroup-symbolic"));
+        let compose_page = stack.add_titled(compose_view.widget(), Some("compose"), "Compose");
+        compose_page.set_icon_name(Some("package-x-generic-symbolic"));
 
         let switcher = adw::ViewSwitcher::builder().stack(&stack).build();
 
@@ -77,12 +84,21 @@ impl MainWindow {
             .icon_name("preferences-system-symbolic")
             .tooltip_text("Preferences")
             .build();
+        let account_btn = gtk::Button::builder()
+            .icon_name("avatar-default-symbolic")
+            .tooltip_text("Registry login")
+            .build();
 
         let header = adw::HeaderBar::builder().title_widget(&switcher).build();
         header.pack_start(&daemon_badge);
         header.pack_start(&daemon_btn);
         header.pack_end(&refresh_btn);
+        header.pack_end(&account_btn);
         header.pack_end(&prefs_btn);
+        let spinner = gtk::Spinner::new();
+        spinner.set_tooltip_text(Some("Working…"));
+        spinner.stop();
+        header.pack_start(&spinner);
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header);
@@ -101,10 +117,13 @@ impl MainWindow {
             images_view,
             volumes_view,
             networks_view,
+            compose_view,
             daemon_badge,
             daemon_btn,
+            account_btn,
             prefs_btn,
             refresh_btn,
+            spinner,
         });
 
         view.connect_signals(&stack);
@@ -117,6 +136,31 @@ impl MainWindow {
     }
 
     fn connect_signals(self: &Rc<Self>, stack: &adw::ViewStack) {
+        // Keyboard shortcuts: Ctrl+R refresh, Ctrl+, preferences.
+        let weak = Rc::downgrade(self);
+        let refresh_shortcut = gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>r"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if let Some(v) = weak.upgrade() {
+                    v.refresh_all();
+                }
+                glib::Propagation::Stop
+            })),
+        );
+        let weak = Rc::downgrade(self);
+        let prefs_shortcut = gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>comma"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if let Some(v) = weak.upgrade() {
+                    crate::ui::preferences::PreferencesDialog::present(&v.state);
+                }
+                glib::Propagation::Stop
+            })),
+        );
+        let controller = gtk::ShortcutController::new();
+        controller.add_shortcut(refresh_shortcut);
+        controller.add_shortcut(prefs_shortcut);
+        self.window.add_controller(controller);
         let weak = Rc::downgrade(self);
         self.daemon_btn.connect_clicked(move |_| {
             if let Some(v) = weak.upgrade() {
@@ -128,6 +172,13 @@ impl MainWindow {
         self.prefs_btn.connect_clicked(move |_| {
             if let Some(v) = weak.upgrade() {
                 crate::ui::preferences::PreferencesDialog::present(&v.state);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.account_btn.connect_clicked(move |_| {
+            if let Some(v) = weak.upgrade() {
+                crate::ui::login_dialog::LoginDialog::present(&v.state);
             }
         });
 
@@ -148,6 +199,7 @@ impl MainWindow {
                     Some("images") => v.images_view.refresh(),
                     Some("volumes") => v.volumes_view.refresh(),
                     Some("networks") => v.networks_view.refresh(),
+                    Some("compose") => v.compose_view.refresh(),
                     _ => {}
                 }
             }
@@ -185,6 +237,9 @@ impl MainWindow {
                 let socket = self.state.active_socket().map(|p| p.display().to_string());
                 self.system_view.set_engine_info(&info, socket.as_deref());
             }
+            AppEvent::DiskUsage(report) => {
+                self.system_view.set_df(&report);
+            }
             AppEvent::Containers(items) => self.containers_view.set_containers(items),
             AppEvent::ContainerStats(id, stats) => {
                 self.containers_view.set_stats(&id, &stats);
@@ -192,13 +247,20 @@ impl MainWindow {
             AppEvent::Images(items) => self.images_view.set_images(items),
             AppEvent::Volumes(items) => self.volumes_view.set_volumes(items),
             AppEvent::Networks(items) => self.networks_view.set_networks(items),
-            AppEvent::Logs(_, _) => {}
-            AppEvent::PullProgress(_) => {}
             AppEvent::PullDone(Ok(())) => self.toast("Image pull finished"),
             AppEvent::PullDone(Err(e)) => self.toast(&format!("Pull failed: {e}")),
-            AppEvent::Toast(msg) => self.toast(&msg),
-            AppEvent::Error(msg) => self.toast(&format!("Error: {msg}")),
-            AppEvent::Busy(_) => self.refresh_all(),
+            AppEvent::Toast(msg) => {
+                self.spinner.stop();
+                self.toast(&msg);
+            }
+            AppEvent::Error(msg) => {
+                self.spinner.stop();
+                self.show_error(&msg);
+            }
+            AppEvent::Busy(scope) => {
+                self.spinner.start();
+                self.refresh_scope(scope);
+            }
         }
     }
 
@@ -242,12 +304,43 @@ impl MainWindow {
         self.images_view.refresh();
         self.volumes_view.refresh();
         self.networks_view.refresh();
+        self.compose_view.refresh();
+    }
+
+    /// Refresh only the view named by `scope`; daemon completions re-poll
+    /// daemon state so the header badge stays honest.
+    pub fn refresh_scope(self: &Rc<Self>, scope: RefreshScope) {
+        match scope {
+            RefreshScope::Daemon => self.state.refresh_daemon(),
+            RefreshScope::Containers => self.containers_view.refresh(),
+            RefreshScope::Images => self.images_view.refresh(),
+            RefreshScope::Volumes => self.volumes_view.refresh(),
+            RefreshScope::Networks => self.networks_view.refresh(),
+            RefreshScope::Compose => self.compose_view.refresh(),
+            RefreshScope::All => self.refresh_all(),
+        }
     }
 
     fn toast(&self, message: &str) {
         let toast = adw::Toast::new(message);
         toast.set_timeout(4);
         self.toast_overlay.add_toast(toast);
+    }
+
+    /// Short errors become toasts; long ones (>120 chars) get a dialog so the
+    /// full message (e.g. a daemon stderr dump) stays readable.
+    fn show_error(&self, message: &str) {
+        if message.chars().count() <= 120 {
+            self.toast(&format!("Error: {message}"));
+            return;
+        }
+        let dlg = adw::AlertDialog::builder()
+            .heading("Error")
+            .body(message)
+            .build();
+        dlg.add_response("ok", "OK");
+        dlg.set_default_response(Some("ok"));
+        dlg.present(Some(&self.window));
     }
 
     /// Poll stats for every running container every few seconds.

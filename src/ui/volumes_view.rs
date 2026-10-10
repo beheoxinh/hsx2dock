@@ -3,8 +3,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::Orientation;
 
-use super::app_state::{AppEvent, AppState};
+use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::VolumeItem;
+use crate::ui::common::copy_to_clipboard;
 
 struct VolumeRow {
     root: gtk::Box,
@@ -38,6 +39,11 @@ impl VolumeRow {
             .css_classes(["destructive-action"])
             .valign(gtk::Align::Center)
             .build();
+        let copy_btn = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy volume name")
+            .valign(gtk::Align::Center)
+            .build();
 
         let texts = gtk::Box::builder()
             .orientation(Orientation::Vertical)
@@ -57,11 +63,20 @@ impl VolumeRow {
             .margin_end(12)
             .build();
         root.append(&texts);
+        root.append(&copy_btn);
         root.append(&delete_btn);
 
         let row = Rc::new(Self {
             root,
             item: std::cell::RefCell::new(item),
+        });
+
+        let r_copy = row.clone();
+        let st_copy = state.clone();
+        copy_btn.connect_clicked(move |_| {
+            let name = r_copy.item.borrow().name.clone();
+            copy_to_clipboard(&r_copy.root.clone().upcast::<gtk::Widget>(), &name);
+            st_copy.toast(format!("Copied {name}"));
         });
 
         let r = row.clone();
@@ -88,7 +103,7 @@ impl VolumeRow {
                     match client.remove_volume(&name, true).await {
                         Ok(()) => {
                             let _ = tx.send(AppEvent::Toast("Volume removed".into())).await;
-                            let _ = tx.send(AppEvent::Busy(true)).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Volumes)).await;
                         }
                         Err(e) => {
                             let _ = tx
@@ -245,7 +260,7 @@ impl VolumesView {
                             let _ = tx
                                 .send(AppEvent::Toast(format!("Pruned {n} volume(s)")))
                                 .await;
-                            let _ = tx.send(AppEvent::Busy(true)).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Volumes)).await;
                         }
                         Err(e) => {
                             let _ = tx

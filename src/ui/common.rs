@@ -21,6 +21,17 @@ where
     tx
 }
 
+/// Shorten an ID for display (first 12 chars, char-boundary safe).
+pub fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+/// Copy `text` to the system clipboard via the widget's display.
+pub fn copy_to_clipboard(widget: &gtk::Widget, text: &str) {
+    use gtk::prelude::WidgetExt;
+    widget.clipboard().set_text(text);
+}
+
 /// Human readable byte size (SI-ish, binary units).
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -80,6 +91,24 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.00 KiB");
         assert_eq!(format_bytes(1024 * 1024 * 3 / 2), "1.50 MiB");
+    }
+
+    #[test]
+    fn bytes_boundaries() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+    }
+
+    #[test]
+    fn relative_ranges() {
+        let ago = |secs: u64| SystemTime::now() - Duration::from_secs(secs);
+        assert_eq!(format_relative(ago(30)), "30 seconds ago");
+        assert_eq!(format_relative(ago(90)), "1 minutes ago");
+        assert_eq!(format_relative(ago(3700)), "1 hours ago");
+        assert_eq!(format_relative(ago(90000)), "1 days ago");
     }
 
     #[test]

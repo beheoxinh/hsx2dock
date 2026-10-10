@@ -68,10 +68,22 @@ impl PreferencesDialog {
         let st = state.clone();
         let dlg = dialog.clone();
         save_btn.connect_clicked(move |_| {
+            let prefer_socket =
+                match crate::docker::daemon::DaemonManager::validate_preferred_socket(
+                    &socket_row.text(),
+                ) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        socket_row.add_css_class("error");
+                        socket_row.set_tooltip_text(Some(&msg));
+                        return;
+                    }
+                };
             let next = crate::config::AppConfig {
                 auto_start_daemon: auto_row.is_active(),
                 daemon_unit: unit_row.text().trim().to_string(),
-                prefer_socket: socket_row.text().trim().to_string(),
+                prefer_socket,
+                compose_file: st.config.borrow().compose_file.clone(),
             };
             let st2 = st.clone();
             let dlg2 = dlg.clone();

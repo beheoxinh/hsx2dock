@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use super::app_state::{AppEvent, AppState};
+use super::app_state::{AppEvent, AppState, RefreshScope};
 
 pub struct VolumeCreateDialog;
 
@@ -71,7 +71,7 @@ impl VolumeCreateDialog {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Created volume {name}")))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Volumes)).await;
                         let _ = close.send(()).await;
                     }
                     Err(e) => {
@@ -154,7 +154,7 @@ impl NetworkCreateDialog {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Created network {name}")))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Networks)).await;
                         let _ = close.send(()).await;
                     }
                     Err(e) => {

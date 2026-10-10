@@ -2,8 +2,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use super::app_state::{AppEvent, AppState};
+use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::NetworkItem;
+use crate::ui::common::copy_to_clipboard;
 
 pub struct NetworkRow {
     root: gtk::Box,
@@ -38,6 +39,11 @@ impl NetworkRow {
             .css_classes(["destructive-action"])
             .valign(gtk::Align::Center)
             .build();
+        let copy_btn = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy network ID")
+            .valign(gtk::Align::Center)
+            .build();
 
         let texts = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -57,11 +63,20 @@ impl NetworkRow {
             .margin_end(12)
             .build();
         root.append(&texts);
+        root.append(&copy_btn);
         root.append(&delete_btn);
 
         let row = Rc::new(Self {
             root,
             item: std::cell::RefCell::new(item),
+        });
+
+        let r_copy = row.clone();
+        let st_copy = state.clone();
+        copy_btn.connect_clicked(move |_| {
+            let id = r_copy.item.borrow().id.clone();
+            copy_to_clipboard(&r_copy.root.clone().upcast::<gtk::Widget>(), &id);
+            st_copy.toast("Copied network ID".to_string());
         });
 
         let r = row.clone();
@@ -88,7 +103,7 @@ impl NetworkRow {
                     match client.remove_network(&name).await {
                         Ok(()) => {
                             let _ = tx.send(AppEvent::Toast("Network removed".into())).await;
-                            let _ = tx.send(AppEvent::Busy(true)).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Networks)).await;
                         }
                         Err(e) => {
                             let _ = tx
@@ -245,7 +260,7 @@ impl NetworksView {
                             let _ = tx
                                 .send(AppEvent::Toast(format!("Pruned {n} network(s)")))
                                 .await;
-                            let _ = tx.send(AppEvent::Busy(true)).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Networks)).await;
                         }
                         Err(e) => {
                             let _ = tx

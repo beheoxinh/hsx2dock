@@ -2,16 +2,18 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use super::app_state::{AppEvent, AppState};
-use crate::docker::models::DaemonState;
+use super::app_state::{AppEvent, AppState, RefreshScope};
+use crate::docker::models::{DaemonState, DfReport};
 use crate::ui::common::format_bytes;
 
 /// System / Engine information page shown in the main view stack.
 pub struct SystemView {
     widget: gtk::Box,
-    info_label: gtk::Label,
+    engine_label: gtk::Label,
+    usage_label: gtk::Label,
     status_label: gtk::Label,
     daemon_btn: gtk::Button,
+    prune_btn: gtk::Button,
     refresh_btn: gtk::Button,
     state: Rc<AppState>,
 }
@@ -30,6 +32,10 @@ impl SystemView {
             .tooltip_text("Refresh engine information")
             .build();
 
+        let prune_btn = gtk::Button::with_label("System Prune");
+        prune_btn.add_css_class("destructive-action");
+        prune_btn.set_tooltip_text(Some("Remove unused data (confirm first)"));
+
         let actions = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -37,9 +43,18 @@ impl SystemView {
             .build();
         actions.append(&daemon_btn);
         actions.append(&refresh_btn);
+        actions.append(&prune_btn);
 
-        let info_label = gtk::Label::builder()
+        let engine_label = gtk::Label::builder()
             .label("Waiting for Docker daemon…")
+            .selectable(true)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label"])
+            .build();
+
+        let usage_label = gtk::Label::builder()
+            .label("Disk usage: —")
             .selectable(true)
             .wrap(true)
             .justify(gtk::Justification::Center)
@@ -57,7 +72,8 @@ impl SystemView {
             .build();
         content.append(&status_label);
         content.append(&actions);
-        content.append(&info_label);
+        content.append(&engine_label);
+        content.append(&usage_label);
 
         let clamp = adw::Clamp::builder()
             .maximum_size(760)
@@ -71,9 +87,11 @@ impl SystemView {
 
         let view = Rc::new(Self {
             widget,
-            info_label,
+            engine_label,
+            usage_label,
             status_label,
             daemon_btn,
+            prune_btn,
             refresh_btn,
             state,
         });
@@ -108,6 +126,14 @@ impl SystemView {
             btn.set_sensitive(false);
             state.toggle_daemon();
         });
+
+        let weak = Rc::downgrade(self);
+        self.prune_btn.connect_clicked(move |_| {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            view.confirm_system_prune();
+        });
     }
 
     /// Apply the daemon state to the header widgets.
@@ -137,7 +163,7 @@ impl SystemView {
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("destructive-action");
                 self.daemon_btn.add_css_class("suggested-action");
-                self.info_label
+                self.engine_label
                     .set_label("Docker daemon is not detected. Start it with the button above.");
             }
         }
@@ -165,6 +191,65 @@ impl SystemView {
             cgroup = info.cgroup_driver,
             socket = socket.unwrap_or("default"),
         );
-        self.info_label.set_label(&text);
+        self.engine_label.set_label(&text);
+    }
+
+    /// Render disk usage reported by `docker system df`.
+    pub fn set_df(&self, report: &DfReport) {
+        let text = format!(
+            "Disk usage — Images: {} ({}) · Containers: {} ({}) · Volumes: {} ({})",
+            report.images_count,
+            format_bytes(report.images_size),
+            report.containers_count,
+            format_bytes(report.containers_size),
+            report.volumes_count,
+            format_bytes(report.volumes_size),
+        );
+        self.usage_label.set_label(&text);
+    }
+
+    /// Confirm then run a full system prune, reporting reclaimed bytes.
+    fn confirm_system_prune(self: &Rc<Self>) {
+        let dlg = adw::AlertDialog::builder()
+            .heading("Prune unused Docker data?")
+            .body("Unused images, stopped containers, networks and volumes will be deleted.")
+            .build();
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("prune", "Prune");
+        dlg.set_response_appearance("prune", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+
+        let state = self.state.clone();
+        dlg.connect_response(None, move |_, response| {
+            if response != "prune" {
+                return;
+            }
+            let state = state.clone();
+            state.with_client(move |client, tx| async move {
+                match client.system_prune().await {
+                    Ok(reclaimed) => {
+                        let _ = tx
+                            .send(AppEvent::Toast(format!(
+                                "Reclaimed {}",
+                                format_bytes(reclaimed)
+                            )))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::Error(format!("system prune failed: {e}")))
+                            .await;
+                    }
+                }
+                let _ = tx.send(AppEvent::Busy(RefreshScope::Daemon)).await;
+            });
+        });
+
+        if let Some(root) = self.widget.root() {
+            dlg.present(Some(&root));
+        } else {
+            dlg.present(None::<&gtk::Widget>);
+        }
     }
 }

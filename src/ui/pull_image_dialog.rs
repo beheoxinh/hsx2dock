@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use super::app_state::{AppEvent, AppState};
+use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::ui::common::main_loop_channel;
 
 /// Modal dialog to pull an image, showing live progress from the daemon stream.
@@ -10,15 +10,20 @@ pub struct PullImageDialog;
 
 impl PullImageDialog {
     pub fn present(state: &Rc<AppState>) {
+        Self::present_with(state, "");
+    }
+
+    pub fn present_with(state: &Rc<AppState>, prefill: &str) {
         let entry = gtk::Entry::builder()
             .placeholder_text("e.g. alpine:latest, postgres:17")
             .activates_default(true)
             .hexpand(true)
+            .text(prefill)
             .build();
 
         let pull_btn = gtk::Button::with_label("Pull");
         pull_btn.add_css_class("suggested-action");
-        pull_btn.set_sensitive(false);
+        pull_btn.set_sensitive(!prefill.trim().is_empty());
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
@@ -131,7 +136,7 @@ impl PullImageDialog {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Pulled {image_for_worker}")))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Images)).await;
                         let _ = render_done.send(Ok(())).await;
                         let _ = close.send(()).await;
                     }

@@ -6,28 +6,41 @@ use async_channel::{Receiver, Sender};
 
 use crate::config::AppConfig;
 use crate::docker::client::DockerClient;
-use crate::docker::daemon::{DaemonManager, DaemonState};
+use crate::docker::daemon::DaemonManager;
 use crate::docker::models::{
-    ContainerItem, ContainerStats, EngineInfo, ImageItem, NetworkItem, VolumeItem,
+    ContainerItem, ContainerStats, DaemonState, DfReport, EngineInfo, ImageItem, NetworkItem,
+    VolumeItem,
 };
 use crate::runtime::spawn;
+
+/// Scope of a [`AppEvent::Busy`] completion: only the affected view reloads
+/// instead of refreshing every tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshScope {
+    Daemon,
+    Containers,
+    Images,
+    Volumes,
+    Networks,
+    Compose,
+    All,
+}
 
 /// Events flowing from background Tokio tasks back to the GTK main loop.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     DaemonState(DaemonState),
     EngineInfo(Box<EngineInfo>),
+    DiskUsage(Box<DfReport>),
     Containers(Vec<ContainerItem>),
     ContainerStats(String, ContainerStats),
     Images(Vec<ImageItem>),
     Volumes(Vec<VolumeItem>),
     Networks(Vec<NetworkItem>),
-    Logs(String, String),
-    PullProgress(String),
     PullDone(Result<(), String>),
     Toast(String),
     Error(String),
-    Busy(bool),
+    Busy(RefreshScope),
 }
 
 /// Shared application state: config, daemon manager, docker client factory and
@@ -38,7 +51,6 @@ pub struct AppState {
     client: RefCell<Option<DockerClient>>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
-    pub busy: RefCell<bool>,
 }
 
 impl AppState {
@@ -51,7 +63,6 @@ impl AppState {
             client: RefCell::new(None),
             tx,
             rx,
-            busy: RefCell::new(false),
         })
     }
 
@@ -111,27 +122,63 @@ impl AppState {
     }
 
     /// Refresh daemon state + engine info in the background.
+    ///
+    /// The socket existing is not enough: a stale socket file reports a dead
+    /// daemon as running. Ping the API first and only report `Running` when
+    /// the daemon actually answers; otherwise fall back to `Stopped` so the
+    /// UI never claims a live connection it does not have.
     pub fn refresh_daemon(&self) {
         let tx = self.sender();
         let state = self.daemon_state();
-        let _ = tx.send_blocking(AppEvent::DaemonState(state.clone()));
-        if matches!(state, DaemonState::Running) {
-            self.reset_client();
-            let Some(client) = self.client() else {
-                self.error("Docker socket detected but the API is unreachable");
+        if !matches!(state, DaemonState::Running) {
+            let _ = tx.send_blocking(AppEvent::DaemonState(state));
+            return;
+        }
+        self.reset_client();
+        let Some(client) = self.client() else {
+            let _ = tx.send_blocking(AppEvent::DaemonState(DaemonState::Stopped));
+            self.error("Docker socket detected but the API is unreachable");
+            return;
+        };
+        spawn(async move {
+            if !client.is_healthy().await {
+                let _ = tx.send(AppEvent::DaemonState(DaemonState::Stopped)).await;
+                let _ = tx
+                    .send(AppEvent::Error(
+                        "Docker socket detected but the API is unreachable".into(),
+                    ))
+                    .await;
                 return;
-            };
-            spawn(async move {
-                match client.engine_info().await {
-                    Ok(info) => {
-                        let _ = tx.send(AppEvent::EngineInfo(Box::new(info))).await;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Error(format!("engine info: {e}"))).await;
+            }
+            match client.ping().await {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::DaemonState(DaemonState::Running)).await;
+                    match client.engine_info().await {
+                        Ok(info) => {
+                            let _ = tx.send(AppEvent::EngineInfo(Box::new(info))).await;
+                            match client.system_df().await {
+                                Ok(df) => {
+                                    let _ = tx.send(AppEvent::DiskUsage(Box::new(df))).await;
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(AppEvent::Error(format!("disk usage: {e}"))).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Error(format!("engine info: {e}"))).await;
+                        }
                     }
                 }
-            });
-        }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::DaemonState(DaemonState::Stopped)).await;
+                    let _ = tx
+                        .send(AppEvent::Error(format!("daemon ping failed: {e}")))
+                        .await;
+                }
+            }
+        });
     }
 
     /// Auto-start the daemon unit once when enabled and no socket is live.
@@ -217,7 +264,7 @@ impl AppState {
                 Err(e) => format!("systemctl failed: {e}"),
             };
             let _ = tx.send(AppEvent::Toast(msg)).await;
-            let _ = tx.send(AppEvent::Busy(false)).await;
+            let _ = tx.send(AppEvent::Busy(RefreshScope::Daemon)).await;
         });
     }
 
@@ -231,10 +278,32 @@ impl AppState {
         F: FnOnce(DockerClient, Sender<AppEvent>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        if !self.has_client() {
+            self.error("Docker daemon is not running");
+            return;
+        }
+        self.with_client_or_toast(f);
+    }
+
+    /// Run `f` on the Tokio runtime, toasting on failure instead of erroring.
+    ///
+    /// Unlike [`with_client`](Self::with_client), a missing daemon produces a
+    /// transient toast (no error styling) — use this for user-initiated action
+    /// buttons where a quiet heads-up beats an error banner.
+    pub fn with_client_or_toast<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(DockerClient, Sender<AppEvent>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let tx = self.sender();
         match self.client() {
             Some(client) => spawn(async move { f(client, tx).await }),
-            None => self.error("Docker daemon is not running"),
+            None => self.toast("Docker daemon is not running"),
         }
+    }
+
+    /// True when a cached client (or a connectable socket) exists.
+    pub fn has_client(&self) -> bool {
+        self.client().is_some()
     }
 }

@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub daemon_unit: String,
     #[serde(default)]
     pub prefer_socket: String,
+    #[serde(default)]
+    pub compose_file: String,
 }
 
 impl Default for AppConfig {
@@ -25,6 +27,7 @@ impl Default for AppConfig {
             auto_start_daemon: default_auto_start(),
             daemon_unit: default_daemon_unit(),
             prefer_socket: String::new(),
+            compose_file: String::new(),
         }
     }
 }
@@ -108,6 +111,7 @@ mod tests {
             auto_start_daemon: false,
             daemon_unit: "custom.service".to_string(),
             prefer_socket: "/tmp/test-docker.sock".to_string(),
+            compose_file: "/tmp/docker-compose.yml".to_string(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");

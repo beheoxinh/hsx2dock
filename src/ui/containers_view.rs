@@ -3,10 +3,10 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 
-use super::app_state::{AppEvent, AppState};
+use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::{ContainerItem, ContainerStats};
 use crate::terminal_launcher::TerminalLauncher;
-use crate::ui::common::{format_bytes, format_relative_unix};
+use crate::ui::common::{copy_to_clipboard, format_bytes, format_relative_unix};
 
 /// A single container row with live stats + action buttons.
 struct ContainerRow {
@@ -17,9 +17,13 @@ struct ContainerRow {
     start_btn: gtk::Button,
     stop_btn: gtk::Button,
     restart_btn: gtk::Button,
+    pause_btn: gtk::Button,
     shell_btn: gtk::Button,
     logs_btn: gtk::Button,
+    inspect_btn: gtk::Button,
+    rename_btn: gtk::Button,
     delete_btn: gtk::Button,
+    copy_btn: gtk::Button,
     item: std::cell::RefCell<ContainerItem>,
 }
 
@@ -76,6 +80,10 @@ impl ContainerRow {
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Restart container")
             .build();
+        let pause_btn = gtk::Button::builder()
+            .icon_name("media-playback-pause-symbolic")
+            .tooltip_text("Pause / resume container")
+            .build();
         let shell_btn = gtk::Button::builder()
             .icon_name("utilities-terminal-symbolic")
             .tooltip_text("Open shell in terminal (ptyxis/gnome-terminal)")
@@ -84,10 +92,23 @@ impl ContainerRow {
             .icon_name("text-x-generic-symbolic")
             .tooltip_text("View logs")
             .build();
+        let inspect_btn = gtk::Button::builder()
+            .icon_name("dialog-information-symbolic")
+            .tooltip_text("Inspect container")
+            .build();
+        let rename_btn = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Rename container")
+            .build();
         let delete_btn = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Remove container")
             .css_classes(["destructive-action"])
+            .build();
+        let copy_btn = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy container ID")
+            .valign(Align::Center)
             .build();
 
         let buttons = gtk::Box::builder()
@@ -99,9 +120,13 @@ impl ContainerRow {
             &start_btn,
             &stop_btn,
             &restart_btn,
+            &pause_btn,
             &shell_btn,
             &logs_btn,
+            &inspect_btn,
+            &rename_btn,
             &delete_btn,
+            &copy_btn,
         ] {
             buttons.append(b);
         }
@@ -152,9 +177,13 @@ impl ContainerRow {
             start_btn,
             stop_btn,
             restart_btn,
+            pause_btn,
             shell_btn,
             logs_btn,
+            inspect_btn,
+            rename_btn,
             delete_btn,
+            copy_btn,
             item: std::cell::RefCell::new(item),
         });
         row.bind_actions(state);
@@ -169,6 +198,13 @@ impl ContainerRow {
     fn bind_actions(self: &Rc<Self>, state: Rc<AppState>) {
         let row = self.clone();
         let st = state.clone();
+        self.copy_btn.clone().connect_clicked(move |_| {
+            let id = row.id();
+            copy_to_clipboard(&row.root.clone().upcast::<gtk::Widget>(), &id);
+            st.toast(format!("Copied {}", crate::ui::common::short_id(&id)));
+        });
+        let row = self.clone();
+        let st = state.clone();
         self.start_btn.clone().connect_clicked(move |_| {
             let id = row.id();
             st.with_client(move |client, tx| async move {
@@ -177,7 +213,7 @@ impl ContainerRow {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Started {}", short(&id))))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::Error(format!("start: {e}"))).await;
@@ -196,7 +232,7 @@ impl ContainerRow {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Stopped {}", short(&id))))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::Error(format!("stop: {e}"))).await;
@@ -215,7 +251,7 @@ impl ContainerRow {
                         let _ = tx
                             .send(AppEvent::Toast(format!("Restarted {}", short(&id))))
                             .await;
-                        let _ = tx.send(AppEvent::Busy(true)).await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::Error(format!("restart: {e}"))).await;
@@ -245,6 +281,135 @@ impl ContainerRow {
 
         let row = self.clone();
         let st = state.clone();
+        self.pause_btn.clone().connect_clicked(move |_| {
+            let id = row.id();
+            let paused = row.item.borrow().state.to_lowercase() == "paused";
+            st.with_client(move |client, tx| async move {
+                let result = if paused {
+                    client.unpause_container(&id).await
+                } else {
+                    client.pause_container(&id).await
+                };
+                match result {
+                    Ok(()) => {
+                        let verb = if paused { "Resumed" } else { "Paused" };
+                        let _ = tx
+                            .send(AppEvent::Toast(format!("{verb} {}", short(&id))))
+                            .await;
+                        let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
+                    }
+                    Err(e) => {
+                        let verb = if paused { "resume" } else { "pause" };
+                        let _ = tx.send(AppEvent::Error(format!("{verb}: {e}"))).await;
+                    }
+                }
+            });
+        });
+
+        let row = self.clone();
+        let st = state.clone();
+        self.inspect_btn.clone().connect_clicked(move |_| {
+            let id = row.id();
+            let label = row.item.borrow().name.clone();
+            let label_for_show = label.clone();
+            st.with_client(move |client, tx| async move {
+                match client.inspect_container(&id).await {
+                    Ok(d) => {
+                        let body = format!(
+                            "Name: {}\nImage: {}\nState: {} ({})\nCreated: {}\nCommand: {}\nPorts: {}\nRestart: {}\nNetworks: {}\n\nEnv:\n{}\n\nMounts:\n{}",
+                            d.name,
+                            d.image,
+                            d.state,
+                            d.status,
+                            d.created,
+                            d.command,
+                            d.ports,
+                            d.restart_policy,
+                            d.networks.join(", "),
+                            d.env.join("\n"),
+                            d.mounts.join("\n"),
+                        );
+                        let show = crate::ui::common::main_loop_channel(move |()| {
+                            let dlg = adw::AlertDialog::builder()
+                                .heading(format!("Inspect · {label_for_show}"))
+                                .body(body.clone())
+                                .build();
+                            dlg.add_response("close", "Close");
+                            dlg.present(None::<&gtk::Widget>);
+                        });
+                        let _ = show.send(()).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!("inspect: {e}"))).await;
+                    }
+                }
+            });
+        });
+
+        let row = self.clone();
+        let st = state.clone();
+        self.rename_btn.clone().connect_clicked(move |_| {
+            let id = row.id();
+            let current = row.item.borrow().name.clone();
+            let entry = gtk::Entry::builder()
+                .text(current.as_str())
+                .activates_default(true)
+                .build();
+            let rename_btn = gtk::Button::with_label("Rename");
+            rename_btn.add_css_class("suggested-action");
+            let form = gtk::Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(6)
+                .margin_top(12)
+                .margin_bottom(12)
+                .margin_start(12)
+                .margin_end(12)
+                .build();
+            form.append(&gtk::Label::new(Some("New name:")));
+            form.append(&entry);
+            let toolbar = adw::ToolbarView::new();
+            let header = adw::HeaderBar::new();
+            header.pack_end(&rename_btn);
+            toolbar.add_top_bar(&header);
+            toolbar.set_content(Some(&form));
+            let dialog = adw::Dialog::builder()
+                .title("Rename Container")
+                .content_width(400)
+                .child(&toolbar)
+                .build();
+            let st2 = st.clone();
+            let entry2 = entry.clone();
+            let dialog2 = dialog.clone();
+            let id2 = id.clone();
+            rename_btn.connect_clicked(move |_| {
+                let name = entry2.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let st = st2.clone();
+                let id = id2.clone();
+                let dialog = dialog2.clone();
+                let close = crate::ui::common::main_loop_channel(move |()| {
+                    dialog.close();
+                });
+                st.with_client(move |client, tx| async move {
+                    match client.rename_container(&id, &name).await {
+                        Ok(()) => {
+                            let _ = tx.send(AppEvent::Toast(format!("Renamed to {name}"))).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
+                            let _ = close.send(()).await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Error(format!("rename: {e}"))).await;
+                        }
+                    }
+                });
+            });
+            dialog.present(None::<&gtk::Widget>);
+        });
+
+        let row = self.clone();
+        let st = state.clone();
         self.delete_btn.clone().connect_clicked(move |_| {
             let id = row.id();
             let label = row.item.borrow().name.clone();
@@ -270,7 +435,7 @@ impl ContainerRow {
                     match client.remove_container(&id, true).await {
                         Ok(()) => {
                             let _ = tx.send(AppEvent::Toast("Container removed".into())).await;
-                            let _ = tx.send(AppEvent::Busy(true)).await;
+                            let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
                         }
                         Err(e) => {
                             let _ = tx.send(AppEvent::Error(format!("remove: {e}"))).await;
@@ -288,9 +453,21 @@ impl ContainerRow {
 
     fn sync_buttons(&self) {
         let running = self.item.borrow().running;
+        let paused = self.item.borrow().state.to_lowercase() == "paused";
         self.start_btn.set_sensitive(!running);
         self.stop_btn.set_sensitive(running);
         self.restart_btn.set_sensitive(running);
+        self.pause_btn.set_sensitive(running);
+        self.pause_btn.set_icon_name(if paused {
+            "media-playback-start-symbolic"
+        } else {
+            "media-playback-pause-symbolic"
+        });
+        self.pause_btn.set_tooltip_text(Some(if paused {
+            "Resume container"
+        } else {
+            "Pause container"
+        }));
         self.shell_btn.set_sensitive(running);
         if running {
             self.status_pill.add_css_class("success");
@@ -348,6 +525,13 @@ impl ContainersView {
             .tooltip_text("Include non-running containers")
             .build();
 
+        let run_btn = gtk::Button::builder()
+            .label("Run")
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Run a new container…")
+            .css_classes(["suggested-action"])
+            .build();
+
         let toolbar = gtk::Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(6)
@@ -358,6 +542,7 @@ impl ContainersView {
             .build();
         toolbar.append(&search);
         toolbar.append(&show_all);
+        toolbar.append(&run_btn);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -405,6 +590,7 @@ impl ContainersView {
         widget.append(&gtk::Separator::new(Orientation::Horizontal));
         widget.append(&scrolled);
 
+        let state_for_run = state.clone();
         let view = Rc::new(Self {
             widget,
             list,
@@ -416,6 +602,9 @@ impl ContainersView {
         });
 
         view.connect_signals();
+        run_btn.connect_clicked(move |_| {
+            super::run_container_dialog::RunContainerDialog::present(&state_for_run);
+        });
         view.refresh();
         view
     }

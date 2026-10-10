@@ -22,6 +22,13 @@ via [bollard](https://crates.io/crates/bollard).
   prune unused.
 - **Networks** — list name/driver/subnet/gateway, create (name + driver),
   delete, prune unused.
+- **Compose** — pick a compose file, Up/Down (Down confirmed), service list,
+  per-service logs.
+- **Registries** — tag/push/history, build with live progress, Docker Hub
+  search, login/logout via the `docker` CLI (no secrets stored in-app).
+- **Polish** — `Ctrl+R` refresh / `Ctrl+,` preferences shortcuts, header
+  working spinner, long-error dialog, copy-ID buttons on every row,
+  confirm-before-every-prune/delete.
 - **On-demand daemon control** — the app detects the active socket
   (`~/.docker/desktop/docker.sock`, then `/var/run/docker.sock`) and can
   start/stop the daemon via systemd user units (`docker-desktop.service` by
@@ -91,7 +98,15 @@ src/
   ui/
     app_state.rs        AppEvent bus, with_client, refresh/toggle daemon
     common.rs           format helpers + main_loop_channel marshalling
-    window.rs           ViewStack shell, event drain, poll loops
+    window.rs           ViewStack shell, event drain, poll loops, spinner,
+                      shortcuts, error dialog
+    dialogs/           run/exec/logs/inspect/pull/push/build/tag/login/hub/preferences
+```
+
+Full map: [docs/architecture.md](docs/architecture.md) ·
+Usage: [docs/user-guide.md](docs/user-guide.md) ·
+Config: [docs/configuration.md](docs/configuration.md) ·
+Dev: [docs/development.md](docs/development.md)
     system_view.rs      engine dashboard
     containers_view.rs  containers + stats bars
     container_details_dialog.rs   logs dialog
