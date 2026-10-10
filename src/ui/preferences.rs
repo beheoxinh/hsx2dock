@@ -33,8 +33,38 @@ impl PreferencesDialog {
             .description("How the app finds and starts the Docker daemon")
             .build();
         group.add(&auto_row);
+        // Unit presets: system docker.service first (self-managed Engine),
+        // legacy Desktop unit kept for old configs, plus free-form custom.
+        let unit_presets = gtk::StringList::new(&[
+            "docker.service",
+            "docker-desktop.service (legacy)",
+            "custom…",
+        ]);
+        let current = cfg.daemon_unit.trim();
+        let preset_row = adw::ComboRow::builder()
+            .title("Daemon unit preset")
+            .subtitle("System unit this app starts/stops (never Docker Desktop)")
+            .model(&unit_presets)
+            .build();
+        if current == "docker.service" {
+            preset_row.set_selected(0);
+        } else if current == "docker-desktop.service" {
+            preset_row.set_selected(1);
+        } else {
+            preset_row.set_selected(2);
+        }
+        group.add(&preset_row);
         group.add(&unit_row);
         group.add(&socket_row);
+        // Warn when a legacy Desktop-coupled unit is configured: the app
+        // respects it but no longer manages Docker Desktop itself.
+        if crate::docker::daemon::is_legacy_desktop_unit(&cfg.daemon_unit) {
+            let warn = adw::Banner::builder()
+                .title("Legacy Docker Desktop unit configured — switch to docker.service to let this app fully manage the Engine")
+                .build();
+            warn.add_css_class("warning");
+            group.add(&warn);
+        }
 
         let page = adw::PreferencesPage::builder()
             .title("General")
@@ -81,7 +111,11 @@ impl PreferencesDialog {
                 };
             let next = crate::config::AppConfig {
                 auto_start_daemon: auto_row.is_active(),
-                daemon_unit: unit_row.text().trim().to_string(),
+                daemon_unit: match preset_row.selected() {
+                    0 => "docker.service".to_string(),
+                    1 => "docker-desktop.service".to_string(),
+                    _ => unit_row.text().trim().to_string(),
+                },
                 prefer_socket,
                 compose_file: st.config.borrow().compose_file.clone(),
             };

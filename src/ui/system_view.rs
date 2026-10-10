@@ -11,6 +11,11 @@ pub struct SystemView {
     widget: gtk::Box,
     engine_label: gtk::Label,
     usage_label: gtk::Label,
+    guide_box: gtk::Box,
+    install_btn: gtk::Button,
+    docs_btn: gtk::Button,
+    reconfig_btn: gtk::Button,
+    uninstall_btn: gtk::Button,
     status_label: gtk::Label,
     daemon_btn: gtk::Button,
     prune_btn: gtk::Button,
@@ -75,6 +80,42 @@ impl SystemView {
         content.append(&engine_label);
         content.append(&usage_label);
 
+        // Install guide panel: visible only when the docker CLI is missing.
+        let guide_label = gtk::Label::builder()
+            .label("Docker Engine is not installed.\n\n1. Press Install (escalates with your password).\n2. Or follow https://docs.docker.com/engine/install/ manually.\n3. Press Refresh / Reconfig once `docker --version` works.")
+            .selectable(true)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label"])
+            .build();
+        let install_btn = gtk::Button::with_label("Install Docker Engine");
+        install_btn.add_css_class("suggested-action");
+        install_btn.set_tooltip_text(Some("Install via distro package manager (pkexec)"));
+        let docs_btn = gtk::Button::with_label("Open Install Docs");
+        let reconfig_btn = gtk::Button::with_label("Reconfig");
+        reconfig_btn.set_tooltip_text(Some("Open Preferences to fix unit/socket"));
+        let uninstall_btn = gtk::Button::with_label("Uninstall…");
+        uninstall_btn.add_css_class("destructive-action");
+        uninstall_btn.set_tooltip_text(Some("Remove Engine packages (confirm first)"));
+        let guide_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .build();
+        guide_row.append(&install_btn);
+        guide_row.append(&docs_btn);
+        guide_row.append(&reconfig_btn);
+        guide_row.append(&uninstall_btn);
+        let guide_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .halign(gtk::Align::Center)
+            .build();
+        guide_box.append(&guide_label);
+        guide_box.append(&guide_row);
+        guide_box.set_visible(false);
+        content.append(&guide_box);
+
         let clamp = adw::Clamp::builder()
             .maximum_size(760)
             .child(&content)
@@ -93,6 +134,11 @@ impl SystemView {
             daemon_btn,
             prune_btn,
             refresh_btn,
+            guide_box,
+            install_btn,
+            docs_btn,
+            reconfig_btn,
+            uninstall_btn,
             state,
         });
 
@@ -117,14 +163,46 @@ impl SystemView {
                 return;
             };
             let state = view.state.clone();
-            if matches!(state.daemon_state(), DaemonState::Stopped) {
-                btn.set_label("Starting…");
-                state.notify(AppEvent::DaemonState(DaemonState::Starting));
-            } else {
-                btn.set_label("Stopping…");
+            match state.daemon_state() {
+                DaemonState::NotInstalled => {
+                    view.install_engine();
+                    return;
+                }
+                DaemonState::Stopped | DaemonState::Error(_) => {
+                    btn.set_label("Starting…");
+                    state.notify(AppEvent::DaemonState(DaemonState::Starting));
+                }
+                _ => {
+                    btn.set_label("Stopping…");
+                }
             }
             btn.set_sensitive(false);
             state.toggle_daemon();
+        });
+
+        let weak = Rc::downgrade(self);
+        self.install_btn.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.install_engine();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.docs_btn.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.open_docs();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.reconfig_btn.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                crate::ui::preferences::PreferencesDialog::present(&view.state);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.uninstall_btn.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.confirm_uninstall();
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -166,7 +244,109 @@ impl SystemView {
                 self.engine_label
                     .set_label("Docker daemon is not detected. Start it with the button above.");
             }
+            DaemonState::NotInstalled => {
+                self.status_label.set_label("NOT INSTALLED");
+                self.status_label.remove_css_class("success");
+                self.status_label.add_css_class("error");
+                self.daemon_btn.set_label("Install Docker");
+                self.daemon_btn.set_sensitive(false);
+                self.daemon_btn.remove_css_class("destructive-action");
+                self.daemon_btn.add_css_class("suggested-action");
+                self.engine_label.set_label(
+                    "Docker CLI is not installed. See https://docs.docker.com/engine/install/ to install it, then press Refresh.",
+                );
+            }
+            DaemonState::Error(msg) => {
+                let msg = msg.clone();
+                self.status_label.set_label("ERROR");
+                self.status_label.remove_css_class("success");
+                self.status_label.add_css_class("error");
+                self.daemon_btn.set_label("Start Docker");
+                self.daemon_btn.set_sensitive(true);
+                self.daemon_btn.remove_css_class("destructive-action");
+                self.daemon_btn.add_css_class("suggested-action");
+                self.engine_label.set_label(msg.as_str());
+            }
         }
+        self.guide_box
+            .set_visible(matches!(self.state.daemon_state(), DaemonState::NotInstalled));
+    }
+
+    /// Run the distro Engine install under pkexec (blocking worker thread).
+    fn install_engine(self: &Rc<Self>) {
+        self.state.notify(AppEvent::Toast("Installing Docker Engine…".into()));
+        let tx = self.state.sender();
+        crate::runtime::spawn(async move {
+            let ok = tokio::task::spawn_blocking(crate::docker::install::install_blocking)
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+            if ok {
+                let _ = tx.send(AppEvent::Toast("Docker Engine installed".into())).await;
+            } else {
+                let _ = tx
+                    .send(AppEvent::Error(
+                    "Engine install failed — see https://docs.docker.com/engine/install/".into(),
+                ))
+                .await;
+            }
+            let _ = tx.send(AppEvent::EngineChanged).await;
+        });
+    }
+
+    /// Confirm then uninstall Engine packages, optionally clearing all data.
+    fn confirm_uninstall(self: &Rc<Self>) {
+        let dlg = adw::AlertDialog::builder()
+            .heading("Uninstall Docker Engine?")
+            .body("Removes Engine packages via your distro package manager (pkexec). \"Clear data\" also runs `docker system prune -af --volumes`.")
+            .build();
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("keep", "Uninstall");
+        dlg.add_response("clear", "Uninstall + Clear Data");
+        dlg.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+
+        let state = self.state.clone();
+        dlg.connect_response(None, move |_, response| {
+            if response == "cancel" {
+                return;
+            }
+            let clear_data = response == "clear";
+            let tx = state.sender();
+            state.notify(AppEvent::Toast("Uninstalling Docker Engine…".into()));
+            crate::runtime::spawn(async move {
+                let ok = tokio::task::spawn_blocking(move || {
+                    crate::docker::install::uninstall_blocking(clear_data)
+                })
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+                if ok {
+                    let _ = tx.send(AppEvent::Toast("Docker Engine uninstalled".into())).await;
+                } else {
+                    let _ = tx
+                        .send(AppEvent::Error(
+                        "Engine uninstall failed — see https://docs.docker.com/engine/install/".into(),
+                    ))
+                    .await;
+                }
+                let _ = tx.send(AppEvent::EngineChanged).await;
+            });
+        });
+
+        if let Some(root) = self.widget.root() {
+            dlg.present(Some(&root));
+        } else {
+            dlg.present(None::<&gtk::Widget>);
+        }
+    }
+
+    /// Open the official Engine install docs in the default browser.
+    fn open_docs(&self) {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(crate::docker::install::DOCKER_INSTALL_DOCS_URL)
+            .spawn();
     }
 
     /// Render engine details reported by the daemon.

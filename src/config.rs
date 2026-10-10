@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 fn default_daemon_unit() -> String {
-    "docker-desktop.service".to_string()
+    "docker.service".to_string()
 }
 
 fn default_auto_start() -> bool {
@@ -85,7 +85,7 @@ mod tests {
     fn defaults_ship_ready_to_start_daemon() {
         let cfg = AppConfig::default();
         assert!(cfg.auto_start_daemon);
-        assert_eq!(cfg.daemon_unit, "docker-desktop.service");
+        assert_eq!(cfg.daemon_unit, "docker.service");
         assert!(cfg.prefer_socket.is_empty());
     }
 

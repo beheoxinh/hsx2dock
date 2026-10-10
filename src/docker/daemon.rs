@@ -21,15 +21,18 @@ pub struct DaemonManager {
 impl DaemonManager {
     pub fn new(config: AppConfig) -> Self {
         let mut socket_candidates = Vec::new();
+        // Preferred socket first, then the standard system daemon socket.
+        // Docker Desktop's user socket stays LAST so this app never prefers
+        // (or auto-starts) Docker Desktop: it manages its own Engine.
         let preferred = config.prefer_socket.trim();
         if !preferred.is_empty() {
             socket_candidates.push(PathBuf::from(preferred));
         }
+        socket_candidates.push(PathBuf::from("/var/run/docker.sock"));
         socket_candidates.push(PathBuf::from(format!(
             "{}/.docker/desktop/docker.sock",
             std::env::var("HOME").unwrap_or_default()
         )));
-        socket_candidates.push(PathBuf::from("/var/run/docker.sock"));
         Self {
             config,
             socket_candidates,
@@ -79,12 +82,7 @@ impl DaemonManager {
             return Ok(false);
         }
         for unit in self.unit_candidates() {
-            let status = Command::new("systemctl")
-                .arg("--user")
-                .arg("start")
-                .arg(&unit)
-                .status()?;
-            if status.success() {
+            if start_system_unit(&unit)? {
                 return Ok(true);
             }
         }
@@ -111,12 +109,9 @@ impl DaemonManager {
         }
         let mut stopped = false;
         for unit in self.unit_candidates() {
-            let status = Command::new("systemctl")
-                .arg("--user")
-                .arg("stop")
-                .arg(&unit)
-                .status()?;
-            stopped = stopped || status.success();
+            if stop_system_unit(&unit)? {
+                stopped = true;
+            }
         }
         Ok(stopped)
     }
@@ -126,15 +121,58 @@ impl DaemonManager {
         if unit.is_empty() {
             return Ok(false);
         }
-        let status = Command::new("systemctl")
-            .arg("--user")
-            .arg("is-active")
-            .arg(unit)
-            .output()?;
-        let out = String::from_utf8_lossy(&status.stdout);
-        Ok(out.trim().contains("active"))
+        Ok(is_system_unit_active(unit))
     }
+}
 
+/// Whether a unit looks like a legacy Docker Desktop coupling.
+/// Saved configs with this value are still respected (T4 compat) but the
+/// UI warns that Desktop is no longer managed by this app.
+pub fn is_legacy_desktop_unit(unit: &str) -> bool {
+    unit.trim() == "docker-desktop.service"
+}
+
+/// Start a system-scope unit, escalating via `pkexec` when plain systemctl
+/// reports a permission problem. Returns true when the unit came up.
+fn start_system_unit(unit: &str) -> io::Result<bool> {
+    let status = Command::new("systemctl").arg("start").arg(unit).status()?;
+    if status.success() {
+        return Ok(true);
+    }
+    // Permission-denied: retry escalated so desktop users get a polkit prompt
+    // instead of a silent failure.
+    let escalated = Command::new("pkexec")
+        .arg("systemctl")
+        .arg("start")
+        .arg(unit)
+        .status()?;
+    Ok(escalated.success())
+}
+
+fn stop_system_unit(unit: &str) -> io::Result<bool> {
+    let status = Command::new("systemctl").arg("stop").arg(unit).status()?;
+    if status.success() {
+        return Ok(true);
+    }
+    let escalated = Command::new("pkexec")
+        .arg("systemctl")
+        .arg("stop")
+        .arg(unit)
+        .status()?;
+    Ok(escalated.success())
+}
+
+fn is_system_unit_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .arg("is-active")
+        .arg(unit)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("active"))
+        .unwrap_or(false)
+}
+
+/// Per-manager config directory helper (stays on the impl).
+impl DaemonManager {
     pub async fn ensure_config_dir(&self) -> io::Result<()> {
         if let Some(dir) = crate::config::AppConfig::config_dir() {
             tfs::create_dir_all(dir).await?;

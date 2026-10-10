@@ -1,6 +1,15 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Monotonic-ish wall clock in ms (sufficient for short grace windows).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 use async_channel::{Receiver, Sender};
 
@@ -41,6 +50,9 @@ pub enum AppEvent {
     Toast(String),
     Error(String),
     Busy(RefreshScope),
+    /// Engine install state may have changed (CLI installed/removed):
+    /// drop the cached CLI probe and re-run daemon detection on the main loop.
+    EngineChanged,
 }
 
 /// Shared application state: config, daemon manager, docker client factory and
@@ -49,6 +61,10 @@ pub struct AppState {
     pub config: RefCell<AppConfig>,
     pub daemon: RefCell<DaemonManager>,
     client: RefCell<Option<DockerClient>>,
+    /// Cached `docker` CLI presence probe + timestamp (monotonic ms).
+    cli_probe: RefCell<(bool, u64)>,
+    /// Monotonic ms when the last explicit start was requested (Starting grace).
+    starting_since: RefCell<Option<u64>>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
 }
@@ -61,6 +77,8 @@ impl AppState {
             config: RefCell::new(config),
             daemon: RefCell::new(daemon),
             client: RefCell::new(None),
+            cli_probe: RefCell::new((false, 0)),
+            starting_since: RefCell::new(None),
             tx,
             rx,
         })
@@ -75,8 +93,56 @@ impl AppState {
     }
 
     /// Current daemon state, derived from socket presence.
+    ///
+    /// When the `docker` CLI is absent the engine cannot be managed locally,
+    /// so `NotInstalled` wins over socket probing. The CLI check is cached
+    /// for ~30s so the 2s poll loop never spawns a process per tick.
+    /// A recent explicit start (≤30s) keeps `Starting` until the socket/API
+    /// proves `Running`, so the UI never flickers to Stopped mid-start.
     pub fn daemon_state(&self) -> DaemonState {
-        self.daemon.borrow().state_from_socket()
+        if !self.cli_available_cached() {
+            return DaemonState::NotInstalled;
+        }
+        let socket_state = self.daemon.borrow().state_from_socket();
+        if matches!(socket_state, DaemonState::Running) {
+            *self.starting_since.borrow_mut() = None;
+            return socket_state;
+        }
+        if self.start_in_grace_period() {
+            return DaemonState::Starting;
+        }
+        socket_state
+    }
+
+    /// Cheap cached `docker` CLI presence check (TTL ~30s).
+    fn cli_available_cached(&self) -> bool {        let now = now_ms();
+        let (cached, at) = *self.cli_probe.borrow();
+        if now.saturating_sub(at) < 30_000 && at != 0 {
+            return cached;
+        }
+        let available = crate::docker::install::cli_available();
+        *self.cli_probe.borrow_mut() = (available, now);
+        available
+    }
+
+    /// Whether a start was requested within the last 30s.
+    fn start_in_grace_period(&self) -> bool {
+        match *self.starting_since.borrow() {
+            Some(t) => now_ms().saturating_sub(t) < 30_000,
+            None => false,
+        }
+    }
+
+    /// Drop the cached `docker` CLI probe so the next `daemon_state()` call
+    /// re-probes the real CLI. Called on the GTK main loop after an
+    /// (un)install completes (`AppEvent::EngineChanged`).
+    pub fn invalidate_cli_cache(&self) {
+        *self.cli_probe.borrow_mut() = (false, 0);
+    }
+
+    /// Record an explicit start request (arms the Starting grace window).
+    fn mark_start_requested(&self) {
+        *self.starting_since.borrow_mut() = Some(now_ms());
     }
 
     /// Active unix socket path when the daemon is reachable.
@@ -130,6 +196,16 @@ impl AppState {
     pub fn refresh_daemon(&self) {
         let tx = self.sender();
         let state = self.daemon_state();
+        if matches!(state, DaemonState::NotInstalled) {
+            let _ = tx.send_blocking(AppEvent::DaemonState(state));
+            return;
+        }
+        if matches!(state, DaemonState::Starting) {
+            // Within the start grace window the socket may not exist yet;
+            // keep the transient badge without spamming error toasts.
+            let _ = tx.send_blocking(AppEvent::DaemonState(state));
+            return;
+        }
         if !matches!(state, DaemonState::Running) {
             let _ = tx.send_blocking(AppEvent::DaemonState(state));
             return;
@@ -189,6 +265,11 @@ impl AppState {
         if self.active_socket().is_some() {
             return;
         }
+        if !self.cli_available_cached() {
+            self.notify(AppEvent::DaemonState(DaemonState::NotInstalled));
+            return;
+        }
+        self.mark_start_requested();
         let tx = self.sender();
         let daemon = self.daemon.borrow().clone();
         self.notify(AppEvent::DaemonState(DaemonState::Starting));
@@ -234,6 +315,16 @@ impl AppState {
         // Branch on the live systemd unit state rather than socket presence:
         // a stale socket file can otherwise invert start/stop.
         let start = !matches!(self.daemon.borrow().is_unit_active(), Ok(true));
+        if start {
+            if !self.cli_available_cached() {
+                self.notify(AppEvent::DaemonState(DaemonState::NotInstalled));
+                self.notify(AppEvent::Toast(
+                    "Docker CLI is not installed — see the Engine page guide".into(),
+                ));
+                return;
+            }
+            self.mark_start_requested();
+        }
         self.notify(AppEvent::DaemonState(if start {
             DaemonState::Starting
         } else {
@@ -263,6 +354,19 @@ impl AppState {
                 Ok(false) => "No systemd unit configured — start Docker manually".to_string(),
                 Err(e) => format!("systemctl failed: {e}"),
             };
+            let socket_live = tokio::task::spawn_blocking(|| {
+                DaemonManager::new(crate::config::AppConfig::default()).active_socket()
+            })
+            .await
+            .unwrap_or(None)
+            .is_some();
+            if start && !socket_live {
+                let _ = tx
+                    .send(AppEvent::DaemonState(DaemonState::Error(
+                        "Docker did not come up within 30s — check `systemctl status docker.service`".into(),
+                    )))
+                    .await;
+            }
             let _ = tx.send(AppEvent::Toast(msg)).await;
             let _ = tx.send(AppEvent::Busy(RefreshScope::Daemon)).await;
         });

@@ -1,8 +1,7 @@
 use std::rc::Rc;
-use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::{glib, Orientation};
+use gtk::glib;
 
 use crate::docker::models::DaemonState;
 use crate::runtime::spawn;
@@ -39,9 +38,16 @@ impl MainWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Docker Manager")
-            .default_width(1060)
-            .default_height(720)
             .build();
+        // Default to ~90% of the usable area of the monitor showing the
+        // window so the app opens large without covering top bar / dock.
+        if let Some(display) = gtk::gdk::Display::default() {
+            if let Some(monitor) = display.monitors().item(0).and_downcast::<gtk::gdk::Monitor>()
+            {
+                let geom = monitor.geometry();
+                window.set_default_size(geom.width() * 9 / 10, geom.height() * 9 / 10);
+            }
+        }
 
         let system_view = SystemView::new(state.clone());
         let containers_view = ContainersView::new(state.clone());
@@ -261,6 +267,11 @@ impl MainWindow {
                 self.spinner.start();
                 self.refresh_scope(scope);
             }
+            AppEvent::EngineChanged => {
+                self.state.invalidate_cli_cache();
+                self.state.refresh_daemon();
+                self.system_view.refresh_daemon_state();
+            }
         }
     }
 
@@ -290,6 +301,24 @@ impl MainWindow {
                 self.daemon_badge.remove_css_class("warning");
                 self.daemon_badge.add_css_class("error");
                 self.daemon_btn.set_label("Start");
+                self.daemon_btn.set_sensitive(true);
+                self.daemon_btn.remove_css_class("destructive-action");
+                self.daemon_btn.add_css_class("suggested-action");
+            }
+            DaemonState::NotInstalled => {
+                self.daemon_badge.set_label("NOT INSTALLED");
+                self.daemon_badge.remove_css_class("success");
+                self.daemon_badge.add_css_class("error");
+                self.daemon_btn.set_label("Install");
+                self.daemon_btn.set_sensitive(true);
+                self.daemon_btn.remove_css_class("destructive-action");
+                self.daemon_btn.add_css_class("suggested-action");
+            }
+            DaemonState::Error(_) => {
+                self.daemon_badge.set_label("ERROR");
+                self.daemon_badge.remove_css_class("success");
+                self.daemon_badge.add_css_class("error");
+                self.daemon_btn.set_label("Retry");
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("destructive-action");
                 self.daemon_btn.add_css_class("suggested-action");
@@ -394,6 +423,4 @@ impl MainWindow {
 /// Convenience: keep a minimum window size so the layout never collapses.
 pub fn apply_min_size(window: &adw::ApplicationWindow) {
     window.set_size_request(720, 520);
-    let _ = Duration::from_secs(0);
-    let _ = Orientation::Horizontal;
 }

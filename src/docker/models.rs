@@ -6,6 +6,9 @@ pub enum DaemonState {
     Stopped,
     Starting,
     Running,
+    NotInstalled,
+    /// Engine probe failed with a human-readable reason (e.g. ping error).
+    Error(String),
 }
 
 #[derive(Debug, Clone, Default)]

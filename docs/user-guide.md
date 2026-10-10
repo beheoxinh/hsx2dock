@@ -4,13 +4,16 @@ How to use Docker Manager day to day.
 
 ## First run
 
-1. Make sure the Docker daemon is reachable: either the system socket
-   (`/var/run/docker.sock`) or Docker Desktop's user socket
-   (`~/.docker/desktop/docker.sock`).
+1. Make sure the Docker Engine is installed. If the `docker` CLI is
+   missing, the Deep Engine page shows an install guide (distro steps +
+   https://docs.docker.com/engine/install/) with **Install**,
+   **Open Install Docs**, **Reconfig**, and **Uninstall…** actions.
 2. Launch the app. The header badge shows daemon state:
-   **Stopped / Starting / Running**.
-3. If stopped, press **Start** (systemd user unit, configurable in
-   Preferences). Without a daemon every action degrades to a toast —
+   **Not Installed / Stopped / Starting / Running / Error**,
+   refreshed every 2s with a live engine probe.
+3. If stopped, press **Start** (`docker.service` on the system scope,
+   configurable in Preferences incl. the legacy `docker-desktop.service`
+   preset). Without a daemon every action degrades to a toast —
    nothing crashes.
 
 ## Views

@@ -33,7 +33,9 @@ impl DockerClient {
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
-        self.docker.ping().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.docker.ping())
+            .await
+            .map_err(|_| anyhow::anyhow!("docker ping timed out after 5s"))??;
         Ok(())
     }
 
