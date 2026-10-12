@@ -356,6 +356,10 @@ impl SystemView {
     pub fn refresh_cli_state(self: &Rc<Self>) {
         let cfg = self.state.config.borrow().clone();
         let socket = self.state.engine.socket().to_path_buf();
+        // Liveness drives teardown: a symlink/context pointing at a dead
+        // socket is misleading, so reconcile removes it when the engine is
+        // down (and re-creates it once the engine comes back).
+        let engine_live = matches!(self.state.daemon_state(), DaemonState::Running);
         let weak = Rc::downgrade(self);
         let tx = crate::ui::common::main_loop_channel(move |st: CliStatus| {
             if let Some(view) = weak.upgrade() {
@@ -364,9 +368,12 @@ impl SystemView {
         });
         crate::runtime::spawn(async move {
             let st = crate::runtime::engine_op(move || {
-                if cfg.cli_bridge_enabled {
-                    let _ = engine_cli::reconcile(&socket, true, cfg.cli_bridge_set_default);
-                }
+                let _ = engine_cli::reconcile(
+                    &socket,
+                    cfg.cli_bridge_enabled,
+                    cfg.cli_bridge_set_default,
+                    engine_live,
+                );
                 engine_cli::status(&socket)
             })
             .await;
@@ -380,38 +387,52 @@ impl SystemView {
     fn render_cli_state(&self, st: &CliStatus) {
         use crate::ui::common::{set_pill, PillTone};
         let bridge_enabled = self.state.config.borrow().cli_bridge_enabled;
-        self.cli_toggle.set_active(bridge_enabled);
-        let (tone, text) = match st.link {
-            CliLink::Connected => (PillTone::Running, "Connected"),
-            CliLink::Partial => (PillTone::Warn, "Partial"),
-            CliLink::Disconnected => (PillTone::Stopped, "Disconnected"),
+        let engine_live = matches!(self.state.daemon_state(), DaemonState::Running);
+        let (tone, text) = if !bridge_enabled {
+            (PillTone::Stopped, "Disabled")
+        } else if !engine_live {
+            (PillTone::Stopped, "Engine stopped")
+        } else {
+            match st.link {
+                CliLink::Connected => (PillTone::Running, "Connected"),
+                CliLink::Partial => (PillTone::Warn, "Partial"),
+                CliLink::Disconnected => (PillTone::Stopped, "Disconnected"),
+            }
         };
         set_pill(&self.cli_pill, text, tone);
-        let sub = match st.link {
-            CliLink::Connected => "`docker` in any terminal reaches this engine.".to_string(),
-            CliLink::Partial if st.symlink_ok && !st.context_is_default => {
-                match &st.active_context {
-                    Some(c) => format!(
-                        "Context active is \"{c}\". Use `docker --context {} ...` or enable \"set as default\".",
-                        CONTEXT_NAME
-                    ),
-                    None => format!(
-                        "Use `docker --context {} ...`, or enable \"set as default\".",
-                        CONTEXT_NAME
-                    ),
+        let sub = if !bridge_enabled {
+            "Not linked. Turn the switch on to connect the system `docker` command.".to_string()
+        } else if !engine_live {
+            "Engine is stopped — the mapping is removed; the CLI cannot reach it until it starts."
+                .to_string()
+        } else {
+            match st.link {
+                CliLink::Connected => "`docker` in any terminal reaches this engine.".to_string(),
+                CliLink::Partial if st.symlink_ok && !st.context_is_default => {
+                    match &st.active_context {
+                        Some(c) => format!(
+                            "Context active is \"{c}\". Use `docker --context {} ...` or enable \"set as default\".",
+                            CONTEXT_NAME
+                        ),
+                        None => format!(
+                            "Use `docker --context {} ...`, or enable \"set as default\".",
+                            CONTEXT_NAME
+                        ),
+                    }
                 }
-            }
-            CliLink::Partial => format!(
-                "Symlink {} in place; context not selected.",
-                st.xdg_path.display()
-            ),
-            CliLink::Disconnected => {
-                "Not connected — turn the switch on to link the CLI.".to_string()
+                CliLink::Partial => format!(
+                    "Symlink {} in place; context not selected.",
+                    st.xdg_path.display()
+                ),
+                CliLink::Disconnected => {
+                    "Not connected — the bridge repairs symlink and context on the next tick."
+                        .to_string()
+                }
             }
         };
         self.cli_row.set_subtitle(&sub);
-        self.cli_toggle
-            .set_sensitive(self.state.engine.is_installed());
+        self.cli_toggle.set_active(bridge_enabled);
+        self.cli_toggle.set_sensitive(engine_live || bridge_enabled);
     }
 
     pub fn widget(&self) -> &gtk::Box {

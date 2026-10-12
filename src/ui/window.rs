@@ -359,6 +359,10 @@ impl MainWindow {
             AppEvent::DaemonState(state) => {
                 self.apply_daemon_state(&state);
                 self.system_view.refresh_daemon_state();
+                // Engine up/down changes whether the CLI bridge should hold
+                // its symlink/context — reconcile now instead of waiting for
+                // the 10s poll.
+                self.system_view.refresh_cli_state();
                 if matches!(state, DaemonState::Running) {
                     self.state.refresh_daemon();
                 }

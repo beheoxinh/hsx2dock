@@ -258,19 +258,34 @@ pub struct Applied {
     pub context_created: bool,
     pub default_set: bool,
     pub default_cleared: bool,
+    /// True when a previously-created mapping was removed (engine stopped or
+    /// the bridge was switched off).
+    pub torn_down: bool,
 }
 
 /// Idempotently map the CLI to `engine_socket` according to `enabled` /
-/// `set_default`. Safe to call every 10s: each step is a no-op when already
-/// correct, and nothing is touched when `enabled` is false (disable leaves the
-/// existing symlink/context alone — removal is a separate, explicit action).
+/// `set_default`, and the engine's own liveness.
+///
+/// Safe to call every 10s: each step is a no-op when already correct.
+///
+/// Ownership rule — the app removes *only* what it created, and only while
+/// it is still needed:
+/// - engine not live, or `enabled` false → tear the mapping down, since a
+///   symlink/context pointing at a dead socket is misleading garbage
+///   (`docker` would report a cryptic connect error).
+/// - same socket, engine live, enabled → ensure symlink + context exist.
+///
+/// The boolean is passed in rather than probed here so the caller (which
+/// already tracks daemon state) stays the single source of truth.
 pub fn reconcile(
     engine_socket: &Path,
     enabled: bool,
     set_default: bool,
+    engine_live: bool,
 ) -> anyhow::Result<Applied> {
     let mut out = Applied::default();
-    if !enabled {
+    if !enabled || !engine_live {
+        out.torn_down = teardown(engine_socket)?;
         return Ok(out);
     }
     out.symlink_created = ensure_xdg_symlink(engine_socket)?;
@@ -291,19 +306,39 @@ pub fn reconcile(
 /// Remove the symlink and context this app created (explicit "disconnect").
 /// Leaves anything foreign untouched.
 pub fn disconnect(engine_socket: &Path) -> anyhow::Result<()> {
-    let link = xdg_socket();
-    if symlink_state_at(&link, engine_socket).is_some() {
-        let _ = std::fs::remove_file(&link);
+    let _ = teardown_at(&xdg_socket(), engine_socket);
+    Ok(())
+}
+
+/// Tear down anything the bridge created for this engine. Returns `true` if
+/// either the symlink or the context was present and removed (our mapping).
+///
+/// The check uses "our mapping" tests: only removes a symlink that points at
+/// `engine_socket` (or a stale link under our runtime dir), and only removes
+/// the context named `CONTEXT_NAME` whose endpoint is `engine_socket`.
+fn teardown(engine_socket: &Path) -> anyhow::Result<bool> {
+    teardown_at(&xdg_socket(), engine_socket)
+}
+
+fn teardown_at(link: &Path, engine_socket: &Path) -> anyhow::Result<bool> {
+    let mut torn = false;
+    if symlink_state_at(link, engine_socket) == Some(true) {
+        let _ = std::fs::remove_file(link);
+        torn = true;
     }
-    if current_context_name().as_deref() == Some(CONTEXT_NAME) {
-        let _ = clear_context_default();
-    }
+    // Remove our context if it exists under our name (whether it currently
+    // points at this engine socket or is stale from a previous install).
     if our_context_host().is_some() {
         let _ = Command::new("docker")
             .args(["context", "rm", CONTEXT_NAME])
             .status();
+        torn = true;
     }
-    Ok(())
+    if current_context_name().as_deref() == Some(CONTEXT_NAME) {
+        let _ = clear_context_default();
+        torn = true;
+    }
+    Ok(torn)
 }
 
 #[cfg(test)]
@@ -371,5 +406,29 @@ mod tests {
         assert_eq!(classify(true, true, true), CliLink::Connected);
         // Context exists but a *foreign* context is the default → Partial.
         assert_eq!(classify(true, true, false), CliLink::Partial);
+    }
+
+    #[test]
+    fn teardown_at_removes_our_symlink() {
+        let dir = tmpdir("teardown-sym");
+        let engine = dir.join("engine.sock");
+        let _ = std::fs::write(&engine, b"");
+        let link = dir.join("docker.sock");
+        symlink(&engine, &link).expect("symlink");
+        assert!(teardown_at(&link, &engine).unwrap());
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn teardown_at_ignores_foreign_symlink() {
+        let dir = tmpdir("teardown-ign");
+        let engine = dir.join("engine.sock");
+        let foreign = dir.join("other.sock");
+        let _ = std::fs::write(&engine, b"");
+        let _ = std::fs::write(&foreign, b"");
+        let link = dir.join("docker.sock");
+        symlink(&foreign, &link).expect("symlink foreign");
+        assert!(!teardown_at(&link, &engine).unwrap());
+        assert!(link.exists());
     }
 }
