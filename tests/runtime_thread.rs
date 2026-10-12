@@ -27,7 +27,12 @@ mod tests {
     fn engine_thread_is_dedicated() {
         // The persistent engine thread has a stable name; a Tokio blocking-pool
         // thread would be unnamed ("<unnamed>").
-        let rx = run_engine_op(|| std::thread::current().name().unwrap_or("<unnamed>").to_string());
+        let rx = run_engine_op(|| {
+            std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string()
+        });
         assert_eq!(rx.recv_blocking().expect("name"), "docker-engine");
     }
 
@@ -38,7 +43,9 @@ mod tests {
         let a = run_engine_op(|| std::thread::current().id())
             .recv_blocking()
             .expect("id");
-        let b = run_engine_op(|| std::thread::current().id()).recv_blocking().expect("id");
+        let b = run_engine_op(|| std::thread::current().id())
+            .recv_blocking()
+            .expect("id");
         assert_eq!(a, b);
     }
 }

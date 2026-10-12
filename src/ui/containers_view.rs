@@ -535,7 +535,10 @@ impl ContainersView {
             .build();
 
         // Canonical, clamped toolbar so it lines up with the list below.
-        let toolbar = page_toolbar(&search, &[show_all.clone().upcast(), run_btn.clone().upcast()]);
+        let toolbar = page_toolbar(
+            &search,
+            &[show_all.clone().upcast(), run_btn.clone().upcast()],
+        );
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)

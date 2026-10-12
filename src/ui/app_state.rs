@@ -384,13 +384,15 @@ impl AppState {
         spawn(async move {
             let runner = engine.clone();
             let result =
-                crate::runtime::engine_op(move || {
-                    if start {
-                        runner.start()
-                    } else {
-                        runner.stop()
-                    }
-                })
+                crate::runtime::engine_op(
+                    move || {
+                        if start {
+                            runner.start()
+                        } else {
+                            runner.stop()
+                        }
+                    },
+                )
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("engine op: {e}")));
             let msg = match result {

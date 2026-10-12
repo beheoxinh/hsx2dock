@@ -273,7 +273,10 @@ impl EngineManager {
             let _ = fs::remove_file(&self.paths.pid_file);
             return Ok(());
         };
-        if matches!(proc_comm(pid).as_deref(), Some("rootlesskit") | Some("dockerd")) {
+        if matches!(
+            proc_comm(pid).as_deref(),
+            Some("rootlesskit") | Some("dockerd")
+        ) {
             signal(pid as u32, libc::SIGTERM);
             let deadline = Instant::now() + Duration::from_secs(5);
             while pid_alive(pid) && Instant::now() < deadline {
@@ -540,11 +543,17 @@ pub struct InstallProgress {
 /// Nothing is extracted until every artifact has passed its checksum, and the
 /// live `current` symlink is only swapped once the new version is complete — so
 /// a failed or interrupted update leaves the previous engine intact.
-pub async fn install_release<F>(paths: &EnginePaths, release: &Release, mut on_progress: F) -> Result<()>
+pub async fn install_release<F>(
+    paths: &EnginePaths,
+    release: &Release,
+    mut on_progress: F,
+) -> Result<()>
 where
     F: FnMut(InstallProgress),
 {
-    let staging = paths.versions_dir.join(format!(".staging-{}", release.version));
+    let staging = paths
+        .versions_dir
+        .join(format!(".staging-{}", release.version));
     let _ = fs::remove_dir_all(&staging);
     let bin_dir = staging.join("bin");
     fs::create_dir_all(&bin_dir)?;
@@ -561,7 +570,11 @@ where
             "rootless-extras",
             release.rootless_sha256,
         ),
-        (compose_url(release.compose_version), "compose", release.compose_sha256),
+        (
+            compose_url(release.compose_version),
+            "compose",
+            release.compose_sha256,
+        ),
     ];
     for (i, (url, name, expected)) in artifacts.iter().enumerate() {
         let dest = tmp.join(name);
@@ -631,8 +644,6 @@ pub fn swap_current(paths: &EnginePaths, version: &str) -> Result<()> {
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,7 +651,10 @@ mod tests {
     #[test]
     fn paths_use_xdg_and_keep_socket_short() {
         let p = EnginePaths::new();
-        assert!(p.socket.as_os_str().len() < 100, "unix socket path too long");
+        assert!(
+            p.socket.as_os_str().len() < 100,
+            "unix socket path too long"
+        );
         assert!(p.data_root.to_string_lossy().contains("docker-manager"));
         assert!(p.bin_dir().ends_with("bin"));
         assert!(p.compose_plugin().ends_with("docker-compose"));
@@ -676,7 +690,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let f = dir.join("x.tgz");
         std::fs::write(&f, b"nope").unwrap();
-        assert!(verify(&f, "0000000000000000000000000000000000000000000000000000000000000000").is_err());
+        assert!(verify(
+            &f,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -714,12 +732,26 @@ mod tests {
         let cmd = docker_command(&p);
         let prog = cmd.get_program().to_str().unwrap().to_string();
         assert!(prog.ends_with("docker"));
-        let envs: Vec<(String, String)> = cmd.get_envs().filter_map(|(k, v)| {
-            v.map(|val| (k.to_string_lossy().into_owned(), val.to_string_lossy().into_owned()))
-        }).collect();
-        let host = envs.iter().find(|(k, _)| k == "DOCKER_HOST").expect("DOCKER_HOST set");
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        val.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        let host = envs
+            .iter()
+            .find(|(k, _)| k == "DOCKER_HOST")
+            .expect("DOCKER_HOST set");
         assert!(host.1.starts_with("unix://"));
-        let cfg = envs.iter().find(|(k, _)| k == "DOCKER_CONFIG").expect("DOCKER_CONFIG set");
+        let cfg = envs
+            .iter()
+            .find(|(k, _)| k == "DOCKER_CONFIG")
+            .expect("DOCKER_CONFIG set");
         assert!(cfg.1.ends_with("docker-config"));
         let path = envs.iter().find(|(k, _)| k == "PATH").expect("PATH set");
         assert!(path.1.starts_with(&p.bin_dir().display().to_string()));
@@ -740,7 +772,10 @@ mod tests {
         };
         swap_current(&paths, "v1").unwrap();
         assert!(current.is_symlink());
-        assert_eq!(std::fs::canonicalize(&current).unwrap(), versions.join("v1").canonicalize().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(&current).unwrap(),
+            versions.join("v1").canonicalize().unwrap()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -100,7 +100,11 @@ impl MainWindow {
         for (name, title, icon) in sections {
             let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
             row_box.append(&gtk::Image::from_icon_name(icon));
-            let label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).build();
+            let label = gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
             row_box.append(&label);
             let row = gtk::ListBoxRow::builder().child(&row_box).build();
             row.set_widget_name(name);
