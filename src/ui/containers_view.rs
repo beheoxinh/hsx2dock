@@ -515,6 +515,8 @@ pub struct ContainersView {
 
 impl ContainersView {
     pub fn new(state: Rc<AppState>) -> Rc<Self> {
+        use crate::ui::common::{clamp_grid, page_toolbar};
+
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Filter containers…")
             .hexpand(true)
@@ -532,17 +534,8 @@ impl ContainersView {
             .css_classes(["suggested-action"])
             .build();
 
-        let toolbar = gtk::Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .build();
-        toolbar.append(&search);
-        toolbar.append(&show_all);
-        toolbar.append(&run_btn);
+        // Canonical, clamped toolbar so it lines up with the list below.
+        let toolbar = page_toolbar(&search, &[show_all.clone().upcast(), run_btn.clone().upcast()]);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -559,14 +552,8 @@ impl ContainersView {
             .description("Containers created with `docker run` will show up here.")
             .build();
 
-        let list_clamp = adw::Clamp::builder()
-            .maximum_size(1100)
-            .child(&list)
-            .build();
-        let empty_clamp = adw::Clamp::builder()
-            .maximum_size(1100)
-            .child(&empty)
-            .build();
+        let list_clamp = clamp_grid(&list);
+        let empty_clamp = clamp_grid(&empty);
 
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)

@@ -13,12 +13,13 @@ use crate::ui::networks_view::NetworksView;
 use crate::ui::system_view::SystemView;
 use crate::ui::volumes_view::VolumesView;
 
-/// The main application window: header bar with daemon badge, a view switcher
-/// and a toast overlay for notifications.
+/// The main application window: a navigation sidebar, a header bar with the
+/// engine status/actions, and a toast overlay for notifications.
 pub struct MainWindow {
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
     state: Rc<AppState>,
+    stack: adw::ViewStack,
     system_view: Rc<SystemView>,
     containers_view: Rc<ContainersView>,
     images_view: Rc<ImagesView>,
@@ -42,7 +43,10 @@ impl MainWindow {
         // Default to ~90% of the usable area of the monitor showing the
         // window so the app opens large without covering top bar / dock.
         if let Some(display) = gtk::gdk::Display::default() {
-            if let Some(monitor) = display.monitors().item(0).and_downcast::<gtk::gdk::Monitor>()
+            if let Some(monitor) = display
+                .monitors()
+                .item(0)
+                .and_downcast::<gtk::gdk::Monitor>()
             {
                 let geom = monitor.geometry();
                 window.set_default_size(geom.width() * 9 / 10, geom.height() * 9 / 10);
@@ -57,6 +61,13 @@ impl MainWindow {
         let compose_view = ComposeView::new(state.clone());
 
         let stack = adw::ViewStack::new();
+
+        // The header shows the current section name (the sidebar replaces the
+        // old ViewSwitcher).
+        let page_title = gtk::Label::builder()
+            .label("Engine")
+            .css_classes(["title"])
+            .build();
         let engine_page = stack.add_titled(system_view.widget(), Some("engine"), "Engine");
         engine_page.set_icon_name(Some("computer-symbolic"));
         let containers_page =
@@ -71,7 +82,51 @@ impl MainWindow {
         let compose_page = stack.add_titled(compose_view.widget(), Some("compose"), "Compose");
         compose_page.set_icon_name(Some("package-x-generic-symbolic"));
 
-        let switcher = adw::ViewSwitcher::builder().stack(&stack).build();
+        // ---- sidebar -------------------------------------------------------
+        // One row per section; selecting a row switches the content stack and
+        // updates the header title.
+        let sidebar_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        let sections: [(&str, &str, &str); 6] = [
+            ("engine", "Engine", "computer-symbolic"),
+            ("containers", "Containers", "applications-system-symbolic"),
+            ("images", "Images", "package-x-generic-symbolic"),
+            ("volumes", "Volumes", "drive-harddisk-symbolic"),
+            ("networks", "Networks", "network-workgroup-symbolic"),
+            ("compose", "Compose", "view-list-symbolic"),
+        ];
+        for (name, title, icon) in sections {
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            row_box.append(&gtk::Image::from_icon_name(icon));
+            let label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).build();
+            row_box.append(&label);
+            let row = gtk::ListBoxRow::builder().child(&row_box).build();
+            row.set_widget_name(name);
+            sidebar_list.append(&row);
+        }
+
+        let sidebar_head = adw::HeaderBar::builder().build();
+        let sidebar_title = gtk::Label::builder()
+            .label("Docker Manager")
+            .css_classes(["title"])
+            .build();
+        sidebar_head.set_title_widget(Some(&sidebar_title));
+        let sidebar_view = adw::ToolbarView::new();
+        sidebar_view.add_top_bar(&sidebar_head);
+        let sidebar_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&sidebar_list)
+            .build();
+        sidebar_view.set_content(Some(&sidebar_scroll));
+        let sidebar_page = adw::NavigationPage::builder()
+            .title("Docker Manager")
+            .child(&sidebar_view)
+            .build();
+
+        // (Sidebar selection is wired up once the split view exists, below.)
 
         let daemon_badge = gtk::Label::builder()
             .label("STOPPED")
@@ -79,7 +134,7 @@ impl MainWindow {
             .build();
         let daemon_btn = gtk::Button::builder()
             .label("Start")
-            .tooltip_text("Start or stop the Docker daemon")
+            .tooltip_text("Start or stop the bundled engine")
             .build();
         daemon_btn.add_css_class("suggested-action");
         let refresh_btn = gtk::Button::builder()
@@ -95,29 +150,92 @@ impl MainWindow {
             .tooltip_text("Registry login")
             .build();
 
-        let header = adw::HeaderBar::builder().title_widget(&switcher).build();
-        header.pack_start(&daemon_badge);
-        header.pack_start(&daemon_btn);
-        header.pack_end(&refresh_btn);
-        header.pack_end(&account_btn);
-        header.pack_end(&prefs_btn);
+        let header = adw::HeaderBar::builder().build();
+        header.set_title_widget(Some(&page_title));
+        // Engine status reads as one unit: the state badge sits right next to
+        // the action that changes it (start / stop / retry).
+        let engine_group = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        engine_group.append(&daemon_badge);
+        engine_group.append(&daemon_btn);
         let spinner = gtk::Spinner::new();
         spinner.set_tooltip_text(Some("Working…"));
         spinner.stop();
+        header.pack_start(&engine_group);
         header.pack_start(&spinner);
+        header.pack_end(&refresh_btn);
+        header.pack_end(&account_btn);
+        header.pack_end(&prefs_btn);
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header);
         toolbar_view.set_content(Some(&stack));
 
+        let content_page = adw::NavigationPage::builder()
+            .title("Docker Manager")
+            .child(&toolbar_view)
+            .build();
+
+        let split = adw::NavigationSplitView::builder()
+            .sidebar(&sidebar_page)
+            .content(&content_page)
+            .min_sidebar_width(200.0)
+            .max_sidebar_width(280.0)
+            .build();
+
+        // Responsive: collapse the sidebar below 700sp so the content uses the
+        // whole window; expand again when there is room.
+        let collapse = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            700.0,
+            adw::LengthUnit::Sp,
+        ));
+        collapse.add_setter(&split, "collapsed", Some(&true.to_value()));
+        let expand = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MinWidth,
+            700.0,
+            adw::LengthUnit::Sp,
+        ));
+        expand.add_setter(&split, "collapsed", Some(&false.to_value()));
+        window.add_breakpoint(collapse);
+        window.add_breakpoint(expand);
+
+        // Selecting a sidebar row switches the stack and reveals the content
+        // (so a collapsed sidebar still navigates like a drawer).
+        sidebar_list.connect_row_selected({
+            let stack = stack.clone();
+            let page_title = page_title.clone();
+            let split = split.clone();
+            move |_, row| {
+                if let Some(row) = row {
+                    let name = row.widget_name();
+                    stack.set_visible_child_name(&name);
+                    let title = match name.as_str() {
+                        "engine" => "Engine",
+                        "containers" => "Containers",
+                        "images" => "Images",
+                        "volumes" => "Volumes",
+                        "networks" => "Networks",
+                        "compose" => "Compose",
+                        other => other,
+                    };
+                    page_title.set_label(title);
+                    split.set_show_content(true);
+                }
+            }
+        });
+        if let Some(first) = sidebar_list.row_at_index(0) {
+            sidebar_list.select_row(Some(&first));
+        }
+
         let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&toolbar_view));
+        toast_overlay.set_child(Some(&split));
         window.set_content(Some(&toast_overlay));
 
         let view = Rc::new(Self {
             window,
             toast_overlay,
             state,
+            stack: stack.clone(),
             system_view,
             containers_view,
             images_view,
@@ -132,7 +250,7 @@ impl MainWindow {
             spinner,
         });
 
-        view.connect_signals(&stack);
+        view.connect_signals();
         view.refresh_all();
         view
     }
@@ -141,7 +259,7 @@ impl MainWindow {
         &self.window
     }
 
-    fn connect_signals(self: &Rc<Self>, stack: &adw::ViewStack) {
+    fn connect_signals(self: &Rc<Self>) {
         // Keyboard shortcuts: Ctrl+R refresh, Ctrl+, preferences.
         let weak = Rc::downgrade(self);
         let refresh_shortcut = gtk::Shortcut::new(
@@ -169,6 +287,7 @@ impl MainWindow {
         self.window.add_controller(controller);
         let weak = Rc::downgrade(self);
         self.daemon_btn.connect_clicked(move |_| {
+            tracing::info!("header daemon_btn clicked");
             if let Some(v) = weak.upgrade() {
                 v.state.toggle_daemon();
             }
@@ -197,7 +316,7 @@ impl MainWindow {
 
         // Refresh the view that becomes visible.
         let weak = Rc::downgrade(self);
-        stack.connect_visible_child_name_notify(move |stack| {
+        self.stack.connect_visible_child_name_notify(move |stack| {
             if let Some(v) = weak.upgrade() {
                 match stack.visible_child_name().as_deref() {
                     Some("engine") => v.state.refresh_daemon(),
@@ -235,6 +354,7 @@ impl MainWindow {
         match event {
             AppEvent::DaemonState(state) => {
                 self.apply_daemon_state(&state);
+                self.system_view.refresh_daemon_state();
                 if matches!(state, DaemonState::Running) {
                     self.state.refresh_daemon();
                 }
@@ -255,12 +375,18 @@ impl MainWindow {
             AppEvent::Networks(items) => self.networks_view.set_networks(items),
             AppEvent::PullDone(Ok(())) => self.toast("Image pull finished"),
             AppEvent::PullDone(Err(e)) => self.toast(&format!("Pull failed: {e}")),
+            AppEvent::EngineProgress(label, fraction) => {
+                self.system_view.set_engine_progress(&label, fraction);
+            }
             AppEvent::Toast(msg) => {
                 self.spinner.stop();
                 self.toast(&msg);
             }
             AppEvent::Error(msg) => {
                 self.spinner.stop();
+                // A failed download must not leave the page stuck in "Installing".
+                self.state.set_installing(false);
+                self.system_view.refresh_daemon_state();
                 self.show_error(&msg);
             }
             AppEvent::Busy(scope) => {
@@ -276,55 +402,52 @@ impl MainWindow {
     }
 
     fn apply_daemon_state(self: &Rc<Self>, state: &DaemonState) {
+        use crate::ui::common::{set_pill, PillTone};
         match state {
             DaemonState::Running => {
-                self.daemon_badge.set_label("RUNNING");
-                self.daemon_badge.remove_css_class("error");
-                self.daemon_badge.remove_css_class("warning");
-                self.daemon_badge.add_css_class("success");
+                set_pill(&self.daemon_badge, "RUNNING", PillTone::Running);
                 self.daemon_btn.set_label("Stop");
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("suggested-action");
                 self.daemon_btn.add_css_class("destructive-action");
             }
             DaemonState::Starting => {
-                self.daemon_badge.set_label("STARTING");
-                self.daemon_badge.remove_css_class("error");
-                self.daemon_badge.remove_css_class("success");
-                self.daemon_badge.add_css_class("warning");
+                set_pill(&self.daemon_badge, "STARTING", PillTone::Warn);
                 self.daemon_btn.set_label("Starting…");
                 self.daemon_btn.set_sensitive(false);
             }
+            DaemonState::Installing => {
+                set_pill(&self.daemon_badge, "INSTALLING", PillTone::Warn);
+                self.daemon_btn.set_label("Installing…");
+                self.daemon_btn.set_sensitive(false);
+            }
+            DaemonState::Stopping => {
+                set_pill(&self.daemon_badge, "STOPPING", PillTone::Warn);
+                self.daemon_btn.set_label("Stopping…");
+                self.daemon_btn.set_sensitive(false);
+            }
             DaemonState::Stopped => {
-                self.daemon_badge.set_label("STOPPED");
-                self.daemon_badge.remove_css_class("success");
-                self.daemon_badge.remove_css_class("warning");
-                self.daemon_badge.add_css_class("error");
+                set_pill(&self.daemon_badge, "STOPPED", PillTone::Stopped);
                 self.daemon_btn.set_label("Start");
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("destructive-action");
                 self.daemon_btn.add_css_class("suggested-action");
             }
             DaemonState::NotInstalled => {
-                self.daemon_badge.set_label("NOT INSTALLED");
-                self.daemon_badge.remove_css_class("success");
-                self.daemon_badge.add_css_class("error");
+                set_pill(&self.daemon_badge, "NOT INSTALLED", PillTone::Error);
                 self.daemon_btn.set_label("Install");
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("destructive-action");
                 self.daemon_btn.add_css_class("suggested-action");
             }
             DaemonState::Error(_) => {
-                self.daemon_badge.set_label("ERROR");
-                self.daemon_badge.remove_css_class("success");
-                self.daemon_badge.add_css_class("error");
+                set_pill(&self.daemon_badge, "ERROR", PillTone::Error);
                 self.daemon_btn.set_label("Retry");
                 self.daemon_btn.set_sensitive(true);
                 self.daemon_btn.remove_css_class("destructive-action");
                 self.daemon_btn.add_css_class("suggested-action");
             }
         }
-        self.system_view.refresh_daemon_state();
     }
 
     pub fn refresh_all(self: &Rc<Self>) {
@@ -410,6 +533,7 @@ impl MainWindow {
             if now != last {
                 last = now.clone();
                 view.apply_daemon_state(&now);
+                view.system_view.refresh_daemon_state();
                 if matches!(now, DaemonState::Running) {
                     view.state.reset_client();
                     view.refresh_all();

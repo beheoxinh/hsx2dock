@@ -114,7 +114,7 @@ impl ContainerLogsDialog {
                 });
                 let id = container_id.clone();
                 let Some(client) = state.client() else {
-                    state.error("Docker daemon is not running");
+                    state.error("Engine is not running");
                     return;
                 };
                 let tx = state.sender();

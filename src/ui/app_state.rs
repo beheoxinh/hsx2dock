@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ use async_channel::{Receiver, Sender};
 
 use crate::config::AppConfig;
 use crate::docker::client::DockerClient;
-use crate::docker::daemon::DaemonManager;
+use crate::docker::engine::EngineManager;
 use crate::docker::models::{
     ContainerItem, ContainerStats, DaemonState, DfReport, EngineInfo, ImageItem, NetworkItem,
     VolumeItem,
@@ -50,8 +50,10 @@ pub enum AppEvent {
     Toast(String),
     Error(String),
     Busy(RefreshScope),
-    /// Engine install state may have changed (CLI installed/removed):
-    /// drop the cached CLI probe and re-run daemon detection on the main loop.
+    /// Engine download/install progress: label + optional 0.0–1.0 fraction.
+    EngineProgress(String, Option<f64>),
+    /// Engine install state may have changed (engine downloaded/removed):
+    /// drop the cached probe and re-run daemon detection on the main loop.
     EngineChanged,
 }
 
@@ -59,12 +61,16 @@ pub enum AppEvent {
 /// the event bus that bridges Tokio workers to the GTK main loop.
 pub struct AppState {
     pub config: RefCell<AppConfig>,
-    pub daemon: RefCell<DaemonManager>,
+    pub engine: EngineManager,
     client: RefCell<Option<DockerClient>>,
     /// Cached `docker` CLI presence probe + timestamp (monotonic ms).
     cli_probe: RefCell<(bool, u64)>,
     /// Monotonic ms when the last explicit start was requested (Starting grace).
     starting_since: RefCell<Option<u64>>,
+    /// Monotonic ms when the last explicit stop was requested (Stopping grace).
+    stopping_since: RefCell<Option<u64>>,
+    /// True while a bundled-engine download/install is in flight.
+    installing: Cell<bool>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
 }
@@ -72,13 +78,15 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: AppConfig) -> Rc<Self> {
         let (tx, rx) = async_channel::unbounded();
-        let daemon = DaemonManager::new(config.clone());
+        let engine = EngineManager::new(crate::docker::engine::EnginePaths::new());
         Rc::new(Self {
             config: RefCell::new(config),
-            daemon: RefCell::new(daemon),
+            engine,
             client: RefCell::new(None),
             cli_probe: RefCell::new((false, 0)),
             starting_since: RefCell::new(None),
+            stopping_since: RefCell::new(None),
+            installing: Cell::new(false),
             tx,
             rx,
         })
@@ -100,10 +108,16 @@ impl AppState {
     /// A recent explicit start (≤30s) keeps `Starting` until the socket/API
     /// proves `Running`, so the UI never flickers to Stopped mid-start.
     pub fn daemon_state(&self) -> DaemonState {
-        if !self.cli_available_cached() {
+        if self.installing.get() {
+            return DaemonState::Installing;
+        }
+        if !self.engine.is_installed() {
             return DaemonState::NotInstalled;
         }
-        let socket_state = self.daemon.borrow().state_from_socket();
+        let socket_state = crate::docker::daemon::state_from_socket(self.engine.socket());
+        if matches!(socket_state, DaemonState::Stopped) {
+            *self.stopping_since.borrow_mut() = None;
+        }
         if matches!(socket_state, DaemonState::Running) {
             *self.starting_since.borrow_mut() = None;
             return socket_state;
@@ -111,16 +125,33 @@ impl AppState {
         if self.start_in_grace_period() {
             return DaemonState::Starting;
         }
+        if self.stop_in_grace_period() && !matches!(socket_state, DaemonState::Stopped) {
+            return DaemonState::Stopping;
+        }
         socket_state
     }
 
-    /// Cheap cached `docker` CLI presence check (TTL ~30s).
-    fn cli_available_cached(&self) -> bool {        let now = now_ms();
+    /// Whether a stop was requested within the last 30s.
+    fn stop_in_grace_period(&self) -> bool {
+        match *self.stopping_since.borrow() {
+            Some(at) => now_ms().saturating_sub(at) < 30_000,
+            None => false,
+        }
+    }
+
+    /// Mark a bundled-engine download/install as in flight (or finished).
+    pub fn set_installing(&self, installing: bool) {
+        self.installing.set(installing);
+    }
+
+    /// Whether the bundled engine is downloaded and ready to run.
+    fn cli_available_cached(&self) -> bool {
+        let now = now_ms();
         let (cached, at) = *self.cli_probe.borrow();
-        if now.saturating_sub(at) < 30_000 && at != 0 {
+        if now.saturating_sub(at) < 2_000 && at != 0 {
             return cached;
         }
-        let available = crate::docker::install::cli_available();
+        let available = self.engine.is_installed();
         *self.cli_probe.borrow_mut() = (available, now);
         available
     }
@@ -143,11 +174,23 @@ impl AppState {
     /// Record an explicit start request (arms the Starting grace window).
     fn mark_start_requested(&self) {
         *self.starting_since.borrow_mut() = Some(now_ms());
+        *self.stopping_since.borrow_mut() = None;
+    }
+
+    /// Record an explicit stop request, clearing any pending start grace.
+    fn mark_stop_requested(&self) {
+        *self.stopping_since.borrow_mut() = Some(now_ms());
+        *self.starting_since.borrow_mut() = None;
     }
 
     /// Active unix socket path when the daemon is reachable.
     pub fn active_socket(&self) -> Option<PathBuf> {
-        self.daemon.borrow().active_socket()
+        let p = self.engine.socket().to_path_buf();
+        if crate::docker::daemon::is_usable_socket(&p) {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     /// Create (and cache) a client bound to the currently active socket.
@@ -169,10 +212,27 @@ impl AppState {
     /// manager (socket candidates derive from it), drop the cached client and
     /// re-poll daemon state so the UI reflects the change immediately.
     pub fn apply_config(&self, config: AppConfig) {
-        *self.config.borrow_mut() = config.clone();
-        *self.daemon.borrow_mut() = DaemonManager::new(config);
+        *self.config.borrow_mut() = config;
         self.reset_client();
         self.refresh_daemon();
+    }
+
+    /// Mutate the stored config in place and persist it in the background.
+    ///
+    /// Unlike [`apply_config`](Self::apply_config) this does not rebuild the
+    /// daemon manager or re-poll — use it for flags that only affect UI-side
+    /// behaviour (e.g. the Docker CLI bridge toggle).
+    pub fn update_config(&self, f: impl FnOnce(&mut AppConfig)) {
+        let snapshot = {
+            let mut cfg = self.config.borrow_mut();
+            f(&mut cfg);
+            cfg.clone()
+        };
+        spawn(async move {
+            if let Err(e) = snapshot.save().await {
+                tracing::warn!("failed to save config: {e}");
+            }
+        });
     }
 
     pub fn notify(&self, event: AppEvent) {
@@ -271,50 +331,38 @@ impl AppState {
         }
         self.mark_start_requested();
         let tx = self.sender();
-        let daemon = self.daemon.borrow().clone();
+        let engine = self.engine.clone();
         self.notify(AppEvent::DaemonState(DaemonState::Starting));
         spawn(async move {
-            match daemon.try_start_unit() {
-                Ok(true) => {
-                    let _ = tx
-                        .send(AppEvent::DaemonState(daemon.state_from_socket()))
-                        .await;
-                }
-                Ok(false) => {
-                    let _ = tx
-                        .send(AppEvent::Error(
-                            "No systemd unit configured — start Docker manually".into(),
-                        ))
-                        .await;
-                    let _ = tx
-                        .send(AppEvent::DaemonState(daemon.state_from_socket()))
-                        .await;
+            let result = crate::runtime::engine_op(move || engine.start())
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("engine op: {e}")));
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::DaemonState(DaemonState::Running)).await;
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(AppEvent::Error(format!("autostart failed: {e}")))
+                        .send(AppEvent::Error(format!("engine autostart failed: {e}")))
                         .await;
-                    let _ = tx
-                        .send(AppEvent::DaemonState(daemon.state_from_socket()))
-                        .await;
+                    let _ = tx.send(AppEvent::DaemonState(DaemonState::Stopped)).await;
                 }
             }
         });
     }
 
-    /// Start or stop the configured systemd user unit.
+    /// Start or stop the bundled engine.
     pub fn toggle_daemon(&self) {
+        tracing::info!("toggle_daemon called");
         let tx = self.sender();
-        let unit = self.config.borrow().daemon_unit.clone();
-        if unit.trim().is_empty() {
+        if !self.engine.is_installed() {
             self.notify(AppEvent::Toast(
-                "No systemd unit configured — set one in Preferences".into(),
+                "Engine is not downloaded yet — see the Engine page".into(),
             ));
             return;
         }
-        // Branch on the live systemd unit state rather than socket presence:
-        // a stale socket file can otherwise invert start/stop.
-        let start = !matches!(self.daemon.borrow().is_unit_active(), Ok(true));
+        // Branch on engine process + socket liveness rather than guessing.
+        let start = !self.engine.is_running() && self.active_socket().is_none();
         if start {
             if !self.cli_available_cached() {
                 self.notify(AppEvent::DaemonState(DaemonState::NotInstalled));
@@ -324,47 +372,49 @@ impl AppState {
                 return;
             }
             self.mark_start_requested();
+        } else {
+            self.mark_stop_requested();
         }
         self.notify(AppEvent::DaemonState(if start {
             DaemonState::Starting
         } else {
-            DaemonState::Stopped
+            DaemonState::Stopping
         }));
-        let daemon = self.daemon.borrow().clone();
+        let engine = self.engine.clone();
         spawn(async move {
-            // systemctl blocks: run it on a blocking thread so neither the GTK
-            // main loop nor the Tokio async workers stall.
-            let result = tokio::task::spawn_blocking(move || {
-                if start {
-                    daemon.try_start_unit()
-                } else {
-                    daemon.try_stop_unit()
-                }
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(format!("task join: {e}"))));
-            let msg = match result {
-                Ok(true) => {
+            let runner = engine.clone();
+            let result =
+                crate::runtime::engine_op(move || {
                     if start {
-                        format!("Started {unit}")
+                        runner.start()
                     } else {
-                        format!("Stopped {unit}")
+                        runner.stop()
                     }
-                }
-                Ok(false) => "No systemd unit configured — start Docker manually".to_string(),
-                Err(e) => format!("systemctl failed: {e}"),
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("engine op: {e}")));
+            let msg = match result {
+                Ok(()) if start => "Engine started".to_string(),
+                Ok(()) => "Engine stopped".to_string(),
+                Err(e) => format!("engine {e}"),
             };
-            let socket_live = tokio::task::spawn_blocking(|| {
-                DaemonManager::new(crate::config::AppConfig::default()).active_socket()
+            let probe = engine.clone();
+            let live = tokio::task::spawn_blocking(move || {
+                crate::docker::daemon::is_usable_socket(probe.socket())
             })
             .await
-            .unwrap_or(None)
-            .is_some();
-            if start && !socket_live {
+            .unwrap_or(false);
+            if start && !live {
                 let _ = tx
                     .send(AppEvent::DaemonState(DaemonState::Error(
-                        "Docker did not come up within 30s — check `systemctl status docker.service`".into(),
+                        "Engine did not come up — see the Engine page log".into(),
                     )))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(AppEvent::DaemonState(
+                        crate::docker::daemon::state_from_socket(engine.socket()),
+                    ))
                     .await;
             }
             let _ = tx.send(AppEvent::Toast(msg)).await;
@@ -383,7 +433,7 @@ impl AppState {
         Fut: std::future::Future<Output = ()> + Send,
     {
         if !self.has_client() {
-            self.error("Docker daemon is not running");
+            self.error("Engine is not running");
             return;
         }
         self.with_client_or_toast(f);
@@ -402,7 +452,7 @@ impl AppState {
         let tx = self.sender();
         match self.client() {
             Some(client) => spawn(async move { f(client, tx).await }),
-            None => self.toast("Docker daemon is not running"),
+            None => self.toast("Engine is not running"),
         }
     }
 

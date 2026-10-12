@@ -1,8 +1,9 @@
 //! Thin wrapper around the `docker compose` CLI plugin.
 //!
 //! bollard speaks the Engine API, which has no first-class Compose concept,
-//! so project lifecycle (`up`/`down`/`ps`/`logs`) shells out to the CLI the
-//! same way [`super::daemon::DaemonManager`] shells out to `systemctl`.
+//! so project lifecycle (`up`/`down`/`ps`/`logs`) shells out to the bundled
+//! `docker` CLI against the app's own engine
+//! (see [`super::engine::docker_command`]).
 //! Every blocking call runs inside `spawn_blocking` so neither the GTK main
 //! loop nor the Tokio async workers stall.
 
@@ -24,20 +25,15 @@ pub struct ComposeService {
     pub ports: String,
 }
 
-/// Probe for a usable Compose implementation: the v2 plugin first
-/// (`docker compose`), then the legacy standalone `docker-compose` binary.
+/// Probe for a usable Compose implementation via the bundled engine.
 pub fn is_available() -> bool {
-    std::process::Command::new("docker")
+    let paths = crate::docker::engine::EnginePaths::new();
+    crate::docker::engine::docker_command(&paths)
         .arg("compose")
         .arg("version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-        || std::process::Command::new("docker-compose")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
 }
 
 /// Bring a project up in detached mode, returning the CLI's combined output.
@@ -83,24 +79,14 @@ fn run_compose(file: &Path, subcommand: &str, extra: &[&str]) -> anyhow::Result<
         bail!("compose file not found: {}", file.display());
     }
     let file_str = file.to_string_lossy();
-    let mut plugin_args: Vec<&str> = vec!["compose", "-f", &file_str, subcommand];
-    plugin_args.extend(extra.iter().copied());
-    match std::process::Command::new("docker")
-        .args(&plugin_args)
+    let mut args: Vec<&str> = vec!["compose", "-f", &file_str, subcommand];
+    args.extend(extra.iter().copied());
+    let paths = crate::docker::engine::EnginePaths::new();
+    let out = crate::docker::engine::docker_command(&paths)
+        .args(&args)
         .output()
-    {
-        Ok(out) => finish_output("docker compose", out),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut legacy_args: Vec<&str> = vec!["-f", &file_str, subcommand];
-            legacy_args.extend(extra.iter().copied());
-            let out = std::process::Command::new("docker-compose")
-                .args(&legacy_args)
-                .output()
-                .context("neither `docker compose` nor `docker-compose` is installed")?;
-            finish_output("docker-compose", out)
-        }
-        Err(e) => Err(e).context("failed to run `docker compose`"),
-    }
+        .context("failed to run `docker compose`")?;
+    finish_output("compose", out)
 }
 
 fn finish_output(label: &str, out: std::process::Output) -> anyhow::Result<String> {

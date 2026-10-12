@@ -108,7 +108,9 @@ impl LoginDialog {
             let user_for_msg = user.clone();
             spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut cmd = std::process::Command::new("docker");
+                    let mut cmd = crate::docker::engine::docker_command(
+                        &crate::docker::engine::EnginePaths::new(),
+                    );
                     cmd.arg("login");
                     if !server.is_empty() {
                         cmd.arg(&server);
@@ -158,7 +160,9 @@ impl LoginDialog {
             let tx2 = tx2.clone();
             spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut cmd = std::process::Command::new("docker");
+                    let mut cmd = crate::docker::engine::docker_command(
+                        &crate::docker::engine::EnginePaths::new(),
+                    );
                     cmd.arg("logout");
                     if !server.is_empty() {
                         cmd.arg(&server);

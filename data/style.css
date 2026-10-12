@@ -1,10 +1,84 @@
-/* Docker Manager custom styles */
-.stat-bar {
-    min-height: 6px;
+/* ============================================================================
+ * Docker Manager — design tokens & shared component styles
+ *
+ * Conventions:
+ *   .page          — vertical page root (top-level view)
+ *   .page-toolbar  — search/filter/action row above a list
+ *   .page-title    — section heading inside a view
+ *   .pill*         — small status badges (running/stopped/warn/error)
+ *   .metric        — big numeric stat + caption
+ *   .dim           — de-emphasised secondary text
+ *   .card          — subtle raised surface for grouped content
+ * ========================================================================== */
+
+/* ---- Spacing / layout --------------------------------------------------- */
+.page           { padding: 0; }
+.page-toolbar   { padding: 6px 12px; }
+.page-section   { padding: 18px 12px 6px 12px; }
+.tight          { margin: 4px; }
+.loose          { margin: 12px; }
+
+/* ---- Typography --------------------------------------------------------- */
+.page-title {
+    font-weight: bold;
+    font-size: 1.05em;
 }
+.dim {
+    opacity: 0.65;
+}
+.mono {
+    font-family: monospace;
+    font-size: 0.9em;
+}
+
+/* ---- Status pills ------------------------------------------------------- */
 .status-pill {
     padding: 1px 8px;
     border-radius: 8px;
     font-size: 0.8em;
     font-weight: bold;
 }
+.status-pill.running { background-color: alpha(@accent_bg_color, 0.18); color: @accent_color; }
+.status-pill.stopped { background-color: alpha(@window_fg_color, 0.10); color: @window_fg_color; }
+.status-pill.warn    { background-color: alpha(@warning_bg_color, 0.20); color: @warning_color; }
+.status-pill.error   { background-color: alpha(@error_bg_color, 0.20);  color: @error_color; }
+
+/* ---- Metrics ------------------------------------------------------------ */
+.metric-value {
+    font-size: 1.6em;
+    font-weight: bold;
+}
+.metric-caption {
+    font-size: 0.85em;
+    opacity: 0.65;
+}
+
+/* ---- Stat bars ---------------------------------------------------------- */
+.stat-bar {
+    min-height: 6px;
+}
+
+/* ---- Cards -------------------------------------------------------------- */
+.card {
+    border-radius: 12px;
+    padding: 12px;
+    background-color: alpha(@window_fg_color, 0.04);
+}
+
+/* ---- Navigation sidebar ------------------------------------------------- */
+.navigation-sidebar row {
+    padding: 8px 10px;
+    border-radius: 8px;
+}
+.navigation-sidebar row:selected {
+    background-color: alpha(@accent_bg_color, 0.25);
+}
+
+/* ---- Dashboard metric tiles -------------------------------------------- */
+.metric-value {
+    font-feature-settings: "tnum";
+}
+.dashboard {
+    padding: 6px 0;
+}
+

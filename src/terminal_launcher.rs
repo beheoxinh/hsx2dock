@@ -26,11 +26,25 @@ impl TerminalLauncher {
         }
     }
 
+    fn term_command(term: &str) -> Command {
+        let paths = crate::docker::engine::EnginePaths::new();
+        let bin = paths.bin_dir();
+        let host = format!("unix://{}", paths.socket.display());
+        let path_env = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new(term);
+        cmd.env("DOCKER_HOST", host).env("PATH", path_env);
+        cmd
+    }
+
     pub fn exec_shell(container_id: &str, shell: &str) -> anyhow::Result<()> {
         let term = Self::detect_preferred();
         match term {
             "ptyxis" => {
-                Command::new("ptyxis")
+                Self::term_command("ptyxis")
                     .arg("--")
                     .arg("docker")
                     .arg("exec")
@@ -40,7 +54,7 @@ impl TerminalLauncher {
                     .spawn()?;
             }
             _ => {
-                Command::new("gnome-terminal")
+                Self::term_command("gnome-terminal")
                     .arg("--")
                     .arg("docker")
                     .arg("exec")

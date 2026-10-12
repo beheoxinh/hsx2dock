@@ -1,14 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect x="4" y="4" width="120" height="120" rx="24" fill="#1d99f3"/>
-  <g fill="#ffffff">
-    <rect x="24" y="44" width="80" height="10" rx="2"/>
-    <rect x="24" y="58" width="80" height="10" rx="2"/>
-    <rect x="24" y="72" width="80" height="10" rx="2"/>
-    <rect x="24" y="86" width="56" height="10" rx="2"/>
-    <rect x="88" y="86" width="16" height="10" rx="2" opacity="0.75"/>
-  </g>
-  <rect x="16" y="28" width="96" height="6" rx="3" fill="#0c5fa8"/>
-  <circle cx="28" cy="31" r="2.2" fill="#bfe3ff"/>
-  <circle cx="36" cy="31" r="2.2" fill="#bfe3ff" opacity="0.8"/>
-  <circle cx="44" cy="31" r="2.2" fill="#bfe3ff" opacity="0.6"/>
-</svg>
+<svg fill="#4285F4" role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><title>Google Container Optimized OS</title><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm0 21.6a9.6 9.6 0 0 1-5.016-1.416L11.28 17.7v-5.4L6.612 9.6v5.424l3.3 1.908-4.152 2.4A9.6 9.6 0 0 1 7.296 3.6v4.8L12 11.136 16.68 8.4 12 5.724 8.688 7.632V2.964a9.6 9.6 0 0 1 12.372 5.64A9.72 9.72 0 0 1 21.672 12v.084L17.352 9.6l-4.68 2.712v5.412l4.68-2.7v-3.816l4.14 2.4A9.6 9.6 0 0 1 12 21.6z"/></svg>

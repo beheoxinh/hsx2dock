@@ -151,7 +151,7 @@ impl ComposeView {
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        widget.append(&picker);
+        widget.append(&crate::ui::common::clamp_grid(&picker));
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&paned);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));

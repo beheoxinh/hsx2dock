@@ -1,5 +1,6 @@
+pub mod cli_bridge;
 pub mod client;
 pub mod compose;
 pub mod daemon;
-pub mod install;
+pub mod engine;
 pub mod models;

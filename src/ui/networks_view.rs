@@ -189,14 +189,14 @@ impl NetworksView {
             .build();
         stack.add_named(
             &adw::Clamp::builder()
-                .maximum_size(1100)
+                .maximum_size(crate::ui::common::GRID_MAX_WIDTH)
                 .child(&list)
                 .build(),
             Some("list"),
         );
         stack.add_named(
             &adw::Clamp::builder()
-                .maximum_size(1100)
+                .maximum_size(crate::ui::common::GRID_MAX_WIDTH)
                 .child(&empty)
                 .build(),
             Some("empty"),
@@ -206,7 +206,7 @@ impl NetworksView {
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        widget.append(&toolbar);
+        widget.append(&crate::ui::common::clamp_grid(&toolbar));
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(
             &gtk::ScrolledWindow::builder()

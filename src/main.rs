@@ -59,6 +59,15 @@ fn main() -> ExitCode {
         }
         let window = MainWindow::new(app, state_for_activate.clone());
         window.window().present();
+        // Keep the strong MainWindow ref alive for the app lifetime: every
+        // closure captures only `Rc::downgrade(self)`, so dropping the strong
+        // ref here would silently disable all UI actions (weak.upgrade() ==
+        // None). Storing it as GTK data ties its lifetime to the app, which
+        // outlives the activate closure. Unsafe is justified: the Rc lives
+        // for the whole app run and is never re-created.
+        unsafe {
+            app.set_data("main-window", window.clone());
+        }
     });
 
     // The runtime must outlive the GTK loop; keep an explicit handle alive.

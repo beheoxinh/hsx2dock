@@ -82,6 +82,179 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+// ============================================================================
+// Shared UI helpers — one canonical layout so every page lines up.
+// ============================================================================
+
+use adw::prelude::*;
+
+/// Maximum content width for a page. Toolbars and lists share this clamp so
+/// their left/right gutters align exactly.
+pub const CONTENT_MAX_WIDTH: i32 = 1100;
+
+/// Wider width used for dashboard-style pages that carry several columns.
+pub const GRID_MAX_WIDTH: i32 = 1400;
+
+/// Wrap `child` in an [`adw::Clamp`] using the shared page width.
+pub fn clamp_page<W: IsA<gtk::Widget>>(child: &W) -> adw::Clamp {
+    adw::Clamp::builder()
+        .maximum_size(CONTENT_MAX_WIDTH)
+        .tightening_threshold(600)
+        .child(child)
+        .build()
+}
+
+/// Like [`clamp_page`] but for wide, multi-column dashboard layouts.
+pub fn clamp_grid<W: IsA<gtk::Widget>>(child: &W) -> adw::Clamp {
+    adw::Clamp::builder()
+        .maximum_size(GRID_MAX_WIDTH)
+        .tightening_threshold(700)
+        .child(child)
+        .build()
+}
+
+/// A grid of metric tiles that automatically reflows into as many columns as
+/// the available width allows (like a responsive card grid).
+pub fn metric_grid(items: &[(String, String)]) -> gtk::FlowBox {
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(false)
+        .row_spacing(12)
+        .column_spacing(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    // Keep the tiles from stretching to absurd widths on very wide screens.
+    flow.set_max_children_per_line(6);
+    flow.set_min_children_per_line(1);
+    for (value, caption) in items {
+        let tile = metric(value, caption);
+        tile.add_css_class("card");
+        tile.set_size_request(150, -1);
+        flow.insert(&tile, -1);
+    }
+    flow
+}
+
+/// A responsive two-column row. The two children share the width evenly and,
+/// because each keeps `hexpand`, they sit side by side when there is room.
+/// Callers should place this inside a [`gtk::FlowBox`] or clamp so that it
+/// stacks cleanly on narrow windows.
+pub fn two_columns(left: &impl IsA<gtk::Widget>, right: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(18)
+        .homogeneous(true)
+        .valign(gtk::Align::Start)
+        .build();
+    left.set_hexpand(true);
+    right.set_hexpand(true);
+    row.append(left);
+    row.append(right);
+    row
+}
+
+/// Left-align a group inside a page so a `PreferencesGroup` does not float in
+/// the middle of a wide column.
+pub fn group_column<W: IsA<gtk::Widget>>(child: &W) -> gtk::Box {
+    let col = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .valign(gtk::Align::Start)
+        .build();
+    col.append(child);
+    col
+}
+
+/// The canonical page toolbar: a search entry that expands, plus any extra
+/// trailing widgets (filters, toggles, icon buttons), all inside one clamp so
+/// it shares the list gutter.
+pub fn page_toolbar(search: &gtk::SearchEntry, extra: &[gtk::Widget]) -> adw::Clamp {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    search.set_hexpand(true);
+    row.append(search);
+    for w in extra {
+        row.append(w);
+    }
+    let clamp = clamp_page(&row);
+    clamp.add_css_class("page-toolbar");
+    clamp
+}
+
+/// A bold section heading used inside a view body.
+pub fn section_title(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .margin_start(12)
+        .margin_top(12)
+        .margin_bottom(4)
+        .css_classes(["page-title"])
+        .build()
+}
+
+/// A big numeric stat with a caption underneath (used on the engine page).
+pub fn metric(value: &str, caption: &str) -> gtk::Box {
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    col.set_halign(gtk::Align::Center);
+    let v = gtk::Label::builder()
+        .label(value)
+        .css_classes(["metric-value"])
+        .build();
+    let c = gtk::Label::builder()
+        .label(caption)
+        .css_classes(["metric-caption"])
+        .build();
+    col.append(&v);
+    col.append(&c);
+    col
+}
+
+/// Like [`metric`] but returns the value label too, so a dashboard can update
+/// the number in place. The tile is wrapped in a `.card` for a bit of depth.
+pub fn metric_tile(value: &str, caption: &str) -> (gtk::Box, gtk::Label) {
+    let value_label = gtk::Label::builder()
+        .label(value)
+        .css_classes(["metric-value"])
+        .build();
+    let caption_label = gtk::Label::builder()
+        .label(caption)
+        .css_classes(["metric-caption"])
+        .build();
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    col.set_halign(gtk::Align::Start);
+    col.set_valign(gtk::Align::Start);
+    col.add_css_class("card");
+    col.set_size_request(150, -1);
+    col.append(&value_label);
+    col.append(&caption_label);
+    (col, value_label)
+}
+
+/// Tag a label as a status pill with the matching colour class, replacing any
+/// previous tone so the same widget can be re-labelled on state changes.
+pub fn set_pill(label: &gtk::Label, text: &str, tone: PillTone) {
+    label.set_label(text);
+    for t in ["running", "stopped", "warn", "error"] {
+        label.remove_css_class(t);
+    }
+    label.add_css_class(match tone {
+        PillTone::Running => "running",
+        PillTone::Stopped => "stopped",
+        PillTone::Warn => "warn",
+        PillTone::Error => "error",
+    });
+}
+
+/// Colour tones for [`set_pill`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillTone {
+    Running,
+    Stopped,
+    Warn,
+    Error,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

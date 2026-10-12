@@ -18,52 +18,35 @@ impl PreferencesDialog {
 
         let auto_row = adw::SwitchRow::builder()
             .title("Auto-start daemon")
-            .subtitle("Start the systemd unit when no socket is live")
+            .subtitle("Start the bundled engine when the app opens")
             .active(cfg.auto_start_daemon)
             .build();
 
-        let unit_row = adw::EntryRow::builder().title("Daemon unit").build();
-        unit_row.set_text(&cfg.daemon_unit);
-
-        let socket_row = adw::EntryRow::builder().title("Preferred socket").build();
-        socket_row.set_text(&cfg.prefer_socket);
-
         let group = adw::PreferencesGroup::builder()
-            .title("Daemon")
-            .description("How the app finds and starts the Docker daemon")
+            .title("Engine")
+            .description("The app runs its own bundled Docker engine")
             .build();
         group.add(&auto_row);
-        // Unit presets: system docker.service first (self-managed Engine),
-        // legacy Desktop unit kept for old configs, plus free-form custom.
-        let unit_presets = gtk::StringList::new(&[
-            "docker.service",
-            "docker-desktop.service (legacy)",
-            "custom…",
-        ]);
-        let current = cfg.daemon_unit.trim();
-        let preset_row = adw::ComboRow::builder()
-            .title("Daemon unit preset")
-            .subtitle("System unit this app starts/stops (never Docker Desktop)")
-            .model(&unit_presets)
+
+        let cli_row = adw::SwitchRow::builder()
+            .title("Expose docker CLI to the system")
+            .subtitle("Create $XDG_RUNTIME_DIR/docker.sock and the docker-manager-engine context")
+            .active(cfg.cli_bridge_enabled)
             .build();
-        if current == "docker.service" {
-            preset_row.set_selected(0);
-        } else if current == "docker-desktop.service" {
-            preset_row.set_selected(1);
-        } else {
-            preset_row.set_selected(2);
-        }
-        group.add(&preset_row);
-        group.add(&unit_row);
-        group.add(&socket_row);
-        // Warn when a legacy Desktop-coupled unit is configured: the app
-        // respects it but no longer manages Docker Desktop itself.
-        if crate::docker::daemon::is_legacy_desktop_unit(&cfg.daemon_unit) {
-            let warn = adw::Banner::builder()
-                .title("Legacy Docker Desktop unit configured — switch to docker.service to let this app fully manage the Engine")
-                .build();
-            warn.add_css_class("warning");
-            group.add(&warn);
+        group.add(&cli_row);
+
+        let cli_default_row = adw::SwitchRow::builder()
+            .title("Set as default context")
+            .subtitle("Run `docker context use docker-manager-engine` so plain `docker` works")
+            .active(cfg.cli_bridge_set_default)
+            .sensitive(cfg.cli_bridge_enabled)
+            .build();
+        group.add(&cli_default_row);
+        {
+            let cli_default_row = cli_default_row.clone();
+            cli_row.connect_active_notify(move |s| {
+                cli_default_row.set_sensitive(s.is_active());
+            });
         }
 
         let page = adw::PreferencesPage::builder()
@@ -98,26 +81,11 @@ impl PreferencesDialog {
         let st = state.clone();
         let dlg = dialog.clone();
         save_btn.connect_clicked(move |_| {
-            let prefer_socket =
-                match crate::docker::daemon::DaemonManager::validate_preferred_socket(
-                    &socket_row.text(),
-                ) {
-                    Ok(v) => v,
-                    Err(msg) => {
-                        socket_row.add_css_class("error");
-                        socket_row.set_tooltip_text(Some(&msg));
-                        return;
-                    }
-                };
             let next = crate::config::AppConfig {
                 auto_start_daemon: auto_row.is_active(),
-                daemon_unit: match preset_row.selected() {
-                    0 => "docker.service".to_string(),
-                    1 => "docker-desktop.service".to_string(),
-                    _ => unit_row.text().trim().to_string(),
-                },
-                prefer_socket,
-                compose_file: st.config.borrow().compose_file.clone(),
+                compose_file: cfg.compose_file.clone(),
+                cli_bridge_enabled: cli_row.is_active(),
+                cli_bridge_set_default: cli_default_row.is_active(),
             };
             let st2 = st.clone();
             let dlg2 = dlg.clone();

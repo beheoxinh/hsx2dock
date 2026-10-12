@@ -5,8 +5,12 @@ pub enum DaemonState {
     #[default]
     Stopped,
     Starting,
+    /// A stop was requested and the socket is still winding down.
+    Stopping,
     Running,
     NotInstalled,
+    /// A bundled-engine download/install is in flight.
+    Installing,
     /// Engine probe failed with a human-readable reason (e.g. ping error).
     Error(String),
 }

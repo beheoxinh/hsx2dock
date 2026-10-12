@@ -29,20 +29,24 @@ via [bollard](https://crates.io/crates/bollard).
 - **Polish** — `Ctrl+R` refresh / `Ctrl+,` preferences shortcuts, header
   working spinner, long-error dialog, copy-ID buttons on every row,
   confirm-before-every-prune/delete.
-- **On-demand daemon control** — the app detects the active socket
-  (`~/.docker/desktop/docker.sock`, then `/var/run/docker.sock`) and can
-  start/stop the daemon via systemd user units (`docker-desktop.service` by
-  default, configurable). No daemon? Every action degrades to a toast instead
-  of a crash.
+- **Bundled engine** — the app downloads its own Docker Engine (official
+  static rootless binaries) into `~/.local/share/docker-manager` on first run
+  and runs `dockerd` rootless as a child process on a private socket. Fully
+  isolated: the system's Docker install is neither required nor touched.
+  No engine yet? Download it from the Engine page (needs network once), then
+  every action just works.
+- **Docker CLI bridge** — optional switch on the Engine page makes the system
+  `docker` command talk to this bundled engine: creates
+  `$XDG_RUNTIME_DIR/docker.sock` and a `docker-manager-engine` context, with an
+  optional "set as default". Re-applied every 10s while enabled; never touches
+  `/var/run/docker.sock` or other contexts.
 
 ## Requirements (Nobara / GNOME)
 
 - GTK 4.12+, libadwaita 1.4+
-- Docker Engine or Docker Desktop (socket at `/var/run/docker.sock` or
-  `~/.docker/desktop/docker.sock`)
+- No system Docker needed — the app bundles its own rootless engine
 - A terminal emulator for `docker exec`: `ptyxis` (preferred) or
   `gnome-terminal`
-- `systemctl --user` for daemon Start/Stop (unit configurable)
 
 ## Build & run
 
@@ -62,13 +66,37 @@ CLI flags: `--help`, `-V` / `--version`.
 Config lives at `~/.config/docker-manager/config.toml` (created on demand):
 
 ```toml
-auto_start_daemon = false
-daemon_unit = "docker-desktop.service"
-prefer_socket = ""
+auto_start_daemon = true
+compose_file = ""
 ```
 
-- `daemon_unit` — systemd user unit used by the Start/Stop buttons.
-- `prefer_socket` — force a socket path instead of auto-detection.
+- `auto_start_daemon` — start the bundled engine when the app opens.
+- `compose_file` — default compose file used by the Compose page.
+
+## Engine layout
+
+The bundled engine lives entirely under the app's own directories — nothing is
+written outside them and the host's Docker is never touched.
+
+```
+~/.local/share/docker-manager/
+  current/bin/            dockerd, docker CLI, rootlesskit, containerd, runc…
+  current/cli-plugins/    docker-compose
+  current/.complete       written only after checksums verified + extracted
+  data/                   containers, images, volumes (survives engine updates)
+  log/engine.log          engine stdout/stderr
+  engine.pid              pidfile for orphan cleanup
+$XDG_RUNTIME_DIR/docker-manager/
+  docker.sock             the private API socket the app talks to
+```
+
+- First run: the Engine page downloads pinned official binaries, verifies their
+  sha256 **before** extracting, then atomically swaps `current` to the new
+  version.
+- Updates keep `data/` untouched; the `current` symlink swap is atomic, so an
+  interrupted update leaves the previous engine in place.
+- The engine is a child process: it stops when the app quits. A pidfile + comm
+  check cleans up leftovers from a hard-killed app.
 
 ## Desktop integration
 
@@ -93,7 +121,9 @@ src/
   terminal_launcher.rs  ptyxis/gnome-terminal `docker exec -it`
   docker/
     client.rs           bollard wrapper (27 methods, all resources)
-    daemon.rs           socket detection + systemd unit control
+    daemon.rs           private-socket detection helpers
+    engine.rs           bundled engine: paths, download/verify/extract,
+                        child-process lifecycle (start/stop), docker_command
     models.rs           ContainerItem/ImageItem/VolumeItem/NetworkItem/stats
   ui/
     app_state.rs        AppEvent bus, with_client, refresh/toggle daemon
@@ -107,12 +137,26 @@ Full map: [docs/architecture.md](docs/architecture.md) ·
 Usage: [docs/user-guide.md](docs/user-guide.md) ·
 Config: [docs/configuration.md](docs/configuration.md) ·
 Dev: [docs/development.md](docs/development.md)
-    system_view.rs      engine dashboard
-    containers_view.rs  containers + stats bars
-    container_details_dialog.rs   logs dialog
-    images_view.rs      images list
-    pull_image_dialog.rs          pull with progress
-    volumes_view.rs / networks_view.rs / dialogs.rs
+
+```
+ui/
+  app_state.rs        AppEvent bus, with_client, refresh/toggle daemon
+  common.rs           format helpers + main_loop_channel marshalling
+  window.rs           ViewStack shell, event drain, poll loops, spinner,
+                      shortcuts, error dialog
+  dialogs/           run/exec/logs/inspect/pull/push/build/tag/login/hub/preferences
+  system_view.rs      engine dashboard
+  containers_view.rs  containers + stats bars
+  container_details_dialog.rs   logs dialog
+  images_view.rs      images list
+  pull_image_dialog.rs          pull with progress
+  volumes_view.rs
+  networks_view.rs
+  compose_view.rs
+  preferences.rs
+  build_image_dialog.rs
+  run_container_dialog.rs
+```
 ```
 
 Threading rule: GTK widgets are `!Send`. All Docker I/O runs on the shared
@@ -123,10 +167,14 @@ loop.
 ## Tests
 
 ```sh
-cargo test            # 6 unit tests
+cargo test            # 31 unit tests
 cargo check --all-targets
 ```
 
-Unit tests cover socket-detection logic (`docker::daemon`), byte/relative-time
-formatting (`ui::common`), and the terminal launcher. Live Docker operations
-require a running daemon and are exercised manually.
+Unit tests cover socket-detection (`docker::daemon`), the engine pipeline
+(paths, checksum rejection, tarball extraction, symlink swap, `docker_command`
+env) (`docker::engine`), config round-trips, byte/relative-time formatting
+(`ui::common`), and the terminal launcher.
+
+The full bundled-engine path (download → verify → extract → rootless start →
+`docker run`) was verified manually against a real 29.9.0 static release.
