@@ -15,11 +15,22 @@ pub async fn toggle_engine(state: State<'_, AppState>) -> Result<DaemonState, St
     let current = state.daemon_state();
     match current {
         DaemonState::Running => {
-            state.engine.stop().map_err(|e| e.to_string())?;
+            let engine = state.engine.clone();
+            crate::runtime::engine_op(move || engine.stop())
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            *state.client.write().await = None;
             Ok(state.daemon_state())
         }
         DaemonState::Stopped | DaemonState::NotInstalled => {
-            state.engine.start().map_err(|e| e.to_string())?;
+            let engine = state.engine.clone();
+            crate::runtime::engine_op(move || engine.start())
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            // Wait briefly for socket to become live or let get_client connect
+            let _ = state.get_client().await;
             Ok(state.daemon_state())
         }
         other => Ok(other),

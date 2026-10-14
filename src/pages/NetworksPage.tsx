@@ -7,7 +7,11 @@ import { api } from "../lib/api";
 import { truncateId } from "../lib/utils";
 import type { NetworkItem } from "../types";
 
-export const NetworksPage: React.FC = () => {
+interface NetworksPageProps {
+  refreshKey?: number;
+}
+
+export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -32,7 +36,7 @@ export const NetworksPage: React.FC = () => {
 
   useEffect(() => {
     loadNetworks();
-  }, []);
+  }, [refreshKey]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -6,7 +6,11 @@ import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
 import type { VolumeItem } from "../types";
 
-export const VolumesPage: React.FC = () => {
+interface VolumesPageProps {
+  refreshKey?: number;
+}
+
+export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -29,7 +33,7 @@ export const VolumesPage: React.FC = () => {
 
   useEffect(() => {
     loadVolumes();
-  }, []);
+  }, [refreshKey]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();

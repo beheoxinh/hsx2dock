@@ -53,12 +53,20 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     loadContainers();
 
     let unlistenStats: (() => void) | undefined;
+    let unlistenContainers: (() => void) | undefined;
+
     events.onContainerStatsTick((stats) => {
       setStatsMap((prev) => ({ ...prev, ...stats }));
     }).then((u) => (unlistenStats = u));
 
+    events.onContainersTick((updatedList) => {
+      setContainers(updatedList);
+      setLoading(false);
+    }).then((u) => (unlistenContainers = u));
+
     return () => {
       if (unlistenStats) unlistenStats();
+      if (unlistenContainers) unlistenContainers();
     };
   }, []);
 

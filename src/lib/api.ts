@@ -105,4 +105,7 @@ export const events = {
 
   onPullProgress: (cb: (payload: PullProgressPayload) => void): Promise<UnlistenFn> =>
     listen<PullProgressPayload>("pull-progress", (event) => cb(event.payload)),
+
+  onContainersTick: (cb: (containers: ContainerItem[]) => void): Promise<UnlistenFn> =>
+    listen<ContainerItem[]>("containers-tick", (event) => cb(event.payload)),
 };

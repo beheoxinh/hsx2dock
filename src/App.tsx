@@ -111,9 +111,9 @@ const MainLayout: React.FC = () => {
                   onOpenWizard={() => setIsWizardOpen(true)}
                 />
               )}
-              {activeTab === "images" && <ImagesPage />}
-              {activeTab === "volumes" && <VolumesPage />}
-              {activeTab === "networks" && <NetworksPage />}
+              {activeTab === "images" && <ImagesPage refreshKey={refreshKey} />}
+              {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} />}
+              {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} />}
               {activeTab === "compose" && <ComposePage />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>

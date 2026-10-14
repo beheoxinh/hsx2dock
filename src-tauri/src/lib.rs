@@ -24,10 +24,12 @@ fn start_background_monitoring(app_handle: AppHandle) {
                     let _ = handle.emit("engine-state-changed", status);
                 }
 
-                // If running, poll running containers stats
+                // If running, poll running containers stats and broadcast list
                 if let Ok(client) = state.get_client().await {
-                    if let Ok(containers) = client.list_containers(false).await {
-                        let running_ids: Vec<String> = containers
+                    if let Ok(all_containers) = client.list_containers(true).await {
+                        let _ = handle.emit("containers-tick", all_containers.clone());
+
+                        let running_ids: Vec<String> = all_containers
                             .into_iter()
                             .filter(|c| c.state == "running")
                             .map(|c| c.id)

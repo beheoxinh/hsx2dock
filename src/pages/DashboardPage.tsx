@@ -11,7 +11,7 @@ import {
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
-import { api } from "../lib/api";
+import { api, events } from "../lib/api";
 import { formatBytes } from "../lib/utils";
 import type {
   ContainerItem,
@@ -54,6 +54,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   useEffect(() => {
     loadData();
+
+    let unlistenContainers: (() => void) | undefined;
+    events.onContainersTick((updatedList) => {
+      setContainers(updatedList);
+    }).then((u) => (unlistenContainers = u));
+
+    return () => {
+      if (unlistenContainers) unlistenContainers();
+    };
   }, [daemonState]);
 
   const handlePrune = async () => {

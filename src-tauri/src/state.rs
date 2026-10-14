@@ -16,7 +16,8 @@ impl AppState {
     pub async fn new() -> Self {
         let config = AppConfig::load().await.unwrap_or_default();
         let engine = Arc::new(EngineManager::new(EnginePaths::new()));
-        let client = match DockerClient::connect(None) {
+        let socket = engine.socket();
+        let client = match DockerClient::connect(Some(socket)) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("Failed initial connection to Docker: {e}");
@@ -34,7 +35,7 @@ impl AppState {
     pub fn daemon_state(&self) -> DaemonState {
         if !self.engine.is_installed() {
             DaemonState::NotInstalled
-        } else if self.engine.is_running() {
+        } else if self.engine.is_running() || self.engine.socket_live() {
             DaemonState::Running
         } else {
             DaemonState::Stopped
@@ -44,13 +45,16 @@ impl AppState {
     pub async fn get_client(&self) -> Result<DockerClient, String> {
         let read_guard = self.client.read().await;
         if let Some(ref c) = *read_guard {
-            return Ok(c.clone());
+            if c.is_healthy().await {
+                return Ok(c.clone());
+            }
         }
         drop(read_guard);
 
-        // Try reconnecting
+        // Try reconnecting to engine socket
         let mut write_guard = self.client.write().await;
-        match DockerClient::connect(None) {
+        let socket = self.engine.socket();
+        match DockerClient::connect(Some(socket)) {
             Ok(c) => {
                 *write_guard = Some(c.clone());
                 Ok(c)

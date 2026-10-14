@@ -18,7 +18,11 @@ import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime, truncateId } from "../lib/utils";
 import type { ImageItem, SearchResult, PullProgressPayload } from "../types";
 
-export const ImagesPage: React.FC = () => {
+interface ImagesPageProps {
+  refreshKey?: number;
+}
+
+export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
   const [images, setImages] = useState<ImageItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -56,7 +60,7 @@ export const ImagesPage: React.FC = () => {
     return () => {
       if (unlistenPull) unlistenPull();
     };
-  }, []);
+  }, [refreshKey]);
 
   const handlePull = async (imgName?: string) => {
     const target = imgName || imageToPull;
