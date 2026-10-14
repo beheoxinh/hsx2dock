@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -11,6 +11,8 @@ import {
   RotateCw,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
+import { TerminalViewer } from "../components/ui/TerminalViewer";
+import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
 import type { ContainerDetails, ContainerStats } from "../types";
@@ -33,7 +35,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   const [, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [logFilter, setLogFilter] = useState("");
-  const logContainerRef = useRef<HTMLPreElement>(null);
+  const toast = useToast();
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -45,7 +47,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
       setLoading(true);
       const [det, log, st] = await Promise.allSettled([
         api.inspectContainer(containerId),
-        api.getContainerLogs(containerId, "300"),
+        api.getContainerLogs(containerId, "400"),
         api.getContainerStats(containerId),
       ]);
 
@@ -69,6 +71,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     if (!details?.raw_json) return;
     navigator.clipboard.writeText(details.raw_json);
     setCopied(true);
+    toast.success("Copied to clipboard", "Raw container inspect JSON copied.");
     setTimeout(() => setCopied(false), 2000);
   };
 
@@ -107,7 +110,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               <span className="font-semibold text-white tracking-tight">
                 {details?.name.replace(/^\//, "") || containerId.slice(0, 12)}
               </span>
-              <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 font-mono">
+              <span className="text-xs px-2.5 py-1 rounded-full bg-zinc-800/80 text-zinc-400 font-mono border border-zinc-700/60">
                 {containerId.slice(0, 12)}
               </span>
             </div>
@@ -123,7 +126,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
           </div>
 
           {/* Tab Navigation */}
-          <div className="flex items-center gap-4 px-6 border-b border-zinc-800 text-sm font-medium">
+          <div className="flex items-center gap-6 px-6 border-b border-zinc-800 text-sm font-medium">
             <button
               onClick={() => setActiveTab("logs")}
               className={`py-3 flex items-center gap-2 border-b-2 transition-all cursor-pointer ${
@@ -133,7 +136,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               }`}
             >
               <FileText className="w-4 h-4" />
-              Logs
+              Logs Stream
             </button>
             <button
               onClick={() => setActiveTab("stats")}
@@ -144,7 +147,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               }`}
             >
               <Activity className="w-4 h-4" />
-              Live Stats
+              Live Telemetry
             </button>
             <button
               onClick={() => setActiveTab("inspect")}
@@ -168,22 +171,17 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                     <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
                     <input
                       type="text"
-                      placeholder="Filter logs..."
+                      placeholder="Search log lines..."
                       value={logFilter}
                       onChange={(e) => setLogFilter(e.target.value)}
                       className="w-full h-8 pl-8 pr-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                     />
                   </div>
-                  <span className="text-xs text-zinc-500">Showing last 300 lines</span>
+                  <span className="text-xs text-zinc-500 font-mono">ANSI Interactive Shell</span>
                 </div>
 
-                <div className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl p-4 overflow-hidden flex flex-col">
-                  <pre
-                    ref={logContainerRef}
-                    className="flex-1 font-mono text-xs text-zinc-300 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed"
-                  >
-                    {filteredLogs || "No logs available."}
-                  </pre>
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col">
+                  <TerminalViewer logs={filteredLogs || "No logs output recorded."} />
                 </div>
               </div>
             )}
@@ -191,57 +189,62 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
             {activeTab === "stats" && (
               <div className="space-y-6">
                 <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-4">
-                    <span className="text-xs font-semibold text-zinc-500 uppercase">
-                      CPU Usage
+                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-5 shadow-lg">
+                    <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                      CPU Compute
                     </span>
-                    <div className="text-2xl font-bold text-white mt-1">
+                    <div className="text-3xl font-extrabold text-blue-400 mt-2 font-mono">
                       {stats ? `${stats.cpu_percent.toFixed(2)}%` : "0%"}
                     </div>
                   </div>
-                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-4">
-                    <span className="text-xs font-semibold text-zinc-500 uppercase">
-                      Memory Usage
+                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-5 shadow-lg">
+                    <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                      Memory Allocated
                     </span>
-                    <div className="text-2xl font-bold text-white mt-1">
+                    <div className="text-3xl font-extrabold text-emerald-400 mt-2 font-mono">
                       {stats ? formatBytes(stats.mem_usage) : "0 B"}
                     </div>
                     <span className="text-xs text-zinc-500 mt-1 block">
-                      Limit: {stats ? formatBytes(stats.mem_limit) : "0 B"}
+                      Limit: {stats ? formatBytes(stats.mem_limit) : "Unlimited"}
                     </span>
                   </div>
-                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-4">
-                    <span className="text-xs font-semibold text-zinc-500 uppercase">
-                      Network RX
+                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-5 shadow-lg">
+                    <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                      Network Inbound (RX)
                     </span>
-                    <div className="text-2xl font-bold text-white mt-1">
+                    <div className="text-3xl font-extrabold text-zinc-200 mt-2 font-mono">
                       {stats ? formatBytes(stats.net_rx) : "0 B"}
                     </div>
                   </div>
-                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-4">
-                    <span className="text-xs font-semibold text-zinc-500 uppercase">
-                      Network TX
+                  <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-5 shadow-lg">
+                    <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                      Network Outbound (TX)
                     </span>
-                    <div className="text-2xl font-bold text-white mt-1">
+                    <div className="text-3xl font-extrabold text-zinc-200 mt-2 font-mono">
                       {stats ? formatBytes(stats.net_tx) : "0 B"}
                     </div>
                   </div>
                 </div>
 
-                <div className="bg-zinc-900/40 border border-zinc-800 rounded-xl p-5 space-y-3 text-xs">
-                  <h4 className="font-semibold text-white">Network & Mounts</h4>
-                  <div className="flex justify-between py-1 border-b border-zinc-800/40">
-                    <span className="text-zinc-500">IP Address</span>
+                <div className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-6 space-y-4 text-xs shadow-lg">
+                  <h4 className="font-semibold text-white text-sm">Network Configuration & Mounts</h4>
+                  <div className="flex justify-between py-2 border-b border-zinc-800/40">
+                    <span className="text-zinc-500">Internal IPv4</span>
                     <span className="font-mono text-zinc-200">
                       {details?.ip_address || "None"}
                     </span>
                   </div>
-                  <div className="py-1">
-                    <span className="text-zinc-500 block mb-1">Mounted Volumes:</span>
+                  <div className="py-2">
+                    <span className="text-zinc-500 block mb-2 font-medium">Mountpoints:</span>
                     {details?.mounts && details.mounts.length > 0 ? (
-                      <ul className="list-disc list-inside space-y-1 font-mono text-zinc-300">
+                      <ul className="space-y-1.5 font-mono text-zinc-300">
                         {details.mounts.map((m, i) => (
-                          <li key={i}>{m}</li>
+                          <li
+                            key={i}
+                            className="bg-zinc-950/60 px-3 py-1.5 rounded-lg border border-zinc-800/50"
+                          >
+                            {m}
+                          </li>
                         ))}
                       </ul>
                     ) : (
@@ -256,14 +259,14 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               <div className="h-full flex flex-col space-y-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-zinc-500 font-mono">
-                    Complete Docker Inspect Result
+                    Complete Docker Container Inspection
                   </span>
                   <Button variant="outline" size="sm" onClick={handleCopyInspect} className="gap-2">
                     {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copied ? "Copied JSON" : "Copy JSON"}</span>
+                    <span>{copied ? "Copied" : "Copy JSON"}</span>
                   </Button>
                 </div>
-                <div className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl p-4 overflow-hidden">
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-4 overflow-hidden shadow-inner">
                   <pre className="h-full font-mono text-xs text-blue-300/90 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed">
                     {details?.raw_json || "Loading inspect JSON..."}
                   </pre>

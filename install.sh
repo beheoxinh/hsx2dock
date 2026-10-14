@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh — Quy trình build và cài đặt ứng dụng vào hệ thống (Fedora/Nobara GNOME Wayland)
-# Cài đặt binary vào ~/.local/bin, desktop entry vào ~/.local/share/applications,
-# và SVG icon vào ~/.local/share/icons/hicolor/scalable/apps.
+# install.sh — Quy trình build và cài đặt ứng dụng vào hệ thống (Tauri v2)
 # ==============================================================================
 
 set -euo pipefail
@@ -35,28 +33,22 @@ cd "$ROOT_DIR"
 APP_ID="com.github.docker_manager"
 SOURCE_ICON="/mnt/SubSystem/Downloads/google-container-optimized-os.svg"
 LOCAL_ICON="$ROOT_DIR/data/icons/${APP_ID}.svg"
-DESKTOP_SRC="$ROOT_DIR/data/${APP_ID}.desktop"
 
 echo "=========================================================="
-echo "   Docker Manager — Build & Cài đặt hệ thống GNOME        "
+echo "   Docker Manager — Build & Cài đặt hệ thống (Tauri v2)   "
 echo "=========================================================="
 
-# 1. Đảm bảo icon mới nhất được áp dụng
+# 1. Đảm bảo icon có sẵn
 if [ -f "$SOURCE_ICON" ]; then
     info "Đang sao chép icon từ $SOURCE_ICON..."
     /bin/cp -f "$SOURCE_ICON" "$LOCAL_ICON"
-elif [ -f "$LOCAL_ICON" ]; then
-    info "Sử dụng icon hiện có trong $LOCAL_ICON"
-else
-    error "Không tìm thấy icon tại $SOURCE_ICON hoặc $LOCAL_ICON"
-    exit 1
 fi
 
 # 2. Chạy quy trình build
 info "Đang chạy script build.sh..."
 "$ROOT_DIR/build.sh"
 
-BIN_SRC="$ROOT_DIR/target/release/docker-manager"
+BIN_SRC="$ROOT_DIR/src-tauri/target/release/docker-manager"
 if [ ! -f "$BIN_SRC" ]; then
     error "Không tìm thấy file binary sau khi build: $BIN_SRC"
     exit 1
@@ -83,9 +75,11 @@ install -m 755 "$BIN_SRC" "$USER_BIN_DIR/docker-manager"
 success "Đã cài đặt binary thành công."
 
 # 5. Cài đặt icon SVG
-info "Đang cài đặt icon '${APP_ID}.svg' vào $USER_ICONS_DIR/..."
-install -m 644 "$LOCAL_ICON" "$USER_ICONS_DIR/${APP_ID}.svg"
-success "Đã cài đặt icon ứng dụng."
+if [ -f "$LOCAL_ICON" ]; then
+    info "Đang cài đặt icon '${APP_ID}.svg' vào $USER_ICONS_DIR/..."
+    install -m 644 "$LOCAL_ICON" "$USER_ICONS_DIR/${APP_ID}.svg"
+    success "Đã cài đặt icon ứng dụng."
+fi
 
 # 6. Cài đặt file .desktop
 info "Đang tạo và cài đặt file .desktop vào $USER_APPS_DIR/..."
@@ -94,8 +88,8 @@ cat << 'EOF' > "$USER_APPS_DIR/${APP_ID}.desktop"
 Type=Application
 Version=1.5
 Name=Docker Manager
-GenericName=Docker GUI Manager
-Comment=Native GTK4/libadwaita GUI to manage Docker containers, images, volumes and networks
+GenericName=Docker Desktop Suite
+Comment=Modern Cross-platform Desktop Suite to manage Docker containers, images, volumes and networks
 Exec=docker-manager
 Icon=com.github.docker_manager
 Terminal=false
@@ -112,7 +106,7 @@ fi
 success "Đã cài đặt file desktop entry: $USER_APPS_DIR/${APP_ID}.desktop"
 
 # 7. Cập nhật cache của GNOME / Desktop database
-info "Đang làm mới cache ứng dụng và icon cho GNOME..."
+info "Đang làm mới cache ứng dụng và icon..."
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$USER_APPS_DIR" || true
 fi
@@ -121,17 +115,10 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t "$USER_DATA_DIR/icons/hicolor" || true
 fi
 
-# 8. Cảnh báo PATH nếu cần
-if [[ ":$PATH:" != *":$USER_BIN_DIR:"* ]]; then
-    warn "Thư mục $USER_BIN_DIR hiện chưa có trong \$PATH của bạn."
-    warn "Hãy thêm dòng sau vào ~/.bashrc hoặc ~/.zshrc:"
-    warn "    export PATH=\"$USER_BIN_DIR:\$PATH\""
-fi
-
 echo "=========================================================="
 success "CÀI ĐẶT THÀNH CÔNG!"
-echo "Ứng dụng Docker Manager đã sẵn sàng trên Fedora/Nobara GNOME."
+echo "Ứng dụng Docker Manager (Tauri) đã sẵn sàng trên hệ thống."
 echo "Bạn có thể mở ứng dụng bằng cách:"
-echo " 1. Tìm 'Docker Manager' trong GNOME App Grid (phím Super)"
+echo " 1. Tìm 'Docker Manager' trong App Launcher (phím Super)"
 echo " 2. Hoặc chạy lệnh trong terminal: docker-manager"
 echo "=========================================================="

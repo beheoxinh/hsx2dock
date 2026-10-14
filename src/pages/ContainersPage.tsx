@@ -16,6 +16,7 @@ import {
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
+import { useToast } from "../components/ui/Toast";
 import { api, events } from "../lib/api";
 import { formatBytes, truncateId } from "../lib/utils";
 import type { ContainerItem, ContainerStats } from "../types";
@@ -34,6 +35,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
+  const toast = useToast();
 
   const loadContainers = async () => {
     try {
@@ -50,7 +52,6 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   useEffect(() => {
     loadContainers();
 
-    // Listen for realtime resource stats
     let unlistenStats: (() => void) | undefined;
     events.onContainerStatsTick((stats) => {
       setStatsMap((prev) => ({ ...prev, ...stats }));
@@ -61,21 +62,32 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     };
   }, []);
 
-  const handleAction = async (id: string, action: "start" | "stop" | "restart" | "remove") => {
+  const handleAction = async (c: ContainerItem, action: "start" | "stop" | "restart" | "remove") => {
+    const cName = c.name.replace(/^\//, "");
     try {
-      setActionLoading((prev) => ({ ...prev, [id]: true }));
-      if (action === "start") await api.startContainer(id);
-      if (action === "stop") await api.stopContainer(id);
-      if (action === "restart") await api.restartContainer(id);
+      setActionLoading((prev) => ({ ...prev, [c.id]: true }));
+      if (action === "start") {
+        await api.startContainer(c.id);
+        toast.success("Container started", `${cName} is now running.`);
+      }
+      if (action === "stop") {
+        await api.stopContainer(c.id);
+        toast.info("Container stopped", `${cName} has been stopped.`);
+      }
+      if (action === "restart") {
+        await api.restartContainer(c.id);
+        toast.success("Container restarted", `${cName} rebooted successfully.`);
+      }
       if (action === "remove") {
-        if (!confirm("Remove this container?")) return;
-        await api.removeContainer(id, true);
+        if (!confirm(`Are you sure you want to remove container '${cName}'?`)) return;
+        await api.removeContainer(c.id, true);
+        toast.success("Container removed", `${cName} was deleted.`);
       }
       await loadContainers();
     } catch (e) {
-      alert(`Action error: ${e}`);
+      toast.error("Operation failed", String(e));
     } finally {
-      setActionLoading((prev) => ({ ...prev, [id]: false }));
+      setActionLoading((prev) => ({ ...prev, [c.id]: false }));
     }
   };
 
@@ -157,32 +169,32 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                   </div>
 
                   {/* Middle: Live Stats / Ports */}
-                  <div className="flex-1 grid grid-cols-2 sm:grid-cols-3 gap-4 text-xs bg-zinc-950/40 border border-zinc-800/40 rounded-xl p-2.5">
+                  <div className="flex-1 grid grid-cols-2 sm:grid-cols-3 gap-4 text-xs bg-zinc-950/50 border border-zinc-800/50 rounded-xl p-3">
                     <div>
-                      <span className="text-zinc-400 block text-[10px] uppercase font-semibold">
+                      <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
                         Ports
                       </span>
-                      <span className="text-zinc-200 truncate block font-mono">
+                      <span className="text-zinc-200 truncate block font-mono mt-0.5">
                         {c.ports || "—"}
                       </span>
                     </div>
 
                     <div>
-                      <span className="text-zinc-400 block text-[10px] uppercase font-semibold">
+                      <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
                         CPU
                       </span>
-                      <span className="text-zinc-200 flex items-center gap-1 font-mono">
-                        <Cpu className="w-3 h-3 text-blue-400" />
+                      <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
+                        <Cpu className="w-3.5 h-3.5 text-blue-400" />
                         {isRunning && stats ? `${stats.cpu_percent.toFixed(1)}%` : "—"}
                       </span>
                     </div>
 
                     <div>
-                      <span className="text-zinc-400 block text-[10px] uppercase font-semibold">
+                      <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
                         Memory
                       </span>
-                      <span className="text-zinc-200 flex items-center gap-1 font-mono">
-                        <Activity className="w-3 h-3 text-emerald-400" />
+                      <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
+                        <Activity className="w-3.5 h-3.5 text-emerald-400" />
                         {isRunning && stats ? formatBytes(stats.mem_usage) : "—"}
                       </span>
                     </div>
@@ -195,7 +207,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                         <Button
                           variant="ghost"
                           size="icon"
-                          onClick={() => handleAction(c.id, "stop")}
+                          onClick={() => handleAction(c, "stop")}
                           disabled={isBusy}
                           title="Stop Container"
                           className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
@@ -205,7 +217,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                         <Button
                           variant="ghost"
                           size="icon"
-                          onClick={() => handleAction(c.id, "restart")}
+                          onClick={() => handleAction(c, "restart")}
                           disabled={isBusy}
                           title="Restart Container"
                           className="text-blue-400 hover:text-blue-300 hover:bg-blue-500/10"
@@ -217,7 +229,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                       <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => handleAction(c.id, "start")}
+                        onClick={() => handleAction(c, "start")}
                         disabled={isBusy}
                         title="Start Container"
                         className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
@@ -249,7 +261,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      onClick={() => handleAction(c.id, "remove")}
+                      onClick={() => handleAction(c, "remove")}
                       disabled={isBusy}
                       title="Delete Container"
                       className="text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
@@ -265,7 +277,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 
         {!loading && filteredContainers.length === 0 && (
           <div className="py-16 text-center text-zinc-400">
-            <Layers className="w-10 h-10 mx-auto text-zinc-400 mb-3" />
+            <Layers className="w-10 h-10 mx-auto text-zinc-500 mb-3" />
             <p className="font-medium text-white">No containers matched</p>
             <p className="text-xs text-zinc-400 mt-1">
               {search ? "Try searching with a different keyword" : "Get started by launching a new container image"}

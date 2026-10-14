@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# build.sh — Build hoàn thiện tất cả các thành phần của dự án
+# build.sh — Build hoàn thiện ứng dụng Docker Manager (Tauri v2 + React 19 + Rust)
 # ==============================================================================
 
 set -euo pipefail
@@ -22,46 +22,31 @@ error() {
     echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
-# Lấy thư mục gốc của project
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# Nạp Rust environment nếu tồn tại
 if [ -f "$HOME/.cargo/env" ]; then
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-    error "Không tìm thấy 'cargo'. Hãy chạy ./prepare.sh trước."
+    error "Không tìm thấy 'cargo'. Hãy cài đặt Rust toolchain trước."
     exit 1
 fi
 
-info "Kiểm tra file cấu hình và icon..."
-# Kiểm tra nếu có icon nguồn /mnt/SubSystem/Downloads/google-container-optimized-os.svg
-SOURCE_ICON="/mnt/SubSystem/Downloads/google-container-optimized-os.svg"
-APP_ICON="$ROOT_DIR/data/icons/com.github.docker_manager.svg"
-
-if [ -f "$SOURCE_ICON" ]; then
-    info "Đang đồng bộ icon từ $SOURCE_ICON..."
-    /bin/cp -f "$SOURCE_ICON" "$APP_ICON"
-fi
-
-if [ ! -f "$APP_ICON" ]; then
-    error "Không tìm thấy file icon ứng dụng tại: $APP_ICON"
+if ! command -v pnpm >/dev/null 2>&1; then
+    error "Không tìm thấy 'pnpm'. Hãy cài đặt pnpm trước."
     exit 1
 fi
 
-info "Kiểm tra tính hợp lệ của file .desktop..."
-if command -v desktop-file-validate >/dev/null 2>&1; then
-    desktop-file-validate "$ROOT_DIR/data/com.github.docker_manager.desktop"
-    success "File .desktop hợp lệ."
-fi
+info "1. Build Frontend assets với Vite..."
+pnpm build
 
-info "Đang tiến hành build release binary với Cargo..."
-cargo build --release
+info "2. Build Tauri Release Binary..."
+cargo build --release --manifest-path src-tauri/Cargo.toml
 
-BIN_PATH="$ROOT_DIR/target/release/docker-manager"
+BIN_PATH="$ROOT_DIR/src-tauri/target/release/docker-manager"
 if [ -f "$BIN_PATH" ]; then
     success "Build hoàn tất thành công!"
     info "Binary path: $BIN_PATH"

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar, NavTab } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
+import { ToastProvider, useToast } from "./components/ui/Toast";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ContainersPage } from "./pages/ContainersPage";
 import { ContainerDetailsDrawer } from "./pages/ContainerDetailsDrawer";
@@ -14,7 +15,7 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
 import type { DaemonState } from "./types";
 
-export const App: React.FC = () => {
+const MainLayout: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
   const [daemonState, setDaemonState] = useState<DaemonState>("Stopped");
   const [isTogglingEngine, setIsTogglingEngine] = useState(false);
@@ -22,6 +23,7 @@ export const App: React.FC = () => {
   const [drawerTab, setDrawerTab] = useState<"logs" | "inspect" | "stats">("logs");
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const toast = useToast();
 
   const fetchEngineStatus = async () => {
     try {
@@ -35,10 +37,14 @@ export const App: React.FC = () => {
   useEffect(() => {
     fetchEngineStatus();
 
-    // Listen to real-time engine state changes from backend
     let unlisten: (() => void) | undefined;
     events.onEngineStateChanged((state) => {
       setDaemonState(state);
+      if (state === "Running") {
+        toast.success("Docker Daemon Ready", "Rootless engine daemon is running.");
+      } else if (state === "Stopped") {
+        toast.info("Docker Daemon Stopped", "Rootless engine has shut down.");
+      }
     }).then((u) => (unlisten = u));
 
     return () => {
@@ -53,7 +59,7 @@ export const App: React.FC = () => {
       setDaemonState(newState);
       setRefreshKey((k) => k + 1);
     } catch (e) {
-      alert(`Toggle Engine Error: ${e}`);
+      toast.error("Failed to toggle engine", String(e));
     } finally {
       setIsTogglingEngine(false);
     }
@@ -66,7 +72,7 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-950 font-sans">
-      {/* Sidebar */}
+      {/* Sidebar Navigation */}
       <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
 
       {/* Main Content Area */}
@@ -76,17 +82,20 @@ export const App: React.FC = () => {
           daemonState={daemonState}
           onToggleEngine={handleToggleEngine}
           isToggling={isTogglingEngine}
-          onRefresh={() => setRefreshKey((k) => k + 1)}
+          onRefresh={() => {
+            setRefreshKey((k) => k + 1);
+            toast.info("Data refreshed", "Updated dashboard state.");
+          }}
         />
 
-        {/* Dynamic Page View with Spring Physics Animations */}
+        {/* Dynamic Page Views with Smooth Framer Motion Spring Transitions */}
         <main className="flex-1 overflow-hidden relative">
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab + refreshKey}
-              initial={{ opacity: 0, y: 8 }}
+              initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
+              exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.18, ease: "easeInOut" }}
               className="h-full w-full"
             >
@@ -125,8 +134,19 @@ export const App: React.FC = () => {
       <RunContainerWizard
         isOpen={isWizardOpen}
         onClose={() => setIsWizardOpen(false)}
-        onSuccess={() => setRefreshKey((k) => k + 1)}
+        onSuccess={() => {
+          setRefreshKey((k) => k + 1);
+          toast.success("Container Launched", "New container instance created.");
+        }}
       />
     </div>
+  );
+};
+
+export const App: React.FC = () => {
+  return (
+    <ToastProvider>
+      <MainLayout />
+    </ToastProvider>
   );
 };
