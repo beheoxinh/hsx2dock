@@ -32,9 +32,8 @@ impl LoginDialog {
             .hexpand(true)
             .build();
 
-        let login_btn = gtk::Button::with_label("Log in");
-        login_btn.add_css_class("suggested-action");
-        let logout_btn = gtk::Button::with_label("Log out");
+        let login_btn = crate::ui::design::button_suggested("Log in", None);
+        let logout_btn = crate::ui::design::button("Log out", None);
 
         let status_label = gtk::Label::builder()
             .xalign(0.0)
@@ -45,10 +44,10 @@ impl LoginDialog {
         let form = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .margin_top(crate::ui::design::SPACE_SM)
+            .margin_bottom(crate::ui::design::SPACE_SM)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
             .build();
         form.append(&registry);
         form.append(&username);

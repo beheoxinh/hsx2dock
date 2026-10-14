@@ -35,31 +35,21 @@ impl ComposeView {
             .placeholder_text("Path to compose file (e.g. ~/projects/web/docker-compose.yml)")
             .hexpand(true)
             .build();
-        let browse_btn = gtk::Button::builder()
-            .icon_name("document-open-symbolic")
-            .tooltip_text("Choose compose file")
-            .build();
-        let up_btn = gtk::Button::builder()
-            .label("Up")
-            .tooltip_text("Start the project (compose up -d)")
-            .css_classes(["suggested-action"])
-            .build();
-        let down_btn = gtk::Button::builder()
-            .label("Down")
-            .tooltip_text("Stop the project (compose down)")
-            .css_classes(["destructive-action"])
-            .build();
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Reload services and logs")
-            .build();
+        let browse_btn =
+            crate::ui::design::icon_button("document-open-symbolic", "Choose compose file");
+        let up_btn = crate::ui::design::button_suggested("Up", None);
+        up_btn.set_tooltip_text(Some("Start the project (compose up -d)"));
+        let down_btn = crate::ui::design::button_destructive("Down", None);
+        down_btn.set_tooltip_text(Some("Stop the project (compose down)"));
+        let refresh_btn =
+            crate::ui::design::icon_button("view-refresh-symbolic", "Reload services and logs");
 
         let picker = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .margin_top(6)
-            .margin_start(6)
-            .margin_end(6)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_top(crate::ui::design::SPACE_XS)
+            .margin_start(crate::ui::design::SPACE_XS)
+            .margin_end(crate::ui::design::SPACE_XS)
             .build();
         picker.append(&file_entry);
         picker.append(&browse_btn);
@@ -83,9 +73,9 @@ impl ComposeView {
             .build();
         let services = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_start(6)
-            .margin_end(6)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_start(crate::ui::design::SPACE_XS)
+            .margin_end(crate::ui::design::SPACE_XS)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -116,10 +106,10 @@ impl ComposeView {
             .build();
         let logs = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_start(6)
-            .margin_end(6)
-            .margin_bottom(6)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_start(crate::ui::design::SPACE_XS)
+            .margin_end(crate::ui::design::SPACE_XS)
+            .margin_bottom(crate::ui::design::SPACE_XS)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -144,8 +134,8 @@ impl ComposeView {
             .label("Compose plugin status unknown")
             .xalign(0.0)
             .css_classes(["dim-label", "caption"])
-            .margin_start(6)
-            .margin_bottom(6)
+            .margin_start(crate::ui::design::SPACE_XS)
+            .margin_bottom(crate::ui::design::SPACE_XS)
             .build();
 
         let widget = gtk::Box::builder()
@@ -438,8 +428,8 @@ fn service_row(item: &ComposeService) -> gtk::Box {
         .spacing(8)
         .margin_start(8)
         .margin_end(8)
-        .margin_top(6)
-        .margin_bottom(6)
+        .margin_top(crate::ui::design::SPACE_XS)
+        .margin_bottom(crate::ui::design::SPACE_XS)
         .build();
     row.append(&dot);
     row.append(&texts);

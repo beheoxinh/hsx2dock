@@ -10,6 +10,11 @@
 //!    `docker context use` makes the system CLI default to it. We create/repair
 //!    only our own context and never modify any other.
 //!
+//! The context (selected as default) is what makes a bare `docker ps` reach our
+//! engine; the XDG symlink alone does not, since the CLI ignores it unless
+//! `DOCKER_HOST` points there. On take-over we remember the context the user
+//! was on and restore it when the bridge is torn down, so we never clobber it.
+//!
 //! State introspection is file-level (no daemon ping), so the 10s timer is
 //! cheap and safe on the main loop.
 
@@ -144,7 +149,7 @@ pub fn ensure_context(engine_socket: &Path) -> anyhow::Result<()> {
     }
     if our_context_host().is_some() {
         let _ = Command::new("docker")
-            .args(["context", "rm", CONTEXT_NAME])
+            .args(["context", "rm", "-f", CONTEXT_NAME])
             .status();
     }
     let ok = Command::new("docker")
@@ -173,22 +178,52 @@ pub fn current_context_name() -> Option<String> {
 /// Select our context as the CLI default. Only called when the user asked for
 /// it; the active context is otherwise never changed.
 pub fn set_context_default() -> anyhow::Result<()> {
-    let ok = Command::new("docker")
-        .args(["context", "use", CONTEXT_NAME])
-        .status()?
-        .success();
-    anyhow::ensure!(ok, "docker context use {CONTEXT_NAME} failed");
-    Ok(())
+    set_context_default_named(CONTEXT_NAME)
 }
 
-/// Deselect: fall back to the implicit default context.
-pub fn clear_context_default() -> anyhow::Result<()> {
+/// `docker context use <name>`. Centralises the only place the app spawns
+/// `context use`, so both the take-over and the restore go through one path.
+pub fn set_context_default_named(name: &str) -> anyhow::Result<()> {
     let ok = Command::new("docker")
-        .args(["context", "use", "default"])
+        .args(["context", "use", name])
         .status()?
         .success();
-    anyhow::ensure!(ok, "docker context use default failed");
+    anyhow::ensure!(ok, "docker context use {name} failed");
     Ok(())
+}
+/// Names of the contexts the CLI currently knows about, from `config.json`'s
+/// sibling `contexts/meta/*/meta.json` files. No `docker` spawn.
+pub fn available_context_names() -> Vec<String> {
+    let meta = contexts_meta_dir();
+    let Ok(entries) = std::fs::read_dir(&meta) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("meta.json")) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(name) = json.get("Name").and_then(|v| v.as_str()) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Pick the context to restore after the bridge releases the default.
+///
+/// Returns `prev` when it still exists on disk, otherwise `"default"` — so we
+/// never leave the CLI pointing at a name we removed or that never existed.
+pub fn resolve_restore_target(prev: Option<&str>, available: &[String]) -> String {
+    match prev {
+        Some(p) if !p.is_empty() && p != CONTEXT_NAME && available.iter().any(|a| a == p) => {
+            p.to_string()
+        }
+        _ => "default".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +269,9 @@ pub struct CliStatus {
     /// is not our engine (so the UI can show what it points at instead).
     pub active_context: Option<String>,
     pub xdg_path: PathBuf,
+    /// Carried over from the accompanying [`reconcile`] pass: the context to
+    /// persist as the restore target. `None` from a bare [`status`] read.
+    pub prev_context_saved: Option<String>,
 }
 
 pub fn status(engine_socket: &Path) -> CliStatus {
@@ -248,6 +286,7 @@ pub fn status(engine_socket: &Path) -> CliStatus {
         context_is_default,
         active_context: active,
         xdg_path: xdg_socket(),
+        prev_context_saved: None,
     }
 }
 
@@ -261,6 +300,10 @@ pub struct Applied {
     /// True when a previously-created mapping was removed (engine stopped or
     /// the bridge was switched off).
     pub torn_down: bool,
+    /// Set on the pass that takes over the default: the context the CLI was on
+    /// beforehand, to be persisted and restored on teardown. `None` when there
+    /// was nothing worth remembering (already `default` / already ours).
+    pub prev_context_saved: Option<String>,
 }
 
 /// Idempotently map the CLI to `engine_socket` according to `enabled` /
@@ -282,22 +325,30 @@ pub fn reconcile(
     enabled: bool,
     set_default: bool,
     engine_live: bool,
+    prev_context: &str,
 ) -> anyhow::Result<Applied> {
     let mut out = Applied::default();
     if !enabled || !engine_live {
-        out.torn_down = teardown(engine_socket)?;
+        out.torn_down = teardown(engine_socket, prev_context)?;
         return Ok(out);
     }
     out.symlink_created = ensure_xdg_symlink(engine_socket)?;
     ensure_context(engine_socket)?;
     out.context_created = has_our_context(engine_socket);
     if set_default {
-        if current_context_name().as_deref() != Some(CONTEXT_NAME) {
+        let active = current_context_name();
+        if active.as_deref() != Some(CONTEXT_NAME) {
+            // First take-over: remember what the user was on so teardown can
+            // put it back. Only capture once (`prev_context` empty).
+            if prev_context.is_empty() {
+                out.prev_context_saved = active.filter(|n| n != "default");
+            }
             set_context_default()?;
             out.default_set = true;
         }
     } else if current_context_name().as_deref() == Some(CONTEXT_NAME) {
-        clear_context_default()?;
+        let target = resolve_restore_target(Some(prev_context), &available_context_names());
+        set_context_default_named(&target)?;
         out.default_cleared = true;
     }
     Ok(out)
@@ -306,7 +357,8 @@ pub fn reconcile(
 /// Remove the symlink and context this app created (explicit "disconnect").
 /// Leaves anything foreign untouched.
 pub fn disconnect(engine_socket: &Path) -> anyhow::Result<()> {
-    let _ = teardown_at(&xdg_socket(), engine_socket);
+    // Explicit disconnect has no stored restore target: fall back to `default`.
+    let _ = teardown_at(&xdg_socket(), engine_socket, "default");
     Ok(())
 }
 
@@ -316,26 +368,29 @@ pub fn disconnect(engine_socket: &Path) -> anyhow::Result<()> {
 /// The check uses "our mapping" tests: only removes a symlink that points at
 /// `engine_socket` (or a stale link under our runtime dir), and only removes
 /// the context named `CONTEXT_NAME` whose endpoint is `engine_socket`.
-fn teardown(engine_socket: &Path) -> anyhow::Result<bool> {
-    teardown_at(&xdg_socket(), engine_socket)
+fn teardown(engine_socket: &Path, restore_to: &str) -> anyhow::Result<bool> {
+    teardown_at(&xdg_socket(), engine_socket, restore_to)
 }
 
-fn teardown_at(link: &Path, engine_socket: &Path) -> anyhow::Result<bool> {
+fn teardown_at(link: &Path, engine_socket: &Path, restore_to: &str) -> anyhow::Result<bool> {
     let mut torn = false;
     if symlink_state_at(link, engine_socket) == Some(true) {
         let _ = std::fs::remove_file(link);
+        torn = true;
+    }
+    if current_context_name().as_deref() == Some(CONTEXT_NAME) {
+        // Hand the default back to whatever the user had before us, not a
+        // blind `default` (which would clobber e.g. `desktop-linux`).
+        let target = resolve_restore_target(Some(restore_to), &available_context_names());
+        let _ = set_context_default_named(&target);
         torn = true;
     }
     // Remove our context if it exists under our name (whether it currently
     // points at this engine socket or is stale from a previous install).
     if our_context_host().is_some() {
         let _ = Command::new("docker")
-            .args(["context", "rm", CONTEXT_NAME])
+            .args(["context", "rm", "-f", CONTEXT_NAME])
             .status();
-        torn = true;
-    }
-    if current_context_name().as_deref() == Some(CONTEXT_NAME) {
-        let _ = clear_context_default();
         torn = true;
     }
     Ok(torn)
@@ -351,6 +406,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Serialises the tests that read `docker_config_dir()`.
+    ///
+    /// `DOCKER_CONFIG` is process-global, so tests that point it at their own
+    /// sandbox must not run concurrently with each other.
+    static CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `DOCKER_CONFIG` at `dir` for the duration of a test and return a
+    /// guard holding the env lock.
+    ///
+    /// `current_context_name()` reads `<DOCKER_CONFIG>/config.json`. Without
+    /// this, a test would read the developer's real `~/.docker/config.json`,
+    /// so its result depended on whatever context the machine happened to have
+    /// selected — `teardown_at_ignores_foreign_symlink` failed whenever the
+    /// live context was `docker-manager-engine`.
+    fn isolate_docker_config(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DOCKER_CONFIG", dir);
+        // A config with no `currentContext` = the CLI default, which is the
+        // state these tests mean by "not ours".
+        let _ = std::fs::write(dir.join("config.json"), "{}");
+        guard
     }
 
     #[test]
@@ -411,24 +489,57 @@ mod tests {
     #[test]
     fn teardown_at_removes_our_symlink() {
         let dir = tmpdir("teardown-sym");
+        let _cfg = isolate_docker_config(&dir);
         let engine = dir.join("engine.sock");
         let _ = std::fs::write(&engine, b"");
         let link = dir.join("docker.sock");
         symlink(&engine, &link).expect("symlink");
-        assert!(teardown_at(&link, &engine).unwrap());
+        assert!(teardown_at(&link, &engine, "default").unwrap());
         assert!(!link.exists());
     }
 
     #[test]
     fn teardown_at_ignores_foreign_symlink() {
         let dir = tmpdir("teardown-ign");
+        let _cfg = isolate_docker_config(&dir);
         let engine = dir.join("engine.sock");
         let foreign = dir.join("other.sock");
         let _ = std::fs::write(&engine, b"");
         let _ = std::fs::write(&foreign, b"");
         let link = dir.join("docker.sock");
         symlink(&foreign, &link).expect("symlink foreign");
-        assert!(!teardown_at(&link, &engine).unwrap());
+        assert!(!teardown_at(&link, &engine, "default").unwrap());
         assert!(link.exists());
+    }
+
+    #[test]
+    fn restore_target_prefers_prev_when_still_present() {
+        let avail = vec!["default".to_string(), "desktop-linux".to_string()];
+        assert_eq!(
+            resolve_restore_target(Some("desktop-linux"), &avail),
+            "desktop-linux"
+        );
+    }
+
+    #[test]
+    fn restore_target_falls_back_to_default_when_prev_gone() {
+        let avail = vec!["default".to_string()];
+        // The remembered context was since deleted → do not point at a ghost.
+        assert_eq!(
+            resolve_restore_target(Some("desktop-linux"), &avail),
+            "default"
+        );
+        assert_eq!(resolve_restore_target(None, &avail), "default");
+        assert_eq!(resolve_restore_target(Some(""), &avail), "default");
+    }
+
+    #[test]
+    fn restore_target_never_restores_our_own_context() {
+        // Guard against a stale config that saved our own name as "previous".
+        let avail = vec![CONTEXT_NAME.to_string()];
+        assert_eq!(
+            resolve_restore_target(Some(CONTEXT_NAME), &avail),
+            "default"
+        );
     }
 }

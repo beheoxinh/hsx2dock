@@ -195,8 +195,8 @@ impl EngineManager {
             .arg(&self.paths.rootless_state)
             .arg(format!("--net={net}"))
             .arg("--mtu=65520");
-        if net == "pasta" {
-            cmd.arg("--disable-host-loopback");
+        for flag in net_flags(&net) {
+            cmd.arg(flag);
         }
         cmd.arg("--copy-up=/etc")
             .arg("--copy-up=/run")
@@ -437,6 +437,23 @@ pub fn is_usable_socket(path: &Path) -> bool {
 fn prefixed_path(bin: &Path) -> String {
     let old = std::env::var("PATH").unwrap_or_default();
     format!("{}:{old}", bin.display())
+}
+
+/// Extra rootlesskit flags for a given `--net` driver.
+///
+/// The port driver is the one that matters: left unset, rootlesskit defaults to
+/// `none` and every published port (`docker run -p`) silently never reaches the
+/// host. `pasta` forwards ports itself (`implicit`); `slirp4netns` needs
+/// rootlesskit's own forwarder (`builtin`). `host` needs neither.
+fn net_flags(net: &str) -> Vec<String> {
+    match net {
+        "pasta" => vec![
+            "--port-driver=implicit".to_string(),
+            "--disable-host-loopback".to_string(),
+        ],
+        "slirp4netns" => vec!["--port-driver=builtin".to_string()],
+        _ => Vec::new(),
+    }
 }
 
 /// Pick a rootless network driver: host `pasta`, else host `slirp4netns`, else
@@ -797,5 +814,25 @@ mod tests {
         let path = std::env::join_paths([&pathdir]).unwrap();
         assert!(net_helper_found(&bin, Some(path.as_os_str())));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn net_flags_pasta_sets_implicit_port_driver() {
+        let f = net_flags("pasta");
+        assert!(f.contains(&"--port-driver=implicit".to_string()));
+        assert!(f.contains(&"--disable-host-loopback".to_string()));
+    }
+
+    #[test]
+    fn net_flags_slirp_sets_builtin_port_driver() {
+        let f = net_flags("slirp4netns");
+        assert!(f.contains(&"--port-driver=builtin".to_string()));
+        assert!(!f.iter().any(|x| x.starts_with("--disable-host-loopback")));
+    }
+
+    #[test]
+    fn net_flags_unknown_returns_empty() {
+        assert!(net_flags("host").is_empty());
+        assert!(net_flags("none").is_empty());
     }
 }

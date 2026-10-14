@@ -5,7 +5,9 @@ use gtk::Orientation;
 
 use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::ImageItem;
+use crate::ui::anim;
 use crate::ui::common::{copy_to_clipboard, format_bytes, format_relative_unix};
+use crate::ui::design::*;
 
 struct ImageRow {
     root: gtk::Box,
@@ -40,51 +42,28 @@ impl ImageRow {
             .css_classes(["dim-label", "caption"])
             .build();
 
-        let tag_btn = gtk::Button::builder()
-            .icon_name("tag-symbolic")
-            .tooltip_text("Tag image")
-            .valign(gtk::Align::Center)
-            .build();
-        let push_btn = gtk::Button::builder()
-            .icon_name("cloud-upload-symbolic")
-            .tooltip_text("Push image to registry")
-            .valign(gtk::Align::Center)
-            .build();
-        let history_btn = gtk::Button::builder()
-            .icon_name("view-list-symbolic")
-            .tooltip_text("Show image history")
-            .valign(gtk::Align::Center)
-            .build();
-        let delete_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove image")
-            .css_classes(["destructive-action"])
-            .valign(gtk::Align::Center)
-            .build();
-        let copy_btn = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .tooltip_text("Copy image ID")
-            .valign(gtk::Align::Center)
-            .build();
+        let run_btn = icon_button_suggested(
+            "media-playback-start-symbolic",
+            "Run container from this image",
+        );
+        let tag_btn = icon_button("tag-symbolic", "Tag image");
+        let push_btn = icon_button("cloud-upload-symbolic", "Push image to registry");
+        let history_btn = icon_button("view-list-symbolic", "Show image history");
+        let delete_btn = icon_button_destructive("user-trash-symbolic", "Remove image");
+        let copy_btn = icon_button("edit-copy-symbolic", "Copy image ID");
 
-        let texts = gtk::Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(2)
-            .hexpand(true)
-            .build();
+        let texts = vstack();
         texts.append(&tags_label);
         texts.append(&meta_label);
         texts.append(&id_label);
 
-        let root = gtk::Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(8)
-            .margin_top(8)
-            .margin_bottom(8)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
+        let root = hrow();
+        root.set_margin_top(MARGIN_ROW);
+        root.set_margin_bottom(MARGIN_ROW);
+        root.set_margin_start(MARGIN_PAGE);
+        root.set_margin_end(MARGIN_PAGE);
         root.append(&texts);
+        root.append(&run_btn);
         root.append(&history_btn);
         root.append(&tag_btn);
         root.append(&push_btn);
@@ -94,6 +73,27 @@ impl ImageRow {
         let row = Rc::new(Self {
             root,
             item: std::cell::RefCell::new(item),
+        });
+
+        let r_run = row.clone();
+        let st_run = state.clone();
+        run_btn.connect_clicked(move |_| {
+            let item = r_run.item.borrow().clone();
+            let img = item
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| item.id.clone());
+            let cfg = crate::docker::models::RunConfig {
+                image: img.clone(),
+                ..Default::default()
+            };
+            let title = format!("Run Image · {img}");
+            super::run_container_dialog::RunContainerDialog::present_with(
+                &st_run,
+                Some(cfg),
+                &title,
+            );
         });
 
         let r_copy = row.clone();
@@ -120,15 +120,14 @@ impl ImageRow {
                 .activates_default(true)
                 .text(&source)
                 .build();
-            let tag_btn_inner = gtk::Button::with_label("Tag");
-            tag_btn_inner.add_css_class("suggested-action");
+            let tag_btn_inner = button_suggested("Tag", None);
             let form = gtk::Box::builder()
                 .orientation(Orientation::Vertical)
-                .spacing(6)
-                .margin_top(12)
-                .margin_bottom(12)
-                .margin_start(12)
-                .margin_end(12)
+                .spacing(SPACE_XS)
+                .margin_top(MARGIN_PAGE)
+                .margin_bottom(MARGIN_PAGE)
+                .margin_start(MARGIN_PAGE)
+                .margin_end(MARGIN_PAGE)
                 .build();
             form.append(&gtk::Label::new(Some("New tag:")));
             form.append(&entry);
@@ -139,7 +138,7 @@ impl ImageRow {
             toolbar.set_content(Some(&form));
             let dialog = adw::Dialog::builder()
                 .title(format!("Tag {source}"))
-                .content_width(440)
+                .content_width(DIALOG_WIDTH)
                 .child(&toolbar)
                 .build();
             let dialog_for_click = dialog.clone();
@@ -220,10 +219,10 @@ impl ImageRow {
                     let list = gtk::ListBox::builder()
                         .selection_mode(gtk::SelectionMode::None)
                         .css_classes(["boxed-list"])
-                        .margin_top(6)
-                        .margin_bottom(6)
-                        .margin_start(6)
-                        .margin_end(6)
+                        .margin_top(SPACE_XS)
+                        .margin_bottom(SPACE_XS)
+                        .margin_start(SPACE_XS)
+                        .margin_end(SPACE_XS)
                         .build();
                     for e in &rows {
                         let created = if e.created > 0 {
@@ -236,14 +235,11 @@ impl ImageRow {
                         } else {
                             e.tags.join(", ")
                         };
-                        let row_box = gtk::Box::builder()
-                            .orientation(Orientation::Vertical)
-                            .spacing(2)
-                            .margin_top(6)
-                            .margin_bottom(6)
-                            .margin_start(12)
-                            .margin_end(12)
-                            .build();
+                        let row_box = vstack();
+                        row_box.set_margin_top(SPACE_XS);
+                        row_box.set_margin_bottom(SPACE_XS);
+                        row_box.set_margin_start(MARGIN_PAGE);
+                        row_box.set_margin_end(MARGIN_PAGE);
                         row_box.append(
                             &gtk::Label::builder()
                                 .label(format!(
@@ -267,12 +263,8 @@ impl ImageRow {
                         );
                         list.append(&row_box);
                     }
-                    let scrolled = gtk::ScrolledWindow::builder()
-                        .hscrollbar_policy(gtk::PolicyType::Never)
-                        .vexpand(true)
-                        .child(&list)
-                        .build();
-                    scrolled.set_size_request(560, 420);
+                    let scrolled = page_scroller(&list);
+                    scrolled.set_size_request(DIALOG_WIDTH, 420);
                     let toolbar = adw::ToolbarView::new();
                     let header = adw::HeaderBar::new();
                     toolbar.add_top_bar(&header);
@@ -365,35 +357,20 @@ impl ImagesView {
             .hexpand(true)
             .build();
 
-        let pull_btn = gtk::Button::builder()
-            .icon_name("cloud-download-symbolic")
-            .tooltip_text("Pull a new image")
-            .build();
-        let build_btn = gtk::Button::builder()
-            .icon_name("package-x-generic-symbolic")
-            .tooltip_text("Build an image from a directory")
-            .build();
-        let hub_btn = gtk::Button::builder()
-            .icon_name("system-search-symbolic")
-            .tooltip_text("Search Docker Hub")
-            .build();
-        let prune_btn = gtk::Button::builder()
-            .icon_name("edit-clear-all-symbolic")
-            .tooltip_text("Prune unused images")
-            .build();
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Reload images")
-            .build();
+        let pull_btn = icon_button("cloud-download-symbolic", "Pull a new image");
+        let build_btn = icon_button(
+            "package-x-generic-symbolic",
+            "Build an image from a directory",
+        );
+        let hub_btn = icon_button("system-search-symbolic", "Search Docker Hub");
+        let prune_btn = icon_button("edit-clear-all-symbolic", "Prune unused images");
+        let refresh_btn = icon_button("view-refresh-symbolic", "Reload images");
 
-        let toolbar = gtk::Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .build();
+        let toolbar = hrow();
+        toolbar.set_margin_top(SPACE_XS);
+        toolbar.set_margin_bottom(SPACE_XS);
+        toolbar.set_margin_start(SPACE_XS);
+        toolbar.set_margin_end(SPACE_XS);
         toolbar.append(&search);
         toolbar.append(&pull_btn);
         toolbar.append(&build_btn);
@@ -404,10 +381,10 @@ impl ImagesView {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
+            .margin_top(SPACE_XS)
+            .margin_bottom(SPACE_XS)
+            .margin_start(SPACE_XS)
+            .margin_end(SPACE_XS)
             .build();
 
         let empty = adw::StatusPage::builder()
@@ -559,6 +536,7 @@ impl ImagesView {
         for item in items {
             let row = ImageRow::new(item, self.state.clone());
             self.list.append(&row.root);
+            anim::fade_in(&row.root);
             rows.push(row);
         }
         *self.rows.borrow_mut() = rows;

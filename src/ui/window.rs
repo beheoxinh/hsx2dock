@@ -1,3 +1,4 @@
+use crate::ui::design;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -10,7 +11,7 @@ use crate::ui::compose_view::ComposeView;
 use crate::ui::containers_view::ContainersView;
 use crate::ui::images_view::ImagesView;
 use crate::ui::networks_view::NetworksView;
-use crate::ui::system_view::SystemView;
+use crate::ui::system::SystemView;
 use crate::ui::volumes_view::VolumesView;
 
 /// The main application window: a navigation sidebar, a header bar with the
@@ -61,6 +62,8 @@ impl MainWindow {
         let compose_view = ComposeView::new(state.clone());
 
         let stack = adw::ViewStack::new();
+        stack.set_transition_duration(220);
+        stack.set_enable_transitions(true);
 
         // The header shows the current section name (the sidebar replaces the
         // old ViewSwitcher).
@@ -98,7 +101,7 @@ impl MainWindow {
             ("compose", "Compose", "view-list-symbolic"),
         ];
         for (name, title, icon) in sections {
-            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, design::SPACE_SM);
             row_box.append(&gtk::Image::from_icon_name(icon));
             let label = gtk::Label::builder()
                 .label(title)
@@ -136,29 +139,17 @@ impl MainWindow {
             .label("STOPPED")
             .css_classes(["status-pill", "error"])
             .build();
-        let daemon_btn = gtk::Button::builder()
-            .label("Start")
-            .tooltip_text("Start or stop the bundled engine")
-            .build();
-        daemon_btn.add_css_class("suggested-action");
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh current view")
-            .build();
-        let prefs_btn = gtk::Button::builder()
-            .icon_name("preferences-system-symbolic")
-            .tooltip_text("Preferences")
-            .build();
-        let account_btn = gtk::Button::builder()
-            .icon_name("avatar-default-symbolic")
-            .tooltip_text("Registry login")
-            .build();
+        let daemon_btn = design::button_suggested("Start", None);
+        daemon_btn.set_tooltip_text(Some("Start or stop the bundled engine"));
+        let refresh_btn = design::icon_button("view-refresh-symbolic", "Refresh current view");
+        let prefs_btn = design::icon_button("preferences-system-symbolic", "Preferences");
+        let account_btn = design::icon_button("avatar-default-symbolic", "Registry login");
 
         let header = adw::HeaderBar::builder().build();
         header.set_title_widget(Some(&page_title));
         // Engine status reads as one unit: the state badge sits right next to
         // the action that changes it (start / stop / retry).
-        let engine_group = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let engine_group = gtk::Box::new(gtk::Orientation::Horizontal, design::SPACE_XS);
         engine_group.append(&daemon_badge);
         engine_group.append(&daemon_btn);
         let spinner = gtk::Spinner::new();
@@ -213,15 +204,11 @@ impl MainWindow {
                 if let Some(row) = row {
                     let name = row.widget_name();
                     stack.set_visible_child_name(&name);
-                    let title = match name.as_str() {
-                        "engine" => "Engine",
-                        "containers" => "Containers",
-                        "images" => "Images",
-                        "volumes" => "Volumes",
-                        "networks" => "Networks",
-                        "compose" => "Compose",
-                        other => other,
-                    };
+                    let title = sections
+                        .iter()
+                        .find(|s| s.0 == name.as_str())
+                        .map(|s| s.1)
+                        .unwrap_or_else(|| name.as_str());
                     page_title.set_label(title);
                     split.set_show_content(true);
                 }

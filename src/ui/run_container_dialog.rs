@@ -1,112 +1,81 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::Orientation;
 
 use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::RunConfig;
 use crate::ui::common::main_loop_channel;
+use crate::ui::run_form::RunConfigForm;
 
-/// Modal "Run container" wizard: image (typed or picked from local tags),
-/// name, command override, port / env / volume mappings, restart policy.
+/// Modal "Run container" wizard: a structured, Docker-Desktop-style form
+/// (image, name, ports, environment, volumes, restart policy, resources,
+/// labels, capabilities, health check) backed by [`RunConfig`].
 pub struct RunContainerDialog;
 
 impl RunContainerDialog {
+    /// Open an empty form.
     pub fn present(state: &Rc<AppState>) {
-        let image_entry = gtk::Entry::builder()
-            .placeholder_text("Image, e.g. nginx:latest")
-            .hexpand(true)
-            .activates_default(true)
-            .build();
+        Self::present_with(state, None, "Run Container");
+    }
+
+    /// Open the form pre-filled from `initial`, used to duplicate or recreate
+    /// an existing container.
+    pub fn present_with(state: &Rc<AppState>, initial: Option<RunConfig>, title: &str) {
+        let form = RunConfigForm::new(initial.as_ref());
+
+        let image_entry = form.image_entry().clone();
         let image_combo = gtk::DropDown::builder()
             .tooltip_text("Pick from pulled images")
             .build();
-        let name_entry = gtk::Entry::builder()
-            .placeholder_text("Container name (optional)")
-            .activates_default(true)
-            .build();
-        let cmd_entry = gtk::Entry::builder()
-            .placeholder_text("Command override (optional, space-separated)")
-            .activates_default(true)
-            .build();
-        let ports_view = multiline_view(3);
-        let env_view = multiline_view(3);
-        let volumes_view = multiline_view(2);
-        let restart_combo =
-            gtk::DropDown::from_strings(&["no", "always", "unless-stopped", "on-failure"]);
-        let detach_check = gtk::CheckButton::builder()
-            .label("Run in background (detach)")
-            .active(true)
-            .build();
-        let start_check = gtk::CheckButton::builder()
-            .label("Start immediately")
-            .active(true)
-            .build();
-        let run_btn = gtk::Button::with_label("Run");
-        run_btn.add_css_class("suggested-action");
-        run_btn.set_sensitive(false);
 
         let image_row = gtk::Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(6)
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(crate::ui::design::SPACE_XS)
             .build();
         image_row.append(&image_entry);
         image_row.append(&image_combo);
 
-        let opts_row = gtk::Box::builder()
-            .orientation(Orientation::Horizontal)
-            .spacing(12)
+        // The form owns the image entry, so the picker sits above it.
+        let body = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(crate::ui::design::SPACE_XS)
             .build();
-        opts_row.append(&gtk::Label::new(Some("Restart:")));
-        opts_row.append(&restart_combo);
-        opts_row.append(&detach_check);
-        opts_row.append(&start_check);
-
-        let form = gtk::Box::builder()
-            .orientation(Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+        body.append(&image_row);
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(form.widget())
             .build();
-        form.append(&gtk::Label::new(Some("Image:")));
-        form.append(&image_row);
-        form.append(&gtk::Label::new(Some("Name:")));
-        form.append(&name_entry);
-        form.append(&gtk::Label::new(Some("Command:")));
-        form.append(&cmd_entry);
-        form.append(&gtk::Label::new(Some(
-            "Ports (one HOST:CONTAINER per line):",
-        )));
-        form.append(&ports_view);
-        form.append(&gtk::Label::new(Some(
-            "Environment (one KEY=VALUE per line):",
-        )));
-        form.append(&env_view);
-        form.append(&gtk::Label::new(Some(
-            "Volumes (one HOST:CONTAINER per line):",
-        )));
-        form.append(&volumes_view);
-        form.append(&opts_row);
+        body.append(&scrolled);
 
-        let toolbar = adw::ToolbarView::new();
-        let header = adw::HeaderBar::new();
-        header.pack_end(&run_btn);
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&form));
+        let run_btn = crate::ui::design::button_suggested("Run", None);
+        run_btn.set_sensitive(false);
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
+            .build();
+        content.append(&body);
+        content.append(&run_btn);
 
         let dialog = adw::Dialog::builder()
-            .title("Run Container")
-            .content_width(600)
-            .child(&toolbar)
+            .title(title)
+            .content_width(720)
+            .content_height(crate::ui::design::DIALOG_HEIGHT)
+            .child(&content)
             .build();
 
         // Run is only meaningful with an image typed in.
-        let run_for_entry = run_btn.clone();
-        image_entry.connect_changed(move |e| {
-            run_for_entry.set_sensitive(!e.text().trim().is_empty());
-        });
+        {
+            let run_for_entry = run_btn.clone();
+            image_entry.connect_changed(move |e| {
+                run_for_entry.set_sensitive(!e.text().trim().is_empty());
+            });
+        }
 
         // Fill the image picker from locally pulled tags (main-loop safe).
         let combo_for_fill = image_combo.clone();
@@ -117,23 +86,22 @@ impl RunContainerDialog {
                 )));
             }
         });
-        state.with_client(move |client, tx| async move {
-            match client.list_images().await {
-                Ok(images) => {
+        {
+            let st = state.clone();
+            let fill_images_ch = fill_images.clone();
+            st.with_client(move |client, _tx| async move {
+                if let Ok(images) = client.list_images().await {
                     let mut tags: Vec<String> = images
                         .iter()
-                        .flat_map(|i| i.tags.clone())
+                        .flat_map(|i| i.tags.iter().cloned())
                         .filter(|t| !t.contains("<none>"))
                         .collect();
                     tags.sort();
                     tags.dedup();
-                    let _ = fill_images.send(tags).await;
+                    let _ = fill_images_ch.send(tags).await;
                 }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("images: {e}"))).await;
-                }
-            }
-        });
+            });
+        }
 
         // Picking a tag copies it into the entry for editing.
         let entry_for_combo = image_entry.clone();
@@ -149,26 +117,14 @@ impl RunContainerDialog {
 
         let state2 = state.clone();
         let dialog_for_run = dialog.clone();
+        let form_for_run = form.clone();
         run_btn.connect_clicked(move |_| {
-            let cfg = RunConfig {
-                image: image_entry.text().trim().to_string(),
-                name: name_entry.text().trim().to_string(),
-                command: cmd_entry
-                    .text()
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect(),
-                ports: RunConfig::parse_lines(&view_text(&ports_view)),
-                env: RunConfig::parse_lines(&view_text(&env_view)),
-                volumes: RunConfig::parse_lines(&view_text(&volumes_view)),
-                restart_policy: restart_value(restart_combo.selected()),
-                detach: detach_check.is_active(),
-            };
-            if let Err(msg) = cfg.validate() {
-                state2.error(format!("run: {msg}"));
+            let cfg = form_for_run.config();
+            if let Err(e) = cfg.validate() {
+                state2.error(format!("Run: {e}"));
                 return;
             }
-            let start = start_check.is_active();
+            let start = form_for_run.start_immediately();
             let st = state2.clone();
             let dialog_for_close = dialog_for_run.clone();
             let close = main_loop_channel(move |()| {
@@ -178,9 +134,7 @@ impl RunContainerDialog {
                 match client.create_container(&cfg, start).await {
                     Ok(id) => {
                         let short: String = id.chars().take(12).collect();
-                        let _ = tx
-                            .send(AppEvent::Toast(format!("Created container {short}")))
-                            .await;
+                        let _ = tx.send(AppEvent::Toast(format!("Created {short}"))).await;
                         let _ = tx.send(AppEvent::Busy(RefreshScope::Containers)).await;
                         let _ = close.send(()).await;
                     }
@@ -193,30 +147,4 @@ impl RunContainerDialog {
 
         dialog.present(None::<&gtk::Widget>);
     }
-}
-
-fn multiline_view(lines: i32) -> gtk::TextView {
-    let view = gtk::TextView::builder()
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::Word)
-        .build();
-    view.set_size_request(-1, 24 * lines);
-    view
-}
-
-fn view_text(view: &gtk::TextView) -> String {
-    let buffer = view.buffer();
-    buffer
-        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-        .to_string()
-}
-
-fn restart_value(selected: u32) -> String {
-    match selected {
-        1 => "always",
-        2 => "unless-stopped",
-        3 => "on-failure",
-        _ => "no",
-    }
-    .to_string()
 }

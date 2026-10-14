@@ -24,6 +24,7 @@ struct ContainerRow {
     rename_btn: gtk::Button,
     delete_btn: gtk::Button,
     copy_btn: gtk::Button,
+    duplicate_btn: gtk::Button,
     item: std::cell::RefCell<ContainerItem>,
 }
 
@@ -50,10 +51,7 @@ impl ContainerRow {
             .xalign(0.0)
             .css_classes(["dim-label", "caption"])
             .build();
-        let status_pill = gtk::Label::builder()
-            .label(item.state.to_uppercase())
-            .css_classes(["status-pill"])
-            .build();
+        let status_pill = crate::ui::design::status_pill(&item.state);
 
         let cpu_bar = gtk::ProgressBar::builder()
             .show_text(true)
@@ -68,65 +66,90 @@ impl ContainerRow {
             .hexpand(true)
             .build();
 
-        let start_btn = gtk::Button::builder()
-            .icon_name("media-playback-start-symbolic")
-            .tooltip_text("Start container")
-            .build();
-        let stop_btn = gtk::Button::builder()
-            .icon_name("media-playback-stop-symbolic")
-            .tooltip_text("Stop container")
-            .build();
-        let restart_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Restart container")
-            .build();
-        let pause_btn = gtk::Button::builder()
-            .icon_name("media-playback-pause-symbolic")
-            .tooltip_text("Pause / resume container")
-            .build();
-        let shell_btn = gtk::Button::builder()
-            .icon_name("utilities-terminal-symbolic")
-            .tooltip_text("Open shell in terminal (ptyxis/gnome-terminal)")
-            .build();
-        let logs_btn = gtk::Button::builder()
-            .icon_name("text-x-generic-symbolic")
-            .tooltip_text("View logs")
-            .build();
-        let inspect_btn = gtk::Button::builder()
-            .icon_name("dialog-information-symbolic")
-            .tooltip_text("Inspect container")
-            .build();
-        let rename_btn = gtk::Button::builder()
-            .icon_name("document-edit-symbolic")
-            .tooltip_text("Rename container")
-            .build();
-        let delete_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove container")
-            .css_classes(["destructive-action"])
-            .build();
-        let copy_btn = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .tooltip_text("Copy container ID")
-            .valign(Align::Center)
-            .build();
+        let start_btn =
+            crate::ui::design::icon_button("media-playback-start-symbolic", "Start container");
+        let stop_btn =
+            crate::ui::design::icon_button("media-playback-stop-symbolic", "Stop container");
+        let restart_btn =
+            crate::ui::design::icon_button("view-refresh-symbolic", "Restart container");
+        let pause_btn = crate::ui::design::icon_button(
+            "media-playback-pause-symbolic",
+            "Pause / resume container",
+        );
+        let shell_btn = crate::ui::design::icon_button(
+            "utilities-terminal-symbolic",
+            "Open shell in terminal (ptyxis/gnome-terminal)",
+        );
+        let logs_btn = crate::ui::design::icon_button("text-x-generic-symbolic", "View logs");
+        let inspect_btn =
+            crate::ui::design::icon_button("dialog-information-symbolic", "Inspect container");
+        let rename_btn =
+            crate::ui::design::icon_button("document-edit-symbolic", "Rename container");
+        let delete_btn =
+            crate::ui::design::icon_button_destructive("user-trash-symbolic", "Remove container");
+        let copy_btn = crate::ui::design::icon_button("edit-copy-symbolic", "Copy container ID");
 
+        let duplicate_btn = crate::ui::design::icon_button(
+            "window-new-symbolic",
+            "Duplicate / Recreate this container",
+        );
         let buttons = gtk::Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(4)
             .valign(Align::Center)
             .build();
+        // Only the high-frequency actions stay inline; the rest move into an
+        // overflow menu so the row reads calmly instead of presenting eleven
+        // equally-weighted icons.
+        let more_btn = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("More actions")
+            .valign(Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+
+        let menu = gio::Menu::new();
+        for (label, action) in [
+            ("Restart", "row.restart"),
+            ("Pause / Resume", "row.pause"),
+            ("Inspect", "row.inspect"),
+            ("Rename…", "row.rename"),
+            ("Duplicate / Recreate", "row.duplicate"),
+            ("Copy ID", "row.copy"),
+            ("Remove", "row.remove"),
+        ] {
+            menu.append(Some(label), Some(action));
+        }
+        more_btn.set_menu_model(Some(&menu));
+
+        // Overflow items drive the existing buttons, so their handlers stay
+        // the single source of truth, and binding "sensitive" -> "enabled"
+        // makes a disabled action grey out in the menu automatically.
+        let row_actions = gio::SimpleActionGroup::new();
+        for (name, btn) in [
+            ("restart", &restart_btn),
+            ("pause", &pause_btn),
+            ("inspect", &inspect_btn),
+            ("rename", &rename_btn),
+            ("duplicate", &duplicate_btn),
+            ("copy", &copy_btn),
+            ("remove", &delete_btn),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            let source = btn.clone();
+            action.connect_activate(move |_, _| source.emit_clicked());
+            btn.bind_property("sensitive", &action, "enabled")
+                .sync_create()
+                .build();
+            row_actions.add_action(&action);
+        }
+
         for b in [
-            &start_btn,
-            &stop_btn,
-            &restart_btn,
-            &pause_btn,
-            &shell_btn,
-            &logs_btn,
-            &inspect_btn,
-            &rename_btn,
-            &delete_btn,
-            &copy_btn,
+            start_btn.upcast_ref::<gtk::Widget>(),
+            stop_btn.upcast_ref::<gtk::Widget>(),
+            shell_btn.upcast_ref::<gtk::Widget>(),
+            logs_btn.upcast_ref::<gtk::Widget>(),
+            more_btn.upcast_ref::<gtk::Widget>(),
         ] {
             buttons.append(b);
         }
@@ -168,6 +191,9 @@ impl ContainerRow {
             .margin_end(12)
             .build();
         root.append(&left);
+        // Attached to the row root so the overflow popover, which is a
+        // descendant of it, can resolve the "row.*" action names.
+        root.insert_action_group("row", Some(&row_actions));
 
         let row = Rc::new(Self {
             root,
@@ -184,6 +210,7 @@ impl ContainerRow {
             rename_btn,
             delete_btn,
             copy_btn,
+            duplicate_btn,
             item: std::cell::RefCell::new(item),
         });
         row.bind_actions(state);
@@ -310,34 +337,18 @@ impl ContainerRow {
         let st = state.clone();
         self.inspect_btn.clone().connect_clicked(move |_| {
             let id = row.id();
-            let label = row.item.borrow().name.clone();
-            let label_for_show = label.clone();
+            let st_main = st.clone();
+            let show = crate::ui::common::main_loop_channel(
+                move |details: crate::docker::models::ContainerDetails| {
+                    super::container_details_dialog::ContainerInspectDialog::present(
+                        &st_main, details,
+                    );
+                },
+            );
             st.with_client(move |client, tx| async move {
                 match client.inspect_container(&id).await {
                     Ok(d) => {
-                        let body = format!(
-                            "Name: {}\nImage: {}\nState: {} ({})\nCreated: {}\nCommand: {}\nPorts: {}\nRestart: {}\nNetworks: {}\n\nEnv:\n{}\n\nMounts:\n{}",
-                            d.name,
-                            d.image,
-                            d.state,
-                            d.status,
-                            d.created,
-                            d.command,
-                            d.ports,
-                            d.restart_policy,
-                            d.networks.join(", "),
-                            d.env.join("\n"),
-                            d.mounts.join("\n"),
-                        );
-                        let show = crate::ui::common::main_loop_channel(move |()| {
-                            let dlg = adw::AlertDialog::builder()
-                                .heading(format!("Inspect · {label_for_show}"))
-                                .body(body.clone())
-                                .build();
-                            dlg.add_response("close", "Close");
-                            dlg.present(None::<&gtk::Widget>);
-                        });
-                        let _ = show.send(()).await;
+                        let _ = show.send(d).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::Error(format!("inspect: {e}"))).await;
@@ -355,8 +366,7 @@ impl ContainerRow {
                 .text(current.as_str())
                 .activates_default(true)
                 .build();
-            let rename_btn = gtk::Button::with_label("Rename");
-            rename_btn.add_css_class("suggested-action");
+            let rename_btn = crate::ui::design::button_suggested("Rename", None);
             let form = gtk::Box::builder()
                 .orientation(Orientation::Vertical)
                 .spacing(6)
@@ -406,6 +416,34 @@ impl ContainerRow {
                 });
             });
             dialog.present(None::<&gtk::Widget>);
+        });
+
+        let row = self.clone();
+        let st = state.clone();
+        self.duplicate_btn.clone().connect_clicked(move |_| {
+            let id = row.id();
+            let st_main = st.clone();
+            let open = crate::ui::common::main_loop_channel(
+                move |(cfg, title): (crate::docker::models::RunConfig, String)| {
+                    super::run_container_dialog::RunContainerDialog::present_with(
+                        &st_main,
+                        Some(cfg),
+                        &title,
+                    );
+                },
+            );
+            st.with_client(move |client, tx| async move {
+                match client.inspect_container(&id).await {
+                    Ok(d) => {
+                        let cfg = crate::docker::models::RunConfig::from_details(&d);
+                        let title = format!("Recreate / Duplicate · {}", d.name);
+                        let _ = open.send((cfg, title)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Error(format!("duplicate: {e}"))).await;
+                    }
+                }
+            });
         });
 
         let row = self.clone();
@@ -469,13 +507,9 @@ impl ContainerRow {
             "Pause container"
         }));
         self.shell_btn.set_sensitive(running);
-        if running {
-            self.status_pill.add_css_class("success");
-            self.status_pill.remove_css_class("error");
-        } else {
-            self.status_pill.add_css_class("error");
-            self.status_pill.remove_css_class("success");
-        }
+        // Tone the badge from the real engine state ("paused" and "created"
+        // are neither running nor failed, and used to render as errors).
+        crate::ui::design::retone_pill(&self.status_pill, &self.item.borrow().state);
         if !running {
             self.cpu_bar.set_text(Some("CPU —"));
             self.cpu_bar.set_fraction(0.0);
@@ -527,12 +561,7 @@ impl ContainersView {
             .tooltip_text("Include non-running containers")
             .build();
 
-        let run_btn = gtk::Button::builder()
-            .label("Run")
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Run a new container…")
-            .css_classes(["suggested-action"])
-            .build();
+        let run_btn = crate::ui::design::button_suggested("Run", Some("list-add-symbolic"));
 
         // Canonical, clamped toolbar so it lines up with the list below.
         let toolbar = page_toolbar(

@@ -16,8 +16,7 @@ impl HubSearchDialog {
             .hexpand(true)
             .build();
 
-        let search_btn = gtk::Button::with_label("Search");
-        search_btn.add_css_class("suggested-action");
+        let search_btn = crate::ui::design::button_suggested("Search", None);
         search_btn.set_sensitive(false);
 
         let list = gtk::ListBox::builder()
@@ -41,11 +40,11 @@ impl HubSearchDialog {
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_top(crate::ui::design::SPACE_SM)
+            .margin_bottom(crate::ui::design::SPACE_SM)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
             .build();
         content.append(&entry);
         content.append(&scrolled);
@@ -59,7 +58,7 @@ impl HubSearchDialog {
 
         let dialog = adw::Dialog::builder()
             .title("Search Docker Hub")
-            .content_width(560)
+            .content_width(crate::ui::design::DIALOG_WIDTH)
             .content_height(480)
             .child(&toolbar)
             .build();
@@ -109,8 +108,8 @@ impl HubSearchDialog {
                                 let vbox = gtk::Box::builder()
                                     .orientation(gtk::Orientation::Vertical)
                                     .spacing(2)
-                                    .margin_top(6)
-                                    .margin_bottom(6)
+                                    .margin_top(crate::ui::design::SPACE_XS)
+                                    .margin_bottom(crate::ui::design::SPACE_XS)
                                     .margin_start(8)
                                     .margin_end(8)
                                     .build();

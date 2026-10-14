@@ -17,14 +17,13 @@ impl PushImageDialog {
             .text(name)
             .build();
 
-        let push_btn = gtk::Button::with_label("Push");
-        push_btn.add_css_class("suggested-action");
+        let push_btn = crate::ui::design::button_suggested("Push", None);
         push_btn.set_sensitive(!name.trim().is_empty());
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
             .text("Idle")
-            .margin_top(6)
+            .margin_top(crate::ui::design::SPACE_XS)
             .build();
 
         let status_label = gtk::Label::builder()
@@ -35,11 +34,11 @@ impl PushImageDialog {
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_top(crate::ui::design::SPACE_SM)
+            .margin_bottom(crate::ui::design::SPACE_SM)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
             .build();
         content.append(&entry);
         content.append(&progress);

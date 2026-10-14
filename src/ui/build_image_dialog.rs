@@ -28,14 +28,13 @@ impl BuildImageDialog {
             .hexpand(true)
             .build();
 
-        let build_btn = gtk::Button::with_label("Build");
-        build_btn.add_css_class("suggested-action");
+        let build_btn = crate::ui::design::button_suggested("Build", None);
         build_btn.set_sensitive(false);
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
             .text("Idle")
-            .margin_top(6)
+            .margin_top(crate::ui::design::SPACE_XS)
             .build();
 
         let status_label = gtk::Label::builder()
@@ -46,11 +45,11 @@ impl BuildImageDialog {
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_top(crate::ui::design::SPACE_SM)
+            .margin_bottom(crate::ui::design::SPACE_SM)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
             .build();
         for (label_text, entry) in [
             ("Context directory", &context_entry),

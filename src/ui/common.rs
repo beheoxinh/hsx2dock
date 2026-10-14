@@ -183,14 +183,7 @@ pub fn page_toolbar(search: &gtk::SearchEntry, extra: &[gtk::Widget]) -> adw::Cl
 
 /// A bold section heading used inside a view body.
 pub fn section_title(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .xalign(0.0)
-        .margin_start(12)
-        .margin_top(12)
-        .margin_bottom(4)
-        .css_classes(["page-title"])
-        .build()
+    crate::ui::design::section_title(text)
 }
 
 /// A big numeric stat with a caption underneath (used on the engine page).

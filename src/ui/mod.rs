@@ -1,9 +1,11 @@
+pub mod anim;
 pub mod app_state;
 pub mod build_image_dialog;
 pub mod common;
 pub mod compose_view;
 pub mod container_details_dialog;
 pub mod containers_view;
+pub mod design;
 pub mod dialogs;
 pub mod hub_search_dialog;
 pub mod images_view;
@@ -13,7 +15,8 @@ pub mod preferences;
 pub mod pull_image_dialog;
 pub mod push_image_dialog;
 pub mod run_container_dialog;
-pub mod system_view;
+pub mod run_form;
+pub mod system;
 pub mod volumes_view;
 pub mod window;
 

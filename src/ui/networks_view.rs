@@ -4,7 +4,9 @@ use adw::prelude::*;
 
 use super::app_state::{AppEvent, AppState, RefreshScope};
 use crate::docker::models::NetworkItem;
+use crate::ui::anim;
 use crate::ui::common::copy_to_clipboard;
+use crate::ui::design::*;
 
 pub struct NetworkRow {
     root: gtk::Box,
@@ -33,42 +35,72 @@ impl NetworkRow {
             .css_classes(["dim-label", "caption"])
             .build();
 
-        let delete_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove network")
-            .css_classes(["destructive-action"])
-            .valign(gtk::Align::Center)
-            .build();
-        let copy_btn = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .tooltip_text("Copy network ID")
-            .valign(gtk::Align::Center)
-            .build();
+        let inspect_btn = icon_button("system-search-symbolic", "Inspect network details");
+        let delete_btn = icon_button_destructive("user-trash-symbolic", "Remove network");
+        let copy_btn = icon_button("edit-copy-symbolic", "Copy network ID");
 
-        let texts = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .hexpand(true)
-            .build();
+        let texts = vstack();
         texts.append(&name_label);
         texts.append(&meta_label);
         texts.append(&id_label);
 
-        let root = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .margin_top(8)
-            .margin_bottom(8)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
+        let root = hrow();
+        root.set_margin_top(MARGIN_ROW);
+        root.set_margin_bottom(MARGIN_ROW);
+        root.set_margin_start(MARGIN_PAGE);
+        root.set_margin_end(MARGIN_PAGE);
         root.append(&texts);
+        root.append(&inspect_btn);
         root.append(&copy_btn);
         root.append(&delete_btn);
 
         let row = Rc::new(Self {
             root,
             item: std::cell::RefCell::new(item),
+        });
+
+        let r_insp = row.clone();
+        inspect_btn.connect_clicked(move |_| {
+            let item = r_insp.item.borrow().clone();
+            let group = adw::PreferencesGroup::builder()
+                .title("Network")
+                .description(item.name.clone())
+                .build();
+            let subnet = if item.subnet.is_empty() {
+                "none".to_string()
+            } else {
+                item.subnet.clone()
+            };
+            let gateway = if item.gateway.is_empty() {
+                "none".to_string()
+            } else {
+                item.gateway.clone()
+            };
+            for (title, value) in [
+                ("Name", item.name.clone()),
+                ("Network ID", item.id.clone()),
+                ("Driver", item.driver.clone()),
+                ("Subnet", subnet),
+                ("Gateway", gateway),
+            ] {
+                let prop = adw::ActionRow::builder().title(title).build();
+                prop.add_css_class("property");
+                prop.set_subtitle(&value);
+                prop.set_subtitle_selectable(true);
+                group.add(&prop);
+            }
+            let body = page_body();
+            body.append(&group);
+            let toolbar = adw::ToolbarView::new();
+            let header = adw::HeaderBar::new();
+            toolbar.add_top_bar(&header);
+            toolbar.set_content(Some(&body));
+            let dialog = adw::Dialog::builder()
+                .title(format!("Network · {}", item.name))
+                .content_width(DIALOG_WIDTH)
+                .child(&toolbar)
+                .build();
+            dialog.present(None::<&gtk::Widget>);
         });
 
         let r_copy = row.clone();
@@ -135,27 +167,15 @@ pub struct NetworksView {
 
 impl NetworksView {
     pub fn new(state: Rc<AppState>) -> Rc<Self> {
-        let create_btn = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Create network")
-            .build();
-        let prune_btn = gtk::Button::builder()
-            .icon_name("edit-clear-all-symbolic")
-            .tooltip_text("Prune unused networks")
-            .build();
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Reload networks")
-            .build();
+        let create_btn = icon_button("list-add-symbolic", "Create network");
+        let prune_btn = icon_button("edit-clear-all-symbolic", "Prune unused networks");
+        let refresh_btn = icon_button("view-refresh-symbolic", "Reload networks");
 
-        let toolbar = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .build();
+        let toolbar = hrow();
+        toolbar.set_margin_top(SPACE_XS);
+        toolbar.set_margin_bottom(SPACE_XS);
+        toolbar.set_margin_start(SPACE_XS);
+        toolbar.set_margin_end(SPACE_XS);
         let title = gtk::Label::builder()
             .label("Networks")
             .xalign(0.0)
@@ -170,10 +190,10 @@ impl NetworksView {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
+            .margin_top(SPACE_XS)
+            .margin_bottom(SPACE_XS)
+            .margin_start(SPACE_XS)
+            .margin_end(SPACE_XS)
             .build();
 
         let empty = adw::StatusPage::builder()
@@ -208,13 +228,7 @@ impl NetworksView {
             .build();
         widget.append(&crate::ui::common::clamp_grid(&toolbar));
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        widget.append(
-            &gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(&stack)
-                .build(),
-        );
+        widget.append(&page_scroller(&stack));
 
         let view = Rc::new(Self {
             widget,
@@ -303,6 +317,7 @@ impl NetworksView {
         for item in items {
             let row = NetworkRow::new(item, self.state.clone());
             self.list.append(&row.root);
+            anim::fade_in(&row.root);
             rows.push(row);
         }
         *self.rows.borrow_mut() = rows;

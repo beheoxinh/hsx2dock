@@ -21,14 +21,13 @@ impl PullImageDialog {
             .text(prefill)
             .build();
 
-        let pull_btn = gtk::Button::with_label("Pull");
-        pull_btn.add_css_class("suggested-action");
+        let pull_btn = crate::ui::design::button_suggested("Pull", None);
         pull_btn.set_sensitive(!prefill.trim().is_empty());
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
             .text("Idle")
-            .margin_top(6)
+            .margin_top(crate::ui::design::SPACE_XS)
             .build();
 
         let status_label = gtk::Label::builder()
@@ -39,10 +38,10 @@ impl PullImageDialog {
 
         let presets = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(crate::ui::design::SPACE_XS)
             .build();
         for preset in ["alpine:latest", "ubuntu:24.04", "postgres:17", "redis:7"] {
-            let btn = gtk::Button::with_label(preset);
+            let btn = crate::ui::design::button_flat(preset, None);
             btn.add_css_class("pill");
             let entry2 = entry.clone();
             btn.connect_clicked(move |_| entry2.set_text(preset));
@@ -51,11 +50,11 @@ impl PullImageDialog {
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .spacing(crate::ui::design::SPACE_XS)
+            .margin_top(crate::ui::design::SPACE_SM)
+            .margin_bottom(crate::ui::design::SPACE_SM)
+            .margin_start(crate::ui::design::SPACE_SM)
+            .margin_end(crate::ui::design::SPACE_SM)
             .build();
         content.append(&entry);
         content.append(&presets);

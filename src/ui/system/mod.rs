@@ -1,13 +1,9 @@
-use std::rc::Rc;
-
-use adw::prelude::*;
-use gtk::glib;
-
 use super::app_state::{AppEvent, AppState, RefreshScope};
-use crate::docker::cli_bridge::{self as engine_cli, CliLink, CliStatus, CONTEXT_NAME};
 use crate::docker::engine::{self, EnginePaths, DEFAULT_RELEASE};
-use crate::docker::models::{DaemonState, DfReport, EngineInfo};
+use crate::docker::models::DaemonState;
 use crate::ui::common::{copy_to_clipboard, format_bytes};
+use adw::prelude::*;
+use std::rc::Rc;
 
 /// Shown before the engine is downloaded: what it is and how this app uses it.
 const INSTALL_DESC: &str = "This app ships and runs its own Docker Engine — the official \
@@ -64,11 +60,9 @@ impl SystemView {
         banner.set_revealed(false);
 
         // ---- status surface (not installed / installing / starting / error) ---
-        let install_btn = gtk::Button::with_label("Download Engine");
-        install_btn.add_css_class("suggested-action");
+        let install_btn = crate::ui::design::button_suggested("Download Engine", None);
         install_btn.set_tooltip_text(Some("Download the bundled Docker engine"));
-        let learn_btn = gtk::Button::with_label("Learn More");
-        learn_btn.add_css_class("flat");
+        let learn_btn = crate::ui::design::button_flat("Learn More", None);
         learn_btn.set_tooltip_text(Some("What is Docker Engine?"));
         let install_child = button_box(&[&install_btn, &learn_btn]);
 
@@ -90,11 +84,9 @@ impl SystemView {
         progress_child.append(&progress_bar);
         progress_child.append(&progress_label);
 
-        let retry_btn = gtk::Button::with_label("Try Again");
-        retry_btn.add_css_class("suggested-action");
-        let err_log_btn = gtk::Button::with_label("View Log");
-        let err_remove_btn = gtk::Button::with_label("Remove Engine…");
-        err_remove_btn.add_css_class("destructive-action");
+        let retry_btn = crate::ui::design::button_suggested("Try Again", None);
+        let err_log_btn = crate::ui::design::button("View Log", None);
+        let err_remove_btn = crate::ui::design::button_destructive("Remove Engine…", None);
         let error_child = button_box(&[&retry_btn, &err_log_btn, &err_remove_btn]);
 
         let status_child = gtk::Stack::builder()
@@ -122,8 +114,7 @@ impl SystemView {
         let resources_row = plain_row("Containers");
         let disk_row = plain_row("Disk usage");
 
-        let view_log_btn = gtk::Button::with_label("View");
-        view_log_btn.add_css_class("flat");
+        let view_log_btn = crate::ui::design::button_flat("View", None);
         view_log_btn.set_valign(gtk::Align::Center);
         view_log_btn.set_tooltip_text(Some("Open the engine log"));
         log_row.add_suffix(&view_log_btn);
@@ -135,18 +126,12 @@ impl SystemView {
             .build();
         start_stop_btn.add_css_class("suggested-action");
         start_stop_btn.set_valign(gtk::Align::Center);
-        let refresh_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh engine information")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        let prune_btn = gtk::Button::with_label("System Prune");
-        prune_btn.add_css_class("destructive-action");
+        let refresh_btn =
+            crate::ui::design::icon_button("view-refresh-symbolic", "Refresh engine information");
+        let prune_btn = crate::ui::design::button_destructive("System Prune", None);
         prune_btn.set_valign(gtk::Align::Center);
         prune_btn.set_tooltip_text(Some("Remove unused data (confirm first)"));
-        let remove_btn = gtk::Button::with_label("Remove Engine…");
-        remove_btn.add_css_class("destructive-action");
+        let remove_btn = crate::ui::design::button_destructive("Remove Engine…", None);
         remove_btn.set_valign(gtk::Align::Center);
 
         let engine_group = adw::PreferencesGroup::builder()
@@ -230,9 +215,11 @@ impl SystemView {
         prefs_page.add(&dashboard_group);
         prefs_page.add(&engine_group);
 
-        // ---- Docker CLI linkage panel ----------------------------------------
+        // ---- Docker CLI linkage row ------------------------------------------
         // Makes the system `docker` CLI talk to our private engine. Off by
         // default; re-checked every 10s while enabled (see start_cli_watch).
+        // Added to the foot of `resources_group` so it reads as one compact
+        // line under Resources instead of its own full-width panel.
         let cli_pill = gtk::Label::new(None);
         crate::ui::common::set_pill(
             &cli_pill,
@@ -249,12 +236,9 @@ impl SystemView {
         cli_row.add_prefix(&cli_pill);
         cli_row.add_suffix(&cli_toggle);
         cli_row.set_activatable_widget(Some(&cli_toggle));
-        let cli_group = adw::PreferencesGroup::builder()
-            .title("Docker CLI")
-            .description("Let the system `docker` command talk to this app's engine")
-            .build();
-        cli_group.add(&cli_row);
-        prefs_page.add(&cli_group);
+        // Sits at the foot of the Resources group (compact: one row, no
+        // separate group header) rather than its own full-width panel.
+        resources_group.add(&cli_row);
 
         // ---- shell ------------------------------------------------------------
         let stack = gtk::Stack::builder()
@@ -321,126 +305,12 @@ impl SystemView {
         view
     }
 
-    /// Wire the Docker CLI toggle: persist the flag, then reconcile at once.
-    fn connect_cli_toggle(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.cli_toggle.connect_active_notify(move |sw| {
-            let Some(view) = weak.upgrade() else {
-                return;
-            };
-            let enabled = sw.is_active();
-            view.state.update_config(|c| c.cli_bridge_enabled = enabled);
-            view.refresh_cli_state();
-        });
-    }
-
-    /// Poll the Docker CLI linkage every 10s so an external change (user ran
-    /// `docker context use other`) or a missing symlink is repaired/shown
-    /// without the user touching anything.
-    fn start_cli_watch(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_seconds_local(10, move || {
-            let Some(view) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            view.refresh_cli_state();
-            glib::ControlFlow::Continue
-        });
-    }
-
-    /// Reconcile the CLI link (when enabled) and repaint the panel.
-    ///
-    /// The `docker`-spawning work (context create/use, symlink) runs on the
-    /// persistent engine thread, never the GTK main loop; the widget update is
-    /// bounced back through `main_loop_channel`.
-    pub fn refresh_cli_state(self: &Rc<Self>) {
-        let cfg = self.state.config.borrow().clone();
-        let socket = self.state.engine.socket().to_path_buf();
-        // Liveness drives teardown: a symlink/context pointing at a dead
-        // socket is misleading, so reconcile removes it when the engine is
-        // down (and re-creates it once the engine comes back).
-        let engine_live = matches!(self.state.daemon_state(), DaemonState::Running);
-        let weak = Rc::downgrade(self);
-        let tx = crate::ui::common::main_loop_channel(move |st: CliStatus| {
-            if let Some(view) = weak.upgrade() {
-                view.render_cli_state(&st);
-            }
-        });
-        crate::runtime::spawn(async move {
-            let st = crate::runtime::engine_op(move || {
-                let _ = engine_cli::reconcile(
-                    &socket,
-                    cfg.cli_bridge_enabled,
-                    cfg.cli_bridge_set_default,
-                    engine_live,
-                );
-                engine_cli::status(&socket)
-            })
-            .await;
-            if let Ok(st) = st {
-                let _ = tx.send(st).await;
-            }
-        });
-    }
-
-    /// Paint the "Docker CLI" row from a fresh status snapshot.
-    fn render_cli_state(&self, st: &CliStatus) {
-        use crate::ui::common::{set_pill, PillTone};
-        let bridge_enabled = self.state.config.borrow().cli_bridge_enabled;
-        let engine_live = matches!(self.state.daemon_state(), DaemonState::Running);
-        let (tone, text) = if !bridge_enabled {
-            (PillTone::Stopped, "Disabled")
-        } else if !engine_live {
-            (PillTone::Stopped, "Engine stopped")
-        } else {
-            match st.link {
-                CliLink::Connected => (PillTone::Running, "Connected"),
-                CliLink::Partial => (PillTone::Warn, "Partial"),
-                CliLink::Disconnected => (PillTone::Stopped, "Disconnected"),
-            }
-        };
-        set_pill(&self.cli_pill, text, tone);
-        let sub = if !bridge_enabled {
-            "Not linked. Turn the switch on to connect the system `docker` command.".to_string()
-        } else if !engine_live {
-            "Engine is stopped — the mapping is removed; the CLI cannot reach it until it starts."
-                .to_string()
-        } else {
-            match st.link {
-                CliLink::Connected => "`docker` in any terminal reaches this engine.".to_string(),
-                CliLink::Partial if st.symlink_ok && !st.context_is_default => {
-                    match &st.active_context {
-                        Some(c) => format!(
-                            "Context active is \"{c}\". Use `docker --context {} ...` or enable \"set as default\".",
-                            CONTEXT_NAME
-                        ),
-                        None => format!(
-                            "Use `docker --context {} ...`, or enable \"set as default\".",
-                            CONTEXT_NAME
-                        ),
-                    }
-                }
-                CliLink::Partial => format!(
-                    "Symlink {} in place; context not selected.",
-                    st.xdg_path.display()
-                ),
-                CliLink::Disconnected => {
-                    "Not connected — the bridge repairs symlink and context on the next tick."
-                        .to_string()
-                }
-            }
-        };
-        self.cli_row.set_subtitle(&sub);
-        self.cli_toggle.set_active(bridge_enabled);
-        self.cli_toggle.set_sensitive(engine_live || bridge_enabled);
-    }
-
     pub fn widget(&self) -> &gtk::Box {
         &self.widget
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn connect_signals(
+    pub(crate) fn connect_signals(
         self: &Rc<Self>,
         install_btn: &gtk::Button,
         learn_btn: &gtk::Button,
@@ -519,83 +389,8 @@ impl SystemView {
         });
     }
 
-    /// Map the current daemon state onto the right surface.
-    pub fn refresh_daemon_state(&self) {
-        // A present engine means any in-flight install finished.
-        if self.state.engine.is_installed() {
-            self.state.set_installing(false);
-        }
-        self.check_net_helper();
-        self.render_engine_info();
-
-        let state = self.state.daemon_state();
-        match &state {
-            DaemonState::NotInstalled => {
-                self.stack.set_visible_child_name("status");
-                self.status_child.set_visible_child_name("install");
-                self.status_page
-                    .set_icon_name(Some("drive-harddisk-symbolic"));
-                self.status_page.set_title("Docker Engine not installed");
-                self.status_page.set_description(Some(INSTALL_DESC));
-            }
-            DaemonState::Installing => {
-                self.stack.set_visible_child_name("status");
-                self.status_child.set_visible_child_name("progress");
-                self.status_page
-                    .set_icon_name(Some("drive-harddisk-symbolic"));
-                self.status_page.set_title("Downloading Docker Engine");
-                self.status_page.set_description(Some(
-                    "Verifying checksums, then extracting into the app's own folder.",
-                ));
-                self.progress_spinner.set_visible(false);
-                self.progress_bar.set_visible(true);
-            }
-            DaemonState::Starting => {
-                self.stack.set_visible_child_name("status");
-                self.status_child.set_visible_child_name("progress");
-                self.status_page
-                    .set_icon_name(Some("content-loading-symbolic"));
-                self.status_page.set_title("Starting engine…");
-                self.status_page.set_description(Some(STARTING_DESC));
-                self.progress_bar.set_visible(false);
-                self.progress_label.set_label("");
-                self.progress_spinner.set_visible(true);
-                self.progress_spinner.start();
-            }
-            DaemonState::Stopping => {
-                self.stack.set_visible_child_name("status");
-                self.status_child.set_visible_child_name("progress");
-                self.status_page
-                    .set_icon_name(Some("content-loading-symbolic"));
-                self.status_page.set_title("Stopping engine…");
-                self.status_page
-                    .set_description(Some("Waiting for dockerd to release the socket."));
-                self.progress_bar.set_visible(false);
-                self.progress_label.set_label("");
-                self.progress_spinner.set_visible(true);
-                self.progress_spinner.start();
-            }
-            DaemonState::Running => {
-                self.show_prefs("Stop Engine", true);
-            }
-            DaemonState::Stopped => {
-                self.show_prefs("Start Engine", false);
-            }
-            DaemonState::Error(msg) => {
-                let msg = msg.clone();
-                self.stack.set_visible_child_name("status");
-                self.status_child.set_visible_child_name("error");
-                self.status_page
-                    .set_icon_name(Some("dialog-warning-symbolic"));
-                self.status_page.set_title("Engine failed to start");
-                self.status_page.set_description(Some(&msg));
-                self.progress_spinner.stop();
-            }
-        }
-    }
-
     /// Switch to the preferences surface with the right power action.
-    fn show_prefs(&self, power_label: &str, running: bool) {
+    pub(crate) fn show_prefs(&self, power_label: &str, running: bool) {
         self.stack.set_visible_child_name("prefs");
         self.progress_spinner.stop();
         self.action_spinner.stop();
@@ -610,126 +405,14 @@ impl SystemView {
             self.start_stop_btn.add_css_class("suggested-action");
         }
     }
-
-    /// Show an in-button spinner and busy label while a start/stop runs.
-    fn set_power_busy(&self, label: &str) {
-        set_button_text(&self.start_stop_btn, label);
-        self.start_stop_btn.set_sensitive(false);
-        self.action_spinner.set_visible(true);
-        self.action_spinner.start();
-    }
-
-    /// Fill the engine-fact rows from the on-disk engine and the pinned release.
-    fn render_engine_info(&self) {
-        let paths = self.state.engine.paths();
-        let bundled = DEFAULT_RELEASE.version;
-        let version = match self.state.engine.installed_version() {
-            Some(v) if v == bundled => format!("{v} (bundled, up to date)"),
-            Some(v) => format!("{v} — update available: {bundled}"),
-            None => format!("{bundled} (not downloaded)"),
-        };
-        self.version_row.set_subtitle(&version);
-        self.socket_row
-            .set_subtitle(&paths.socket.display().to_string());
-        self.data_row
-            .set_subtitle(&paths.data_root.display().to_string());
-        self.log_row
-            .set_subtitle(&paths.log_file.display().to_string());
-        self.location_row
-            .set_subtitle(&paths.current_dir.display().to_string());
-    }
-
-    /// Reveal the preflight banner when rootless networking would fail.
-    fn check_net_helper(&self) {
-        let paths = self.state.engine.paths();
-        let missing = self.state.engine.is_installed() && engine::missing_net_helper(paths);
-        self.banner.set_revealed(missing);
-    }
-
-    /// Update the download progress bar/label (called on the GTK main loop).
-    pub fn set_engine_progress(&self, label: &str, fraction: Option<f64>) {
-        // Show the progress page immediately — the 2s state poll would
-        // otherwise leave the user staring at a dead "Download Engine" button.
-        self.stack.set_visible_child_name("status");
-        self.status_child.set_visible_child_name("progress");
-        self.status_page
-            .set_icon_name(Some("drive-harddisk-symbolic"));
-        self.status_page.set_title("Downloading Docker Engine");
-        self.progress_spinner.set_visible(false);
-        self.progress_spinner.set_visible(true);
-        self.progress_spinner.start();
-        match fraction {
-            Some(f) if f > 0.0 && f <= 1.0 => {
-                self.progress_bar.set_visible(true);
-                self.progress_bar.set_fraction(f);
-                self.progress_label
-                    .set_label(&format!("{label} — {}%", (f * 100.0).round() as u32));
-            }
-            // Unknown or zero total (first tick, or a step with no content-length):
-            // pulse so the bar still shows activity instead of vanishing.
-            _ => {
-                self.progress_bar.set_visible(true);
-                self.progress_bar.pulse();
-                self.progress_label.set_label(label);
-            }
-        }
-    }
-
-    /// Render engine details reported by the daemon.
-    pub fn set_engine_info(&self, info: &EngineInfo, socket: Option<&str>) {
-        self.api_row.set_subtitle(&info.api_version);
-        self.os_row.set_subtitle(&format!(
-            "{} ({}) · {} cores · {} · kernel {}",
-            info.os,
-            info.arch,
-            info.n_cpu,
-            format_bytes(info.mem_total.max(0) as u64),
-            info.kernel,
-        ));
-        self.resources_row.set_subtitle(&format!(
-            "{} running · {} paused · {} stopped · {} images",
-            info.containers_running, info.containers_paused, info.containers_stopped, info.images,
-        ));
-        self.metric_containers.set_label(&format!(
-            "{}",
-            info.containers_running + info.containers_paused + info.containers_stopped
-        ));
-        self.metric_images.set_label(&format!("{}", info.images));
-        self.metric_cpu.set_label(&format!("{}", info.n_cpu));
-        self.metric_memory
-            .set_label(&format_bytes(info.mem_total.max(0) as u64));
-        if let Some(socket) = socket {
-            self.socket_row.set_subtitle(socket);
-        }
-    }
-
-    /// Render disk usage reported by `docker system df`.
-    pub fn set_df(&self, report: &DfReport) {
-        self.disk_row.set_subtitle(&format!(
-            "Images {} ({}) · Containers {} ({}) · Volumes {} ({})",
-            report.images_count,
-            format_bytes(report.images_size),
-            report.containers_count,
-            format_bytes(report.containers_size),
-            report.volumes_count,
-            format_bytes(report.volumes_size),
-        ));
-        self.metric_volumes
-            .set_label(&format!("{}", report.volumes_count));
-        let total = report.images_size + report.containers_size + report.volumes_size;
-        self.metric_disk.set_label(&format_bytes(total));
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Free-standing UI helpers and actions (no `Rc<Self>` needed).
-// ---------------------------------------------------------------------------
 
 /// A button child: an optional spinner (hidden by default) plus a text label.
 fn button_with_spinner(label: &str, spinner: &gtk::Spinner) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .spacing(crate::ui::design::SPACE_XS)
+        .valign(gtk::Align::Center)
         .build();
     row.append(spinner);
     row.append(&gtk::Label::new(Some(label)));
@@ -749,7 +432,7 @@ fn set_button_text(button: &gtk::Button, text: &str) {
 fn button_box(buttons: &[&gtk::Button]) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .spacing(crate::ui::design::SPACE_XS)
         .halign(gtk::Align::Center)
         .build();
     for b in buttons {
@@ -765,12 +448,7 @@ fn copy_row(title: &str) -> adw::ActionRow {
         .subtitle("—")
         .subtitle_selectable(true)
         .build();
-    let btn = gtk::Button::builder()
-        .icon_name("edit-copy-symbolic")
-        .tooltip_text("Copy")
-        .valign(gtk::Align::Center)
-        .css_classes(["flat"])
-        .build();
+    let btn = crate::ui::design::icon_button("edit-copy-symbolic", "Copy");
     let src = row.clone();
     btn.connect_clicked(move |b| {
         let text = src.subtitle().map(|s| s.to_string()).unwrap_or_default();
@@ -942,3 +620,7 @@ fn confirm_system_prune(state: Rc<AppState>, parent: gtk::Widget) {
 
     dlg.present(Some(&parent));
 }
+
+mod disk;
+mod engine_info;
+mod progress;

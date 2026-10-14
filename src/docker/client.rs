@@ -5,8 +5,9 @@ use bollard::Docker;
 use futures_util::StreamExt;
 
 use super::models::{
-    ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo, ImageHistoryEntry,
-    ImageItem, NetworkItem, RunConfig, VolumeItem,
+    ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo, EnvVar, Healthcheck,
+    ImageHistoryEntry, ImageItem, NetworkItem, PortMapping, PortProtocol, ResourceLimits,
+    RunConfig, VolumeItem, VolumeMount,
 };
 
 #[derive(Clone)]
@@ -293,7 +294,13 @@ impl DockerClient {
             .collect())
     }
 
-    pub async fn create_volume(&self, name: &str, driver: &str) -> anyhow::Result<()> {
+    pub async fn create_volume(
+        &self,
+        name: &str,
+        driver: &str,
+        driver_opts: std::collections::HashMap<String, String>,
+        labels: std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
         let body = bollard::models::VolumeCreateRequest {
             name: Some(name.to_string()),
             driver: Some(if driver.is_empty() {
@@ -301,6 +308,16 @@ impl DockerClient {
             } else {
                 driver.to_string()
             }),
+            driver_opts: if driver_opts.is_empty() {
+                None
+            } else {
+                Some(driver_opts)
+            },
+            labels: if labels.is_empty() {
+                None
+            } else {
+                Some(labels)
+            },
             ..Default::default()
         };
         self.docker.create_volume(body).await?;
@@ -349,7 +366,39 @@ impl DockerClient {
             .collect())
     }
 
-    pub async fn create_network(&self, name: &str, driver: &str) -> anyhow::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_network(
+        &self,
+        name: &str,
+        driver: &str,
+        subnet: &str,
+        gateway: &str,
+        internal: bool,
+        attachable: bool,
+        labels: std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let ipam = if !subnet.trim().is_empty() || !gateway.trim().is_empty() {
+            Some(bollard::models::Ipam {
+                driver: Some("default".to_string()),
+                config: Some(vec![bollard::models::IpamConfig {
+                    subnet: if subnet.trim().is_empty() {
+                        None
+                    } else {
+                        Some(subnet.trim().to_string())
+                    },
+                    gateway: if gateway.trim().is_empty() {
+                        None
+                    } else {
+                        Some(gateway.trim().to_string())
+                    },
+                    ..Default::default()
+                }]),
+                options: None,
+            })
+        } else {
+            None
+        };
+
         let body = bollard::models::NetworkCreateRequest {
             name: name.to_string(),
             driver: Some(if driver.is_empty() {
@@ -357,6 +406,14 @@ impl DockerClient {
             } else {
                 driver.to_string()
             }),
+            internal: Some(internal),
+            attachable: Some(attachable),
+            ipam,
+            labels: if labels.is_empty() {
+                None
+            } else {
+                Some(labels)
+            },
             ..Default::default()
         };
         self.docker.create_network(body).await?;
@@ -582,37 +639,18 @@ impl DockerClient {
     /// Create (and optionally start) a container from a [`RunConfig`].
     /// Returns the new container id.
     pub async fn create_container(&self, cfg: &RunConfig, start: bool) -> anyhow::Result<String> {
-        cfg.validate().map_err(anyhow::Error::msg)?;
-        let mut port_bindings: std::collections::HashMap<
-            String,
-            Option<Vec<bollard::models::PortBinding>>,
-        > = std::collections::HashMap::new();
-        let mut exposed_ports: Vec<String> = Vec::new();
-        for p in &cfg.ports {
-            // Validated as HOST:CONTAINER above.
-            let parts: Vec<&str> = p.split(':').collect();
-            let (host, container) = (parts[0].trim(), parts[1].trim());
-            let container_key = if container.contains('/') {
-                container.to_string()
-            } else {
-                format!("{container}/tcp")
-            };
-            exposed_ports.push(container_key.clone());
-            port_bindings.insert(
-                container_key,
-                Some(vec![bollard::models::PortBinding {
-                    host_ip: None,
-                    host_port: Some(host.to_string()),
-                }]),
-            );
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("Invalid container configuration: {e}"))?;
+
+        let port_bindings = cfg.port_bindings();
+        let exposed_ports = cfg.exposed_ports();
+        let binds: Vec<String> = cfg.volumes.iter().map(|v| v.to_spec()).collect();
+
+        let mut labels_map = std::collections::HashMap::new();
+        for l in &cfg.labels {
+            labels_map.insert(l.key.clone(), l.value.clone());
         }
-        let binds: Vec<String> = cfg.volumes.clone();
-        let restart_name = match cfg.restart_policy.as_str() {
-            "always" => bollard::models::RestartPolicyNameEnum::ALWAYS,
-            "unless-stopped" => bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED,
-            "on-failure" => bollard::models::RestartPolicyNameEnum::ON_FAILURE,
-            _ => bollard::models::RestartPolicyNameEnum::NO,
-        };
+
         let host_config = bollard::models::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
             port_bindings: if port_bindings.is_empty() {
@@ -620,24 +658,96 @@ impl DockerClient {
             } else {
                 Some(port_bindings)
             },
-            restart_policy: Some(bollard::models::RestartPolicy {
-                name: Some(restart_name),
-                maximum_retry_count: None,
-            }),
+            restart_policy: Some(cfg.restart_policy_body()),
+            memory: cfg
+                .resources
+                .memory_bytes()
+                .map_err(|e| anyhow::anyhow!("Invalid memory limit: {e}"))?,
+            nano_cpus: cfg
+                .resources
+                .nano_cpus()
+                .map_err(|e| anyhow::anyhow!("Invalid CPU limit: {e}"))?,
+            cpu_shares: cfg
+                .resources
+                .cpu_shares_value()
+                .map_err(|e| anyhow::anyhow!("Invalid CPU shares: {e}"))?,
+            cpuset_cpus: if cfg.resources.cpuset_cpus.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.resources.cpuset_cpus.trim().to_string())
+            },
+            pids_limit: cfg
+                .resources
+                .pids_limit_value()
+                .map_err(|e| anyhow::anyhow!("Invalid PIDs limit: {e}"))?,
+            cap_add: if cfg.cap_add.is_empty() {
+                None
+            } else {
+                Some(cfg.cap_add.clone())
+            },
+            cap_drop: if cfg.cap_drop.is_empty() {
+                None
+            } else {
+                Some(cfg.cap_drop.clone())
+            },
+            extra_hosts: if cfg.extra_hosts.is_empty() {
+                None
+            } else {
+                Some(cfg.extra_hosts.clone())
+            },
+            network_mode: if cfg.network.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.network.trim().to_string())
+            },
+            privileged: Some(cfg.privileged),
+            readonly_rootfs: Some(cfg.read_only_rootfs),
+            auto_remove: Some(cfg.auto_remove),
             ..Default::default()
         };
         let body = bollard::models::ContainerCreateBody {
-            image: Some(cfg.image.clone()),
+            image: Some(cfg.image.trim().to_string()),
+            hostname: if cfg.hostname.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.hostname.trim().to_string())
+            },
+            working_dir: if cfg.workdir.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.workdir.trim().to_string())
+            },
+            user: if cfg.user.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.user.trim().to_string())
+            },
             cmd: if cfg.command.is_empty() {
                 None
             } else {
                 Some(cfg.command.clone())
             },
-            env: if cfg.env.is_empty() {
+            entrypoint: if cfg.entrypoint.is_empty() {
                 None
             } else {
-                Some(cfg.env.clone())
+                Some(cfg.entrypoint.clone())
             },
+            env: if cfg.env_list().is_empty() {
+                None
+            } else {
+                Some(cfg.env_list())
+            },
+            labels: if labels_map.is_empty() {
+                None
+            } else {
+                Some(labels_map)
+            },
+            tty: Some(cfg.tty),
+            open_stdin: Some(cfg.stdin_open),
+            attach_stdin: Some(cfg.stdin_open && !cfg.detach),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            healthcheck: cfg.healthcheck_body(),
             exposed_ports: if exposed_ports.is_empty() {
                 None
             } else {
@@ -790,6 +900,206 @@ fn container_details_from_inspect(
             .and_then(|r| r.name)
             .map(|n| format!("{n:?}").to_lowercase())
             .unwrap_or_default(),
+        command_vec: info
+            .path
+            .clone()
+            .into_iter()
+            .chain(info.args.clone().unwrap_or_default())
+            .collect(),
+        entrypoint: config
+            .and_then(|c| c.entrypoint.clone())
+            .unwrap_or_default(),
+        port_mappings: port_mappings_from_inspect(info),
+        env_pairs: config
+            .and_then(|c| c.env.clone())
+            .unwrap_or_default()
+            .iter()
+            .map(|e| {
+                EnvVar::parse(e).unwrap_or_else(|_| EnvVar {
+                    key: e.clone(),
+                    value: String::new(),
+                })
+            })
+            .collect(),
+        volume_mounts: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.binds.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| VolumeMount::parse(b).ok())
+            .collect(),
+        labels: config
+            .and_then(|c| c.labels.clone())
+            .unwrap_or_default()
+            .iter()
+            .map(|(k, v)| EnvVar::new(k, v))
+            .collect(),
+        hostname: config.and_then(|c| c.hostname.clone()).unwrap_or_default(),
+        workdir: config
+            .and_then(|c| c.working_dir.clone())
+            .unwrap_or_default(),
+        user: config.and_then(|c| c.user.clone()).unwrap_or_default(),
+        network: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.network_mode.clone())
+            .unwrap_or_default(),
+        resources: ResourceLimits {
+            memory_mb: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.memory)
+                .filter(|m| *m > 0)
+                .map(|m| (m / (1024 * 1024)).to_string())
+                .unwrap_or_default(),
+            cpus: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.nano_cpus)
+                .filter(|c| *c > 0)
+                .map(|c| {
+                    let cores = c as f64 / 1_000_000_000.0;
+                    if (cores.fract()).abs() < f64::EPSILON {
+                        format!("{}", cores as i64)
+                    } else {
+                        format!("{cores}")
+                    }
+                })
+                .unwrap_or_default(),
+            cpuset_cpus: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.cpuset_cpus.clone())
+                .unwrap_or_default(),
+            cpu_shares: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.cpu_shares)
+                .filter(|v| *v > 0)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            pids_limit: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.pids_limit)
+                .filter(|v| *v > 0)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        },
+        restart_max_retries: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.restart_policy.clone())
+            .and_then(|r| r.maximum_retry_count)
+            .filter(|v| *v > 0)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        healthcheck: healthcheck_from_inspect(config),
+        privileged: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.privileged)
+            .unwrap_or(false),
+        tty: config.and_then(|c| c.tty).unwrap_or(false),
+        stdin_open: config.and_then(|c| c.open_stdin).unwrap_or(false),
+        auto_remove: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.auto_remove)
+            .unwrap_or(false),
+        read_only_rootfs: info
+            .host_config
+            .as_ref()
+            .and_then(|h| h.readonly_rootfs)
+            .unwrap_or(false),
+    }
+}
+
+/// Published ports from `inspect`, rendered back into structured mappings.
+fn port_mappings_from_inspect(
+    info: &bollard::models::ContainerInspectResponse,
+) -> Vec<PortMapping> {
+    let Some(net) = info.network_settings.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (spec, binding) in net.ports.clone().unwrap_or_default().iter() {
+        // `spec` is `"80/tcp"`.
+        let (container_port, proto) = spec
+            .split_once('/')
+            .map(|(p, pr)| (p.to_string(), pr.to_string()))
+            .unwrap_or_else(|| (spec.clone(), "tcp".to_string()));
+        let protocol = PortProtocol::parse(&proto).unwrap_or_default();
+        match binding {
+            Some(bindings) if !bindings.is_empty() => {
+                for b in bindings {
+                    out.push(PortMapping {
+                        host_ip: b.host_ip.clone().unwrap_or_default(),
+                        host_port: b.host_port.clone().unwrap_or_default(),
+                        container_port: container_port.clone(),
+                        protocol,
+                    });
+                }
+            }
+            _ => out.push(PortMapping {
+                host_ip: String::new(),
+                host_port: String::new(),
+                container_port,
+                protocol,
+            }),
+        }
+    }
+    out.sort_by(|a, b| {
+        a.container_port
+            .cmp(&b.container_port)
+            .then(a.host_port.cmp(&b.host_port))
+    });
+    out
+}
+
+/// Health check from `inspect`, mapped back into the form's shape.
+fn healthcheck_from_inspect(config: Option<&bollard::models::ContainerConfig>) -> Healthcheck {
+    let Some(hc) = config.and_then(|c| c.healthcheck.clone()) else {
+        return Healthcheck::default();
+    };
+    let test = hc.test.clone().unwrap_or_default();
+    if test.is_empty() || test == ["NONE"] {
+        return Healthcheck::default();
+    }
+    Healthcheck {
+        test,
+        interval_s: hc
+            .interval
+            .filter(|v| *v > 0)
+            .map(ns_to_duration)
+            .unwrap_or_default(),
+        timeout_s: hc
+            .timeout
+            .filter(|v| *v > 0)
+            .map(ns_to_duration)
+            .unwrap_or_default(),
+        retries: hc
+            .retries
+            .filter(|v| *v > 0)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        start_period_s: hc
+            .start_period
+            .filter(|v| *v > 0)
+            .map(ns_to_duration)
+            .unwrap_or_default(),
+    }
+}
+
+/// Render nanoseconds back into a compact Go-style duration string.
+fn ns_to_duration(ns: i64) -> String {
+    const S: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+    if ns >= S && ns % S == 0 {
+        format!("{}s", ns / S)
+    } else {
+        format!("{}ms", ns / MS)
     }
 }
 
@@ -837,16 +1147,22 @@ fn append_dir_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::docker::models::{EnvVar, PortMapping};
 
     #[test]
     fn run_config_validation() {
         let mut cfg = RunConfig::default();
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_err(), "image is required");
         cfg.image = "nginx:latest".to_string();
         assert!(cfg.validate().is_ok());
-        cfg.ports = vec!["bad".to_string()];
+        cfg.ports
+            .push(PortMapping::parse("bad").unwrap_or_default());
         assert!(cfg.validate().is_err());
-        cfg.ports = vec!["8080:80".to_string()];
+        cfg.ports.clear();
+        cfg.ports.push(PortMapping::parse("8080:80").unwrap());
+        assert!(cfg.validate().is_ok());
+        cfg.env.push(EnvVar::parse("a=1").unwrap());
+        cfg.env.push(EnvVar::parse("b=2").unwrap());
         assert!(cfg.validate().is_ok());
     }
 

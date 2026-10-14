@@ -55,10 +55,8 @@ impl PreferencesDialog {
             .build();
         page.add(&group);
 
-        let save_btn = gtk::Button::builder()
-            .label("Save")
-            .tooltip_text("Save preferences")
-            .build();
+        let save_btn = crate::ui::design::button_suggested("Save", None);
+        save_btn.set_tooltip_text(Some("Save preferences"));
         save_btn.add_css_class("suggested-action");
 
         let header = adw::HeaderBar::new();
@@ -86,6 +84,10 @@ impl PreferencesDialog {
                 compose_file: cfg.compose_file.clone(),
                 cli_bridge_enabled: cli_row.is_active(),
                 cli_bridge_set_default: cli_default_row.is_active(),
+                // Preserve the saved restore target; it is managed by the
+                // bridge reconciler, not by this dialog.
+                cli_bridge_prev_context: cfg.cli_bridge_prev_context.clone(),
+                schema_version: cfg.schema_version,
             };
             let st2 = st.clone();
             let dlg2 = dlg.clone();
