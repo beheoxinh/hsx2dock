@@ -13,7 +13,7 @@ use state::AppState;
 
 fn start_background_monitoring(app_handle: AppHandle) {
     let handle = app_handle.clone();
-    tokio::spawn(async move {
+    crate::runtime::spawn(async move {
         let mut last_state = None;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -51,12 +51,7 @@ fn start_background_monitoring(app_handle: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to build Tokio runtime");
-
-    let app_state = rt.block_on(AppState::new());
+    let app_state = crate::runtime::runtime().block_on(AppState::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
