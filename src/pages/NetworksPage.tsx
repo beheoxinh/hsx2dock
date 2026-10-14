@@ -1,0 +1,293 @@
+import React, { useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Network, Plus, Trash2, Search, X } from "lucide-react";
+import { Card } from "../components/ui/Card";
+import { Button } from "../components/ui/Button";
+import { api } from "../lib/api";
+import { truncateId } from "../lib/utils";
+import type { NetworkItem } from "../types";
+
+export const NetworksPage: React.FC = () => {
+  const [networks, setNetworks] = useState<NetworkItem[]>([]);
+  const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [driver, setDriver] = useState("bridge");
+  const [subnet, setSubnet] = useState("");
+  const [gateway, setGateway] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  const loadNetworks = async () => {
+    try {
+      setLoading(true);
+      const list = await api.listNetworks();
+      setNetworks(list);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadNetworks();
+  }, []);
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+
+    try {
+      setCreating(true);
+      await api.createNetwork(
+        name.trim(),
+        driver,
+        subnet.trim() || undefined,
+        gateway.trim() || undefined
+      );
+      setModalOpen(false);
+      setName("");
+      setSubnet("");
+      setGateway("");
+      await loadNetworks();
+    } catch (err) {
+      alert(`Create network failed: ${err}`);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleRemove = async (id: string, netName: string) => {
+    if (!confirm(`Are you sure you want to remove network '${netName}'?`)) return;
+    try {
+      await api.removeNetwork(id);
+      await loadNetworks();
+    } catch (err) {
+      alert(`Remove network failed: ${err}`);
+    }
+  };
+
+  const handlePrune = async () => {
+    if (!confirm("Prune all unused Docker networks?")) return;
+    try {
+      const pruned = await api.pruneNetworks();
+      alert(`Pruned ${pruned} networks.`);
+      await loadNetworks();
+    } catch (err) {
+      alert(`Prune error: ${err}`);
+    }
+  };
+
+  const filteredNetworks = networks.filter((n) =>
+    n.name.toLowerCase().includes(search.toLowerCase())
+  );
+
+  return (
+    <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight text-white">Networks</h2>
+          <p className="text-sm text-zinc-400 mt-1">
+            Configure software bridges, subnets, and container network topologies
+          </p>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <div className="relative w-64">
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
+            <input
+              type="text"
+              placeholder="Search networks..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
+            />
+          </div>
+
+          <Button variant="outline" size="sm" onClick={handlePrune} className="gap-2">
+            <Trash2 className="w-4 h-4 text-rose-400" />
+            <span>Prune</span>
+          </Button>
+
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => setModalOpen(true)}
+            className="gap-2"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Create Network</span>
+          </Button>
+        </div>
+      </div>
+
+      {/* Networks List */}
+      <div className="flex-1 overflow-y-auto space-y-3 pb-8">
+        <AnimatePresence>
+          {filteredNetworks.map((net) => {
+            const isDefault = ["bridge", "host", "none"].includes(net.name);
+
+            return (
+              <motion.div
+                key={net.id}
+                layout
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+              >
+                <Card className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 hover:border-zinc-700/80 transition-all">
+                  <div className="flex items-start gap-4">
+                    <div className="w-10 h-10 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400 shrink-0">
+                      <Network className="w-5 h-5" />
+                    </div>
+
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-white tracking-tight text-sm">
+                          {net.name}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full text-[11px] bg-zinc-800 text-zinc-400 font-mono">
+                          {net.driver}
+                        </span>
+                        {isDefault && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-zinc-800/80 text-zinc-500">
+                            system
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-zinc-400 mt-1 font-mono">
+                        <span>{truncateId(net.id)}</span>
+                        {net.subnet && (
+                          <>
+                            <span>•</span>
+                            <span>Subnet: {net.subnet}</span>
+                          </>
+                        )}
+                        {net.gateway && (
+                          <>
+                            <span>•</span>
+                            <span>Gateway: {net.gateway}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {!isDefault && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => handleRemove(net.id, net.name)}
+                      title="Remove Network"
+                      className="text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                  )}
+                </Card>
+              </motion.div>
+            );
+          })}
+        </AnimatePresence>
+
+        {!loading && filteredNetworks.length === 0 && (
+          <div className="py-16 text-center text-zinc-400">
+            <Network className="w-10 h-10 mx-auto text-zinc-400 mb-3" />
+            <p className="font-medium text-white">No networks found</p>
+          </div>
+        )}
+      </div>
+
+      {/* Create Modal */}
+      {modalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div
+            className="fixed inset-0 bg-black/70 backdrop-blur-md"
+            onClick={() => setModalOpen(false)}
+          />
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="relative w-full max-w-md bg-zinc-950 border border-zinc-800 rounded-2xl shadow-2xl p-6 z-10 space-y-5"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold text-lg text-white">Create Network</h3>
+              <Button variant="ghost" size="icon" onClick={() => setModalOpen(false)}>
+                <X className="w-5 h-5" />
+              </Button>
+            </div>
+
+            <form onSubmit={handleCreate} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
+                  Network Name *
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. app-tier, internal-db"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  required
+                  className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
+                  Driver
+                </label>
+                <select
+                  value={driver}
+                  onChange={(e) => setDriver(e.target.value)}
+                  className="w-full h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer"
+                >
+                  <option value="bridge">Bridge (Default)</option>
+                  <option value="macvlan">Macvlan</option>
+                  <option value="ipvlan">IPvlan</option>
+                  <option value="overlay">Overlay</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
+                  Subnet (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. 172.28.0.0/16"
+                  value={subnet}
+                  onChange={(e) => setSubnet(e.target.value)}
+                  className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-1.5">
+                  Gateway (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. 172.28.0.1"
+                  value={gateway}
+                  onChange={(e) => setGateway(e.target.value)}
+                  className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end gap-3">
+                <Button type="button" variant="ghost" onClick={() => setModalOpen(false)}>
+                  Cancel
+                </Button>
+                <Button type="submit" variant="primary" isLoading={creating}>
+                  Create
+                </Button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+    </div>
+  );
+};
