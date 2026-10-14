@@ -30,7 +30,7 @@ error() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-APP_ID="com.github.docker_manager"
+APP_ID="com.github.docker-manager"
 SOURCE_ICON="/mnt/SubSystem/Downloads/google-container-optimized-os.svg"
 LOCAL_ICON="$ROOT_DIR/data/icons/${APP_ID}.svg"
 

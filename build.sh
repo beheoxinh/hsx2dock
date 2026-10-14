@@ -40,11 +40,8 @@ if ! command -v pnpm >/dev/null 2>&1; then
     exit 1
 fi
 
-info "1. Build Frontend assets với Vite..."
-pnpm build
-
-info "2. Build Tauri Release Binary..."
-cargo build --release --manifest-path src-tauri/Cargo.toml
+info "Tiến hành build ứng dụng với Tauri CLI (Release mode, nhúng offline assets)..."
+pnpm tauri build --no-bundle
 
 BIN_PATH="$ROOT_DIR/src-tauri/target/release/docker-manager"
 if [ -f "$BIN_PATH" ]; then
