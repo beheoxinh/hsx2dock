@@ -60,6 +60,27 @@ pub fn run() {
         .manage(app_state)
         .setup(|app| {
             let handle = app.handle().clone();
+            
+            // Check auto-start engine daemon
+            if let Some(state) = handle.try_state::<AppState>() {
+                let should_autostart = crate::runtime::runtime().block_on(async {
+                    state.config.read().await.auto_start_daemon
+                });
+                if should_autostart && state.daemon_state() != docker::models::DaemonState::Running {
+                    let engine = state.engine.clone();
+                    let h = handle.clone();
+                    crate::runtime::spawn(async move {
+                        tracing::info!("Auto-starting engine daemon...");
+                        let _ = crate::runtime::engine_op(move || engine.start()).await;
+                        // Trigger client reconnection
+                        if let Some(s) = h.try_state::<AppState>() {
+                            let _ = s.get_client().await;
+                            let _ = h.emit("engine-state-changed", s.daemon_state());
+                        }
+                    });
+                }
+            }
+
             start_background_monitoring(handle);
             Ok(())
         })
@@ -77,6 +98,7 @@ pub fn run() {
             containers::get_container_logs,
             containers::get_container_stats,
             containers::run_container,
+            containers::exec_container,
             // Images
             images::list_images,
             images::remove_image,

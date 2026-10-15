@@ -81,9 +81,12 @@ if [ -f "$LOCAL_ICON" ]; then
     success "Đã cài đặt icon ứng dụng."
 fi
 
-# 6. Cài đặt file .desktop
+# 6. Cài đặt file .desktop (Dọn dẹp các desktop entry cũ không đồng bộ)
+info "Đang dọn dẹp các desktop entry cũ..."
+rm -f "$USER_APPS_DIR/com.github.docker_manager.desktop"
+
 info "Đang tạo và cài đặt file .desktop vào $USER_APPS_DIR/..."
-cat << 'EOF' > "$USER_APPS_DIR/${APP_ID}.desktop"
+cat << EOF > "$USER_APPS_DIR/${APP_ID}.desktop"
 [Desktop Entry]
 Type=Application
 Version=1.5
@@ -91,7 +94,7 @@ Name=Docker Manager
 GenericName=Docker Desktop Suite
 Comment=Modern Cross-platform Desktop Suite to manage Docker containers, images, volumes and networks
 Exec=docker-manager
-Icon=com.github.docker_manager
+Icon=${APP_ID}
 Terminal=false
 Categories=Development;
 Keywords=docker;containers;images;volumes;networks;

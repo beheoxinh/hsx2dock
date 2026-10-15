@@ -15,7 +15,8 @@ pub struct AppState {
 impl AppState {
     pub async fn new() -> Self {
         let config = AppConfig::load().await.unwrap_or_default();
-        let engine = Arc::new(EngineManager::new(EnginePaths::new()));
+        let paths = EnginePaths::with_custom_data_root(Some(&config.data_root));
+        let engine = Arc::new(EngineManager::new(paths));
         let socket = engine.socket();
         let client = match DockerClient::connect(Some(socket)) {
             Ok(c) => Some(c),

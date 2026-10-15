@@ -549,40 +549,86 @@ impl DockerClient {
             .docker
             .df(None::<bollard::query_parameters::DataUsageOptions>)
             .await?;
+
+        let images_size = df
+            .image_usage
+            .as_ref()
+            .and_then(|u| u.total_size)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let containers_size = df
+            .container_usage
+            .as_ref()
+            .and_then(|u| u.total_size)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let volumes_size = df
+            .volume_usage
+            .as_ref()
+            .and_then(|u| u.total_size)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let build_cache_size = df
+            .build_cache_usage
+            .as_ref()
+            .and_then(|u| u.total_size)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let img_reclaimable = df
+            .image_usage
+            .as_ref()
+            .and_then(|u| u.reclaimable)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let cnt_reclaimable = df
+            .container_usage
+            .as_ref()
+            .and_then(|u| u.reclaimable)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let vol_reclaimable = df
+            .volume_usage
+            .as_ref()
+            .and_then(|u| u.reclaimable)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let cache_reclaimable = df
+            .build_cache_usage
+            .as_ref()
+            .and_then(|u| u.reclaimable)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        let total_reclaimable = img_reclaimable + cnt_reclaimable + vol_reclaimable + cache_reclaimable;
+
         Ok(DfReport {
             images_count: df
                 .image_usage
                 .as_ref()
                 .and_then(|u| u.total_count)
                 .unwrap_or(0) as usize,
-            images_size: df
-                .image_usage
-                .as_ref()
-                .and_then(|u| u.total_size)
-                .unwrap_or(0)
-                .max(0) as u64,
+            images_size,
             containers_count: df
                 .container_usage
                 .as_ref()
                 .and_then(|u| u.total_count)
                 .unwrap_or(0) as usize,
-            containers_size: df
-                .container_usage
-                .as_ref()
-                .and_then(|u| u.total_size)
-                .unwrap_or(0)
-                .max(0) as u64,
+            containers_size,
             volumes_count: df
                 .volume_usage
                 .as_ref()
                 .and_then(|u| u.total_count)
                 .unwrap_or(0) as usize,
-            volumes_size: df
-                .volume_usage
-                .as_ref()
-                .and_then(|u| u.total_size)
-                .unwrap_or(0)
-                .max(0) as u64,
+            volumes_size,
+            build_cache_size,
+            total_reclaimable,
         })
     }
 

@@ -85,6 +85,7 @@ pub struct EngineInfo {
     pub storage_driver: String,
     pub root_dir: String,
     pub cgroup_driver: String,
+    #[serde(rename = "cpus")]
     pub n_cpu: i64,
     pub mem_total: i64,
 }
@@ -1038,6 +1039,8 @@ pub struct DfReport {
     pub containers_size: u64,
     pub volumes_count: usize,
     pub volumes_size: u64,
+    pub build_cache_size: u64,
+    pub total_reclaimable: u64,
 }
 
 #[cfg(test)]

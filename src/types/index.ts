@@ -142,6 +142,8 @@ export interface AppConfig {
   cli_bridge_enabled: boolean;
   cli_bridge_set_default: boolean;
   cli_bridge_prev_context: string;
+  data_root?: string;
+  theme?: string;
   schema_version: number;
 }
 

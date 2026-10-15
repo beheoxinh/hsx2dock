@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
@@ -140,6 +140,83 @@ export const SettingsPage: React.FC = () => {
               />
               <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
             </label>
+          </div>
+        </Card>
+
+        {/* Engine Storage Location (Data Root) */}
+        <Card className="space-y-4">
+          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+            <HardDrive className="w-5 h-5 text-emerald-400" />
+            <div>
+              <h3 className="font-semibold text-white">Engine Storage Location (Data Root)</h3>
+              <p className="text-xs text-zinc-400">
+                Custom directory path for images, containers, and volumes (`dockerd --data-root`)
+              </p>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+              Custom Data Root Path
+            </label>
+            <input
+              type="text"
+              placeholder="Leave blank for default (~/.local/share/docker-manager/data) or enter e.g. /mnt/data/docker"
+              value={config.data_root || ""}
+              onChange={(e) => setConfig({ ...config, data_root: e.target.value })}
+              className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+            />
+            <p className="text-xs text-zinc-500 mt-2">
+              * Note: Changing this path requires restarting the Docker Daemon for changes to take effect. Ensure target directory has appropriate user permissions.
+            </p>
+          </div>
+        </Card>
+
+        {/* Theme Settings */}
+        <Card className="space-y-4">
+          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+            <Palette className="w-5 h-5 text-indigo-400" />
+            <div>
+              <h3 className="font-semibold text-white">Appearance & Theme</h3>
+              <p className="text-xs text-zinc-400">Switch color theme for application interface</p>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between py-2">
+            <div>
+              <span className="font-medium text-sm text-zinc-200 block">Theme Mode</span>
+              <span className="text-xs text-zinc-400 block mt-0.5">
+                Choose between Dark, Light or System default
+              </span>
+            </div>
+            <select
+              value={config.theme || "dark"}
+              onChange={(e) => {
+                const val = e.target.value;
+                setConfig({ ...config, theme: val });
+                if (val === "dark") {
+                  document.documentElement.classList.add("dark");
+                  document.documentElement.classList.remove("light");
+                  localStorage.setItem("theme", "dark");
+                } else if (val === "light") {
+                  document.documentElement.classList.remove("dark");
+                  document.documentElement.classList.add("light");
+                  localStorage.setItem("theme", "light");
+                } else {
+                  localStorage.removeItem("theme");
+                  if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
+                    document.documentElement.classList.add("dark");
+                  } else {
+                    document.documentElement.classList.remove("dark");
+                  }
+                }
+              }}
+              className="h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer [&>option]:bg-zinc-900 [&>option]:text-white"
+            >
+              <option value="dark">Dark Theme</option>
+              <option value="light">Light Theme</option>
+              <option value="system">System Default</option>
+            </select>
           </div>
         </Card>
 

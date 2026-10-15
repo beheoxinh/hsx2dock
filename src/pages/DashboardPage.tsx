@@ -7,6 +7,11 @@ import {
   ArrowUpRight,
   Database,
   Trash2,
+  HardDrive,
+  Activity,
+  PlusCircle,
+  Download,
+  FolderGit2,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -258,6 +263,197 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               <span className="text-zinc-400">Total Containers</span>
               <span className="font-medium text-zinc-200">{engineInfo?.containers || 0}</span>
             </div>
+            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
+              <span className="text-zinc-400">Running / Paused</span>
+              <span className="font-medium text-emerald-400">
+                {engineInfo?.containers_running || 0} / {engineInfo?.containers_paused || 0}
+              </span>
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* Storage Breakdown & Quick Actions */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Storage Breakdown Bar */}
+        <Card className="lg:col-span-2 space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
+            <div className="flex items-center gap-2.5">
+              <HardDrive className="w-4 h-4 text-emerald-400" />
+              <h3 className="font-semibold text-white">Docker Storage Utilization</h3>
+            </div>
+            <span className="text-xs text-zinc-400">
+              Total: {formatBytes(
+                (diskUsage?.images_size || 0) +
+                (diskUsage?.containers_size || 0) +
+                (diskUsage?.volumes_size || 0) +
+                (diskUsage?.build_cache_size || 0)
+              )}
+            </span>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-zinc-400">Images ({formatBytes(diskUsage?.images_size)})</span>
+                <span className="text-purple-400 font-mono">
+                  {diskUsage?.images_size ? formatBytes(diskUsage.images_size) : "0 B"}
+                </span>
+              </div>
+              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-purple-500 rounded-full"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.max(
+                        5,
+                        ((diskUsage?.images_size || 0) /
+                          Math.max(
+                            1,
+                            (diskUsage?.images_size || 0) +
+                              (diskUsage?.containers_size || 0) +
+                              (diskUsage?.volumes_size || 0) +
+                              (diskUsage?.build_cache_size || 0)
+                          )) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-zinc-400">Containers Writable Layer ({formatBytes(diskUsage?.containers_size)})</span>
+                <span className="text-blue-400 font-mono">
+                  {diskUsage?.containers_size ? formatBytes(diskUsage.containers_size) : "0 B"}
+                </span>
+              </div>
+              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 rounded-full"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.max(
+                        3,
+                        ((diskUsage?.containers_size || 0) /
+                          Math.max(
+                            1,
+                            (diskUsage?.images_size || 0) +
+                              (diskUsage?.containers_size || 0) +
+                              (diskUsage?.volumes_size || 0) +
+                              (diskUsage?.build_cache_size || 0)
+                          )) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-zinc-400">Volumes ({formatBytes(diskUsage?.volumes_size)})</span>
+                <span className="text-amber-400 font-mono">
+                  {diskUsage?.volumes_size ? formatBytes(diskUsage.volumes_size) : "0 B"}
+                </span>
+              </div>
+              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-amber-500 rounded-full"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.max(
+                        3,
+                        ((diskUsage?.volumes_size || 0) /
+                          Math.max(
+                            1,
+                            (diskUsage?.images_size || 0) +
+                              (diskUsage?.containers_size || 0) +
+                              (diskUsage?.volumes_size || 0) +
+                              (diskUsage?.build_cache_size || 0)
+                          )) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-zinc-400">Build Cache ({formatBytes(diskUsage?.build_cache_size)})</span>
+                <span className="text-emerald-400 font-mono">
+                  {diskUsage?.build_cache_size ? formatBytes(diskUsage.build_cache_size) : "0 B"}
+                </span>
+              </div>
+              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-emerald-500 rounded-full"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.max(
+                        2,
+                        ((diskUsage?.build_cache_size || 0) /
+                          Math.max(
+                            1,
+                            (diskUsage?.images_size || 0) +
+                              (diskUsage?.containers_size || 0) +
+                              (diskUsage?.volumes_size || 0) +
+                              (diskUsage?.build_cache_size || 0)
+                          )) * 100
+                      )
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        {/* Quick Actions Shortcuts */}
+        <Card className="space-y-3">
+          <div className="pb-3 border-b border-zinc-800/80 flex items-center gap-2">
+            <Activity className="w-4 h-4 text-blue-400" />
+            <h3 className="font-semibold text-white">Quick Shortcuts</h3>
+          </div>
+          <div className="grid grid-cols-1 gap-2.5 pt-1">
+            <button
+              onClick={() => onNavigate("containers")}
+              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
+            >
+              <div className="flex items-center gap-3">
+                <PlusCircle className="w-4 h-4 text-blue-400" />
+                <span className="text-xs font-medium text-zinc-200">Create Container</span>
+              </div>
+              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
+            </button>
+
+            <button
+              onClick={() => onNavigate("images")}
+              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
+            >
+              <div className="flex items-center gap-3">
+                <Download className="w-4 h-4 text-purple-400" />
+                <span className="text-xs font-medium text-zinc-200">Pull Image from Hub</span>
+              </div>
+              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
+            </button>
+
+            <button
+              onClick={() => onNavigate("compose")}
+              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
+            >
+              <div className="flex items-center gap-3">
+                <FolderGit2 className="w-4 h-4 text-indigo-400" />
+                <span className="text-xs font-medium text-zinc-200">Deploy Compose Project</span>
+              </div>
+              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
+            </button>
           </div>
         </Card>
       </div>

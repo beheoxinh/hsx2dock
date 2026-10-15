@@ -32,10 +32,21 @@ pub struct AppConfig {
     /// (e.g. `desktop-linux`) by blindly falling back to `default`.
     #[serde(default)]
     pub cli_bridge_prev_context: String,
+    /// Custom storage directory for containers, images, and volumes.
+    /// If empty, defaults to `$XDG_DATA_HOME/docker-manager/data`.
+    #[serde(default)]
+    pub data_root: String,
+    /// UI Theme preference: "system" | "dark" | "light"
+    #[serde(default = "default_theme")]
+    pub theme: String,
     /// Bumped when a default changes in a way old files must be migrated onto.
     /// `0` = written before the CLI bridge became on-by-default.
     #[serde(default)]
     pub schema_version: u32,
+}
+
+fn default_theme() -> String {
+    "system".to_string()
 }
 
 /// Current config schema. See [`AppConfig::schema_version`].
@@ -49,6 +60,8 @@ impl Default for AppConfig {
             cli_bridge_enabled: default_true(),
             cli_bridge_set_default: default_true(),
             cli_bridge_prev_context: String::new(),
+            data_root: String::new(),
+            theme: default_theme(),
             schema_version: CONFIG_SCHEMA_VERSION,
         }
     }
@@ -183,6 +196,8 @@ mod tests {
             cli_bridge_enabled: true,
             cli_bridge_set_default: true,
             cli_bridge_prev_context: "desktop-linux".to_string(),
+            data_root: "/mnt/storage/docker".to_string(),
+            theme: "dark".to_string(),
             schema_version: CONFIG_SCHEMA_VERSION,
         };
         cfg.save_to(&path).await.expect("save works");

@@ -266,12 +266,12 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                 <select
                   value={restartPolicy}
                   onChange={(e) => setRestartPolicy(e.target.value)}
-                  className="w-full h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer"
+                  className="w-full h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white dark:text-white dark:bg-zinc-900 focus:outline-none focus:border-blue-500 cursor-pointer [&>option]:bg-zinc-900 [&>option]:text-white"
                 >
-                  <option value="unless-stopped">Unless Stopped</option>
-                  <option value="always">Always</option>
-                  <option value="on-failure">On Failure</option>
-                  <option value="no">Never (No)</option>
+                  <option value="unless-stopped" className="bg-zinc-900 text-white">Unless Stopped</option>
+                  <option value="always" className="bg-zinc-900 text-white">Always</option>
+                  <option value="on-failure" className="bg-zinc-900 text-white">On Failure</option>
+                  <option value="no" className="bg-zinc-900 text-white">Never (No)</option>
                 </select>
               </div>
 

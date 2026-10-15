@@ -44,6 +44,7 @@ export const api = {
   getContainerLogs: (id: string, tail: string = "200") => invoke<string>("get_container_logs", { id, tail }),
   getContainerStats: (id: string) => invoke<ContainerStats>("get_container_stats", { id }),
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),
+  execContainer: (id: string, cmd: string) => invoke<string>("exec_container", { id, cmd }),
 
   // Images
   listImages: () => invoke<ImageItem[]>("list_images"),

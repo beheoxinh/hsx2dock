@@ -72,13 +72,21 @@ impl Default for EnginePaths {
 
 impl EnginePaths {
     pub fn new() -> Self {
+        Self::with_custom_data_root(None)
+    }
+
+    pub fn with_custom_data_root(custom_data_root: Option<&str>) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let data = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
         let runtime = dirs::runtime_dir().unwrap_or_else(|| home.join(".local/state"));
         let base = data.join("docker-manager");
         let rt = runtime.join("docker-manager");
+        let data_root = match custom_data_root {
+            Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
+            _ => base.join("data"),
+        };
         Self {
-            data_root: base.join("data"),
+            data_root,
             versions_dir: base.join("versions"),
             current_dir: base.join("current"),
             log_file: base.join("log/engine.log"),

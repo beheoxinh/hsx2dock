@@ -12,6 +12,9 @@ import {
   Activity,
   Cpu,
   Layers,
+  Pause,
+  Copy,
+  ExternalLink,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -22,7 +25,7 @@ import { formatBytes, truncateId } from "../lib/utils";
 import type { ContainerItem, ContainerStats } from "../types";
 
 interface ContainersPageProps {
-  onOpenDetails: (id: string, tab?: "logs" | "inspect" | "stats") => void;
+  onOpenDetails: (id: string, tab?: "logs" | "inspect" | "stats" | "terminal") => void;
   onOpenWizard: () => void;
 }
 
@@ -70,23 +73,46 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     };
   }, []);
 
-  const handleAction = async (c: ContainerItem, action: "start" | "stop" | "restart" | "remove") => {
+  const handleAction = async (
+    c: ContainerItem,
+    action: "start" | "stop" | "restart" | "pause" | "unpause" | "clone" | "remove"
+  ) => {
     const cName = c.name.replace(/^\//, "");
     try {
       setActionLoading((prev) => ({ ...prev, [c.id]: true }));
       if (action === "start") {
         await api.startContainer(c.id);
         toast.success("Container started", `${cName} is now running.`);
-      }
-      if (action === "stop") {
+      } else if (action === "stop") {
         await api.stopContainer(c.id);
         toast.info("Container stopped", `${cName} has been stopped.`);
-      }
-      if (action === "restart") {
+      } else if (action === "restart") {
         await api.restartContainer(c.id);
         toast.success("Container restarted", `${cName} rebooted successfully.`);
-      }
-      if (action === "remove") {
+      } else if (action === "pause") {
+        await api.pauseContainer(c.id);
+        toast.info("Container paused", `${cName} has been paused.`);
+      } else if (action === "unpause") {
+        await api.unpauseContainer(c.id);
+        toast.success("Container unpaused", `${cName} resumed.`);
+      } else if (action === "clone") {
+        const details = await api.inspectContainer(c.id);
+        const newName = `${cName}-clone-${Math.floor(Math.random() * 1000)}`;
+        const envVars = (details.env || []).map((e) => {
+          const idx = e.indexOf("=");
+          return idx !== -1
+            ? { key: e.slice(0, idx), value: e.slice(idx + 1) }
+            : { key: e, value: "" };
+        });
+        await api.runContainer({
+          image: details.image,
+          name: newName,
+          env: envVars,
+          command: details.command ? details.command.split(" ") : undefined,
+          restart_policy: "unless-stopped",
+        });
+        toast.success("Container cloned", `Created duplicate container: ${newName}`);
+      } else if (action === "remove") {
         if (!confirm(`Are you sure you want to remove container '${cName}'?`)) return;
         await api.removeContainer(c.id, true);
         toast.success("Container removed", `${cName} was deleted.`);
@@ -182,9 +208,23 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                       <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
                         Ports
                       </span>
-                      <span className="text-zinc-200 truncate block font-mono mt-0.5">
-                        {c.ports || "—"}
-                      </span>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span className="text-zinc-200 truncate block font-mono">
+                          {c.ports || "—"}
+                        </span>
+                        {c.ports && c.ports.includes("->") && (
+                          <a
+                            href={`http://localhost:${c.ports.split("->")[0].split(":").pop()}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="Open in Browser"
+                            className="text-blue-400 hover:text-blue-300"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <ExternalLink className="w-3 h-3 inline" />
+                          </a>
+                        )}
+                      </div>
                     </div>
 
                     <div>
@@ -215,10 +255,29 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                         <Button
                           variant="ghost"
                           size="icon"
+                          onClick={() => onOpenDetails(c.id, "terminal")}
+                          title="Open Container Terminal / Shell"
+                          className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
+                        >
+                          <Terminal className="w-4 h-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => handleAction(c, "pause")}
+                          disabled={isBusy}
+                          title="Pause Container"
+                          className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                        >
+                          <Pause className="w-4 h-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
                           onClick={() => handleAction(c, "stop")}
                           disabled={isBusy}
                           title="Stop Container"
-                          className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                          className="text-rose-400 hover:text-rose-300 hover:bg-rose-500/10"
                         >
                           <Square className="w-4 h-4 fill-current" />
                         </Button>
@@ -234,17 +293,30 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                         </Button>
                       </>
                     ) : (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => handleAction(c, "start")}
-                        disabled={isBusy}
-                        title="Start Container"
-                        className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
-                      >
-                        <Play className="w-4 h-4 fill-current" />
-                      </Button>
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => handleAction(c, c.state === "paused" ? "unpause" : "start")}
+                          disabled={isBusy}
+                          title={c.state === "paused" ? "Unpause Container" : "Start Container"}
+                          className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
+                        >
+                          <Play className="w-4 h-4 fill-current" />
+                        </Button>
+                      </>
                     )}
+
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => handleAction(c, "clone")}
+                      disabled={isBusy}
+                      title="Clone / Duplicate Container"
+                      className="text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                    </Button>
 
                     <Button
                       variant="ghost"
@@ -254,16 +326,6 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                       className="text-zinc-400 hover:text-white"
                     >
                       <FileText className="w-4 h-4" />
-                    </Button>
-
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => onOpenDetails(c.id, "inspect")}
-                      title="Inspect JSON"
-                      className="text-zinc-400 hover:text-white"
-                    >
-                      <Terminal className="w-4 h-4" />
                     </Button>
 
                     <Button

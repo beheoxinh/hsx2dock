@@ -19,7 +19,7 @@ import type { ContainerDetails, ContainerStats } from "../types";
 
 interface ContainerDetailsDrawerProps {
   containerId: string | null;
-  initialTab?: "logs" | "inspect" | "stats";
+  initialTab?: "logs" | "inspect" | "stats" | "terminal";
   onClose: () => void;
 }
 
@@ -28,14 +28,36 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   initialTab = "logs",
   onClose,
 }) => {
-  const [activeTab, setActiveTab] = useState<"logs" | "inspect" | "stats">(initialTab);
+  const [activeTab, setActiveTab] = useState<"logs" | "inspect" | "stats" | "terminal">(initialTab);
   const [details, setDetails] = useState<ContainerDetails | null>(null);
   const [stats, setStats] = useState<ContainerStats | null>(null);
   const [logs, setLogs] = useState<string>("");
   const [, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [logFilter, setLogFilter] = useState("");
+  const [execCmd, setExecCmd] = useState("");
+  const [terminalOutput, setTerminalOutput] = useState<string>(
+    "Connected to container terminal. Type commands (e.g. 'ls -la', 'ps aux', 'env', 'cat /etc/os-release') to execute:\n\n"
+  );
+  const [executing, setExecuting] = useState(false);
   const toast = useToast();
+
+  const handleExec = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!containerId || !execCmd.trim() || executing) return;
+    const commandToRun = execCmd.trim();
+    setExecCmd("");
+    setExecuting(true);
+    setTerminalOutput((prev) => prev + `$ ${commandToRun}\n`);
+    try {
+      const output = await api.execContainer(containerId, commandToRun);
+      setTerminalOutput((prev) => prev + (output || "(no output)") + "\n\n");
+    } catch (err) {
+      setTerminalOutput((prev) => prev + `[error] ${err}\n\n`);
+    } finally {
+      setExecuting(false);
+    }
+  };
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -160,6 +182,17 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               <TerminalIcon className="w-4 h-4" />
               Inspect JSON
             </button>
+            <button
+              onClick={() => setActiveTab("terminal")}
+              className={`py-3 flex items-center gap-2 border-b-2 transition-all cursor-pointer ${
+                activeTab === "terminal"
+                  ? "border-emerald-500 text-emerald-400 font-semibold"
+                  : "border-transparent text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              <TerminalIcon className="w-4 h-4 text-emerald-400" />
+              Exec Terminal
+            </button>
           </div>
 
           {/* Drawer Body */}
@@ -271,6 +304,44 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                     {details?.raw_json || "Loading inspect JSON..."}
                   </pre>
                 </div>
+              </div>
+            )}
+
+            {activeTab === "terminal" && (
+              <div className="h-full flex flex-col space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-zinc-500 font-mono">
+                    Direct Container Execution Shell
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setTerminalOutput(
+                        "Console cleared.\nReady to execute commands inside container:\n\n"
+                      )
+                    }
+                  >
+                    Clear Console
+                  </Button>
+                </div>
+
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col">
+                  <TerminalViewer logs={terminalOutput} />
+                </div>
+
+                <form onSubmit={handleExec} className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Enter command inside container (e.g. sh, uname -a, ls /)..."
+                    value={execCmd}
+                    onChange={(e) => setExecCmd(e.target.value)}
+                    className="flex-1 h-10 px-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                  <Button type="submit" variant="primary" isLoading={executing} className="px-5">
+                    Execute
+                  </Button>
+                </form>
               </div>
             )}
           </div>

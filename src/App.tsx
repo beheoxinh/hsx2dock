@@ -20,7 +20,7 @@ const MainLayout: React.FC = () => {
   const [daemonState, setDaemonState] = useState<DaemonState>("Stopped");
   const [isTogglingEngine, setIsTogglingEngine] = useState(false);
   const [selectedContainerId, setSelectedContainerId] = useState<string | null>(null);
-  const [drawerTab, setDrawerTab] = useState<"logs" | "inspect" | "stats">("logs");
+  const [drawerTab, setDrawerTab] = useState<"logs" | "inspect" | "stats" | "terminal">("logs");
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const toast = useToast();
@@ -35,6 +35,16 @@ const MainLayout: React.FC = () => {
   };
 
   useEffect(() => {
+    // Initialize Theme
+    const savedTheme = localStorage.getItem("theme");
+    if (savedTheme === "dark" || (!savedTheme && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+      document.documentElement.classList.add("dark");
+      document.documentElement.classList.remove("light");
+    } else if (savedTheme === "light") {
+      document.documentElement.classList.remove("dark");
+      document.documentElement.classList.add("light");
+    }
+
     fetchEngineStatus();
 
     let unlisten: (() => void) | undefined;
@@ -65,7 +75,7 @@ const MainLayout: React.FC = () => {
     }
   };
 
-  const handleOpenDetails = (id: string, tab: "logs" | "inspect" | "stats" = "logs") => {
+  const handleOpenDetails = (id: string, tab: "logs" | "inspect" | "stats" | "terminal" = "logs") => {
     setSelectedContainerId(id);
     setDrawerTab(tab);
   };
