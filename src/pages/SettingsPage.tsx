@@ -350,10 +350,10 @@ export const SettingsPage: React.FC = () => {
                       className="w-full h-11 px-3.5 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
                     />
                   </div>
-                  <div className="text-xs text-zinc-400 space-y-1 bg-zinc-950/60 p-3.5 rounded-xl border border-zinc-800/60">
-                    <span className="font-semibold text-zinc-300 block">Note:</span>
-                    <span>• The folder will be checked to determine if it is brand new or already has files.</span>
-                    <span>• If the folder is empty or not yet created, you can choose to transfer existing data.</span>
+                  <div className="text-xs text-zinc-400 bg-zinc-950/60 p-3.5 rounded-xl border border-zinc-800/60 flex flex-col gap-1.5">
+                    <span className="font-semibold text-zinc-300 block mb-0.5">Note:</span>
+                    <p className="m-0 block leading-relaxed">• The folder will be checked to determine if it is brand new or already has files.</p>
+                    <p className="m-0 block leading-relaxed">• If the folder is empty or not yet created, you can choose to transfer existing data.</p>
                   </div>
                 </div>
               )}

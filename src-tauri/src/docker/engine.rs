@@ -229,6 +229,8 @@ impl EngineManager {
             // is handled by the implicit port driver), and bridge netfilter
             // sysctls don't exist inside the user namespace.
             .arg("--userland-proxy=false")
+            .arg("--feature")
+            .arg("containerd-snapshotter=false")
             .env("DOCKER_IGNORE_BR_NETFILTER_ERROR", "1")
             .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
             .env("PATH", prefixed_path(&bin))
