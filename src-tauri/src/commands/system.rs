@@ -125,6 +125,8 @@ pub struct InspectPathResult {
     pub is_dir: bool,
     pub is_empty: bool,
     pub current_data_root: String,
+    /// `null` when the path is fine, otherwise the reason it is unusable.
+    pub fs_error: Option<String>,
 }
 
 #[tauri::command]
@@ -147,11 +149,18 @@ pub async fn check_data_root_path(
         }
     }
 
+    // Surface a d_type-incompatible filesystem here so the wizard can stop the
+    // user before a daemon restart + copy that could never have worked.
+    let fs_error = crate::docker::engine::check_data_root_filesystem(&p)
+        .err()
+        .map(|e| e.to_string());
+
     Ok(InspectPathResult {
         exists,
         is_dir,
         is_empty,
         current_data_root,
+        fs_error,
     })
 }
 
@@ -166,6 +175,10 @@ pub async fn migrate_data_root(
     if target.as_os_str().is_empty() {
         return Err("Target data root path cannot be empty".to_string());
     }
+
+    // Re-check server-side: the wizard check is advisory, and a bad filesystem
+    // would otherwise leave the engine unable to pull any image.
+    crate::docker::engine::check_data_root_filesystem(&target).map_err(|e| e.to_string())?;
 
     let old_data_root = state.engine.paths().data_root.clone();
 

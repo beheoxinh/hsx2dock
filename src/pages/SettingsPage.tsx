@@ -20,6 +20,7 @@ export const SettingsPage: React.FC = () => {
     is_dir: boolean;
     is_empty: boolean;
     current_data_root: string;
+    fs_error?: string | null;
   } | null>(null);
   const [shouldMoveData, setShouldMoveData] = useState(false);
   const [, setShouldClearOld] = useState(false);
@@ -501,6 +502,13 @@ export const SettingsPage: React.FC = () => {
                       setMigrationError("");
                       const inspection = await api.checkDataRootPath(clean);
                       setPathInspection(inspection);
+                      // Refuse up front: a filesystem without d_type cannot
+                      // run the engine's snapshotters, so every image pull
+                      // would fail with a lease error.
+                      if (inspection.fs_error) {
+                        setMigrationError(inspection.fs_error);
+                        return;
+                      }
                       if (!inspection.exists || inspection.is_empty) {
                         setStep("ask_move");
                       } else {

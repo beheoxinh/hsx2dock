@@ -36,6 +36,7 @@ export const api = {
       is_dir: boolean;
       is_empty: boolean;
       current_data_root: string;
+      fs_error?: string | null;
     }>("check_data_root_path", { path }),
   migrateDataRoot: (targetPath: string, moveData: boolean, clearOld: boolean) =>
     invoke<void>("migrate_data_root", {

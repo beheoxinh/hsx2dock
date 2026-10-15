@@ -228,6 +228,11 @@ impl EngineManager {
         self.kill_stale()?;
 
         let paths = self.paths();
+
+        // Refuse a data root on a filesystem without d_type *before* spawning:
+        // dockerd would boot, then fail every pull with an opaque lease error.
+        check_data_root_filesystem(&paths.data_root)?;
+
         for d in [
             &paths.data_root,
             &paths.runtime_dir,
@@ -524,6 +529,130 @@ fn set_executable(_path: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Data-root filesystem compatibility
+// ---------------------------------------------------------------------------
+
+/// Whether `dir` reports real `d_type` values from `readdir`.
+///
+/// containerd's `overlayfs` and `erofs` snapshotters **refuse to load** on a
+/// filesystem where `readdir` returns `DT_UNKNOWN`. When they fail, the
+/// `leases` gRPC service they register goes down with them, and every image
+/// pull dies with:
+///
+/// ```text
+/// error creating temporary lease: Unimplemented:
+///   unknown service containerd.services.leases.v1.Leases
+/// ```
+///
+/// This is a *filesystem* property, not a data-root one: an ext4 volume
+/// formatted **without** the `filetype` feature fails, while btrfs, xfs
+/// (`ftype=1`), tmpfs and ext4-with-`filetype` all work.
+///
+/// We probe with a raw `getdents64` because Rust's `read_dir` hides the
+/// distinction — `DirEntry::file_type()` falls back to an `lstat` when the
+/// kernel reports `DT_UNKNOWN`, so such a filesystem still looks fine.
+pub fn dir_supports_d_type(dir: &Path) -> Option<bool> {
+    /// The kernel's `DT_UNKNOWN`, returned when the fs cannot supply d_type.
+    const DT_UNKNOWN: u8 = 0;
+
+    // An empty directory tells us nothing — probe its parent instead.
+    let mut saw_entry = false;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if name != "." && name != ".." {
+                    saw_entry = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !saw_entry {
+        return dir.parent().and_then(dir_supports_d_type);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let file = File::open(dir).ok()?;
+        // 32 KiB comfortably holds a typical directory's dirents.
+        let mut buf = vec![0u8; 32 * 1024];
+        let nread = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                file.as_raw_fd() as libc::c_long,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len() as libc::c_long,
+            )
+        };
+        if nread <= 0 {
+            return None;
+        }
+        let end = nread as usize;
+        let mut off = 0usize;
+        let mut saw_real_type = false;
+        // struct linux_dirent64: u64 d_ino, s64 d_off, u16 d_reclen,
+        //                         u8 d_type, char d_name[]
+        while off + 19 <= end {
+            let d_reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            if d_reclen == 0 || off + d_reclen > end {
+                break;
+            }
+            let d_type = buf[off + 18];
+            let name = buf[off + 19..off + d_reclen]
+                .split(|b| *b == 0)
+                .next()
+                .unwrap_or(b"");
+            if name != b"." && name != b".." {
+                if d_type == DT_UNKNOWN {
+                    // One unknown entry means the fs cannot answer at all.
+                    return Some(false);
+                }
+                saw_real_type = true;
+            }
+            off += d_reclen;
+        }
+        return Some(saw_real_type);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(true)
+    }
+}
+
+/// Reject a data-root whose filesystem cannot support the bundled engine's
+/// containerd snapshotters, with an explanation the user can act on.
+///
+/// Called before spawning `dockerd` and by the Settings wizard, so a bad path
+/// is refused up front instead of surfacing later as an opaque
+/// "unknown service containerd.services.leases.v1.Leases" on the first pull.
+pub fn check_data_root_filesystem(dir: &Path) -> Result<()> {
+    // The directory may not exist yet — its nearest existing ancestor is on
+    // the same filesystem, so probe that.
+    let mut probe = dir;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) if p != probe => probe = p,
+            _ => return Ok(()), // nothing to probe; let dockerd report it
+        }
+    }
+    if dir_supports_d_type(probe) == Some(false) {
+        bail!(
+            "the filesystem holding {} does not report directory entry types \
+             (d_type), which Docker's containerd snapshotters require. Image \
+             pulls would fail with \"unknown service \
+             containerd.services.leases.v1.Leases\". Choose a data root on a \
+             filesystem that supports d_type — btrfs, xfs with ftype=1, ext4 \
+             with the filetype feature, or tmpfs.",
+            probe.display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle helpers
 // ---------------------------------------------------------------------------
 
@@ -763,6 +892,75 @@ pub fn swap_current(paths: &EnginePaths, version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detector must accept a filesystem that answers with real d_types.
+    /// We can't conjure a d_type-less fs in a unit test, so this pins the
+    /// contract on the tmpfs/ext4 the tests run on plus the empty-directory
+    /// path, which must fall through to the parent rather than report `false`.
+    #[test]
+    fn d_type_probe_accepts_populated_dir() {
+        let dir = std::env::temp_dir().join(format!("dm-dtype-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("entry"), b"x").unwrap();
+
+        assert_eq!(dir_supports_d_type(&dir), Some(true));
+        assert!(check_data_root_filesystem(&dir).is_ok());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty directory carries no dirents to inspect, so the probe must walk
+    /// up to a parent that does — never claim `false` out of silence.
+    #[test]
+    fn d_type_probe_walks_up_from_empty_dir() {
+        let root = std::env::temp_dir().join(format!("dm-dtype-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+
+        assert_eq!(dir_supports_d_type(&empty), Some(true));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path that does not exist yet must still be judged by the filesystem it
+    /// would land on — that is exactly the Settings-wizard case.
+    #[test]
+    fn filesystem_check_probes_nearest_existing_ancestor() {
+        let root = std::env::temp_dir().join(format!("dm-dtype-new-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let not_yet = root.join("a/b/c");
+
+        assert!(!not_yet.exists());
+        assert!(check_data_root_filesystem(&not_yet).is_ok());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Opt-in probe against a real path, to check the detector on the actual
+    /// volume rather than tmpfs. The fs backing `/mnt` on the machine that
+    /// reported this bug is ext4 formatted **without** the `filetype` feature,
+    /// where containerd's snapshotters refuse to load and every pull fails with
+    /// the lease error. Run with:
+    /// `DM_DTYPE_PATH=/mnt/... cargo test --lib d_type_against_real -- --ignored`
+    #[test]
+    #[ignore = "requires a machine-specific path in DM_DTYPE_PATH"]
+    fn d_type_against_real_path_matches_gate() {
+        let Ok(path) = std::env::var("DM_DTYPE_PATH") else {
+            return;
+        };
+        let probe = std::path::PathBuf::from(path);
+        // The two functions must always agree: a detection of `false` is
+        // exactly what makes the pre-flight check refuse the path.
+        assert_eq!(
+            dir_supports_d_type(&probe) == Some(false),
+            check_data_root_filesystem(&probe).is_err(),
+            "detector and pre-flight gate disagree for {}",
+            probe.display()
+        );
+    }
 
     #[test]
     fn paths_use_xdg_and_keep_socket_short() {
