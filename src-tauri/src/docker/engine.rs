@@ -24,6 +24,11 @@ const COMPOSE_BASE: &str = "https://github.com/docker/compose/releases/download"
 /// Where users can read about the engine upstream.
 pub const DOCKER_INSTALL_DOCS_URL: &str = "https://docs.docker.com/engine/install/";
 
+/// How long `start()` waits for the daemon's API socket to answer before
+/// declaring the start a failure. dockerd's first boot on a cold data-root can
+/// take a few seconds (unpacking layers, initializing storage driver).
+const HEALTH_TIMEOUT_SECS: u64 = 30;
+
 /// Pinned default release.
 ///
 /// `download.docker.com` publishes **no** checksum manifest for the static
@@ -165,11 +170,45 @@ impl EngineManager {
         is_usable_socket(&p.socket)
     }
 
+    /// True only when the engine process is genuinely alive AND the API socket
+    /// answers. A spawned-but-immediately-crashed child (e.g. dockerd exiting
+    /// during buildkit init) must not report as running: we reap it here with
+    /// `try_wait` so the stale handle is cleared and the UI flips to Stopped.
     pub fn is_running(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|i| i.child.is_some())
-            .unwrap_or(false)
+        // `try_lock`: the engine thread may be inside `stop()` (which holds the
+        // lock for up to 15s while waiting for SIGTERM). Blocking the caller —
+        // including the 2s background monitor — on that would stall the runtime;
+        // when contended we simply report "not running", which is what a stop
+        // in progress means anyway.
+        let mut guard = match self.inner.try_lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+
+        let Some(child) = guard.child.as_mut() else {
+            return false;
+        };
+
+        // Reap: `Ok(Some(status))` means the child already exited.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::warn!("engine process exited unexpectedly: {status}");
+                guard.child = None;
+                false
+            }
+            Ok(None) => {
+                // Process still alive; confirm the API socket is actually up.
+                let socket = self.paths.read().map(|p| p.socket.clone()).ok();
+                match socket {
+                    Some(s) => is_usable_socket(&s),
+                    None => false,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("engine try_wait failed: {e}");
+                false
+            }
+        }
     }
 
     /// Spawn `rootlesskit` running `dockerd` rootless, as our child.
@@ -253,8 +292,48 @@ impl EngineManager {
 
         let child = cmd.spawn().context("failed to spawn rootlesskit")?;
         let _ = fs::write(&paths.pid_file, child.id().to_string());
+        let pid = child.id();
         self.inner.lock().unwrap().child = Some(child);
-        Ok(())
+
+        // Verify the daemon actually reaches a live API socket. dockerd can
+        // spawn fine and then die during init (e.g. buildkit/containerd
+        // failure) — without this probe the UI would show "Running" for a
+        // process that is already gone.
+        let deadline = Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECS);
+        loop {
+            if is_usable_socket(&paths.socket) {
+                tracing::info!("engine socket is live after start (pid {pid})");
+                return Ok(());
+            }
+            let exited = {
+                let mut guard = self.inner.lock().unwrap();
+                match guard.child.as_mut() {
+                    Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                    None => true,
+                }
+            };
+            if exited {
+                let mut guard = self.inner.lock().unwrap();
+                guard.child = None;
+                let _ = fs::remove_file(&paths.pid_file);
+                bail!(
+                    "engine exited during startup; see {} for details",
+                    paths.log_file.display()
+                );
+            }
+            if Instant::now() >= deadline {
+                // Still alive but never opened the socket — kill and report.
+                if let Some(c) = self.inner.lock().unwrap().child.take() {
+                    signal(c.id(), libc::SIGKILL);
+                }
+                let _ = fs::remove_file(&paths.pid_file);
+                bail!(
+                    "engine did not open its API socket within {HEALTH_TIMEOUT_SECS}s; see {}",
+                    paths.log_file.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// SIGTERM → wait up to 15s → SIGKILL → reap. Never leaves a zombie.

@@ -35,12 +35,15 @@ impl AppState {
 
     pub fn daemon_state(&self) -> DaemonState {
         if !self.engine.is_installed() {
-            DaemonState::NotInstalled
-        } else if self.engine.is_running() || self.engine.socket_live() {
-            DaemonState::Running
-        } else {
-            DaemonState::Stopped
+            return DaemonState::Stopped;
         }
+        if self.engine.is_running() {
+            return DaemonState::Running;
+        }
+        if self.engine.socket_live() {
+            return DaemonState::Running;
+        }
+        DaemonState::Stopped
     }
 
     pub async fn get_client(&self) -> Result<DockerClient, String> {

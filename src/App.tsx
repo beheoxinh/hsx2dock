@@ -85,8 +85,20 @@ const MainLayout: React.FC = () => {
       const newState = await api.toggleEngine();
       setDaemonState(newState);
       setRefreshKey((k) => k + 1);
+      // Re-verify against the backend: `toggle_engine` may return Running from
+      // a process that has not opened its socket yet, and a failed start must
+      // not leave a stale "Running" label on the button.
+      const verified = await api.getEngineStatus();
+      setDaemonState(verified);
     } catch (e) {
       toast.error("Failed to toggle engine", String(e));
+      // The daemon may have died mid-startup; never leave a stale "Running"
+      // button behind — re-read the real state from the backend.
+      try {
+        setDaemonState(await api.getEngineStatus());
+      } catch {
+        setDaemonState("Stopped");
+      }
     } finally {
       setIsTogglingEngine(false);
     }
