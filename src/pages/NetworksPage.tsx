@@ -247,10 +247,10 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
                   onChange={(e) => setDriver(e.target.value)}
                   className="w-full h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer"
                 >
-                  <option value="bridge">Bridge (Default)</option>
-                  <option value="macvlan">Macvlan</option>
-                  <option value="ipvlan">IPvlan</option>
-                  <option value="overlay">Overlay</option>
+                  <option value="bridge" className="bg-zinc-900 text-white">Bridge (Default)</option>
+                  <option value="macvlan" className="bg-zinc-900 text-white">Macvlan</option>
+                  <option value="ipvlan" className="bg-zinc-900 text-white">IPvlan</option>
+                  <option value="overlay" className="bg-zinc-900 text-white">Overlay</option>
                 </select>
               </div>
 

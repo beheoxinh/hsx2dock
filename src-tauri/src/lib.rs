@@ -81,6 +81,20 @@ pub fn run() {
                 }
             }
 
+            // Resize window to 90% width and 95% height of primary monitor
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(Some(monitor)) = window.primary_monitor() {
+                    let screen_size = monitor.size();
+                    let target_width = (screen_size.width as f64 * 0.90) as u32;
+                    let target_height = (screen_size.height as f64 * 0.95) as u32;
+                    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+                        width: target_width,
+                        height: target_height,
+                    }));
+                    let _ = window.center();
+                }
+            }
+
             start_background_monitoring(handle);
             Ok(())
         })
