@@ -160,6 +160,8 @@ pub fn run() {
             system::save_app_config,
             system::get_cli_bridge_status,
             system::toggle_cli_bridge,
+            system::check_data_root_path,
+            system::migrate_data_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

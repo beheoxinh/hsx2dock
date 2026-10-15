@@ -69,6 +69,8 @@ pub async fn save_app_config(
     config: AppConfig,
 ) -> Result<(), String> {
     config.save().await.map_err(|e| e.to_string())?;
+    // Sync data_root immediately to engine paths so subsequent daemon restarts take effect without restarting the app
+    state.engine.set_data_root(Some(&config.data_root));
     *state.config.write().await = config;
     Ok(())
 }
@@ -82,7 +84,8 @@ pub struct CliBridgeStatus {
 #[tauri::command]
 pub async fn get_cli_bridge_status(state: State<'_, AppState>) -> Result<CliBridgeStatus, String> {
     let config = state.config.read().await;
-    let engine_socket = &state.engine.paths().socket;
+    let engine_paths = state.engine.paths();
+    let engine_socket = &engine_paths.socket;
     let link_state = xdg_symlink_state(engine_socket);
 
     Ok(CliBridgeStatus {
@@ -114,4 +117,113 @@ pub async fn toggle_cli_bridge(
         enabled: config.cli_bridge_enabled,
         link_state: xdg_symlink_state(&engine_socket),
     })
+}
+
+#[derive(serde::Serialize)]
+pub struct InspectPathResult {
+    pub exists: bool,
+    pub is_dir: bool,
+    pub is_empty: bool,
+    pub current_data_root: String,
+}
+
+#[tauri::command]
+pub async fn check_data_root_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<InspectPathResult, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    let current_data_root = state.engine.paths().data_root.to_string_lossy().to_string();
+
+    let exists = p.exists();
+    let is_dir = p.is_dir();
+    let mut is_empty = true;
+
+    if exists && is_dir {
+        if let Ok(mut entries) = std::fs::read_dir(&p) {
+            if entries.next().is_some() {
+                is_empty = false;
+            }
+        }
+    }
+
+    Ok(InspectPathResult {
+        exists,
+        is_dir,
+        is_empty,
+        current_data_root,
+    })
+}
+
+#[tauri::command]
+pub async fn migrate_data_root(
+    state: State<'_, AppState>,
+    target_path: String,
+    move_data: bool,
+    clear_old: bool,
+) -> Result<(), String> {
+    let target = std::path::PathBuf::from(target_path.trim());
+    if target.as_os_str().is_empty() {
+        return Err("Target data root path cannot be empty".to_string());
+    }
+
+    let old_data_root = state.engine.paths().data_root.clone();
+
+    // 1. If engine is currently running, stop it first before moving files
+    let was_running = state.daemon_state() == DaemonState::Running;
+    if was_running {
+        let engine = state.engine.clone();
+        crate::runtime::engine_op(move || engine.stop())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        *state.client.write().await = None;
+    }
+
+    // 2. Ensure target directory exists
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|e| format!("Failed to create target directory: {e}"))?;
+
+    // 3. Move/Copy data if requested and old directory exists
+    if move_data && old_data_root.exists() && old_data_root != target {
+        tracing::info!("Copying data from {:?} to {:?}", old_data_root, target);
+        // Use cp -a via std::process::Command for rootless layer preserving permissions and symlinks
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(format!("{}/.", old_data_root.display()))
+            .arg(format!("{}/", target.display()))
+            .status()
+            .map_err(|e| format!("Failed to copy data root content: {e}"))?;
+
+        if !status.success() {
+            return Err("Failed to copy existing data to new path".to_string());
+        }
+    }
+
+    // 4. Clear old data if requested
+    if clear_old && old_data_root.exists() && old_data_root != target {
+        tracing::info!("Clearing old data root directory: {:?}", old_data_root);
+        let _ = tokio::fs::remove_dir_all(&old_data_root).await;
+    }
+
+    // 5. Update engine paths immediately
+    state.engine.set_data_root(Some(&target.to_string_lossy()));
+
+    // 6. Save updated path into AppConfig
+    let mut config = state.config.write().await;
+    config.data_root = target.to_string_lossy().to_string();
+    config.save().await.map_err(|e| e.to_string())?;
+
+    // 7. Restart engine if it was running before
+    if was_running {
+        let engine = state.engine.clone();
+        crate::runtime::engine_op(move || engine.start())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let _ = state.get_client().await;
+    }
+
+    Ok(())
 }

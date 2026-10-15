@@ -116,7 +116,7 @@ impl EnginePaths {
 #[derive(Clone)]
 pub struct EngineManager {
     inner: Arc<Mutex<Inner>>,
-    paths: EnginePaths,
+    paths: Arc<std::sync::RwLock<EnginePaths>>,
 }
 
 struct Inner {
@@ -127,25 +127,32 @@ impl EngineManager {
     pub fn new(paths: EnginePaths) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { child: None })),
-            paths,
+            paths: Arc::new(std::sync::RwLock::new(paths)),
         }
     }
 
-    pub fn paths(&self) -> &EnginePaths {
-        &self.paths
+    pub fn paths(&self) -> EnginePaths {
+        self.paths.read().unwrap().clone()
     }
 
-    pub fn socket(&self) -> &Path {
-        &self.paths.socket
+    pub fn set_data_root(&self, custom_data_root: Option<&str>) {
+        let mut p = self.paths.write().unwrap();
+        *p = EnginePaths::with_custom_data_root(custom_data_root);
+    }
+
+    pub fn socket(&self) -> PathBuf {
+        self.paths.read().unwrap().socket.clone()
     }
 
     /// True once a release has been fully downloaded, verified and extracted.
     pub fn is_installed(&self) -> bool {
-        self.paths.current_dir.join(".complete").is_file()
+        let p = self.paths();
+        p.current_dir.join(".complete").is_file()
     }
 
     pub fn installed_version(&self) -> Option<String> {
-        fs::read_to_string(self.paths.current_dir.join("VERSION"))
+        let p = self.paths();
+        fs::read_to_string(p.current_dir.join("VERSION"))
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -154,7 +161,8 @@ impl EngineManager {
     /// Socket the engine listens on, if the socket exists and accepts a
     /// connection. Mirrors the "usable socket" rule used elsewhere.
     pub fn socket_live(&self) -> bool {
-        is_usable_socket(&self.paths.socket)
+        let p = self.paths();
+        is_usable_socket(&p.socket)
     }
 
     pub fn is_running(&self) -> bool {
@@ -180,27 +188,28 @@ impl EngineManager {
         // Reap anything left over from a hard-killed previous run.
         self.kill_stale()?;
 
+        let paths = self.paths();
         for d in [
-            &self.paths.data_root,
-            &self.paths.runtime_dir,
-            &self.paths.exec_root,
-            &self.paths.rootless_state,
+            &paths.data_root,
+            &paths.runtime_dir,
+            &paths.exec_root,
+            &paths.rootless_state,
         ] {
             fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
-        if let Some(parent) = self.paths.log_file.parent() {
+        if let Some(parent) = paths.log_file.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let bin = self.paths.bin_dir();
+        let bin = paths.bin_dir();
         let net = detect_net_driver(&bin);
-        let log = File::create(&self.paths.log_file)
-            .with_context(|| format!("open {}", self.paths.log_file.display()))?;
+        let log = File::create(&paths.log_file)
+            .with_context(|| format!("open {}", paths.log_file.display()))?;
         let log_err = log.try_clone()?;
 
         let mut cmd = Command::new(bin.join("rootlesskit"));
         cmd.arg("--state-dir")
-            .arg(&self.paths.rootless_state)
+            .arg(&paths.rootless_state)
             .arg(format!("--net={net}"))
             .arg("--mtu=65520");
         for flag in net_flags(&net) {
@@ -210,18 +219,18 @@ impl EngineManager {
             .arg("--copy-up=/run")
             .arg("--")
             .arg(bin.join("dockerd"))
-            .arg(format!("--data-root={}", self.paths.data_root.display()))
-            .arg(format!("--exec-root={}", self.paths.exec_root.display()))
-            .arg(format!("--host=unix://{}", self.paths.socket.display()))
+            .arg(format!("--data-root={}", paths.data_root.display()))
+            .arg(format!("--exec-root={}", paths.exec_root.display()))
+            .arg(format!("--host=unix://{}", paths.socket.display()))
             .arg("--pidfile")
-            .arg(self.paths.dockerd_pid_file())
+            .arg(paths.dockerd_pid_file())
             // Required for rootless: the userland proxy can't work without
             // its helper binary (and pasta needs no proxy — port forwarding
             // is handled by the implicit port driver), and bridge netfilter
             // sysctls don't exist inside the user namespace.
             .arg("--userland-proxy=false")
             .env("DOCKER_IGNORE_BR_NETFILTER_ERROR", "1")
-            .env("XDG_RUNTIME_DIR", &self.paths.runtime_dir)
+            .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
             .env("PATH", prefixed_path(&bin))
             .stdin(Stdio::null())
             // A `piped` stdout that nobody drains would fill the 64 KB pipe
@@ -241,7 +250,7 @@ impl EngineManager {
         }
 
         let child = cmd.spawn().context("failed to spawn rootlesskit")?;
-        let _ = fs::write(&self.paths.pid_file, child.id().to_string());
+        let _ = fs::write(&paths.pid_file, child.id().to_string());
         self.inner.lock().unwrap().child = Some(child);
         Ok(())
     }
@@ -267,18 +276,19 @@ impl EngineManager {
                 }
             }
         }
-        let _ = fs::remove_file(&self.paths.pid_file);
+        let _ = fs::remove_file(&self.paths().pid_file);
         Ok(())
     }
 
     /// Kill an engine left behind by a previous (hard-killed) app run, but only
     /// if the pidfile's process is really ours — never signal a recycled PID.
     fn kill_stale(&self) -> Result<()> {
-        let Ok(raw) = fs::read_to_string(&self.paths.pid_file) else {
+        let paths = self.paths();
+        let Ok(raw) = fs::read_to_string(&paths.pid_file) else {
             return Ok(());
         };
         let Ok(pid) = raw.trim().parse::<i32>() else {
-            let _ = fs::remove_file(&self.paths.pid_file);
+            let _ = fs::remove_file(&paths.pid_file);
             return Ok(());
         };
         if matches!(
@@ -291,7 +301,7 @@ impl EngineManager {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        let _ = fs::remove_file(&self.paths.pid_file);
+        let _ = fs::remove_file(&paths.pid_file);
         Ok(())
     }
 }

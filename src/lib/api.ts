@@ -30,6 +30,19 @@ export const api = {
   saveAppConfig: (config: AppConfig) => invoke<void>("save_app_config", { config }),
   getCliBridgeStatus: () => invoke<CliBridgeStatus>("get_cli_bridge_status"),
   toggleCliBridge: (enabled: boolean) => invoke<CliBridgeStatus>("toggle_cli_bridge", { enabled }),
+  checkDataRootPath: (path: string) =>
+    invoke<{
+      exists: boolean;
+      is_dir: boolean;
+      is_empty: boolean;
+      current_data_root: string;
+    }>("check_data_root_path", { path }),
+  migrateDataRoot: (targetPath: string, moveData: boolean, clearOld: boolean) =>
+    invoke<void>("migrate_data_root", {
+      targetPath,
+      moveData,
+      clearOld,
+    }),
 
   // Containers
   listContainers: (all: boolean = true) => invoke<ContainerItem[]>("list_containers", { all }),

@@ -18,7 +18,7 @@ impl AppState {
         let paths = EnginePaths::with_custom_data_root(Some(&config.data_root));
         let engine = Arc::new(EngineManager::new(paths));
         let socket = engine.socket();
-        let client = match DockerClient::connect(Some(socket)) {
+        let client = match DockerClient::connect(Some(&socket)) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("Failed initial connection to Docker: {e}");
@@ -55,7 +55,7 @@ impl AppState {
         // Try reconnecting to engine socket
         let mut write_guard = self.client.write().await;
         let socket = self.engine.socket();
-        match DockerClient::connect(Some(socket)) {
+        match DockerClient::connect(Some(&socket)) {
             Ok(c) => {
                 *write_guard = Some(c.clone());
                 Ok(c)

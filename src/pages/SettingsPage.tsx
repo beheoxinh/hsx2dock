@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
@@ -10,6 +10,20 @@ export const SettingsPage: React.FC = () => {
   const [cliStatus, setCliStatus] = useState<CliBridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  // Modal Migration State
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [newPathInput, setNewPathInput] = useState("");
+  const [step, setStep] = useState<"input" | "ask_move" | "ask_clear" | "migrating">("input");
+  const [pathInspection, setPathInspection] = useState<{
+    exists: boolean;
+    is_dir: boolean;
+    is_empty: boolean;
+    current_data_root: string;
+  } | null>(null);
+  const [shouldMoveData, setShouldMoveData] = useState(false);
+  const [, setShouldClearOld] = useState(false);
+  const [migrationError, setMigrationError] = useState("");
 
   const loadSettings = async () => {
     try {
@@ -35,6 +49,22 @@ export const SettingsPage: React.FC = () => {
       if (config) setConfig({ ...config, cli_bridge_enabled: enabled });
     } catch (e) {
       alert(`Toggle CLI bridge failed: ${e}`);
+    }
+  };
+
+  const performMigration = async (clearOldSelection: boolean) => {
+    const clean = newPathInput.trim();
+    if (!clean) return;
+    try {
+      setStep("migrating");
+      setMigrationError("");
+      await api.migrateDataRoot(clean, shouldMoveData, clearOldSelection);
+      // Reload updated config
+      await loadSettings();
+      setIsModalOpen(false);
+    } catch (err) {
+      setMigrationError(String(err));
+      setStep("ask_clear");
     }
   };
 
@@ -157,17 +187,36 @@ export const SettingsPage: React.FC = () => {
 
           <div>
             <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
-              Custom Data Root Path
+              Current Data Root Path
             </label>
-            <input
-              type="text"
-              placeholder="Leave blank for default (~/.local/share/docker-manager/data) or enter e.g. /mnt/data/docker"
-              value={config.data_root || ""}
-              onChange={(e) => setConfig({ ...config, data_root: e.target.value })}
-              className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
-            />
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                readOnly
+                disabled
+                value={config.data_root || "Default: ~/.local/share/docker-manager/data"}
+                className="flex-1 h-10 px-3.5 rounded-xl bg-zinc-950/80 border border-zinc-800 text-sm text-zinc-300 font-mono cursor-not-allowed select-text opacity-90"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setNewPathInput(config.data_root || "");
+                  setStep("input");
+                  setPathInspection(null);
+                  setShouldMoveData(false);
+                  setShouldClearOld(false);
+                  setMigrationError("");
+                  setIsModalOpen(true);
+                }}
+                className="gap-2 h-10 px-4 shrink-0 font-medium"
+              >
+                <FolderEdit className="w-4 h-4 text-emerald-400" />
+                <span>Change Path</span>
+              </Button>
+            </div>
             <p className="text-xs text-zinc-500 mt-2">
-              * Note: Changing this path requires restarting the Docker Daemon for changes to take effect. Ensure target directory has appropriate user permissions.
+              * Note: Modifying the path uses an interactive wizard to safely check folder contents, offer data migration, and switch paths seamlessly.
             </p>
           </div>
         </Card>
@@ -252,6 +301,227 @@ export const SettingsPage: React.FC = () => {
           </Button>
         </div>
       </form>
+
+      {/* Change Data Root Interactive Wizard Modal */}
+      {isModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-xl overflow-hidden shadow-2xl flex flex-col">
+            {/* Modal Header */}
+            <div className="h-14 px-6 border-b border-zinc-800 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <HardDrive className="w-5 h-5 text-emerald-400" />
+                <h3 className="font-semibold text-white">Change Engine Data Root Path</h3>
+              </div>
+              {step !== "migrating" && (
+                <button
+                  type="button"
+                  onClick={() => setIsModalOpen(false)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-5">
+              {migrationError && (
+                <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-center gap-2.5 text-xs text-rose-400">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{migrationError}</span>
+                </div>
+              )}
+
+              {/* Step 1: Input Path */}
+              {step === "input" && (
+                <div className="space-y-4">
+                  <p className="text-sm text-zinc-300">
+                    Enter the new absolute destination folder for storing all container layers, images, and volumes:
+                  </p>
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                      New Directory Path
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. /mnt/data/docker-storage"
+                      value={newPathInput}
+                      onChange={(e) => setNewPathInput(e.target.value)}
+                      className="w-full h-11 px-3.5 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+                    />
+                  </div>
+                  <div className="text-xs text-zinc-400 space-y-1 bg-zinc-950/60 p-3.5 rounded-xl border border-zinc-800/60">
+                    <span className="font-semibold text-zinc-300 block">Note:</span>
+                    <span>• The folder will be checked to determine if it is brand new or already has files.</span>
+                    <span>• If the folder is empty or not yet created, you can choose to transfer existing data.</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 2: Destination is empty/new -> Ask to move existing data */}
+              {step === "ask_move" && (
+                <div className="space-y-4">
+                  <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl space-y-2">
+                    <div className="flex items-center gap-2 font-medium text-sm text-blue-300">
+                      <Check className="w-4 h-4 text-blue-400" />
+                      <span>Destination Directory is Empty / New</span>
+                    </div>
+                    <p className="text-xs text-zinc-300">
+                      Target location: <span className="font-mono text-white">{newPathInput}</span>
+                    </p>
+                  </div>
+
+                  <p className="text-sm text-zinc-200">
+                    Do you want to <span className="font-semibold text-emerald-400">transfer (clone/move) your existing containers, images and volumes</span> to this new location?
+                  </p>
+
+                  <div className="grid grid-cols-2 gap-3 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShouldMoveData(true);
+                        setStep("ask_clear");
+                      }}
+                      className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-left transition-colors group cursor-pointer"
+                    >
+                      <span className="font-semibold text-sm text-white block group-hover:text-emerald-300">
+                        Yes, Move Data
+                      </span>
+                      <span className="text-xs text-zinc-400 mt-1 block">
+                        Preserves all current images, volumes, and containers.
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShouldMoveData(false);
+                        setStep("ask_clear");
+                      }}
+                      className="p-4 rounded-xl border border-zinc-800 bg-zinc-950 hover:bg-zinc-800/60 text-left transition-colors group cursor-pointer"
+                    >
+                      <span className="font-semibold text-sm text-white block group-hover:text-zinc-200">
+                        No, Start Fresh
+                      </span>
+                      <span className="text-xs text-zinc-400 mt-1 block">
+                        Initialize a fresh empty Docker data root environment.
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 3: Ask to clear old data root directory */}
+              {step === "ask_clear" && (
+                <div className="space-y-4">
+                  <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl space-y-2">
+                    <div className="flex items-center gap-2 font-medium text-sm text-amber-300">
+                      <AlertTriangle className="w-4 h-4 text-amber-400" />
+                      <span>Clean Up Old Storage</span>
+                    </div>
+                    <p className="text-xs text-zinc-300">
+                      Old location: <span className="font-mono text-zinc-200">{pathInspection?.current_data_root || "default data root"}</span>
+                    </p>
+                  </div>
+
+                  <p className="text-sm text-zinc-200">
+                    Do you want to <span className="font-semibold text-amber-400">delete and clear all files at the old data root path</span> to reclaim disk space?
+                  </p>
+
+                  <div className="grid grid-cols-2 gap-3 pt-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setShouldClearOld(true);
+                        await performMigration(true);
+                      }}
+                      className="p-4 rounded-xl border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 text-left transition-colors group cursor-pointer"
+                    >
+                      <span className="font-semibold text-sm text-white block group-hover:text-rose-300">
+                        Yes, Delete Old Files
+                      </span>
+                      <span className="text-xs text-zinc-400 mt-1 block">
+                        Reclaim storage on the previous filesystem.
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setShouldClearOld(false);
+                        await performMigration(false);
+                      }}
+                      className="p-4 rounded-xl border border-zinc-800 bg-zinc-950 hover:bg-zinc-800/60 text-left transition-colors group cursor-pointer"
+                    >
+                      <span className="font-semibold text-sm text-white block group-hover:text-zinc-200">
+                        Keep Old Files
+                      </span>
+                      <span className="text-xs text-zinc-400 mt-1 block">
+                        Leave files intact as a backup.
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 4: Migrating progress spinner */}
+              {step === "migrating" && (
+                <div className="py-8 flex flex-col items-center justify-center space-y-4">
+                  <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+                  <div className="text-center">
+                    <p className="font-semibold text-white">Applying Data Root Changes...</p>
+                    <p className="text-xs text-zinc-400 mt-1">
+                      Stopping daemon, migrating storage directories, updating configurations, and restarting engine.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            {step === "input" && (
+              <div className="h-16 px-6 border-t border-zinc-800 flex items-center justify-between bg-zinc-950/40">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setIsModalOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary"
+                  onClick={async () => {
+                    const clean = newPathInput.trim();
+                    if (!clean) {
+                      setMigrationError("Please specify a valid folder path");
+                      return;
+                    }
+                    try {
+                      setMigrationError("");
+                      const inspection = await api.checkDataRootPath(clean);
+                      setPathInspection(inspection);
+                      if (!inspection.exists || inspection.is_empty) {
+                        setStep("ask_move");
+                      } else {
+                        // Folder already exists and contains files -> ask to clear old or switch directly
+                        setShouldMoveData(false);
+                        setStep("ask_clear");
+                      }
+                    } catch (e) {
+                      setMigrationError(String(e));
+                    }
+                  }}
+                  className="gap-2"
+                >
+                  <span>Continue</span>
+                  <ArrowRight className="w-4 h-4" />
+                </Button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
