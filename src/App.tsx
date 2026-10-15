@@ -14,6 +14,7 @@ import { ComposePage } from "./pages/ComposePage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
 import type { DaemonState } from "./types";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
 const MainLayout: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
@@ -43,6 +44,22 @@ const MainLayout: React.FC = () => {
     } else if (savedTheme === "light") {
       document.documentElement.classList.remove("dark");
       document.documentElement.classList.add("light");
+    }
+
+    // Enforce 90% width and 95% height on application mount
+    try {
+      const appWin = getCurrentWindow();
+      if (window.screen && window.screen.availWidth && window.screen.availHeight) {
+        const targetW = Math.round(window.screen.availWidth * 0.90);
+        const targetH = Math.round(window.screen.availHeight * 0.95);
+        appWin.setSize(new LogicalSize(targetW, targetH)).then(() => {
+          appWin.center();
+        }).catch((err) => {
+          console.warn("Failed to set window size from frontend:", err);
+        });
+      }
+    } catch (err) {
+      console.warn("Could not access Tauri window API:", err);
     }
 
     fetchEngineStatus();

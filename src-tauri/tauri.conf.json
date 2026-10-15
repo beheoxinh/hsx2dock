@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Docker Manager",
-        "width": 1280,
-        "height": 840,
+        "width": 1720,
+        "height": 1000,
         "minWidth": 960,
         "minHeight": 640,
         "center": true,
