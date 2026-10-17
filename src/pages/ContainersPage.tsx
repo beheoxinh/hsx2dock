@@ -20,6 +20,7 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { useToast } from "../components/ui/Toast";
+import { useModal } from "../components/ui/ModalContext";
 import { api, events } from "../lib/api";
 import { formatBytes, truncateId } from "../lib/utils";
 import type { ContainerItem, ContainerStats } from "../types";
@@ -39,6 +40,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const toast = useToast();
+  const modal = useModal();
 
   const loadContainers = async () => {
     try {
@@ -113,7 +115,8 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         });
         toast.success("Container cloned", `Created duplicate container: ${newName}`);
       } else if (action === "remove") {
-        if (!confirm(`Are you sure you want to remove container '${cName}'?`)) return;
+        const confirmed = await modal.showConfirm(`Are you sure you want to remove container '${cName}'?\n\nThis action cannot be undone.`, "Remove Container", "danger");
+        if (!confirmed) return;
         await api.removeContainer(c.id, true);
         toast.success("Container removed", `${cName} was deleted.`);
       }

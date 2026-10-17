@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::config::AppConfig;
 use crate::docker::cli_bridge::{reconcile, xdg_symlink_state};
@@ -71,6 +71,19 @@ pub async fn save_app_config(
     config.save().await.map_err(|e| e.to_string())?;
     // Sync data_root immediately to engine paths so subsequent daemon restarts take effect without restarting the app
     state.engine.set_data_root(Some(&config.data_root));
+    // Keep the process-wide CLI preference in step so the next docker
+    // invocation resolves against the mode the user just picked.
+    crate::docker::engine::set_cli_mode(&config.cli_mode);
+    // A shim pins the binary it was generated for, so switching mode has to
+    // rewrite it — otherwise `docker -v` in a terminal keeps reporting the old
+    // CLI no matter what Settings says.
+    if crate::docker::engine::shim_installed() {
+        let paths = state.engine.paths();
+        let mode = config.cli_mode.clone();
+        if let Err(e) = crate::docker::engine::ensure_shim(&paths, &mode) {
+            tracing::warn!("could not refresh the docker shim after a mode change: {e:#}");
+        }
+    }
     *state.config.write().await = config;
     Ok(())
 }
@@ -99,24 +112,38 @@ pub async fn toggle_cli_bridge(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<CliBridgeStatus, String> {
-    let mut config = state.config.write().await;
-    config.cli_bridge_enabled = enabled;
-    config.save().await.map_err(|e| e.to_string())?;
+    {
+        let mut config = state.config.write().await;
+        config.cli_bridge_enabled = enabled;
+        config.save().await.map_err(|e| e.to_string())?;
+    }
+    let link_state = apply_cli_bridge(&state).await;
 
-    let engine_socket = state.engine.paths().socket.clone();
-    let is_live = state.daemon_state() == DaemonState::Running;
-    let _ = reconcile(
-        &engine_socket,
-        config.cli_bridge_enabled,
-        config.cli_bridge_set_default,
-        is_live,
-        &config.cli_bridge_prev_context,
-    );
-
+    let config = state.config.read().await;
     Ok(CliBridgeStatus {
         enabled: config.cli_bridge_enabled,
-        link_state: xdg_symlink_state(&engine_socket),
+        link_state,
     })
+}
+
+/// Bring the terminal bridge in line with `cli_bridge_enabled`.
+///
+/// Runs reconcile using the current daemon state so enabling the bridge when
+/// the engine comes up auto-links without needing the user to toggle it again.
+pub async fn apply_cli_bridge(state: &AppState) -> Option<bool> {
+    let engine_socket = state.engine.paths().socket.clone();
+    let is_live = state.daemon_state() == DaemonState::Running;
+    {
+        let config = state.config.read().await;
+        let _ = reconcile(
+            &engine_socket,
+            config.cli_bridge_enabled,
+            config.cli_bridge_set_default,
+            is_live,
+            &config.cli_bridge_prev_context,
+        );
+    }
+    xdg_symlink_state(&engine_socket)
 }
 
 #[derive(serde::Serialize)]
@@ -150,10 +177,19 @@ pub async fn check_data_root_path(
     }
 
     // Surface a d_type-incompatible filesystem here so the wizard can stop the
-    // user before a daemon restart + copy that could never have worked.
-    let fs_error = crate::docker::engine::check_data_root_filesystem(&p)
-        .err()
-        .map(|e| e.to_string());
+    // user before a daemon restart + copy that could never have worked. A bad
+    // filesystem is still workable when we can retarget containerd's
+    // snapshotter dirs onto a d_type-capable one, so only report it when that
+    // fallback is unavailable.
+    let fs_error = if crate::docker::engine::dir_supports_d_type(&p) == Some(false)
+        && crate::docker::engine::dtype_compat_root().is_some()
+    {
+        None
+    } else {
+        crate::docker::engine::check_data_root_filesystem(&p)
+            .err()
+            .map(|e| e.to_string())
+    };
 
     Ok(InspectPathResult {
         exists,
@@ -176,11 +212,30 @@ pub async fn migrate_data_root(
         return Err("Target data root path cannot be empty".to_string());
     }
 
-    // Re-check server-side: the wizard check is advisory, and a bad filesystem
-    // would otherwise leave the engine unable to pull any image.
-    crate::docker::engine::check_data_root_filesystem(&target).map_err(|e| e.to_string())?;
-
     let old_data_root = state.engine.paths().data_root.clone();
+
+    // Migrating onto the active data root is a no-op that would otherwise offer
+    // to wipe it; refuse before stopping the engine or touching any file.
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canon(&target) == canon(&old_data_root) {
+        return Err("This path is already the active data root — nothing to migrate.".to_string());
+    }
+
+    // Fail fast, before stopping the engine or copying anything, if the target
+    // filesystem cannot report d_type and no compatible fallback exists. Also,
+    // if source contains non-empty snapshotter dirs that must become symlinks on
+    // a d_type-less target, refuse before moving 42M of data.
+    if crate::docker::engine::dir_supports_d_type(&target) == Some(false) {
+        if let Some(msg) = crate::docker::engine::migrate_dtype_conflict(&old_data_root, &target)
+        {
+            return Err(msg);
+        }
+        if crate::docker::engine::dtype_compat_root().is_none() {
+            return crate::docker::engine::check_data_root_filesystem(&target)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
+    }
 
     // 1. If engine is currently running, stop it first before moving files
     let was_running = state.daemon_state() == DaemonState::Running;
@@ -214,6 +269,11 @@ pub async fn migrate_data_root(
         }
     }
 
+    // 3b. After the copy, make containerd's snapshotter dirs d_type-compatible
+    // if the new root's filesystem needs it. Idempotent, and no-op when the
+    // filesystem already reports real entry types.
+    crate::docker::engine::ensure_snapshotter_compat(&target).map_err(|e| e.to_string())?;
+
     // 4. Clear old data if requested
     if clear_old && old_data_root.exists() && old_data_root != target {
         tracing::info!("Clearing old data root directory: {:?}", old_data_root);
@@ -239,4 +299,210 @@ pub async fn migrate_data_root(
     }
 
     Ok(())
+}
+
+/// Check Docker's official static channel against the installed engine.
+///
+/// Errors are returned rather than swallowed: the UI has to be able to say
+/// "couldn't check" instead of reporting a false "up to date".
+#[tauri::command]
+pub async fn check_engine_update(
+    state: State<'_, AppState>,
+) -> Result<crate::docker::engine::EngineUpdateInfo, String> {
+    let paths = state.engine.paths();
+    crate::docker::engine::check_engine_update(&paths)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Download a newer engine and swap it in, streaming `engine-install-progress`
+/// events while it runs.
+///
+/// The daemon is stopped first because it holds the binaries being replaced,
+/// and restarted afterwards only if it was running — a failed install leaves
+/// the previous engine intact, so there is always something to come back to.
+#[tauri::command]
+pub async fn install_engine_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<String, String> {
+    let version = version.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        return Err("No engine version to install".to_string());
+    }
+
+    let was_running = state.daemon_state() == DaemonState::Running;
+    // A first-ever install leaves the engine stopped unless we start it here:
+    // nothing else on this path triggers a boot.
+    let should_start = was_running || state.engine.installed_version().is_none();
+    if was_running {
+        let engine = state.engine.clone();
+        crate::runtime::engine_op(move || engine.stop())
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner.map_err(|e| e.to_string()))?;
+        let _ = app.emit("engine-state-changed", state.daemon_state());
+    }
+
+    let paths = state.engine.paths();
+    let progress_app = app.clone();
+    let install = crate::docker::engine::install_engine_update(&paths, &version, move |progress| {
+        let _ = progress_app.emit("engine-install-progress", &progress);
+    })
+    .await;
+
+    let restart = if should_start {
+        let engine = state.engine.clone();
+        crate::runtime::engine_op(move || engine.start())
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|inner| inner.map_err(|e| e.to_string()))
+    } else {
+        Ok(())
+    };
+
+    install.map_err(|e| format!("{e:#}"))?;
+    restart?;
+    if should_start {
+        let _ = state.get_client().await;
+        // A restarted engine gets a new socket, so the terminal bridge has to
+        // re-attach before the next reconcile tick would.
+        let _ = apply_cli_bridge(&state).await;
+    }
+
+    let _ = app.emit("engine-state-changed", state.daemon_state());
+    Ok(version)
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct CliShimStatus {
+    pub installed: bool,
+    pub path: Option<String>,
+    /// Whether the shim would actually win in a terminal (`active`),
+    /// is unreachable (`not_on_path`), or is beaten by another docker
+    /// (`shadowed`). `None` when no shim is installed.
+    pub effect: Option<crate::docker::engine::ShimEffect>,
+    /// A `docker` already on PATH that the shim would override, so the UI can
+    /// warn before the user hides their own install.
+    pub shadows: Option<String>,
+    /// The binary the shim execs. If it differs from what the resolver currently
+    /// picks, the shim is stale and should be regenerated.
+    pub target: Option<String>,
+    pub stale: bool,
+}
+
+/// Everything the Docker CLI settings card needs, in one round trip: which
+/// binary the app resolved, the versions it compared, and whether the
+/// terminal shim is in place.
+#[derive(Clone, serde::Serialize)]
+pub struct CliStatus {
+    pub resolution: crate::docker::engine::CliResolution,
+    pub shim: CliShimStatus,
+}
+
+/// Which docker CLI the app is using, and why.
+///
+/// Also normalises the compose plugin layout first: the answer is only
+/// truthful if `docker compose` will actually resolve to the bundled plugin.
+#[tauri::command]
+pub async fn check_docker_cli(state: State<'_, AppState>) -> Result<CliStatus, String> {
+    let paths = state.engine.paths();
+    let _ = crate::docker::engine::ensure_compose_layout(&paths);
+    let config = state.config.read().await;
+    let resolution = crate::docker::engine::resolve_cli(&paths, &config.cli_mode, &[])?;
+    // Report what the shim would override, so the card can warn before the
+    // user hides a docker they already had.
+    let shadows = crate::docker::engine::find_system_docker(
+        &paths,
+        &crate::docker::engine::shim_path()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )
+    .map(|p| p.display().to_string());
+    // Cloned before `resolution` is moved into the return value; the shim is
+    // stale when the binary it pins is no longer the one the resolver picked.
+    let resolved_path = resolution.path.clone();
+    Ok(CliStatus {
+        resolution,
+        shim: CliShimStatus {
+            shadows,
+            ..current_shim_status(Some(&resolved_path))
+        },
+    })
+}
+
+/// Read-only shim state, shared by the builders above.
+///
+/// `expected` is the binary the resolver would pick right now; passing it lets
+/// the card tell "installed and current" apart from "installed but pinned to a
+/// CLI the user has since switched away from".
+fn current_shim_status(expected: Option<&std::path::Path>) -> CliShimStatus {
+    let target = crate::docker::engine::shim_target();
+    let stale = match (&target, expected) {
+        (Some(t), Some(e)) => t.as_path() != e,
+        _ => false,
+    };
+    CliShimStatus {
+        installed: crate::docker::engine::shim_installed(),
+        path: crate::docker::engine::shim_path().map(|p| p.display().to_string()),
+        effect: crate::docker::engine::shim_effect(),
+        shadows: None,
+        target: target.map(|t| t.display().to_string()),
+        stale,
+    }
+}
+
+/// Install or remove the `~/.local/bin/docker` shim.
+#[tauri::command]
+pub async fn toggle_cli_shim(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<CliShimStatus, String> {
+    let paths = state.engine.paths();
+    let mode = state.config.read().await.cli_mode.clone();
+
+    if enabled {
+        crate::docker::engine::ensure_shim(&paths, &mode).map_err(|e| format!("{e:#}"))?;
+    } else {
+        crate::docker::engine::remove_shim().map_err(|e| format!("{e:#}"))?;
+    }
+
+    let mut config = state.config.write().await;
+    config.cli_shim_enabled = enabled;
+    config.save().await.map_err(|e| e.to_string())?;
+
+    let expected = crate::docker::engine::resolve_cli(&paths, &mode, &[])
+        .ok()
+        .map(|r| r.path);
+    Ok(current_shim_status(expected.as_deref()))
+}
+
+/// Check the docker-compose plugin against its own GitHub release channel.
+#[tauri::command]
+pub async fn check_compose_update(
+    state: State<'_, AppState>,
+) -> Result<crate::docker::engine::ComposeUpdateInfo, String> {
+    let paths = state.engine.paths();
+    crate::docker::engine::check_compose_update(&paths)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Download and install a newer docker-compose plugin, streaming progress on
+/// the same channel the engine update uses.
+#[tauri::command]
+pub async fn install_compose_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<String, String> {
+    let paths = state.engine.paths();
+    let progress_app = app.clone();
+    crate::docker::engine::install_compose_update(&paths, &version, move |progress| {
+        let _ = progress_app.emit("engine-install-progress", &progress);
+    })
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(version)
 }

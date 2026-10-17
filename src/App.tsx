@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar, NavTab } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
 import { ToastProvider, useToast } from "./components/ui/Toast";
+import { ModalProvider } from "./components/ui/ModalContext";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ContainersPage } from "./pages/ContainersPage";
 import { ContainerDetailsDrawer } from "./pages/ContainerDetailsDrawer";
@@ -185,7 +186,9 @@ const MainLayout: React.FC = () => {
 export const App: React.FC = () => {
   return (
     <ToastProvider>
-      <MainLayout />
+      <ModalProvider>
+        <MainLayout />
+      </ModalProvider>
     </ToastProvider>
   );
 };

@@ -1,11 +1,32 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck } from "lucide-react";
 import { Card } from "../components/ui/Card";
+import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
-import { api } from "../lib/api";
-import type { AppConfig, CliBridgeStatus } from "../types";
+import { api, events } from "../lib/api";
+import type {
+  AppConfig,
+  CliBridgeStatus,
+  EngineUpdateInfo,
+  EngineInstallProgress,
+  CliResolution,
+  CliShimStatus,
+  ComposeUpdateInfo,
+} from "../types";
+
+const humanError = (e: unknown): string => {
+  const s = String(e);
+  if (/403|forbidden|rate/i.test(s) && /github/i.test(s)) {
+    return "GitHub refused the request (rate limited). Try again later.";
+  }
+  if (/429/i.test(s)) return "GitHub rate limited. Try again later.";
+  if (/timeout|timed out/i.test(s)) return "Request timed out. Check your connection.";
+  if (/network|connect|dns/i.test(s)) return "Network error. Check your connection.";
+  return s;
+};
 
 export const SettingsPage: React.FC = () => {
+  const toast = useToast();
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [cliStatus, setCliStatus] = useState<CliBridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
@@ -39,8 +60,130 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
+  // Engine update: what the official channel reports, plus in-flight state.
+  const [release, setRelease] = useState<EngineUpdateInfo | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<EngineInstallProgress | null>(null);
+
+  const checkForEngineUpdate = async (announce?: boolean) => {
+    setChecking(true);
+    try {
+      const info = await api.checkEngineUpdate();
+      setRelease(info);
+      if (announce && !info.update_available) {
+        toast.success(
+          "Engine is up to date",
+          `Installed ${info.installed_version ?? "nothing"} · channel reports ${info.latest_version}`
+        );
+      }
+    } catch (e) {
+      toast.error("Update check failed", humanError(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const applyEngineUpdate = async () => {
+    if (!release) return;
+    setUpdating(true);
+    setUpdateProgress(null);
+    try {
+      const version = await api.installEngineUpdate(release.latest_version);
+      toast.success("Engine updated", `Docker Engine ${version} is now active.`);
+      await checkForEngineUpdate();
+    } catch (e) {
+      toast.error("Engine update failed", String(e));
+    } finally {
+      setUpdating(false);
+      setUpdateProgress(null);
+    }
+  };
+
+  const [cliResolution, setCliResolution] = useState<CliResolution | null>(null);
+  const [shimStatus, setShimStatus] = useState<CliShimStatus | null>(null);
+  const [shimBusy, setShimBusy] = useState(false);
+  const [compose, setCompose] = useState<ComposeUpdateInfo | null>(null);
+  const [checkingCompose, setCheckingCompose] = useState(false);
+  const [updatingCompose, setUpdatingCompose] = useState(false);
+
+  const checkDockerCli = async () => {
+    try {
+      const res = await api.checkDockerCli();
+      setCliResolution(res.resolution);
+      setShimStatus(res.shim);
+    } catch (e) {
+      toast.error("CLI check failed", String(e));
+    }
+  };
+
+  const handleToggleShim = async () => {
+    setShimBusy(true);
+    try {
+      const target = !(shimStatus?.installed ?? false);
+      const st = await api.toggleCliShim(target);
+      setShimStatus(st);
+      toast.success(
+        target ? "Docker shim installed" : "Docker shim removed",
+        st.path ?? "~/.local/bin/docker"
+      );
+    } catch (e) {
+      toast.error("Shim operation failed", String(e));
+    } finally {
+      setShimBusy(false);
+    }
+  };
+
+  const checkCompose = async (announce?: boolean) => {
+    setCheckingCompose(true);
+    try {
+      const info = await api.checkComposeUpdate();
+      setCompose(info);
+      if (announce) {
+        if (info.update_available) {
+          toast.info("Compose update available", `${info.latest_version} ready to install`);
+        } else {
+          toast.success("Compose up to date", `Latest available: ${info.latest_version}`);
+        }
+      }
+    } catch (e) {
+      toast.error("Compose check failed", humanError(e));
+    } finally {
+      setCheckingCompose(false);
+    }
+  };
+
+  const applyComposeUpdate = async () => {
+    if (!compose?.update_available) return;
+    setUpdatingCompose(true);
+    try {
+      const version = compose.latest_version;
+      await api.installComposeUpdate(version);
+      toast.success("Docker Compose updated", `Now using ${version}`);
+      await checkCompose();
+      await checkDockerCli();
+    } catch (e) {
+      toast.error("Compose update failed", String(e));
+    } finally {
+      setUpdatingCompose(false);
+    }
+  };
+
   useEffect(() => {
     loadSettings();
+    checkForEngineUpdate().catch(() => {});
+    checkDockerCli().catch(() => {});
+    checkCompose().catch(() => {});
+    let dispose: (() => void) | undefined;
+    events
+      .onEngineInstallProgress((progress) => setUpdateProgress(progress))
+      .then((fn) => {
+        dispose = fn;
+      })
+      .catch(() => {});
+    return () => {
+      dispose?.();
+    };
   }, []);
 
   const handleToggleCliBridge = async (enabled: boolean) => {
@@ -49,7 +192,7 @@ export const SettingsPage: React.FC = () => {
       setCliStatus(res);
       if (config) setConfig({ ...config, cli_bridge_enabled: enabled });
     } catch (e) {
-      alert(`Toggle CLI bridge failed: ${e}`);
+      toast.error("CLI Bridge Error", String(e));
     }
   };
 
@@ -77,9 +220,10 @@ export const SettingsPage: React.FC = () => {
       setSaving(true);
       await api.saveAppConfig(config);
       setSaved(true);
+      await checkDockerCli().catch(() => {});
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
-      alert(`Failed to save config: ${e}`);
+      toast.error("Save Error", String(e));
     } finally {
       setSaving(false);
     }
@@ -97,67 +241,234 @@ export const SettingsPage: React.FC = () => {
       </div>
 
       <form onSubmit={handleSave} className="space-y-6">
-        {/* CLI Integration Bridge */}
+
+
+        {/* Docker CLI */}
         <Card className="space-y-4">
           <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <Terminal className="w-5 h-5 text-blue-400" />
-            <div>
-              <h3 className="font-semibold text-white">Docker CLI Bridge</h3>
-              <p className="text-xs text-zinc-400">
-                Allow external terminal CLI commands like `docker ps` to connect to this rootless engine
+            <div className="p-2 rounded-lg bg-zinc-800/80 border border-zinc-700/50">
+              <Terminal className="w-5 h-5 text-emerald-400" />
+            </div>
+            <div className="flex-1">
+              <h3 className="font-semibold text-white">Docker CLI</h3>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Prefer a docker CLI you already have, or use the one bundled with the app.
               </p>
             </div>
           </div>
 
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <span className="font-medium text-sm text-zinc-200 block">
-                Enable Socket Bridge
-              </span>
-              <span className="text-xs text-zinc-400 block mt-0.5">
-                Creates a symlink in `$XDG_RUNTIME_DIR/docker.sock` and configures context
-              </span>
+          {cliResolution ? (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span
+                  className={`text-xs font-medium px-2 py-0.5 rounded border ${
+                    cliResolution.source === "system"
+                      ? "bg-sky-500/10 text-sky-300 border-sky-500/30"
+                      : "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+                  }`}
+                >
+                  Using {cliResolution.source === "system" ? "system docker" : "bundled docker"}{" "}
+                  {cliResolution.version}
+                </span>
+                <span className="text-xs text-zinc-400">{cliResolution.reason}</span>
+              </div>
+
+              <div className="grid gap-2 text-xs">
+                <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
+                  <span className="text-zinc-400">System</span>
+                  <span className="font-mono text-zinc-300 truncate">
+                    {cliResolution.system_path
+                      ? `${cliResolution.system_path} · ${cliResolution.system_version}`
+                      : "not installed"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
+                  <span className="text-zinc-400">Bundled</span>
+                  <span className="font-mono text-zinc-300 truncate">
+                    {cliResolution.bundled_version
+                      ? `${cliResolution.bundled_path} · ${cliResolution.bundled_version}`
+                      : "no engine installed"}
+                  </span>
+                </div>
+              </div>
             </div>
-            <label className="relative inline-flex items-center cursor-pointer">
-              <input
-                type="checkbox"
-                checked={config.cli_bridge_enabled}
-                onChange={(e) => handleToggleCliBridge(e.target.checked)}
-                className="sr-only peer"
-              />
-              <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-            </label>
+          ) : (
+            <p className="text-xs text-zinc-500">Checking which docker CLI is available…</p>
+          )}
+
+          <div className="space-y-2">
+            <label className="text-xs font-medium text-zinc-300">Preference</label>
+            <select
+              value={config?.cli_mode ?? "auto"}
+              onChange={(e) => setConfig((c) => (c ? { ...c, cli_mode: e.target.value } : c))}
+              className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-sm text-white focus:border-blue-500 focus:outline-none"
+            >
+              <option value="auto">Automatic — use whichever is newer</option>
+              <option value="system">Always use the system docker</option>
+              <option value="bundled">Always use the bundled docker</option>
+            </select>
           </div>
 
-          <div className="p-3 bg-zinc-950/60 rounded-xl border border-zinc-800/60 text-xs flex items-center justify-between">
-            <span className="text-zinc-400">Symlink Status:</span>
-            <span
-              className={`font-mono font-medium ${
-                cliStatus?.link_state ? "text-emerald-400" : "text-zinc-400"
-              }`}
+          {/* Terminal access: how a shell reaches this engine. The socket
+              bridge is the right answer when a docker already exists; the
+              shim only when there is none to bridge. */}
+          <div className="space-y-3 pt-1">
+            <p className="text-xs font-medium text-zinc-400 uppercase tracking-wide">
+              Terminal access
+            </p>
+
+            <div className="flex items-start justify-between gap-4 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+              <div className="flex-1">
+                <p className="text-sm text-zinc-200">Socket bridge</p>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  Symlinks <span className="font-mono">$XDG_RUNTIME_DIR/docker.sock</span> and
+                  registers a docker context, so your existing{" "}
+                  <span className="font-mono">docker</span> reaches this app's engine.
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                <input
+                  type="checkbox"
+                  className="sr-only peer"
+                  checked={config.cli_bridge_enabled}
+                  onChange={(e) => handleToggleCliBridge(e.target.checked)}
+                />
+                <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-between px-3 py-2 text-xs">
+              <span className="text-zinc-400">Bridge status</span>
+              <span
+                className={`font-mono font-medium ${
+                  !config.cli_bridge_enabled
+                    ? "text-zinc-500"
+                    : cliStatus?.link_state
+                      ? "text-emerald-400"
+                      : "text-amber-400"
+                }`}
+              >
+                {/* Three distinct states: the toggle is off (nothing to
+                    report), the link is live, or the toggle is on but the
+                    symlink/context is missing — which IS a problem. */}
+                {!config.cli_bridge_enabled
+                  ? "Off"
+                  : cliStatus?.link_state
+                    ? "Connected & Active"
+                    : "Enabled, but not connected"}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-start justify-between gap-4 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+            <div className="flex-1">
+              <p className="text-sm text-zinc-200">Expose docker in your terminal</p>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                Installs <span className="font-mono">{shimStatus?.path ?? "~/.local/bin/docker"}</span>{" "}
+                so the <span className="font-mono">docker</span> command reaches this app's engine —
+                useful when no docker is installed system-wide.
+              </p>
+              {shimStatus?.installed && shimStatus.effect === "shadowed" && (
+                <p className="text-xs text-amber-400 mt-1">
+                  Inactive — <span className="font-mono">{shimStatus.shadows}</span> comes
+                  first on your PATH, so the shell still uses that docker.
+                </p>
+              )}
+              {shimStatus?.installed && shimStatus.stale && (
+                <p className="text-xs text-amber-400/90">
+                  This shim still points at{" "}
+                  <span className="font-mono">{shimStatus.target}</span>, not the CLI
+                  selected above. Re-install it to pick up the new choice.
+                </p>
+              )}
+              {shimStatus?.installed && shimStatus.effect === "not_on_path" && (
+                <p className="text-xs text-amber-400 mt-1">
+                  Inactive — <span className="font-mono">~/.local/bin</span> is not on your
+                  PATH, so a shell will not find this shim.
+                </p>
+              )}
+              {!shimStatus?.installed && shimStatus?.shadows && (
+                <p className="text-xs text-amber-400 mt-1">
+                  You already have <span className="font-mono">{shimStatus.shadows}</span>.
+                  Installing the shim would hide it from your terminal — prefer the socket
+                  bridge above instead.
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={handleToggleShim}
+              disabled={shimBusy}
+              className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
+                shimStatus?.installed
+                  ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20"
+                  : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"
+              } disabled:opacity-50`}
             >
-              {cliStatus?.link_state ? "Connected & Active" : "Inactive / Disconnected"}
-            </span>
+              {shimBusy ? "Working…" : shimStatus?.installed ? "Remove" : "Install"}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 pt-1">
+            <div className="text-xs text-zinc-400">
+              {compose ? (
+                <>
+                  Docker Compose: <span className="font-mono text-zinc-300">
+                    {compose.installed_version ?? "not installed"}
+                  </span>
+                  {compose.update_available && (
+                    <>
+                      {" "}· <span className="text-amber-300">{compose.latest_version} available</span>
+                    </>
+                  )}
+                </>
+              ) : (
+                "Docker Compose: not checked"
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => checkCompose(true)}
+                disabled={checkingCompose || updatingCompose}
+                className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-xs font-medium text-zinc-200 transition-colors"
+              >
+                {checkingCompose ? "Checking…" : "Check Compose"}
+              </button>
+              <button
+                type="button"
+                onClick={applyComposeUpdate}
+                disabled={
+                  updatingCompose || checkingCompose || !compose?.update_available
+                }
+                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
+              >
+                {updatingCompose ? "Updating…" : "Update Compose"}
+              </button>
+            </div>
           </div>
         </Card>
 
-        {/* Engine Lifecycle */}
+        {/* Engine Update */}
         <Card className="space-y-4">
           <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
             <Power className="w-5 h-5 text-amber-400" />
             <div>
-              <h3 className="font-semibold text-white">Engine Autostart</h3>
-              <p className="text-xs text-zinc-400">Control engine daemon startup behavior</p>
+              <h3 className="font-semibold text-white">Docker Engine</h3>
+              <p className="text-xs text-zinc-400">
+                Manage the rootless engine: whether it starts automatically, and when to update it.
+              </p>
             </div>
           </div>
 
+          {/* Lifecycle: the one engine setting that is not an update. */}
           <div className="flex items-center justify-between py-2">
             <div>
               <span className="font-medium text-sm text-zinc-200 block">
                 Auto-start on App Launch
               </span>
               <span className="text-xs text-zinc-400 block mt-0.5">
-                Automatically boot the rootless dockerd background process when opening the desktop suite
+                Boot the rootless dockerd when this app opens
               </span>
             </div>
             <label className="relative inline-flex items-center cursor-pointer">
@@ -172,6 +483,85 @@ export const SettingsPage: React.FC = () => {
               <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
             </label>
           </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm">
+                {updating ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
+                    <span className="text-zinc-200">
+                      {updateProgress?.label ?? "Starting…"}
+                    </span>
+                  </>
+                ) : release?.update_available ? (
+                  <>
+                    <DownloadCloud className="w-4 h-4 text-sky-400" />
+                    <span className="text-zinc-200">
+                      Docker Engine{" "}
+                      <span className="font-mono text-sky-300">{release.latest_version}</span> is available
+                    </span>
+                  </>
+                ) : release ? (
+                  <>
+                    <PackageCheck className="w-4 h-4 text-emerald-400" />
+                    <span className="text-zinc-200">
+                      {release.installed_version
+                        ? `Up to date · ${release.installed_version}`
+                        : `No engine installed · latest is ${release.latest_version}`}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-zinc-400">
+                    {checking ? "Checking for updates…" : "Update status unknown"}
+                  </span>
+                )}
+              </div>
+              {release && !updating && (
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  Installed: {release.installed_version ?? "none"} · Latest: {release.latest_version}
+                  {release.update_available && release.latest_version !== release.pinned_version && (
+                    <> · checksums for this version come from Docker over TLS (not pinned)</>
+                  )}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={checking || updating}
+                onClick={() => checkForEngineUpdate(true)}
+              >
+                <RefreshCw className={`w-4 h-4 ${checking ? "animate-spin" : ""}`} />
+                <span>Check</span>
+              </Button>
+              <Button
+                type="button"
+                variant="primary"
+                disabled={updating || checking || !release?.update_available}
+                onClick={applyEngineUpdate}
+              >
+                <DownloadCloud className="w-4 h-4" />
+                <span>{release?.installed_version ? "Update Engine" : "Install Engine"}</span>
+              </Button>
+            </div>
+          </div>
+
+          {updating && (
+            <div className="space-y-2">
+              <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-sky-500 transition-all duration-300"
+                  style={{ width: `${Math.round((updateProgress?.fraction ?? 0) * 100)}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-zinc-400">
+                The engine restarts when this finishes. Container and image data is untouched.
+              </p>
+            </div>
+          )}
         </Card>
 
         {/* Engine Storage Location (Data Root) */}
@@ -507,6 +897,11 @@ export const SettingsPage: React.FC = () => {
                       // would fail with a lease error.
                       if (inspection.fs_error) {
                         setMigrationError(inspection.fs_error);
+                        return;
+                      }
+                      const normalize = (s: string) => s.replace(/\/+$/, "");
+                      if (normalize(clean) === normalize(inspection.current_data_root)) {
+                        setMigrationError("This path is already the active data root — nothing to migrate.");
                         return;
                       }
                       if (!inspection.exists || inspection.is_empty) {

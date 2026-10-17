@@ -1,59 +1,89 @@
 import React, { useEffect, useState } from "react";
-import { motion } from "framer-motion";
 import {
-  Box,
-  Layers,
-  Cpu,
-  ArrowUpRight,
-  Database,
-  Trash2,
   HardDrive,
-  Activity,
-  PlusCircle,
-  Download,
-  FolderGit2,
+  Layers,
+  Network,
+  Server,
+  Trash2,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { StatusBadge } from "../components/ui/StatusBadge";
+import { useToast } from "../components/ui/Toast";
+import { useModal } from "../components/ui/ModalContext";
 import { api, events } from "../lib/api";
+import { useSeries } from "../hooks/useSeries";
+import { AreaChart } from "../components/charts/AreaChart";
+import { DonutChart } from "../components/charts/DonutChart";
+import { BarList } from "../components/charts/BarList";
 import { formatBytes } from "../lib/utils";
 import type {
   ContainerItem,
-  EngineInfo,
-  DfReport,
+  ContainerStats,
   DaemonState,
+  DfReport,
+  EngineInfo,
+  NetworkItem,
+  VolumeItem,
 } from "../types";
 
 interface DashboardPageProps {
   daemonState: DaemonState;
-  onNavigate: (tab: any) => void;
+  onNavigate: (
+    tab: "dashboard" | "containers" | "images" | "volumes" | "networks" | "compose" | "settings"
+  ) => void;
 }
 
+interface StatSample {
+  cpu: number;
+  mem: number;
+  rxRate: number;
+  txRate: number;
+}
+
+const MAX_SAMPLES = 120;
+
+/**
+ * The page fills `main` exactly (the app clips overflow rather than scrolling),
+ * so every row is sized to share the available height instead of stacking to a
+ * fixed total. Rows are `auto-rows-fr` grids: they split the height evenly and
+ * their children can shrink, which is what keeps all panels on screen.
+ */
 export const DashboardPage: React.FC<DashboardPageProps> = ({
   daemonState,
   onNavigate,
 }) => {
+  const toast = useToast();
+  const modal = useModal();
+
   const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null);
   const [diskUsage, setDiskUsage] = useState<DfReport | null>(null);
   const [containers, setContainers] = useState<ContainerItem[]>([]);
-  const [, setLoading] = useState(true);
+  const [volumes, setVolumes] = useState<VolumeItem[]>([]);
+  const [networks, setNetworks] = useState<NetworkItem[]>([]);
+  const [stats, setStats] = useState<Record<string, ContainerStats>>({});
   const [pruning, setPruning] = useState(false);
+
+  const { samples, push, reset } = useSeries<StatSample>(MAX_SAMPLES);
+
+  const runningCount = containers.filter((c) => c.state === "running").length;
+  const isRunning = daemonState === "Running";
 
   const loadData = async () => {
     try {
-      setLoading(true);
-      const [info, df, cList] = await Promise.allSettled([
+      const [infoR, dfR, cR, vR, nR] = await Promise.allSettled([
         api.getEngineInfo(),
         api.getDiskUsage(),
         api.listContainers(true),
+        api.listVolumes(),
+        api.listNetworks(),
       ]);
-
-      if (info.status === "fulfilled") setEngineInfo(info.value);
-      if (df.status === "fulfilled") setDiskUsage(df.value);
-      if (cList.status === "fulfilled") setContainers(cList.value);
-    } finally {
-      setLoading(false);
+      if (infoR.status === "fulfilled") setEngineInfo(infoR.value);
+      if (dfR.status === "fulfilled") setDiskUsage(dfR.value);
+      if (cR.status === "fulfilled") setContainers(cR.value);
+      if (vR.status === "fulfilled") setVolumes(vR.value);
+      if (nR.status === "fulfilled") setNetworks(nR.value);
+    } catch (e) {
+      toast.error("Failed to load dashboard data", String(e));
     }
   };
 
@@ -61,399 +91,437 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     loadData();
 
     let unlistenContainers: (() => void) | undefined;
-    events.onContainersTick((updatedList) => {
-      setContainers(updatedList);
-    }).then((u) => (unlistenContainers = u));
+    let unlistenStats: (() => void) | undefined;
+    let disposed = false;
+    let prevNet: Record<string, { rx: number; tx: number }> = {};
+    let lastTs = Date.now();
+
+    events.onContainersTick((updated) => {
+      setContainers(updated);
+    }).then((u) => {
+      if (disposed) u();
+      else unlistenContainers = u;
+    });
+
+    events.onContainerStatsTick((tick: Record<string, ContainerStats>) => {
+      const now = Date.now();
+      const dt = Math.max(0.5, (now - lastTs) / 1000);
+      lastTs = now;
+
+      const ids = Object.keys(tick);
+      let cpuSum = 0;
+      let memSum = 0;
+      let rxRate = 0;
+      let txRate = 0;
+      const nextNet: Record<string, { rx: number; tx: number }> = {};
+
+      for (const id of ids) {
+        const s = tick[id];
+        const rx = s.net_rx ?? 0;
+        const tx = s.net_tx ?? 0;
+        const prev = prevNet[id];
+        if (prev) {
+          rxRate += Math.max(0, rx - prev.rx) / dt;
+          txRate += Math.max(0, tx - prev.tx) / dt;
+        }
+        nextNet[id] = { rx, tx };
+        cpuSum += s.cpu_percent ?? 0;
+        memSum += s.mem_usage ?? 0;
+      }
+      prevNet = nextNet;
+
+      setStats(tick);
+      push({
+        cpu: ids.length ? cpuSum / ids.length : 0,
+        mem: memSum,
+        rxRate,
+        txRate,
+      });
+    }).then((u) => {
+      if (disposed) u();
+      else unlistenStats = u;
+    });
 
     return () => {
+      disposed = true;
       if (unlistenContainers) unlistenContainers();
+      if (unlistenStats) unlistenStats();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [daemonState]);
 
+  useEffect(() => {
+    if (!isRunning) {
+      reset();
+      setStats({});
+    }
+  }, [isRunning, reset]);
+
   const handlePrune = async () => {
-    if (!confirm("Are you sure you want to prune unused Docker resources?")) return;
+    const confirmed = await modal.showConfirm(
+      "Prune unused containers, images, volumes and build cache?\n\nThis action cannot be undone.",
+      "Prune System",
+      "danger"
+    );
+    if (!confirmed) return;
     try {
       setPruning(true);
       await api.pruneSystem();
+      toast.success("Prune completed", "Reclaimable space freed");
       await loadData();
     } catch (e) {
-      alert("Prune error: " + e);
+      toast.error("Prune error", String(e));
     } finally {
       setPruning(false);
     }
   };
 
-  const runningCount = containers.filter((c) => c.state === "running").length;
+  const totalMem = engineInfo?.memory_total ?? 0;
+  const last = samples.length ? samples[samples.length - 1] : undefined;
+  const cpuSeries = samples.map((s) => s.cpu);
+  const memSeries = samples.map((s) => s.mem);
+  const rxSeries = samples.map((s) => s.rxRate);
+  const txSeries = samples.map((s) => s.txRate);
 
-  const cards = [
+  const topConsumers = Object.entries(stats)
+    .map(([id, s]) => {
+      const c = containers.find((x) => x.id === id || x.short_id === id.slice(0, 12));
+      return {
+        key: id,
+        label: c?.name || id.slice(0, 12),
+        sublabel: c?.image || "",
+        value: s.cpu_percent ?? 0,
+        mem: s.mem_usage ?? 0,
+      };
+    })
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 6);
+
+  const kpiItems: {
+    icon: typeof Server;
+    label: string;
+    value: string;
+    sub: string;
+    color: string;
+    glow: string;
+    onClick?: () => void;
+  }[] = [
     {
-      title: "Containers",
-      value: `${runningCount} / ${containers.length}`,
-      subtext: `${runningCount} running currently`,
-      icon: Box,
-      color: "from-blue-500/20 to-blue-600/5 text-blue-400 border-blue-500/30",
-      action: () => onNavigate("containers"),
+      icon: Server,
+      label: "Containers",
+      value: String(containers.length),
+      sub: `${runningCount} running`,
+      color: "text-blue-400",
+      glow: "from-blue-500/15 to-blue-600/5 border-blue-500/25",
+      onClick: () => onNavigate("containers"),
     },
     {
-      title: "Images",
-      value: engineInfo ? engineInfo.images : "-",
-      subtext: diskUsage ? formatBytes(diskUsage.images_size) : "Storage used",
       icon: Layers,
-      color: "from-purple-500/20 to-purple-600/5 text-purple-400 border-purple-500/30",
-      action: () => onNavigate("images"),
+      label: "Images",
+      value: engineInfo ? String(engineInfo.images) : "—",
+      sub: "local images",
+      color: "text-purple-400",
+      glow: "from-purple-500/15 to-purple-600/5 border-purple-500/25",
+      onClick: () => onNavigate("images"),
     },
     {
-      title: "Disk Reclaimable",
-      value: diskUsage ? formatBytes(diskUsage.total_reclaimable) : "-",
-      subtext: "Unused cache & layers",
-      icon: Database,
-      color: "from-amber-500/20 to-amber-600/5 text-amber-400 border-amber-500/30",
-      action: handlePrune,
+      icon: HardDrive,
+      label: "Volumes",
+      value: String(volumes.length),
+      sub: "persistent volumes",
+      color: "text-amber-400",
+      glow: "from-amber-500/15 to-amber-600/5 border-amber-500/25",
+      onClick: () => onNavigate("volumes"),
     },
     {
-      title: "System Hardware",
-      value: engineInfo ? `${engineInfo.cpus} Cores` : "-",
-      subtext: engineInfo ? formatBytes(engineInfo.memory_total) : "Memory",
-      icon: Cpu,
-      color: "from-emerald-500/20 to-emerald-600/5 text-emerald-400 border-emerald-500/30",
+      icon: Network,
+      label: "Networks",
+      value: String(networks.length),
+      sub: "bridge + custom",
+      color: "text-indigo-400",
+      glow: "from-indigo-500/15 to-indigo-600/5 border-indigo-500/25",
+      onClick: () => onNavigate("networks"),
+    },
+    {
+      icon: HardDrive,
+      label: "Disk Use",
+      value: diskUsage
+        ? formatBytes(
+            (diskUsage.images_size ?? 0) +
+              (diskUsage.containers_size ?? 0) +
+              (diskUsage.volumes_size ?? 0) +
+              (diskUsage.build_cache_size ?? 0)
+          )
+        : "—",
+      sub: diskUsage
+        ? `${formatBytes(diskUsage.total_reclaimable ?? 0)} reclaimable`
+        : "reclaimable",
+      color: "text-emerald-400",
+      glow: "from-emerald-500/15 to-emerald-600/5 border-emerald-500/25",
     },
   ];
 
-  return (
-    <div className="p-8 space-y-8 max-w-7xl mx-auto overflow-y-auto h-full">
-      {/* Page Title */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight text-white">System Dashboard</h2>
-          <p className="text-sm text-zinc-400 mt-1">
-            Realtime overview of containers, volumes, and engine resource consumption
-          </p>
-        </div>
-        <div className="flex gap-3">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handlePrune}
-            isLoading={pruning}
-            className="gap-2"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-            <span>Prune System</span>
-          </Button>
-        </div>
-      </div>
+  const storageSegments = diskUsage
+    ? [
+        { label: "Images", value: diskUsage.images_size ?? 0, color: "#a855f7" },
+        { label: "Containers", value: diskUsage.containers_size ?? 0, color: "#3b82f6" },
+        { label: "Volumes", value: diskUsage.volumes_size ?? 0, color: "#f59e0b" },
+        { label: "Build cache", value: diskUsage.build_cache_size ?? 0, color: "#f43f5e" },
+      ]
+    : [];
+  const storageTotal = storageSegments.reduce((a, s) => a + s.value, 0);
 
-      {/* Metrics Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
-        {cards.map((c, i) => {
-          const Icon = c.icon;
-          return (
-            <motion.div
-              key={c.title}
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: i * 0.05, duration: 0.3 }}
+  const specRows: [string, string][] = [
+    ["Version", engineInfo?.version ?? "—"],
+    ["Storage driver", engineInfo?.driver ?? "—"],
+    [
+      "Platform",
+      engineInfo?.os && engineInfo?.arch ? `${engineInfo.os}/${engineInfo.arch}` : "—",
+    ],
+    ["CPU cores", engineInfo ? String(engineInfo.cpus) : "—"],
+    ["Total memory", totalMem ? formatBytes(totalMem) : "—"],
+  ];
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto p-4">
+      {/* KPI strip — every metric appears exactly once */}
+      <div className="grid shrink-0 auto-rows-fr grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        {kpiItems.map((k) => {
+          const Icon = k.icon;
+          const body = (
+            <Card
+              className={`h-full border bg-gradient-to-br p-3 ${k.glow} ${
+                k.onClick ? "transition-colors hover:border-zinc-700/70" : ""
+              }`}
             >
-              <Card
-                className={`relative overflow-hidden cursor-pointer group hover:scale-[1.02] bg-gradient-to-br ${c.color}`}
-                onClick={c.action}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                    {c.title}
-                  </span>
-                  <div className="p-2 rounded-xl bg-zinc-950/40 border border-zinc-800/80">
-                    <Icon className="w-4 h-4" />
-                  </div>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    {k.label}
+                  </p>
+                  <p className="mt-1 text-xl font-semibold tabular-nums text-white">
+                    {k.value}
+                  </p>
+                  <p className="truncate text-[11px] text-zinc-500">{k.sub}</p>
                 </div>
-                <div className="mt-4">
-                  <div className="text-3xl font-extrabold tracking-tight text-white">
-                    {c.value}
-                  </div>
-                  <div className="text-xs text-zinc-400 mt-1 flex items-center justify-between">
-                    <span>{c.subtext}</span>
-                    <ArrowUpRight className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 transition-opacity" />
-                  </div>
+                <div
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-zinc-900/60 ${k.color}`}
+                >
+                  <Icon className="h-4 w-4" />
                 </div>
-              </Card>
-            </motion.div>
+              </div>
+            </Card>
+          );
+          return k.onClick ? (
+            <button key={k.label} onClick={k.onClick} className="text-left">
+              {body}
+            </button>
+          ) : (
+            <div key={k.label}>{body}</div>
           );
         })}
       </div>
 
-      {/* Recent Containers and Engine Info */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Containers Table Summary */}
-        <Card className="lg:col-span-2">
-          <div className="flex items-center justify-between pb-4 border-b border-zinc-800/80">
-            <div>
-              <h3 className="font-semibold text-white">Active Containers</h3>
-              <p className="text-xs text-zinc-400">Quick view of running instances</p>
+      {/* Live resource charts — each row shares the leftover height */}
+      <div className="grid min-h-0 flex-[1.15] auto-rows-fr grid-cols-1 gap-3 lg:grid-cols-2">
+        <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
+          <div className="flex shrink-0 items-start justify-between gap-2">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">CPU Usage</h3>
+              <p className="truncate text-[11px] text-zinc-500">
+                Average across {runningCount} running{" "}
+                {runningCount === 1 ? "container" : "containers"}
+              </p>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onNavigate("containers")}
-              className="text-xs gap-1"
-            >
-              View all
-              <ArrowUpRight className="w-3.5 h-3.5" />
-            </Button>
+            <span className="shrink-0 text-sm font-medium tabular-nums text-cyan-400">
+              {last ? `${last.cpu.toFixed(1)}%` : "—"}
+            </span>
           </div>
-
-          <div className="divide-y divide-zinc-800/40 mt-2">
-            {containers.slice(0, 5).map((container) => (
-              <div
-                key={container.id}
-                className="py-3 flex items-center justify-between group hover:bg-zinc-800/30 px-3 rounded-xl transition-colors cursor-pointer"
-                onClick={() => onNavigate("containers")}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-zinc-800 flex items-center justify-center text-zinc-400">
-                    <Box className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <div className="font-medium text-sm text-white group-hover:text-blue-400 transition-colors">
-                      {container.name.replace(/^\//, "")}
-                    </div>
-                    <div className="text-xs text-zinc-400">{container.image}</div>
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <span className="text-xs text-zinc-400 hidden sm:inline-block">
-                    {container.ports || "No ports exposed"}
-                  </span>
-                  <StatusBadge status={container.state} />
-                </div>
-              </div>
-            ))}
-
-            {containers.length === 0 && (
-              <div className="py-8 text-center text-zinc-400 text-sm">
-                No containers found. Create or run a new container to see it here.
-              </div>
-            )}
+          <div className="min-h-0 flex-1">
+            <AreaChart
+              series={[{ name: "CPU", color: "#22d3ee", data: cpuSeries }]}
+              formatValue={(v) => `${v.toFixed(0)}%`}
+              yMax={100}
+              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+            />
           </div>
         </Card>
 
-        {/* Engine Specification */}
-        <Card>
-          <div className="pb-4 border-b border-zinc-800/80">
-            <h3 className="font-semibold text-white">Engine Specifications</h3>
-            <p className="text-xs text-zinc-400">Environment and platform info</p>
+        <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
+          <div className="flex shrink-0 items-start justify-between gap-2">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">Memory Usage</h3>
+              <p className="truncate text-[11px] text-zinc-500">
+                {totalMem > 0
+                  ? `${(((last?.mem ?? 0) / totalMem) * 100).toFixed(1)}% of ${formatBytes(totalMem)}`
+                  : "Total limit unavailable"}
+              </p>
+            </div>
+            <span className="shrink-0 text-sm font-medium tabular-nums text-lime-400">
+              {last ? formatBytes(last.mem) : "—"}
+            </span>
           </div>
-          <div className="space-y-3 mt-4 text-xs">
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Engine Version</span>
-              <span className="font-medium text-zinc-200">{engineInfo?.version || "-"}</span>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Storage Driver</span>
-              <span className="font-medium text-zinc-200">{engineInfo?.driver || "-"}</span>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Operating System</span>
-              <span className="font-medium text-zinc-200">{engineInfo?.os || "-"}</span>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Architecture</span>
-              <span className="font-medium text-zinc-200">{engineInfo?.arch || "-"}</span>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Total Containers</span>
-              <span className="font-medium text-zinc-200">{engineInfo?.containers || 0}</span>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-zinc-800/40">
-              <span className="text-zinc-400">Running / Paused</span>
-              <span className="font-medium text-emerald-400">
-                {engineInfo?.containers_running || 0} / {engineInfo?.containers_paused || 0}
-              </span>
-            </div>
+          <div className="min-h-0 flex-1">
+            <AreaChart
+              series={[{ name: "Memory", color: "#a3e635", data: memSeries }]}
+              formatValue={(v) => formatBytes(v)}
+              yMax={totalMem > 0 ? totalMem : undefined}
+              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+            />
           </div>
         </Card>
       </div>
 
-      {/* Storage Breakdown & Quick Actions */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Storage Breakdown Bar */}
-        <Card className="lg:col-span-2 space-y-4">
-          <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
-            <div className="flex items-center gap-2.5">
-              <HardDrive className="w-4 h-4 text-emerald-400" />
-              <h3 className="font-semibold text-white">Docker Storage Utilization</h3>
+      <div className="grid min-h-0 flex-[1.15] auto-rows-fr grid-cols-1 gap-3 lg:grid-cols-2">
+        <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
+          <div className="flex shrink-0 items-start justify-between gap-2">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">Network I/O</h3>
+              <p className="truncate text-[11px] text-zinc-500">
+                Aggregate throughput across containers
+              </p>
             </div>
-            <span className="text-xs text-zinc-400">
-              Total: {formatBytes(
-                (diskUsage?.images_size || 0) +
-                (diskUsage?.containers_size || 0) +
-                (diskUsage?.volumes_size || 0) +
-                (diskUsage?.build_cache_size || 0)
-              )}
-            </span>
+            <div className="flex shrink-0 gap-3 text-xs tabular-nums">
+              <span className="text-sky-400">
+                ↓ {last ? `${formatBytes(last.rxRate)}/s` : "—"}
+              </span>
+              <span className="text-orange-400">
+                ↑ {last ? `${formatBytes(last.txRate)}/s` : "—"}
+              </span>
+            </div>
           </div>
-
-          <div className="space-y-3">
-            <div>
-              <div className="flex justify-between text-xs mb-1">
-                <span className="text-zinc-400">Images ({formatBytes(diskUsage?.images_size)})</span>
-                <span className="text-purple-400 font-mono">
-                  {diskUsage?.images_size ? formatBytes(diskUsage.images_size) : "0 B"}
-                </span>
-              </div>
-              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-purple-500 rounded-full"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.max(
-                        5,
-                        ((diskUsage?.images_size || 0) /
-                          Math.max(
-                            1,
-                            (diskUsage?.images_size || 0) +
-                              (diskUsage?.containers_size || 0) +
-                              (diskUsage?.volumes_size || 0) +
-                              (diskUsage?.build_cache_size || 0)
-                          )) * 100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between text-xs mb-1">
-                <span className="text-zinc-400">Containers Writable Layer ({formatBytes(diskUsage?.containers_size)})</span>
-                <span className="text-blue-400 font-mono">
-                  {diskUsage?.containers_size ? formatBytes(diskUsage.containers_size) : "0 B"}
-                </span>
-              </div>
-              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 rounded-full"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.max(
-                        3,
-                        ((diskUsage?.containers_size || 0) /
-                          Math.max(
-                            1,
-                            (diskUsage?.images_size || 0) +
-                              (diskUsage?.containers_size || 0) +
-                              (diskUsage?.volumes_size || 0) +
-                              (diskUsage?.build_cache_size || 0)
-                          )) * 100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between text-xs mb-1">
-                <span className="text-zinc-400">Volumes ({formatBytes(diskUsage?.volumes_size)})</span>
-                <span className="text-amber-400 font-mono">
-                  {diskUsage?.volumes_size ? formatBytes(diskUsage.volumes_size) : "0 B"}
-                </span>
-              </div>
-              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-amber-500 rounded-full"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.max(
-                        3,
-                        ((diskUsage?.volumes_size || 0) /
-                          Math.max(
-                            1,
-                            (diskUsage?.images_size || 0) +
-                              (diskUsage?.containers_size || 0) +
-                              (diskUsage?.volumes_size || 0) +
-                              (diskUsage?.build_cache_size || 0)
-                          )) * 100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between text-xs mb-1">
-                <span className="text-zinc-400">Build Cache ({formatBytes(diskUsage?.build_cache_size)})</span>
-                <span className="text-emerald-400 font-mono">
-                  {diskUsage?.build_cache_size ? formatBytes(diskUsage.build_cache_size) : "0 B"}
-                </span>
-              </div>
-              <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-emerald-500 rounded-full"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.max(
-                        2,
-                        ((diskUsage?.build_cache_size || 0) /
-                          Math.max(
-                            1,
-                            (diskUsage?.images_size || 0) +
-                              (diskUsage?.containers_size || 0) +
-                              (diskUsage?.volumes_size || 0) +
-                              (diskUsage?.build_cache_size || 0)
-                          )) * 100
-                      )
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
+          <div className="min-h-0 flex-1">
+            <AreaChart
+              series={[
+                { name: "Download", color: "#38bdf8", data: rxSeries },
+                { name: "Upload", color: "#fb923c", data: txSeries },
+              ]}
+              formatValue={(v) => `${formatBytes(v)}/s`}
+              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+            />
           </div>
         </Card>
 
-        {/* Quick Actions Shortcuts */}
-        <Card className="space-y-3">
-          <div className="pb-3 border-b border-zinc-800/80 flex items-center gap-2">
-            <Activity className="w-4 h-4 text-blue-400" />
-            <h3 className="font-semibold text-white">Quick Shortcuts</h3>
-          </div>
-          <div className="grid grid-cols-1 gap-2.5 pt-1">
-            <button
+        <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
+          <div className="flex shrink-0 items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-white">Top Consumers</h3>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => onNavigate("containers")}
-              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
+              className="text-[11px] text-zinc-400 hover:text-zinc-100"
             >
-              <div className="flex items-center gap-3">
-                <PlusCircle className="w-4 h-4 text-blue-400" />
-                <span className="text-xs font-medium text-zinc-200">Create Container</span>
-              </div>
-              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
-            </button>
+              View all
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <BarList
+              items={topConsumers.map((c) => ({
+                key: c.key,
+                label: c.label,
+                sublabel: c.sublabel
+                  ? `${c.sublabel} · ${formatBytes(c.mem)}`
+                  : formatBytes(c.mem),
+                value: c.value,
+                display: `${c.value.toFixed(1)}%`,
+                color: "#22d3ee",
+              }))}
+              max={Math.max(0, ...topConsumers.map((c) => c.value))}
+              emptyHint={runningCount ? "Sampling…" : "No running containers"}
+            />
+          </div>
+        </Card>
+      </div>
 
-            <button
-              onClick={() => onNavigate("images")}
-              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
+      {/* Storage · Engine · Containers */}
+      <div className="grid min-h-0 flex-[1.25] auto-rows-fr grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3">
+        <Card className="flex min-h-[150px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[120px]">
+          <div className="flex shrink-0 items-start justify-between gap-2">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">Storage</h3>
+              <p className="truncate text-[11px] text-zinc-500">
+                {formatBytes(diskUsage?.total_reclaimable ?? 0)} reclaimable
+              </p>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handlePrune}
+              disabled={pruning || !diskUsage || (diskUsage.total_reclaimable ?? 0) <= 0}
+              className="shrink-0 text-[11px] text-zinc-400 hover:text-zinc-100"
             >
-              <div className="flex items-center gap-3">
-                <Download className="w-4 h-4 text-purple-400" />
-                <span className="text-xs font-medium text-zinc-200">Pull Image from Hub</span>
-              </div>
-              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
-            </button>
+              <Trash2 className="h-3.5 w-3.5" />
+              {pruning ? "Pruning…" : "Prune"}
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1">
+            <DonutChart
+              segments={storageSegments}
+              total={storageTotal}
+              centerLabel="Total"
+            />
+          </div>
+        </Card>
 
-            <button
-              onClick={() => onNavigate("compose")}
-              className="flex items-center justify-between p-3 rounded-xl bg-zinc-800/40 hover:bg-zinc-800/80 border border-zinc-800/80 transition-colors text-left group"
-            >
-              <div className="flex items-center gap-3">
-                <FolderGit2 className="w-4 h-4 text-indigo-400" />
-                <span className="text-xs font-medium text-zinc-200">Deploy Compose Project</span>
+        <Card className="flex min-h-[150px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[120px]">
+          <div className="flex shrink-0 items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-white">Engine</h3>
+          </div>
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto text-xs">
+            {specRows.map(([label, value]) => (
+              <div key={label} className="flex items-center justify-between gap-3">
+                <span className="text-zinc-400">{label}</span>
+                <span className="truncate tabular-nums text-zinc-200">{value}</span>
               </div>
-              <ArrowUpRight className="w-3.5 h-3.5 text-zinc-500 group-hover:text-white transition-colors" />
-            </button>
+            ))}
+          </div>
+        </Card>
+
+        <Card className="flex min-h-[150px] flex-col gap-2 p-3 lg:col-span-2 xl:col-span-1 [@media(max-height:820px)]:min-h-[120px]">
+          <div className="flex shrink-0 items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-white">Containers</h3>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onNavigate("containers")}
+              className="text-[11px] text-zinc-400 hover:text-zinc-100"
+            >
+              View all
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
+            {containers.slice(0, 8).map((c) => {
+              const s = stats[c.id];
+              return (
+                <div
+                  key={c.id}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs text-zinc-200">
+                      {c.name || c.short_id}
+                    </div>
+                    <div className="truncate text-[10px] text-zinc-500">{c.image}</div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className="text-[11px] tabular-nums text-zinc-300">
+                      {s
+                        ? `${(s.cpu_percent ?? 0).toFixed(1)}% · ${formatBytes(s.mem_usage ?? 0)}`
+                        : c.state}
+                    </div>
+                    <div className="text-[10px] text-zinc-500">{c.status}</div>
+                  </div>
+                </div>
+              );
+            })}
+            {containers.length === 0 && (
+              <div className="py-6 text-center text-xs text-zinc-600">
+                No containers yet — run one from the Containers page.
+              </div>
+            )}
           </div>
         </Card>
       </div>

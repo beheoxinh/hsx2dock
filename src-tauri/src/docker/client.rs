@@ -193,6 +193,16 @@ impl DockerClient {
                 cpu_percent: (cpu_percent * 100.0).round() / 100.0,
                 mem_usage,
                 mem_limit,
+                net_rx: stat
+                    .networks
+                    .as_ref()
+                    .map(|n| n.iter().map(|(_, s)| s.rx_bytes.unwrap_or(0)).sum())
+                    .unwrap_or(0),
+                net_tx: stat
+                    .networks
+                    .as_ref()
+                    .map(|n| n.iter().map(|(_, s)| s.tx_bytes.unwrap_or(0)).sum())
+                    .unwrap_or(0),
             });
         }
         Ok(ContainerStats::default())

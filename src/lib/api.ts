@@ -13,6 +13,11 @@ import type {
   ComposeProjectInfo,
   DfReport,
   EngineInfo,
+  EngineUpdateInfo,
+  EngineInstallProgress,
+  CliShimStatus,
+  CliStatus,
+  ComposeUpdateInfo,
   AppConfig,
   CliBridgeStatus,
   DaemonState,
@@ -22,6 +27,14 @@ import type {
 export const api = {
   // System
   getEngineStatus: () => invoke<DaemonState>("get_engine_status"),
+  checkEngineUpdate: () => invoke<EngineUpdateInfo>("check_engine_update"),
+  installEngineUpdate: (version: string) =>
+    invoke<string>("install_engine_update", { version }),
+  checkDockerCli: () => invoke<CliStatus>("check_docker_cli"),
+  toggleCliShim: (enabled: boolean) => invoke<CliShimStatus>("toggle_cli_shim", { enabled }),
+  checkComposeUpdate: () => invoke<ComposeUpdateInfo>("check_compose_update"),
+  installComposeUpdate: (version: string) =>
+    invoke<string>("install_compose_update", { version }),
   toggleEngine: () => invoke<DaemonState>("toggle_engine"),
   getEngineInfo: () => invoke<EngineInfo | null>("get_engine_info"),
   getDiskUsage: () => invoke<DfReport>("get_disk_usage"),
@@ -110,6 +123,13 @@ export const api = {
 export const events = {
   onEngineStateChanged: (cb: (state: DaemonState) => void): Promise<UnlistenFn> =>
     listen<DaemonState>("engine-state-changed", (event) => cb(event.payload)),
+
+  onEngineInstallProgress: (
+    cb: (progress: EngineInstallProgress) => void
+  ): Promise<UnlistenFn> =>
+    listen<EngineInstallProgress>("engine-install-progress", (event) =>
+      cb(event.payload)
+    ),
 
   onContainerStatsTick: (
     cb: (stats: Record<string, ContainerStats>) => void

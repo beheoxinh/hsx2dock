@@ -29,6 +29,11 @@ pub const DOCKER_INSTALL_DOCS_URL: &str = "https://docs.docker.com/engine/instal
 /// take a few seconds (unpacking layers, initializing storage driver).
 const HEALTH_TIMEOUT_SECS: u64 = 30;
 
+/// How long a `docker --version` sniff may take before we give up on that
+/// candidate. Generous for a real binary, short enough that one broken entry
+/// on PATH cannot stall an interactive action.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Pinned default release.
 ///
 /// `download.docker.com` publishes **no** checksum manifest for the static
@@ -107,7 +112,18 @@ impl EnginePaths {
         self.current_dir.join("bin")
     }
 
+    /// Home of the compose plugin Docker will actually discover.
+    ///
+    /// Docker searches `$DOCKER_CONFIG/cli-plugins`, and every invocation we
+    /// run sets `DOCKER_CONFIG` to `current/docker-config`. Trees installed
+    /// before that became true kept the plugin at `current/cli-plugins`, so
+    /// prefer the canonical path and fall back to the legacy one until
+    /// [`ensure_compose_layout`] has moved it.
     pub fn compose_plugin(&self) -> PathBuf {
+        let canonical = compose_plugin_dir(self).join("docker-compose");
+        if canonical.is_file() {
+            return canonical;
+        }
         self.current_dir.join("cli-plugins/docker-compose")
     }
 
@@ -156,11 +172,7 @@ impl EngineManager {
     }
 
     pub fn installed_version(&self) -> Option<String> {
-        let p = self.paths();
-        fs::read_to_string(p.current_dir.join("VERSION"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        installed_engine_version(&self.paths())
     }
 
     /// Socket the engine listens on, if the socket exists and accepts a
@@ -229,9 +241,14 @@ impl EngineManager {
 
         let paths = self.paths();
 
-        // Refuse a data root on a filesystem without d_type *before* spawning:
-        // dockerd would boot, then fail every pull with an opaque lease error.
-        check_data_root_filesystem(&paths.data_root)?;
+        // Retarget containerd's snapshotter dirs when the data root sits on a
+        // filesystem without d_type, *before* spawning: dockerd would
+        // otherwise boot and then fail every pull with an opaque lease error.
+        ensure_snapshotter_compat(&paths.data_root)?;
+        // Compose must sit under the `DOCKER_CONFIG` we hand every docker
+        // invocation, otherwise the app silently uses the host's copy (or
+        // none). Idempotent, and a no-op on trees that are already correct.
+        let _ = ensure_compose_layout(&paths);
 
         for d in [
             &paths.data_root,
@@ -441,12 +458,10 @@ pub async fn download<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<(
 where
     F: FnMut(u64, Option<u64>),
 {
-    let resp = reqwest::get(url)
+    // `http_get` already turned any non-2xx into an error.
+    let resp = http_get(url)
         .await
         .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        bail!("GET {url} -> HTTP {}", resp.status());
-    }
     let total = resp.content_length();
     let mut file = File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let mut resp = resp;
@@ -622,6 +637,144 @@ pub fn dir_supports_d_type(dir: &Path) -> Option<bool> {
     }
 }
 
+const SNAPSHOTTER_DTYPE_PLUGINS: [&str; 2] = [
+    "io.containerd.snapshotter.v1.overlayfs",
+    "io.containerd.snapshotter.v1.erofs",
+];
+
+/// containerd's snapshotter plugins refuse to start on a filesystem that
+/// reports `DT_UNKNOWN` for every dirent, which cascades into `leases` failing
+/// to load and every `docker pull` dying with "unknown service
+/// containerd.services.leases.v1.Leases".
+///
+/// The offending dirs (`overlayfs`, `erofs`) only carry containerd-side
+/// bookkeeping — with `containerd-snapshotter=false` our image layers live in
+/// the graphdriver under the data root — so retargeting them to a
+/// d_type-capable filesystem fixes the engine without moving any real storage.
+/// Idempotent: an already-linked dir is left alone, a non-empty real dir is
+/// never deleted.
+pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
+    if dir_supports_d_type(dir) != Some(false) {
+        return Ok(());
+    }
+
+    let Some(compat) = dtype_compat_root() else {
+        bail!(
+            "the filesystem holding {} does not report directory entry types \
+             (d_type) and no d_type-capable directory is available to host \
+             containerd's snapshotter state. Pick a data root on btrfs, xfs \
+             with ftype=1, or tmpfs.",
+            dir.display()
+        );
+    };
+
+    let daemon = dir.join("containerd").join("daemon");
+    fs::create_dir_all(&daemon)
+        .with_context(|| format!("create {}", daemon.display()))?;
+
+    for plugin in SNAPSHOTTER_DTYPE_PLUGINS {
+        let target = compat.join(plugin);
+        fs::create_dir_all(&target)
+            .with_context(|| format!("create {}", target.display()))?;
+
+        let link = daemon.join(plugin);
+        match fs::symlink_metadata(&link) {
+            // Already retargeted by a previous boot — nothing to do.
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            // An empty real dir is safe to replace; a populated one is not.
+            Ok(meta) if meta.is_dir() => {
+                let mut entries = fs::read_dir(&link)
+                    .with_context(|| format!("read {}", link.display()))?;
+                if entries.next().is_some() {
+                    bail!(
+                        "{} already contains containerd data on a filesystem \
+                         without d_type. If you're migrating from another root, \
+                         this is likely dormant snapshotter state (with \
+                         containerd-snapshotter=false, image layers live in the \
+                         graphdriver). Consider starting from a clean target \
+                         data root, or move this data to btrfs/xfs with ftype=1 \
+                         first.",
+                        link.display()
+                    );
+                }
+                fs::remove_dir(&link)?;
+                std::os::unix::fs::symlink(&target, &link)?;
+            }
+            Ok(_) => bail!("{} exists and is not a directory", link.display()),
+            Err(_) => std::os::unix::fs::symlink(&target, &link)?,
+        }
+    }
+    Ok(())
+}
+
+/// A directory that does report real `d_type` values, to host the retargeted
+/// containerd snapshotter state. Prefers the app's own data dir; falls back to
+/// `/tmp` (tmpfs, always d_type-capable) when that lives on a bad filesystem.
+pub fn dtype_compat_root() -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let candidates = [
+        home.join(".local/share/docker-manager/dtype-compat"),
+        PathBuf::from("/tmp/docker-manager-dtype-compat"),
+    ];
+
+    candidates.into_iter().find(|candidate| {
+        // The dir may not exist yet — probe the nearest ancestor that does,
+        // exactly like `check_data_root_filesystem` does for the data root.
+        let mut probe: &Path = candidate;
+        while !probe.exists() {
+            match probe.parent() {
+                Some(p) if p != probe => probe = p,
+                _ => break,
+            }
+        }
+        dir_supports_d_type(probe) == Some(true)
+    })
+}
+
+/// Would copying `source` onto the d_type-less `target` leave containerd
+/// snapshotter state that [`ensure_snapshotter_compat`] must refuse to delete?
+///
+/// Checked before the copy so a doomed migration fails up front — no engine
+/// stop, no gigabytes moved, no half-finished target — instead of erroring
+/// *after* `cp -a` has already run.
+pub fn migrate_dtype_conflict(source: &Path, target: &Path) -> Option<String> {
+    if dir_supports_d_type(target) != Some(false) {
+        return None; // target fs is fine, whatever the source holds is fine too
+    }
+    if source == target {
+        return None;
+    }
+
+    for plugin in SNAPSHOTTER_DTYPE_PLUGINS {
+        let from = source.join("containerd").join("daemon").join(plugin);
+        let Ok(meta) = fs::symlink_metadata(&from) else {
+            continue; // absent — cp -a won't copy it
+        };
+        if meta.file_type().is_symlink() {
+            continue; // already retargeted — cp -a preserves the link
+        }
+        if !meta.is_dir() {
+            return Some(format!("{} exists and is not a directory", from.display()));
+        }
+        let populated = fs::read_dir(&from)
+            .ok()
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        if populated {
+            return Some(format!(
+                "{} already contains containerd data, which cannot be moved onto \
+                 a filesystem without d_type. If migrating from another root, \
+                 this is likely dormant snapshotter state (with \
+                 containerd-snapshotter=false image layers live in the \
+                 graphdriver) — start from a clean target data root, or move to \
+                 btrfs/xfs with ftype=1 first.",
+                from.display()
+            ));
+        }
+    }
+    None
+}
+
 /// Reject a data-root whose filesystem cannot support the bundled engine's
 /// containerd snapshotters, with an explanation the user can act on.
 ///
@@ -761,9 +914,31 @@ fn proc_comm(_pid: i32) -> Option<String> {
     None
 }
 
+/// A `Command` for a specific docker binary, pointed at our engine.
+///
+/// `DOCKER_HOST` always targets *our* socket — both the system and the
+/// bundled binary talk to the engine this app manages, never the host
+/// daemon. `DOCKER_CONFIG` always points at our config dir so plugin
+/// resolution (compose) stays inside the app. The two sources differ only in
+/// which binary runs and whether we prepend our own `bin` to `PATH`: for the
+/// bundled CLI that is required so it finds our helpers, while a system CLI
+/// runs in the user's own environment untouched.
+pub fn docker_command_for(paths: &EnginePaths, bin: &Path, source: CliSource) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.env("DOCKER_HOST", format!("unix://{}", paths.socket.display()))
+        .env("DOCKER_CONFIG", paths.current_dir.join("docker-config"));
+    if source == CliSource::Bundled {
+        cmd.env("PATH", prefixed_path(&paths.bin_dir()));
+    }
+    cmd
+}
+
 /// A `Command` for the **bundled** `docker` CLI, pointed at our engine and our
 /// config dir. This is the single choke point: nothing else in the app may
 /// spawn a `docker` binary from PATH.
+///
+/// Callers that should honour the user's system CLI use
+/// [`docker_command_resolved`] instead.
 pub fn docker_command(paths: &EnginePaths) -> Command {
     let mut cmd = Command::new(paths.bin_dir().join("docker"));
     cmd.env("DOCKER_HOST", format!("unix://{}", paths.socket.display()))
@@ -772,12 +947,53 @@ pub fn docker_command(paths: &EnginePaths) -> Command {
     cmd
 }
 
+/// The CLI preference the app is running with.
+///
+/// Held process-wide rather than threaded through every call site: the
+/// resolver runs inside `docker_command_resolved`, which is reached from
+/// compose helpers that have no `AppState`. `save_app_config` keeps this in
+/// step with the persisted config.
+static CLI_MODE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Record the user's CLI preference (`"auto"`, `"system"`, `"bundled"`).
+pub fn set_cli_mode(mode: &str) {
+    let mode = match mode {
+        "system" | "bundled" => mode,
+        _ => "auto",
+    };
+    if let Ok(mut guard) = CLI_MODE.write() {
+        *guard = Some(mode.to_string());
+    }
+}
+
+/// The current CLI preference; `"auto"` until something sets it.
+pub fn cli_mode() -> String {
+    CLI_MODE
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+/// A `Command` for whichever docker CLI the resolver picked.
+///
+/// Falls back to the bundled binary when nothing resolves, so callers never
+/// have to handle a missing CLI just to build a command.
+pub fn docker_command_resolved(paths: &EnginePaths) -> Command {
+    let mode = cli_mode();
+    match resolve_cli(paths, &mode, &[]) {
+        Ok(r) => docker_command_for(paths, &r.path, r.source),
+        Err(_) => docker_command(paths),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Install / update
 // ---------------------------------------------------------------------------
 
 /// Progress for the download phase of an install, as a human-readable label
 /// plus a 0.0–1.0 fraction when the total size is known.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct InstallProgress {
     pub label: String,
     pub fraction: Option<f64>,
@@ -847,10 +1063,21 @@ where
     });
     extract_binaries(&tmp.join("docker"), &bin_dir)?;
     extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
-    let plugins = staging.join("cli-plugins");
-    fs::create_dir_all(&plugins)?;
-    fs::copy(tmp.join("compose"), plugins.join("docker-compose"))?;
-    set_executable(&plugins.join("docker-compose"))?;
+    // Docker finds plugins under `$DOCKER_CONFIG/cli-plugins`, and every
+    // invocation we run sets `DOCKER_CONFIG` to `<current>/docker-config`, so
+    // stage the plugin on that path. The tree becomes `current` by symlink.
+    let compose_src = tmp.join("compose");
+    let compose_dst = staging
+        .join("docker-config")
+        .join("cli-plugins")
+        .join("docker-compose");
+    fs::create_dir_all(
+        compose_dst
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("compose destination has no parent"))?,
+    )?;
+    fs::copy(&compose_src, &compose_dst)?;
+    set_executable(&compose_dst)?;
     fs::write(staging.join("VERSION"), release.version)?;
 
     // 3. Mark complete, move staging into place, then swap the symlink. The
@@ -889,9 +1116,971 @@ pub fn swap_current(paths: &EnginePaths, version: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Runtime engine update: discover a newer release, then install it
+// ---------------------------------------------------------------------------
+
+/// Directory listing of Docker's official static channel — where both the
+/// engine tarballs and the version list we check against come from.
+const STATIC_LISTING_URL: &str = "https://download.docker.com/linux/static/stable/x86_64/";
+
+/// What a "check for engine updates" pass found, for the Settings UI.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EngineUpdateInfo {
+    /// Version the `current` symlink points at, `None` when nothing is installed.
+    pub installed_version: Option<String>,
+    /// Newest stable version Docker publishes on the official static channel.
+    pub latest_version: String,
+    /// True when `latest_version` beats what we have — or when we have nothing
+    /// installed at all, in which case the same button performs a first install.
+    pub update_available: bool,
+    /// Version we ship pinned checksums for, so installing *that* one is
+    /// verified end to end rather than only over TLS.
+    pub pinned_version: String,
+    /// Channel the check read; surfaced so the UI can label the row.
+    pub channel: String,
+}
+
+/// Compare dotted versions by their numeric X.Y.Z prefix, missing parts reading
+/// as zero. Anything unparseable sorts lowest instead of erroring — this is a
+/// UI hint, not a security decision.
+fn version_triple(v: &str) -> (u64, u64, u64) {
+    let mut it = v.trim().trim_start_matches('v').split('.');
+    let mut next = || it.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    (next(), next(), next())
+}
+
+/// True when `a` is a strictly newer dotted version than `b`.
+pub fn version_gt(a: &str, b: &str) -> bool {
+    version_triple(a) > version_triple(b)
+}
+
+/// Whether a freshly discovered `latest` is worth offering an update for.
+/// Nothing installed counts as an update, since the button performs the first
+/// install in that case.
+pub fn update_available(latest: &str, installed: Option<&str>) -> bool {
+    installed.map(|installed| version_gt(latest, installed)).unwrap_or(true)
+}
+
+/// The version token out of `docker --version` output —
+/// `Docker version 29.9.1, build f415da8` → `29.9.1`.
+///
+/// The token arrives comma-punctuated in practice, so punctuation is trimmed
+/// while letters, digits, `.` and `-` are kept. An unrecognised format yields
+/// an empty string, which the install's self-check treats as a failure rather
+/// than as a pass.
+pub fn reported_version(output: &str) -> &str {
+    output
+        .split_whitespace()
+        .skip_while(|word| *word != "version")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+}
+
+/// Highest `docker-<major.minor.patch>.tgz` version in a static-channel
+/// directory listing.
+///
+/// Rootless extras share the `docker-` prefix (`docker-rootless-extras-…`) but
+/// their first segment is not a number, so they are dropped along with any
+/// entry that has a fourth version segment or an unparseable tail — only plain
+/// stable X.Y.Z builds can win.
+pub fn parse_latest_static_version(listing: &str) -> Option<String> {
+    let mut best: Option<((u64, u64, u64), String)> = None;
+    for (idx, _) in listing.match_indices("docker-") {
+        let after = &listing[idx + "docker-".len()..];
+        let Some(end) = after.find(".tgz") else { continue };
+        let version = &after[..end];
+        let mut parts = version.split('.');
+        let (Some(major), Some(minor), Some(patch)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        let (Ok(major), Ok(minor), Ok(patch)) =
+            (major.parse::<u64>(), minor.parse::<u64>(), patch.parse::<u64>())
+        else {
+            continue;
+        };
+        let key = (major, minor, patch);
+        if best.as_ref().is_none_or(|(k, _)| *k < key) {
+            best = Some((key, version.to_string()));
+        }
+    }
+    best.map(|(_, version)| version)
+}
+
+/// Newest stable engine version published on Docker's static channel.
+pub async fn fetch_latest_engine_version() -> Result<String> {
+    let listing = http_get(STATIC_LISTING_URL)
+        .await
+        .context("connect to Docker's static binary channel")?
+        .text()
+        .await
+        .context("read the channel listing body")?;
+    parse_latest_static_version(&listing)
+        .context("no stable engine version found in the channel listing")
+}
+
+/// The engine version `current` points at, `None` when nothing is installed.
+pub fn installed_engine_version(paths: &EnginePaths) -> Option<String> {
+    fs::read_to_string(paths.current_dir.join("VERSION"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Check Docker's official channel against what is installed right now.
+///
+/// A listing fetch failure is an error rather than an empty result: the UI
+/// needs to say "couldn't check" instead of quietly reporting "up to date".
+pub async fn check_engine_update(paths: &EnginePaths) -> Result<EngineUpdateInfo> {
+    let installed_version = installed_engine_version(paths);
+    let latest_version = fetch_latest_engine_version().await?;
+    let update_available = update_available(&latest_version, installed_version.as_deref());
+    Ok(EngineUpdateInfo {
+        installed_version,
+        latest_version,
+        update_available,
+        pinned_version: DEFAULT_RELEASE.version.to_string(),
+        channel: "stable".to_string(),
+    })
+}
+
+/// Download `version` from Docker's official channel and point `current` at it.
+///
+/// The installed engine stays untouched until the new one is fully staged,
+/// self-checked and renamed into place, so an interrupted or failed update
+/// leaves the previous engine working — `swap_current` is the only mutation
+/// and it is a single atomic rename.
+///
+/// `version == DEFAULT_RELEASE.version` routes through [`install_release`] and
+/// is checked against the checksums shipped with the app. Docker publishes no
+/// checksums for any other build, so those are fetched over TLS from
+/// `download.docker.com`, their sha256 is recorded into the new version's
+/// `CHECKSUMS`, and the staged CLI must answer `docker --version` with its own
+/// version before anything becomes current.
+pub async fn install_engine_update<F>(paths: &EnginePaths, version: &str, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(InstallProgress),
+{
+    if version == DEFAULT_RELEASE.version {
+        return install_release(paths, &DEFAULT_RELEASE, on_progress).await;
+    }
+
+    let staging = paths.versions_dir.join(format!(".staging-{version}"));
+    let _ = fs::remove_dir_all(&staging);
+    let bin_dir = staging.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let tmp = staging.join("download");
+    fs::create_dir_all(&tmp)?;
+
+    // 1. Fetch both tarballs, recording what we actually received.
+    let artifacts = [(docker_url(version), "docker"), (rootless_url(version), "rootless-extras")];
+    let mut checksums = String::new();
+    for (i, (url, name)) in artifacts.iter().enumerate() {
+        let dest = tmp.join(name);
+        let base = i as f64;
+        let mut last = 0u64;
+        download(url, &dest, |done, total| {
+            if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
+                return;
+            }
+            last = done;
+            on_progress(InstallProgress {
+                label: format!("Downloading {name}…"),
+                fraction: Some((base + fraction_of(done, total)) / artifacts.len() as f64),
+            });
+        })
+        .await?;
+        checksums.push_str(&format!("{}  {}\n", sha256_file(&dest)?, name));
+    }
+    fs::write(staging.join("CHECKSUMS"), &checksums)?;
+
+    // 2. Extract. Binaries keep only their file name, as in the pinned path.
+    on_progress(InstallProgress {
+        label: "Extracting…".into(),
+        fraction: Some(0.9),
+    });
+    extract_binaries(&tmp.join("docker"), &bin_dir)?;
+    extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
+
+    // 3. Keep the compose plugin the current engine already has; a first ever
+    //    install falls back to the pinned release so `docker compose` works.
+    // Stage the plugin on the path Docker will search once this tree becomes
+    // `current`: `$DOCKER_CONFIG/cli-plugins`, and our invocations always set
+    // `DOCKER_CONFIG` to `<current>/docker-config`.
+    let plugins = staging.join("docker-config").join("cli-plugins");
+    fs::create_dir_all(&plugins)?;
+    let existing = paths.compose_plugin();
+    if existing.is_file() {
+        fs::copy(&existing, plugins.join("docker-compose"))?;
+        set_executable(&plugins.join("docker-compose"))?;
+    } else {
+        let dest = tmp.join("compose");
+        download(
+            &compose_url(DEFAULT_RELEASE.compose_version),
+            &dest,
+            |_, _| {},
+        )
+        .await?;
+        verify(&dest, DEFAULT_RELEASE.compose_sha256).context("verifying compose")?;
+        fs::copy(&dest, plugins.join("docker-compose"))?;
+        set_executable(&plugins.join("docker-compose"))?;
+    }
+
+    // 4. Self-check before anything is swapped: a CLI that cannot report its
+    //    own version must never become `current`.
+    on_progress(InstallProgress {
+        label: "Verifying…".into(),
+        fraction: Some(0.95),
+    });
+    let probe = Command::new(bin_dir.join("docker"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("run the staged docker --version")?;
+    let probe_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    // `docker --version` prints `Docker version <ver>, build <hash>`; match the
+    // version token exactly so `29.9.1` can never pass as `29.9.10`.
+    let reported = reported_version(&probe_out);
+    if !probe.status.success() || reported != version {
+        bail!(
+            "staged engine reported {}, but {version} was expected: {}",
+            if reported.is_empty() {
+                "no readable version"
+            } else {
+                reported
+            },
+            probe_out.trim()
+        );
+    }
+
+    // 5. Mark complete, move staging into place, then swap the symlink. The
+    //    marker is written *before* the move so a half-moved tree never looks
+    //    installed.
+    fs::write(staging.join("VERSION"), version)?;
+    let _ = fs::remove_dir_all(&tmp);
+    fs::write(staging.join(".complete"), "")?;
+    let final_dir = paths.versions_dir.join(version);
+    let _ = fs::remove_dir_all(&final_dir);
+    fs::rename(&staging, &final_dir)
+        .with_context(|| format!("move staged engine to {}", final_dir.display()))?;
+    swap_current(paths, version)?;
+
+    on_progress(InstallProgress {
+        label: "Engine ready".into(),
+        fraction: Some(1.0),
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Docker CLI resolution
+// ---------------------------------------------------------------------------
+//
+// The app must work whether or not the host has Docker installed. Case 1: a
+// system `docker` exists — we link with it and let the user's own binary run
+// against our engine. Case 2: there is no system `docker`, or it is older
+// than the binary we shipped — we run our bundled copy. Either way we always
+// point `DOCKER_HOST` at our socket; the choice of *binary* is what differs.
+
+/// Which docker binary the app decided to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliSource {
+    System,
+    Bundled,
+}
+
+/// What the resolver found, plus the human sentence explaining the choice.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CliResolution {
+    /// The binary that will actually be executed.
+    pub source: CliSource,
+    /// Absolute path of the chosen binary.
+    pub path: PathBuf,
+    /// `docker --version` of the chosen binary.
+    pub version: String,
+    pub system_path: Option<PathBuf>,
+    /// `None` when there is no system `docker` at all.
+    pub system_version: Option<String>,
+    pub bundled_path: PathBuf,
+    /// `None` when no engine has been installed yet.
+    pub bundled_version: Option<String>,
+    /// One sentence naming the winner and why. Always populated.
+    pub reason: String,
+}
+
+pub fn probe_cli_version(bin: &Path) -> Option<String> {
+    // Bounded: a `docker` on PATH that hangs (a broken wrapper, a slow
+    // network mount) must not freeze compose or the settings page. The
+    // version probe is only ever a sniff, so a timeout just means "unknown".
+    let mut child = std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let mut out = Vec::new();
+    child.stdout.as_mut()?.read_to_end(&mut out).ok()?;
+    let stdout = String::from_utf8_lossy(&out);
+    let version = reported_version(&stdout);
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+/// Find a `docker` binary on `PATH`, never one that belongs to us.
+///
+/// `skip` lets the caller exclude paths we installed ourselves (the PATH
+/// shim) so the resolver never mistakes our own shim for the user's CLI.
+pub fn find_system_docker(paths: &EnginePaths, skip: &[PathBuf]) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let ours = paths.bin_dir().canonicalize().ok();
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("docker");
+        if !candidate.is_file() {
+            continue;
+        }
+        if skip.iter().any(|s| s == &candidate) {
+            continue;
+        }
+        // A shim we installed earlier is not the user's CLI: it execs one of
+        // our binaries, so counting it would make the resolver compare our
+        // bundled docker against itself.
+        if is_our_shim(&candidate) {
+            continue;
+        }
+        if let (Some(ours), Ok(real)) = (ours.as_ref(), candidate.canonicalize()) {
+            if &real == ours {
+                continue;
+            }
+        }
+        if probe_cli_version(&candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The pure half of [`resolve_cli`]: given already-probed versions, decide
+/// which CLI wins. Kept separate from the probing so the precedence rules are
+/// testable without a filesystem or a PATH lookup.
+pub fn decide_cli(
+    bundled_path: &Path,
+    bundled_version: Option<&str>,
+    system_path: Option<&Path>,
+    system_version: Option<&str>,
+    mode: &str,
+) -> Result<CliResolution, String> {
+    let bundled_path = bundled_path.to_path_buf();
+    let system_path = system_path.map(Path::to_path_buf);
+    let bundled_version = bundled_version.map(str::to_string);
+    let system_version = system_version.map(str::to_string);
+
+    let build = |source: CliSource, path: PathBuf, version: String, reason: String| CliResolution {
+        source,
+        path,
+        version,
+        system_path: system_path.clone(),
+        system_version: system_version.clone(),
+        bundled_path: bundled_path.clone(),
+        bundled_version: bundled_version.clone(),
+        reason,
+    };
+
+    match mode {
+        "system" => match (system_path.as_deref(), system_version.as_deref()) {
+            (Some(path), Some(version)) => Ok(build(
+                CliSource::System,
+                path.to_path_buf(),
+                version.to_string(),
+                format!(
+                    "Prefer system docker set in Settings — using {version} at {}.",
+                    path.display()
+                ),
+            )),
+            _ => Err(
+                "Prefer system docker is set, but no working system `docker` was found on PATH."
+                    .into(),
+            ),
+        },
+        "bundled" => match bundled_version.as_deref() {
+            Some(version) => Ok(build(
+                CliSource::Bundled,
+                bundled_path.clone(),
+                version.to_string(),
+                format!(
+                    "Prefer bundled docker set in Settings — using {version} at {}.",
+                    bundled_path.display()
+                ),
+            )),
+            None => Err("Prefer bundled docker is set, but no engine has been installed yet.".into()),
+        },
+        _ => match (
+            system_path.as_deref(),
+            system_version.as_deref(),
+            bundled_version.as_deref(),
+        ) {
+            (None, _, None) => Err(
+                "No docker CLI found — install Docker on this machine, or install an engine in Settings."
+                    .into(),
+            ),
+            (Some(path), Some(sv), None) => Ok(build(
+                CliSource::System,
+                path.to_path_buf(),
+                sv.to_string(),
+                format!("No bundled engine installed — using system docker {sv}."),
+            )),
+            (None, _, Some(bv)) => Ok(build(
+                CliSource::Bundled,
+                bundled_path.clone(),
+                bv.to_string(),
+                format!("No system docker on PATH — using bundled docker {bv}."),
+            )),
+            (Some(path), Some(sv), Some(bv)) => {
+                // Bundled only wins when it is strictly newer; a tie goes to
+                // the system binary so we never shadow the user's own
+                // toolchain with an identical copy.
+                if version_gt(bv, sv) {
+                    Ok(build(
+                        CliSource::Bundled,
+                        bundled_path.clone(),
+                        bv.to_string(),
+                        format!(
+                            "Bundled docker {bv} is newer than the system {sv} — using the bundled docker."
+                        ),
+                    ))
+                } else {
+                    Ok(build(
+                        CliSource::System,
+                        path.to_path_buf(),
+                        sv.to_string(),
+                        format!(
+                            "System docker {sv} is at least as new as the bundled {bv} — using your docker."
+                        ),
+                    ))
+                }
+            }
+            // Unreachable: a resolved path always carries a probed version.
+            _ => Err("No docker CLI found.".into()),
+        },
+    }
+}
+
+pub fn resolve_cli(
+    paths: &EnginePaths,
+    mode: &str,
+    skip: &[PathBuf],
+) -> Result<CliResolution, String> {
+    let bundled_path = paths.bin_dir().join("docker");
+    let bundled_version = if bundled_path.is_file() {
+        probe_cli_version(&bundled_path).or_else(|| installed_engine_version(paths))
+    } else {
+        None
+    };
+    let system_path = find_system_docker(paths, skip);
+    let system_version = system_path.as_deref().and_then(probe_cli_version);
+
+    decide_cli(
+        &bundled_path,
+        bundled_version.as_deref(),
+        system_path.as_deref(),
+        system_version.as_deref(),
+        mode,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in PATH shim
+// ---------------------------------------------------------------------------
+//
+// A machine with no Docker installed gets a `docker` command in the user's
+// terminal, without touching the system. The shim is a small script that
+// execs the resolved binary with our engine's socket and config — so it works
+// for a bundled CLI that no other PATH entry would expose. It is only ever
+// written on request, and only ever over itself.
+
+/// Where the shim goes. `~/.local/bin` precedes `/usr/local/bin` on a typical
+/// interactive PATH, so this wins without reordering anything.
+pub fn shim_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".local/bin/docker"))
+}
+
+/// Marker so we never delete a shim we did not write, and can tell an old
+/// shim from a real binary.
+const SHIM_MARKER: &str = "# docker-manager shim";
+
+/// True when `path` is the script we generate, not a real binary the user
+/// installed (nor someone else's file that merely mentions us).
+fn is_our_shim(path: &Path) -> bool {
+    // The marker sits on the second line, after the `/bin/sh` shebang.
+    fs::read_to_string(path)
+        .map(|c| c.lines().take(3).any(|l| l.trim() == SHIM_MARKER))
+        .unwrap_or(false)
+}
+
+pub fn shim_installed() -> bool {
+    shim_path()
+        .filter(|d| is_our_shim(d))
+        .filter(|d| d.exists())
+        .is_some()
+}
+
+/// The binary the installed shim would exec. `None` when not installed.
+pub fn shim_target() -> Option<PathBuf> {
+    let dest = shim_path()?;
+    if !is_our_shim(&dest) || !dest.exists() {
+        return None;
+    }
+    let body = std::fs::read_to_string(&dest).ok()?;
+    parse_shim_exec(&body)
+}
+
+/// Pull the target out of a generated shim's `exec …` line.
+///
+/// Split out from [`shim_target`] so it can be tested without a `$HOME`, the
+/// same way [`is_our_shim`] is.
+fn parse_shim_exec(body: &str) -> Option<PathBuf> {
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("exec ") else {
+            continue;
+        };
+        let rest = rest.trim();
+        // Generated shims write the path unquoted (`exec /p/docker "$@"`), but
+        // accept a quoted form too so a hand-edited shim still parses.
+        if let Some(stripped) = rest.strip_prefix('"') {
+            if let Some(end) = stripped.find('"') {
+                return Some(PathBuf::from(&stripped[..end]));
+            }
+        }
+        if let Some(part) = rest.split_whitespace().next() {
+            return Some(PathBuf::from(part));
+        }
+    }
+    None
+}
+
+/// Whether the shim actually takes effect in a terminal.
+///
+/// Writing the file is not enough: it only wins if its directory is on PATH
+/// *and* no other `docker` sits ahead of it. Reporting "installed" without
+/// this check would promise something the shell may never deliver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShimEffect {
+    /// The shim's directory is on PATH and nothing shadows it.
+    Active,
+    /// The shim's directory is not on PATH at all.
+    NotOnPath,
+    /// Another `docker` earlier on PATH wins over the shim.
+    Shadowed,
+}
+
+/// How the installed shim would resolve, or `None` when none is installed.
+pub fn shim_effect() -> Option<ShimEffect> {
+    let dest = shim_path()?;
+    if !is_our_shim(&dest) {
+        return None;
+    }
+    let shim_dir = dest.parent()?.to_path_buf();
+    let path_var = std::env::var_os("PATH")?;
+
+    let mut shim_at: Option<usize> = None;
+    for (idx, dir) in std::env::split_paths(&path_var).enumerate() {
+        if dir == shim_dir && shim_at.is_none() {
+            shim_at = Some(idx);
+        }
+        // A real docker ahead of the shim directory takes precedence.
+        let candidate = dir.join("docker");
+        if candidate.is_file() && !is_our_shim(&candidate) {
+            match shim_at {
+                // Already passed the shim dir → the shim wins.
+                Some(at) if at < idx => break,
+                // This docker comes first → the shim never runs.
+                _ => return Some(ShimEffect::Shadowed),
+            }
+        }
+    }
+
+    Some(match shim_at {
+        Some(_) => ShimEffect::Active,
+        None => ShimEffect::NotOnPath,
+    })
+}
+
+/// Write the shim, refusing to overwrite anything that is not already ours.
+pub fn ensure_shim(paths: &EnginePaths, mode: &str) -> Result<PathBuf> {
+    let dest = shim_path().ok_or_else(|| anyhow::anyhow!("no home directory for the shim"))?;
+    if dest.exists() && !shim_installed() {
+        bail!(
+            "{} already exists and is not our shim — refusing to overwrite it",
+            dest.display()
+        );
+    }
+    let res = resolve_cli(paths, mode, &[]).map_err(anyhow::Error::msg)?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let script = format!(
+        "#!/bin/sh\n\
+         {SHIM_MARKER}\n\
+         # Generated by Docker Manager; regenerate from Settings if it looks stale.\n\
+         export DOCKER_HOST=unix://{socket}\n\
+         export DOCKER_CONFIG={config}\n\
+         exec {bin} \"$@\"\n",
+        socket = paths.socket.display(),
+        config = paths.current_dir.join("docker-config").display(),
+        bin = res.path.display(),
+    );
+    fs::write(&dest, script).with_context(|| format!("write {}", dest.display()))?;
+    set_executable(&dest)?;
+    Ok(dest)
+}
+
+/// Remove the shim, but only if it is ours.
+pub fn remove_shim() -> Result<bool> {
+    let Some(dest) = shim_path() else {
+        return Ok(false);
+    };
+    if !shim_installed() {
+        return Ok(false);
+    }
+    fs::remove_file(&dest).with_context(|| format!("remove {}", dest.display()))?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Compose plugin layout
+// ---------------------------------------------------------------------------
+//
+// Docker discovers plugins under `$DOCKER_CONFIG/cli-plugins`, and
+// `docker_command` always sets `DOCKER_CONFIG` to `current/docker-config`.
+// Older trees dropped the plugin at `current/cli-plugins`, where Docker will
+// never look, so the app silently fell back to whatever compose the host had
+// (or none at all). `ensure_compose_layout` moves the plugin into place.
+
+/// Canonical home of the bundled compose plugin, under our `DOCKER_CONFIG`.
+pub fn compose_plugin_dir(paths: &EnginePaths) -> PathBuf {
+    paths.current_dir
+        .join("docker-config")
+        .join("cli-plugins")
+}
+
+/// Move a plugin into the directory Docker actually searches.
+fn place_compose_plugin(src: &Path, dest: &Path) -> Result<()> {
+    if src == dest {
+        return Ok(());
+    }
+    fs::create_dir_all(
+        dest.parent()
+            .ok_or_else(|| anyhow::anyhow!("plugin path has no parent"))?,
+    )?;
+    // Copy rather than rename: the source may sit on another filesystem, and
+    // a leftover legacy file is harmless next to a working canonical one.
+    fs::copy(src, dest)
+        .with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
+    set_executable(dest)?;
+    Ok(())
+}
+
+/// Normalise an installed tree so compose lives where Docker will find it.
+///
+/// Idempotent: a missing plugin is simply reported, never invented. Called
+/// before every engine start and by the CLI status command.
+pub fn ensure_compose_layout(paths: &EnginePaths) -> Result<Option<PathBuf>> {
+    let canonical = compose_plugin_dir(paths).join("docker-compose");
+    if canonical.is_file() {
+        return Ok(Some(canonical));
+    }
+    let legacy = paths.current_dir.join("cli-plugins").join("docker-compose");
+    if legacy.is_file() {
+        place_compose_plugin(&legacy, &canonical)?;
+        return Ok(Some(canonical));
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Compose plugin updates (independent release axis)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ComposeUpdateInfo {
+    pub installed_version: Option<String>,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub pinned_version: String,
+}
+
+/// Compose ships `checksums.txt` alongside its release assets, so unlike the
+/// engine its digest is upstream's rather than ours.
+fn compose_checksums_url(version: &str) -> String {
+    format!("{COMPOSE_BASE}/v{version}/checksums.txt")
+}
+
+fn parse_checksums(text: &str, file_name: &str) -> Option<String> {
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let digest = parts.next()?;
+        let name = parts.next()?;
+        if name.trim_start_matches('*') == file_name {
+            return Some(digest.to_string());
+        }
+    }
+    None
+}
+
+/// Version token of `docker-compose version`, or `None` when it will not run.
+pub fn compose_plugin_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("version")
+        .arg("--short")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.trim_start_matches('v').to_string())
+}
+
+/// `GET` with a User-Agent.
+///
+/// The GitHub API rejects requests that omit one with `403 Forbidden`
+/// ("Request forbidden by administrative rules"), and a bare `reqwest::get`
+/// sends none. Release-asset downloads are served from a CDN where the header
+/// is optional, but sending it everywhere keeps one code path.
+pub async fn http_get(url: &str) -> Result<reqwest::Response> {
+    let resp = reqwest::Client::builder()
+        .user_agent(concat!("docker-manager/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("build HTTP client")?
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    resp.error_for_status()
+        .with_context(|| format!("GET {url}"))
+}
+
+/// Latest compose release from GitHub, stripped of a leading `v`.
+pub async fn fetch_latest_compose_version() -> Result<String> {
+    let url = "https://api.github.com/repos/docker/compose/releases/latest";
+    let body = http_get(url)
+        .await?
+        .text()
+        .await
+        .context("read GitHub releases response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("decode GitHub releases JSON")?;
+    let tag = json["tag_name"].as_str().unwrap_or_default();
+    let version = tag.trim().trim_start_matches('v');
+    if version.is_empty() {
+        bail!("could not read a compose release tag from GitHub");
+    }
+    Ok(version.to_string())
+}
+
+pub async fn check_compose_update(paths: &EnginePaths) -> Result<ComposeUpdateInfo> {
+    let plugin = ensure_compose_layout(paths)?
+        .unwrap_or_else(|| compose_plugin_dir(paths).join("docker-compose"));
+    let installed = compose_plugin_version(&plugin);
+    let latest = fetch_latest_compose_version().await?;
+    let update = update_available(&latest, installed.as_deref());
+    Ok(ComposeUpdateInfo {
+        installed_version: installed,
+        latest_version: latest,
+        update_available: update,
+        pinned_version: DEFAULT_RELEASE.compose_version.to_string(),
+    })
+}
+
+/// Download a newer compose plugin and drop it in front of Docker.
+///
+/// No daemon stop: the plugin is a file we load per-invocation, so replacing
+/// it while compose is idle cannot disturb a running engine.
+pub async fn install_compose_update<F>(
+    paths: &EnginePaths,
+    version: &str,
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(InstallProgress),
+{
+    let version = version.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        bail!("no compose version given");
+    }
+
+    let dir = compose_plugin_dir(paths);
+    fs::create_dir_all(&dir)?;
+    let dest = dir.join("docker-compose");
+    let staging = dir.join(format!(".compose-{version}.staging"));
+    if staging.exists() {
+        fs::remove_file(&staging).ok();
+    }
+
+    on_progress(InstallProgress {
+        label: format!("Downloading compose {version}…"),
+        fraction: Some(0.15),
+    });
+    let file_name = "docker-compose-linux-x86_64";
+    download(
+        &compose_url(&version),
+        &staging,
+        |_, _| {},
+    )
+    .await?;
+
+    on_progress(InstallProgress {
+        label: "Verifying…".into(),
+        fraction: Some(0.6),
+    });
+    let sums = http_get(&compose_checksums_url(&version))
+        .await?
+        .text()
+        .await
+        .context("read compose checksums.txt")?;
+    let expected = parse_checksums(&sums, file_name)
+        .ok_or_else(|| anyhow::anyhow!("no {file_name} entry in compose {version} checksums.txt"))?;
+    verify(&staging, &expected).context("verifying compose")?;
+
+    on_progress(InstallProgress {
+        label: "Verifying binary…".into(),
+        fraction: Some(0.75),
+    });
+    // A compose that cannot report its own version is not fit to install.
+    let reported = probe_cli_version(&staging).ok_or_else(|| {
+        anyhow::anyhow!("staged compose {version} failed `--version` — refusing to install")
+    })?;
+    if reported != version {
+        bail!("staged compose reported {reported}, but {version} was expected");
+    }
+
+    on_progress(InstallProgress {
+        label: "Installing…".into(),
+        fraction: Some(0.9),
+    });
+    set_executable(&staging)?;
+    fs::rename(&staging, &dest)
+        .with_context(|| format!("install compose {version} to {}", dest.display()))?;
+
+    on_progress(InstallProgress {
+        label: "Compose ready".into(),
+        fraction: Some(1.0),
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_gt_compares_numeric_triples() {
+        assert!(version_gt("29.9.1", "29.9.0"));
+        assert!(version_gt("29.10.0", "29.9.9"));
+        assert!(version_gt("30.0.0", "29.99.99"));
+        assert!(!version_gt("29.9.0", "29.9.1"));
+        assert!(!version_gt("29.9.1", "29.9.1"));
+        // A leading `v` and a missing trailing part are tolerated.
+        assert!(version_gt("v29.9.1", "29.9.0"));
+        assert!(version_gt("29.10", "29.9.9"));
+        // Unparseable input sorts lowest rather than panicking.
+        assert!(version_gt("29.9.1", "nightly"));
+        assert!(!version_gt("nightly", "29.9.1"));
+    }
+
+    #[test]
+    fn reported_version_reads_the_token_and_tolerates_punctuation() {
+        assert_eq!(
+            reported_version("Docker version 29.9.1, build f415da8"),
+            "29.9.1"
+        );
+        assert_eq!(reported_version("Docker version 29.9.0\n"), "29.9.0");
+        // Unrecognised output must read as "no version", never as a match.
+        assert_eq!(reported_version("docker: command not found"), "");
+        assert_eq!(reported_version(""), "");
+    }
+
+    #[test]
+    fn update_is_offered_only_for_a_newer_version_or_no_engine() {
+        assert!(update_available("29.9.1", Some("29.9.0")));
+        assert!(update_available("29.9.1", None));
+        assert!(!update_available("29.9.1", Some("29.9.1")));
+        assert!(!update_available("29.9.1", Some("29.10.0")));
+    }
+
+    #[test]
+    fn parse_latest_static_version_picks_the_highest_stable_build() {
+        let listing = r#"
+            <a href="../">../</a>
+            <a href="docker-rootless-extras-29.7.0.tgz">docker-rootless-extras-29.7.0.tgz</a>
+            <a href="docker-29.9.0.tgz">docker-29.9.0.tgz</a>
+            <a href="docker-29.9.1.tgz">docker-29.9.1.tgz</a>
+            <a href="docker-rootless-extras-29.9.1.tgz">docker-rootless-extras-29.9.1.tgz</a>
+            <a href="docker-29.10.0.tgz">docker-29.10.0.tgz</a>
+            <a href="sbx/">sbx/</a>
+        "#;
+        assert_eq!(
+            parse_latest_static_version(listing).as_deref(),
+            Some("29.10.0")
+        );
+    }
+
+    #[test]
+    fn parse_latest_static_version_ignores_listings_without_an_engine() {
+        // Rootless extras are the only `docker-` entries here and are not engines.
+        assert_eq!(
+            parse_latest_static_version(
+                "<a href=\"docker-rootless-extras-29.9.1.tgz\">docker-rootless-extras-29.9.1.tgz</a>"
+            )
+            .as_deref(),
+            None
+        );
+        assert_eq!(parse_latest_static_version(""), None);
+    }
 
     /// The detector must accept a filesystem that answers with real d_types.
     /// We can't conjure a d_type-less fs in a unit test, so this pins the
@@ -960,6 +2149,239 @@ mod tests {
             "detector and pre-flight gate disagree for {}",
             probe.display()
         );
+    }
+
+    /// On a healthy filesystem the shim must be a pure no-op: no directories
+    /// created, no symlinks written. This is the case every normal user hits.
+    #[test]
+    fn snapshotter_compat_is_noop_on_d_type_filesystem() {
+        let root = std::env::temp_dir().join(format!("dm-compat-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(dir_supports_d_type(&root), Some(true));
+        ensure_snapshotter_compat(&root).unwrap();
+
+        assert!(
+            !root.join("containerd").exists(),
+            "no-op shim must not create containerd/ under a healthy data root"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `migrate_data_root` calls the shim on a target that may not exist yet.
+    /// It must judge the filesystem the path *would* land on and stay a no-op
+    /// there, rather than erroring or creating directories early.
+    #[test]
+    fn snapshotter_compat_handles_missing_dir() {
+        let root = std::env::temp_dir().join(format!("dm-compat-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let absent = root.join("not/created/yet");
+
+        assert!(!absent.exists());
+        ensure_snapshotter_compat(&absent).unwrap();
+
+        assert!(
+            !absent.exists(),
+            "shim must not create the data root itself"
+        );
+        assert!(
+            !root.join("not").exists(),
+            "shim must not create intermediate directories for a healthy fs"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A doomed migration must be caught *before* any data moves: source holds a
+    /// populated snapshotter dir, target is on a d_type-less fs.
+    #[test]
+    fn migrate_conflict_is_detected_before_copy() {
+        let root = std::env::temp_dir().join(format!("dm-mig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        // Populated overlayfs snapshotter dir in the source, like the default
+        // data root's 42M of dormant state.
+        let plugin = source
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("metadata.db"), b"x").unwrap();
+
+        // Target on a healthy fs → no conflict, whatever source holds.
+        assert_eq!(migrate_dtype_conflict(&source, &target), None);
+        assert!(ensure_snapshotter_compat(&target).is_ok());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The real conflict path needs a d_type-less *target*, so it lives in the
+    /// env-gated test below. What is assertable everywhere: a populated
+    /// snapshotter dir in the source never blocks a migration onto a healthy fs,
+    /// because the target needs no shim at all.
+    #[test]
+    fn migrate_conflict_never_blocks_healthy_target() {
+        let root = std::env::temp_dir().join(format!("dm-mig-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        let plugin = source
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("metadata.db"), b"x").unwrap();
+
+        // Healthy target: no conflict regardless of source contents.
+        if dir_supports_d_type(&target) == Some(true) {
+            assert_eq!(migrate_dtype_conflict(&source, &target), None);
+            assert!(
+                ensure_snapshotter_compat(&target).is_ok(),
+                "shim must stay a no-op on a healthy target"
+            );
+            assert!(
+                !target.join("containerd").exists(),
+                "no-op must not create dirs on a healthy target"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The path that actually matters: source with populated snapshotter state,
+    /// target on a filesystem without d_type. Must be reported *before* any copy.
+    ///
+    /// `DM_DTYPE_PATH=/mnt/... cargo test --lib migrate_conflict_on_dtype_less -- --ignored`
+    #[test]
+    #[ignore = "requires a machine-specific path in DM_DTYPE_PATH"]
+    fn migrate_conflict_on_dtype_less() {
+        let Ok(pat) = std::env::var("DM_DTYPE_PATH") else {
+            return;
+        };
+        let target = std::path::PathBuf::from(&pat);
+        assert_eq!(dir_supports_d_type(&target), Some(false));
+
+        let root = std::env::temp_dir().join(format!("dm-mig-src-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+
+        let plugin = source
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("metadata.db"), b"x").unwrap();
+
+        let conflict = migrate_dtype_conflict(&source, &target);
+        assert!(
+            conflict.is_some(),
+            "populated snapshotter dir moving to a d_type-less target must conflict"
+        );
+        assert!(
+            conflict.unwrap().contains("containerd data"),
+            "conflict message must name the offending data"
+        );
+
+        // Absent and empty source dirs must NOT conflict — those are what the
+        // shim can safely replace with a link after the copy.
+        let clean = root.join("clean");
+        fs::create_dir_all(&clean).unwrap();
+        assert_eq!(migrate_dtype_conflict(&clean, &target), None);
+
+        let empty = root.join("empty");
+        let ep = empty
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[1]);
+        fs::create_dir_all(&ep).unwrap();
+        assert_eq!(migrate_dtype_conflict(&empty, &target), None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fallback directory must itself resolve onto a d_type-capable
+    /// filesystem — retargeting onto another DT_UNKNOWN fs would fix nothing.
+    #[test]
+    fn dtype_compat_root_reports_d_type() {
+        let Some(compat) = dtype_compat_root() else {
+            // No d_type-capable location at all: not something a unit test can
+            // arrange, and the real-path test below covers the shim itself.
+            return;
+        };
+
+        let mut probe: &Path = &compat;
+        while !probe.exists() {
+            match probe.parent() {
+                Some(p) if p != probe => probe = p,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            dir_supports_d_type(probe),
+            Some(true),
+            "compat root {} lands on a filesystem without d_type",
+            compat.display()
+        );
+    }
+
+    /// End-to-end against a real d_type-less volume: both snapshotter dirs come
+    /// back symlinked onto a d_type-capable filesystem, and a re-run is a no-op.
+    ///
+    /// Run with:
+    /// `DM_DTYPE_PATH=/mnt/... cargo test --lib snapshotter_compat_shims -- --ignored`
+    #[test]
+    #[ignore = "requires a machine-specific path in DM_DTYPE_PATH"]
+    fn snapshotter_compat_shims_real_d_type_path() {
+        let Ok(pat) = std::env::var("DM_DTYPE_PATH") else {
+            return;
+        };
+        let data_root = std::path::PathBuf::from(pat);
+        assert_eq!(
+            dir_supports_d_type(&data_root),
+            Some(false),
+            "{} should be on a filesystem without d_type",
+            data_root.display()
+        );
+
+        ensure_snapshotter_compat(&data_root).unwrap();
+        ensure_snapshotter_compat(&data_root).unwrap(); // idempotent
+
+        let daemon = data_root.join("containerd").join("daemon");
+        for plugin in [
+            "io.containerd.snapshotter.v1.overlayfs",
+            "io.containerd.snapshotter.v1.erofs",
+        ] {
+            let link = daemon.join(plugin);
+            let meta = fs::symlink_metadata(&link)
+                .unwrap_or_else(|e| panic!("{}: {e}", link.display()));
+            assert!(
+                meta.file_type().is_symlink(),
+                "{} must be a symlink, got {meta:?}",
+                link.display()
+            );
+
+            let target = fs::read_link(&link).unwrap();
+            let mut probe: &Path = &target;
+            while !probe.exists() {
+                match probe.parent() {
+                    Some(p) if p != probe => probe = p,
+                    _ => break,
+                }
+            }
+            assert_eq!(
+                dir_supports_d_type(probe),
+                Some(true),
+                "{} points at a filesystem without d_type",
+                link.display()
+            );
+        }
     }
 
     #[test]
@@ -1132,4 +2554,158 @@ mod tests {
         assert!(net_flags("host").is_empty());
         assert!(net_flags("none").is_empty());
     }
+
+    #[test]
+    fn resolver_prefers_the_newer_binary() {
+        let d = PathBuf::from("/tmp/bundled");
+        let s = PathBuf::from("/tmp/system");
+        // System newer
+        let r = decide_cli(&d, Some("29.8.2"), Some(&s), Some("29.9.0"), "auto").unwrap();
+        assert_eq!(r.source, CliSource::System);
+        assert!(r.reason.contains("29.9.0"));
+        // Bundled newer
+        let r = decide_cli(&d, Some("29.9.1"), Some(&s), Some("29.9.0"), "auto").unwrap();
+        assert_eq!(r.source, CliSource::Bundled);
+        // Tie → System (we never shadow the user's identical toolchain)
+        let r = decide_cli(&d, Some("29.9.0"), Some(&s), Some("29.9.0"), "auto").unwrap();
+        assert_eq!(r.source, CliSource::System);
+    }
+
+    #[test]
+    fn resolver_reports_why_it_chose() {
+        let d = PathBuf::from("/tmp/bundled");
+        let s = PathBuf::from("/tmp/system");
+        let r = decide_cli(&d, Some("29.8.2"), Some(&s), Some("29.8.3"), "auto").unwrap();
+        assert!(r.reason.to_lowercase().contains("system"));
+        assert!(r.reason.contains("29.8.3"));
+        assert!(r.reason.contains("29.8.2"));
+    }
+
+    #[test]
+    fn resolver_errors_when_nothing_is_installed() {
+        let d = PathBuf::from("/tmp/bundled");
+        assert!(decide_cli(&d, None, None, None, "auto").is_err());
+    }
+
+    #[test]
+    fn ensure_compose_layout_moves_the_legacy_plugin_into_docker_config() {
+        let tmp = std::env::temp_dir().join(format!("dm_compose_test_{}", std::process::id()));
+        let current = tmp.join("current");
+        let legacy_dir = current.join("cli-plugins");
+        std::fs::create_dir_all(&legacy_dir).expect("create legacy dir");
+        std::fs::write(legacy_dir.join("docker-compose"), "# dummy").expect("write legacy compose");
+        let canonical_dir = current.join("docker-config").join("cli-plugins");
+        let canonical = canonical_dir.join("docker-compose");
+        let _ = place_compose_plugin(&legacy_dir.join("docker-compose"), &canonical);
+        assert!(canonical.is_file());
+        // idempotent
+        let _ = place_compose_plugin(&legacy_dir.join("docker-compose"), &canonical);
+        assert!(canonical.is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn compose_plugin_prefers_the_canonical_path_and_falls_back() {
+        let tmp = std::env::temp_dir().join(format!("dm_cp_{}", std::process::id()));
+        let p = EnginePaths {
+            data_root: tmp.join("data"),
+            versions_dir: tmp.join("versions"),
+            current_dir: tmp.join("current"),
+            log_file: tmp.join("dockerd.log"),
+            pid_file: tmp.join("dockerd.pid"),
+            socket: tmp.join("docker.sock"),
+            runtime_dir: tmp.join("run"),
+            exec_root: tmp.join("exec"),
+            rootless_state: tmp.join("rootless"),
+        };
+        std::fs::create_dir_all(p.current_dir.join("cli-plugins")).expect("legacy dir");
+        std::fs::write(p.current_dir.join("cli-plugins").join("docker-compose"), "# legacy")
+            .expect("legacy compose");
+        // Legacy only → fallback points at the legacy file.
+        assert_eq!(p.compose_plugin(), p.current_dir.join("cli-plugins").join("docker-compose"));
+        // Canonical exists → that one wins.
+        let canonical = compose_plugin_dir(&p).join("docker-compose");
+        std::fs::create_dir_all(canonical.parent().unwrap()).expect("canonical dir");
+        std::fs::write(&canonical, "# canonical").expect("canonical compose");
+        assert_eq!(p.compose_plugin(), canonical);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_compose_layout_is_a_noop_without_any_plugin() {
+        let tmp = std::env::temp_dir().join(format!("dm_cl_{}", std::process::id()));
+        let p = EnginePaths {
+            data_root: tmp.join("data"),
+            versions_dir: tmp.join("versions"),
+            current_dir: tmp.join("current"),
+            log_file: tmp.join("dockerd.log"),
+            pid_file: tmp.join("dockerd.pid"),
+            socket: tmp.join("docker.sock"),
+            runtime_dir: tmp.join("run"),
+            exec_root: tmp.join("exec"),
+            rootless_state: tmp.join("rootless"),
+        };
+        std::fs::create_dir_all(&p.current_dir).expect("current dir");
+        assert!(ensure_compose_layout(&p).expect("layout").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_checksums_reads_the_matching_file() {
+        let sums = "abcdef0123456789  docker-compose-linux-x86_64\nfedcba9876543210  checksums.txt\n";
+        assert_eq!(
+            parse_checksums(sums, "docker-compose-linux-x86_64").as_deref(),
+            Some("abcdef0123456789")
+        );
+        assert!(parse_checksums(sums, "docker-buildx").is_none());
+    }
+
+    #[test]
+    fn report_records_the_shim_marker() {
+        // The generated script keeps `/bin/sh` first and puts the marker on
+        // the second line, so detection must look at the first few lines
+        // rather than at byte 0.
+        let ours = format!("#!/bin/sh\n{SHIM_MARKER}\nexec /bin/true \"$@\"\n");
+        let tmp = std::env::temp_dir().join(format!("dm_shim_a_{}", std::process::id()));
+        std::fs::write(&tmp, &ours).expect("write shim");
+        assert!(is_our_shim(&tmp));
+
+        // A script that does not carry our marker is left alone.
+        let theirs = std::env::temp_dir().join(format!("dm_shim_b_{}", std::process::id()));
+        std::fs::write(&theirs, "#!/bin/sh\nexec docker \"$@\"\n").expect("write other");
+        assert!(!is_our_shim(&theirs));
+
+        // A mention buried past the marker window must not count as ours —
+        // otherwise we would refuse to overwrite a file we never wrote.
+        let buried = std::env::temp_dir().join(format!("dm_shim_c_{}", std::process::id()));
+        std::fs::write(&buried, format!("#!/bin/sh\n# other\n# {SHIM_MARKER}\n")).expect("write");
+        assert!(!is_our_shim(&buried));
+
+        // A real ELF binary is not UTF-8 text; reading it must not match.
+        let binary = std::env::temp_dir().join(format!("dm_shim_d_{}", std::process::id()));
+        std::fs::write(&binary, [0u8, 159, 146, 150]).expect("write bytes");
+        assert!(!is_our_shim(&binary));
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&theirs);
+        let _ = std::fs::remove_file(&buried);
+        let _ = std::fs::remove_file(&binary);
+    }
+
+    #[test]
+    fn parse_shim_exec_reads_the_target() {
+        let body = "#!/bin/sh\n# docker-manager shim\nexec /usr/bin/docker \"$@\"\n";
+        assert_eq!(parse_shim_exec(body), Some(PathBuf::from("/usr/bin/docker")));
+        let quoted = "#!/bin/sh\n# docker-manager shim\nexec \"/usr/bin/docker\" \"$@\"\n";
+        assert_eq!(parse_shim_exec(quoted), Some(PathBuf::from("/usr/bin/docker")));
+        let args = "#!/bin/sh\n# docker-manager shim\nexec /usr/local/bin/docker $*\n";
+        assert_eq!(
+            parse_shim_exec(args),
+            Some(PathBuf::from("/usr/local/bin/docker"))
+        );
+        // No exec line → nothing to report, so the caller cannot claim staleness.
+        assert!(parse_shim_exec("#!/bin/sh\n# docker-manager shim\n").is_none());
+    }
 }
+
+

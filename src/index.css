@@ -100,3 +100,214 @@ select:focus {
   border-color: #3b82f6 !important;
   outline: none !important;
 }
+
+
+/* ==========================================================================
+   Comprehensive Light Theme Support
+   ========================================================================== */
+
+html.light {
+  --background: 0 0% 100%;
+  --foreground: 222.2 84% 4.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 222.2 84% 4.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222.2 84% 4.9%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222.2 47.4% 11.2%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215.4 16.3% 46.9%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222.2 47.4% 11.2%;
+  --border: 214.3 31.8% 91.4%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 222.2 84% 4.9%;
+}
+
+html.light body {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+html.light ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+}
+
+html.light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Glassmorphism in Light Mode */
+html.light .glass {
+  background: rgba(255, 255, 255, 0.85) !important;
+  border: 1px solid rgba(0, 0, 0, 0.08) !important;
+}
+
+html.light .glass-card {
+  background: rgba(255, 255, 255, 0.75) !important;
+  border: 1px solid rgba(0, 0, 0, 0.06) !important;
+}
+
+/* Backgrounds in Light Mode */
+html.light .bg-zinc-950,
+html.light .bg-zinc-950\/80,
+html.light .bg-zinc-950\/60,
+html.light .bg-zinc-950\/50,
+html.light .bg-zinc-950\/40 {
+  background-color: #f8fafc !important;
+}
+
+html.light header.bg-zinc-950\/60,
+html.light aside.bg-zinc-950\/80 {
+  background-color: #ffffff !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+}
+
+html.light .bg-zinc-900,
+html.light .bg-zinc-900\/90,
+html.light .bg-zinc-900\/60,
+html.light .bg-zinc-900\/40 {
+  background-color: #ffffff !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.03), 0 1px 2px -1px rgba(0, 0, 0, 0.03);
+}
+
+html.light .bg-zinc-800,
+html.light .bg-zinc-800\/80,
+html.light .bg-zinc-800\/60,
+html.light .bg-zinc-800\/40 {
+  background-color: #f1f5f9 !important;
+}
+
+html.light .hover\:bg-zinc-800\/30:hover,
+html.light .hover\:bg-zinc-800\/60:hover,
+html.light .hover\:bg-zinc-800\/80:hover,
+html.light .hover\:bg-zinc-800:hover,
+html.light .hover\:bg-zinc-900:hover {
+  background-color: #e2e8f0 !important;
+}
+
+html.light .bg-black\/60,
+html.light .bg-black\/70 {
+  background-color: rgba(15, 23, 42, 0.45) !important;
+}
+
+/* Borders in Light Mode */
+html.light .border-zinc-800,
+html.light .border-zinc-800\/80,
+html.light .border-zinc-800\/60,
+html.light .border-zinc-800\/50,
+html.light .border-zinc-800\/40,
+html.light .border-zinc-700\/60,
+html.light .border-zinc-700 {
+  border-color: #e2e8f0 !important;
+}
+
+html.light .hover\:border-zinc-700\/60:hover,
+html.light .hover\:border-zinc-700\/80:hover,
+html.light .hover\:border-zinc-700:hover {
+  border-color: #cbd5e1 !important;
+}
+
+html.light .divide-zinc-800\/40 > :not([hidden]) ~ :not([hidden]),
+html.light .divide-zinc-800\/60 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #e2e8f0 !important;
+}
+
+/* Typography in Light Mode */
+html.light .text-white {
+  color: #0f172a !important;
+}
+
+html.light .text-zinc-100 {
+  color: #1e293b !important;
+}
+
+html.light .text-zinc-200 {
+  color: #334155 !important;
+}
+
+html.light .text-zinc-300 {
+  color: #475569 !important;
+}
+
+html.light .text-zinc-400 {
+  color: #64748b !important;
+}
+
+html.light .text-zinc-500 {
+  color: #94a3b8 !important;
+}
+
+html.light .text-zinc-600 {
+  color: #64748b !important;
+}
+
+html.light .hover\:text-white:hover,
+html.light .group-hover\:text-white:hover {
+  color: #0284c7 !important;
+}
+
+html.light .group-hover\:text-zinc-200:hover {
+  color: #0f172a !important;
+}
+
+html.light .placeholder-zinc-400::placeholder,
+html.light .placeholder-zinc-500::placeholder {
+  color: #94a3b8 !important;
+}
+
+/* Colored buttons & banners keep white text in Light Mode */
+html.light button.bg-blue-600,
+html.light button.bg-rose-600,
+html.light button.bg-rose-600\/90,
+html.light button.bg-blue-600 span,
+html.light button.bg-rose-600 span,
+html.light .bg-blue-600,
+html.light .bg-rose-600,
+html.light .bg-emerald-600,
+html.light .bg-blue-600 *,
+html.light .bg-rose-600 *,
+html.light .bg-emerald-600 * {
+  color: #ffffff !important;
+}
+
+html.light .bg-gradient-to-tr.from-blue-600.to-indigo-500,
+html.light .bg-gradient-to-tr.from-blue-600.to-indigo-500 * {
+  color: #ffffff !important;
+}
+
+/* Form controls in Light Mode */
+html.light input:not([type="checkbox"]):not([type="radio"]),
+html.light textarea {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+  border-color: #cbd5e1 !important;
+}
+
+html.light input:not([type="checkbox"]):not([type="radio"]):focus,
+html.light textarea:focus {
+  border-color: #3b82f6 !important;
+  background-color: #ffffff !important;
+}
+
+/* Toast styling in Light Mode */
+html.light .toast-item {
+  background-color: #ffffff !important;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1) !important;
+}
+
+html.light .toast-item h4 {
+  color: #0f172a !important;
+}
+
+html.light .toast-item p {
+  color: #475569 !important;
+}
+
+html.light .toast-item button {
+  color: #94a3b8 !important;
+}
+
+html.light .toast-item button:hover {
+  color: #0f172a !important;
+}

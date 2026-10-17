@@ -1,3 +1,5 @@
+import { useModal } from "../components/ui/ModalContext";
+import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Network, Plus, Trash2, Search, X } from "lucide-react";
@@ -12,6 +14,8 @@ interface NetworksPageProps {
 }
 
 export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
+  const modal = useModal();
+  const toast = useToast();
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -56,30 +60,32 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
       setGateway("");
       await loadNetworks();
     } catch (err) {
-      alert(`Create network failed: ${err}`);
+      toast.error("Create Network Failed", String(err));
     } finally {
       setCreating(false);
     }
   };
 
   const handleRemove = async (id: string, netName: string) => {
-    if (!confirm(`Are you sure you want to remove network '${netName}'?`)) return;
+    const confirmed = await modal.showConfirm(`Are you sure you want to remove network '${netName}'?`, "Remove Network", "danger");
+    if (!confirmed) return;
     try {
       await api.removeNetwork(id);
       await loadNetworks();
     } catch (err) {
-      alert(`Remove network failed: ${err}`);
+      toast.error("Remove Network Failed", String(err));
     }
   };
 
   const handlePrune = async () => {
-    if (!confirm("Prune all unused Docker networks?")) return;
+    const confirmed = await modal.showConfirm("Are you sure you want to prune all unused Docker networks?", "Prune Networks", "warning");
+    if (!confirmed) return;
     try {
       const pruned = await api.pruneNetworks();
-      alert(`Pruned ${pruned} networks.`);
+      toast.success("Networks Pruned", `Pruned ${pruned} networks.`);
       await loadNetworks();
     } catch (err) {
-      alert(`Prune error: ${err}`);
+      toast.error("Prune Error", String(err));
     }
   };
 

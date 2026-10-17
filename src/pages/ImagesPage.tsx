@@ -1,3 +1,5 @@
+import { useModal } from "../components/ui/ModalContext";
+import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -23,6 +25,8 @@ interface ImagesPageProps {
 }
 
 export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
+  const modal = useModal();
+  const toast = useToast();
   const [images, setImages] = useState<ImageItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -106,23 +110,25 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
   };
 
   const handleRemove = async (id: string) => {
-    if (!confirm("Are you sure you want to remove this image?")) return;
+    const confirmed = await modal.showConfirm("Are you sure you want to remove this image?", "Remove Image", "danger");
+    if (!confirmed) return;
     try {
       await api.removeImage(id, true);
       await loadImages();
     } catch (e) {
-      alert(`Remove error: ${e}`);
+      toast.error("Remove Error", String(e));
     }
   };
 
   const handlePrune = async () => {
-    if (!confirm("Prune all dangling/unused images?")) return;
+    const confirmed = await modal.showConfirm("Are you sure you want to prune all dangling/unused images?", "Prune Images", "warning");
+    if (!confirmed) return;
     try {
       const [count, space] = await api.pruneImages();
-      alert(`Removed ${count} images, reclaimed ${formatBytes(space)}`);
+      toast.success("Images Pruned", `Removed ${count} images, reclaimed ${formatBytes(space)}`);
       await loadImages();
     } catch (e) {
-      alert(`Prune error: ${e}`);
+      toast.error("Prune Error", String(e));
     }
   };
 

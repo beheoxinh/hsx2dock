@@ -56,9 +56,9 @@ export const ToastProvider: React.FC<{ children: ReactNode }> = ({ children }) =
             };
 
             const borders = {
-              success: "border-emerald-500/30 bg-zinc-900/95",
-              error: "border-rose-500/30 bg-zinc-900/95",
-              info: "border-blue-500/30 bg-zinc-900/95",
+              success: "border-emerald-500/40 bg-zinc-900/95 shadow-emerald-500/10",
+              error: "border-rose-500/40 bg-zinc-900/95 shadow-rose-500/10",
+              info: "border-blue-500/40 bg-zinc-900/95 shadow-blue-500/10",
             };
 
             return (
@@ -67,7 +67,7 @@ export const ToastProvider: React.FC<{ children: ReactNode }> = ({ children }) =
                 initial={{ opacity: 0, y: 20, scale: 0.95 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.9, transition: { duration: 0.15 } }}
-                className={`pointer-events-auto flex items-start gap-3 p-4 rounded-2xl border shadow-2xl backdrop-blur-xl ${borders[t.type]}`}
+                className={`toast-item pointer-events-auto flex items-start gap-3 p-4 rounded-2xl border shadow-2xl backdrop-blur-xl ${borders[t.type]}`}
               >
                 {icons[t.type]}
                 <div className="flex-1 min-w-0">

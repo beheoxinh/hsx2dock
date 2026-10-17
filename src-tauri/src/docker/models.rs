@@ -59,6 +59,10 @@ pub struct ContainerStats {
     pub cpu_percent: f64,
     pub mem_usage: u64,
     pub mem_limit: u64,
+    /// Cumulative bytes across the container's network endpoints. The
+    /// dashboard diffs consecutive samples to turn these into rates.
+    pub net_rx: u64,
+    pub net_tx: u64,
 }
 
 impl ContainerStats {

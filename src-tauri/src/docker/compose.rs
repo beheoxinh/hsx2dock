@@ -28,7 +28,7 @@ pub struct ComposeService {
 /// Probe for a usable Compose implementation via the bundled engine.
 pub fn is_available() -> bool {
     let paths = crate::docker::engine::EnginePaths::new();
-    crate::docker::engine::docker_command(&paths)
+    crate::docker::engine::docker_command_resolved(&paths)
         .arg("compose")
         .arg("version")
         .output()
@@ -82,7 +82,7 @@ fn run_compose(file: &Path, subcommand: &str, extra: &[&str]) -> anyhow::Result<
     let mut args: Vec<&str> = vec!["compose", "-f", &file_str, subcommand];
     args.extend(extra.iter().copied());
     let paths = crate::docker::engine::EnginePaths::new();
-    let out = crate::docker::engine::docker_command(&paths)
+    let out = crate::docker::engine::docker_command_resolved(&paths)
         .args(&args)
         .output()
         .context("failed to run `docker compose`")?;

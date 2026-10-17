@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Plus, Trash2, Box, ArrowRight } from "lucide-react";
 import { Button } from "../components/ui/Button";
+import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
 import type { RunConfig, PortMapping, EnvVar } from "../types";
 
@@ -16,6 +17,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   onClose,
   onSuccess,
 }) => {
+  const toast = useToast();
   const [image, setImage] = useState("");
   const [name, setName] = useState("");
   const [restartPolicy, setRestartPolicy] = useState("unless-stopped");
@@ -46,7 +48,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!image.trim()) {
-      alert("Image name is required");
+      toast.error("Validation Error", "Image name is required");
       return;
     }
 
@@ -68,7 +70,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       onSuccess();
       onClose();
     } catch (err) {
-      alert(`Failed to run container: ${err}`);
+      toast.error("Failed to run container", String(err));
     } finally {
       setLoading(false);
     }

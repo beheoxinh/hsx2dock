@@ -21,6 +21,14 @@ fn start_background_monitoring(app_handle: AppHandle) {
                 let status = state.daemon_state();
                 if last_state.as_ref() != Some(&status) {
                     last_state = Some(status.clone());
+                    // The bridge can only attach once the daemon's socket
+                    // exists, so enabling it while the engine was stopped left
+                    // the config on with nothing linked. Re-apply on every
+                    // transition; reconcile is a no-op when the bridge is off.
+                    let is_live = status == crate::docker::models::DaemonState::Running;
+                    if is_live {
+                        let _ = crate::commands::system::apply_cli_bridge(&state).await;
+                    }
                     let _ = handle.emit("engine-state-changed", status);
                 }
 
@@ -63,6 +71,14 @@ pub fn run() {
             
             // Check auto-start engine daemon
             if let Some(state) = handle.try_state::<AppState>() {
+                // Seed the process-wide CLI preference from the saved config so
+                // the first compose/docker invocation resolves the same binary
+                // the Settings card will report.
+                {
+                    let mode = crate::runtime::runtime()
+                        .block_on(async { state.config.read().await.cli_mode.clone() });
+                    docker::engine::set_cli_mode(&mode);
+                }
                 let should_autostart = crate::runtime::runtime().block_on(async {
                     state.config.read().await.auto_start_daemon
                 });
@@ -162,6 +178,12 @@ pub fn run() {
             system::toggle_cli_bridge,
             system::check_data_root_path,
             system::migrate_data_root,
+            system::check_engine_update,
+            system::install_engine_update,
+            system::check_docker_cli,
+            system::toggle_cli_shim,
+            system::check_compose_update,
+            system::install_compose_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

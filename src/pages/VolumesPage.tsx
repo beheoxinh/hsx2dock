@@ -1,3 +1,5 @@
+import { useModal } from "../components/ui/ModalContext";
+import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { HardDrive, Plus, Trash2, Search, X } from "lucide-react";
@@ -11,6 +13,8 @@ interface VolumesPageProps {
 }
 
 export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
+  const modal = useModal();
+  const toast = useToast();
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -46,30 +50,32 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
       setNewVolumeName("");
       await loadVolumes();
     } catch (err) {
-      alert(`Create volume failed: ${err}`);
+      toast.error("Create Volume Failed", String(err));
     } finally {
       setCreating(false);
     }
   };
 
   const handleRemove = async (name: string) => {
-    if (!confirm(`Are you sure you want to remove volume '${name}'?`)) return;
+    const confirmed = await modal.showConfirm(`Are you sure you want to remove volume '${name}'?`, "Remove Volume", "danger");
+    if (!confirmed) return;
     try {
       await api.removeVolume(name, true);
       await loadVolumes();
     } catch (err) {
-      alert(`Remove volume failed: ${err}`);
+      toast.error("Remove Volume Failed", String(err));
     }
   };
 
   const handlePrune = async () => {
-    if (!confirm("Prune all unused Docker volumes?")) return;
+    const confirmed = await modal.showConfirm("Are you sure you want to prune all unused Docker volumes?", "Prune Volumes", "warning");
+    if (!confirmed) return;
     try {
       const deletedCount = await api.pruneVolumes();
-      alert(`Pruned ${deletedCount} unused volumes.`);
+      toast.success("Volumes Pruned", `Pruned ${deletedCount} unused volumes.`);
       await loadVolumes();
     } catch (err) {
-      alert(`Prune error: ${err}`);
+      toast.error("Prune Error", String(err));
     }
   };
 

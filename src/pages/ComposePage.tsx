@@ -1,3 +1,4 @@
+import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { FileCode2, Play, Square, Terminal, RefreshCw } from "lucide-react";
 import { Card } from "../components/ui/Card";
@@ -7,6 +8,7 @@ import { api } from "../lib/api";
 import type { ComposeProjectInfo } from "../types";
 
 export const ComposePage: React.FC = () => {
+  const toast = useToast();
   const [projects, setProjects] = useState<ComposeProjectInfo[]>([]);
   const [, setLoading] = useState(true);
   const [selectedProject, setSelectedProject] = useState<ComposeProjectInfo | null>(null);
@@ -58,7 +60,7 @@ export const ComposePage: React.FC = () => {
       await loadProjects();
       await loadLogs(path);
     } catch (e) {
-      alert(`Compose Up Error: ${e}`);
+      toast.error("Compose Up Error", String(e));
     } finally {
       setActionLoading(false);
     }
@@ -71,7 +73,7 @@ export const ComposePage: React.FC = () => {
       await loadProjects();
       await loadLogs(path);
     } catch (e) {
-      alert(`Compose Down Error: ${e}`);
+      toast.error("Compose Down Error", String(e));
     } finally {
       setActionLoading(false);
     }
