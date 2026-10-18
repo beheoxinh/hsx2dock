@@ -43,6 +43,9 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   const [logFilter, setLogFilter] = useState("");
   const [limitsDraft, setLimitsDraft] = useState<ResourceLimits | null>(null);
   const [savingLimits, setSavingLimits] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [savingName, setSavingName] = useState(false);
   const toast = useToast();
   const terminalFontSize = useTerminalFontSize();
   const isRunning = details?.state === "running";
@@ -65,6 +68,43 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
       toast.error("Could not update limits", String(err));
     } finally {
       setSavingLimits(false);
+    }
+  };
+
+  const startRename = () => {
+    setNameDraft((details?.name || "").replace(/^\//, ""));
+    setRenaming(true);
+  };
+
+  const handleRename = async () => {
+    if (!containerId) return;
+    const next = nameDraft.trim().replace(/^\//, "");
+    if (!next) {
+      toast.error("Name required", "A container name cannot be empty.");
+      return;
+    }
+    if (next === (details?.name || "").replace(/^\//, "")) {
+      setRenaming(false);
+      return;
+    }
+    // Docker's own rule: [a-zA-Z0-9][a-zA-Z0-9_.-]*
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(next)) {
+      toast.error(
+        "Invalid name",
+        "Use letters, digits, '_', '.' and '-' (must start with a letter or digit)."
+      );
+      return;
+    }
+    try {
+      setSavingName(true);
+      await api.renameContainer(containerId, next);
+      toast.success("Container renamed", `Now named ${next}`);
+      setRenaming(false);
+      await loadAll();
+    } catch (err) {
+      toast.error("Could not rename container", String(err));
+    } finally {
+      setSavingName(false);
     }
   };
 
@@ -137,20 +177,58 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
         >
           {/* Header */}
           <div className="h-16 px-6 border-b border-zinc-800 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <span className="font-semibold text-white tracking-tight">
-                {details?.name.replace(/^\//, "") || containerId.slice(0, 12)}
-              </span>
-              <span className="text-xs px-2.5 py-1 rounded-full bg-zinc-800/80 text-zinc-400 font-mono border border-zinc-700/60">
-                {containerId.slice(0, 12)}
-              </span>
+            <div className="flex items-center gap-3 min-w-0">
+              {renaming ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    autoFocus
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void handleRename();
+                      if (e.key === "Escape") setRenaming(false);
+                    }}
+                    placeholder="container-name"
+                    className="h-8 w-56 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 text-sm text-white outline-none focus:border-blue-500"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={handleRename}
+                    disabled={savingName || !nameDraft.trim()}
+                    isLoading={savingName}
+                  >
+                    Save
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setRenaming(false)} disabled={savingName}>
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <span className="font-semibold text-white tracking-tight truncate">
+                    {details?.name.replace(/^\//, "") || containerId.slice(0, 12)}
+                  </span>
+                  <button
+                    type="button"
+                    title="Rename container"
+                    aria-label="Rename container"
+                    onClick={startRename}
+                    className="p-1 rounded-md text-zinc-500 hover:text-white hover:bg-zinc-800/60 transition-colors"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="text-xs px-2.5 py-1 rounded-full bg-zinc-800/80 text-zinc-400 font-mono border border-zinc-700/60">
+                    {containerId.slice(0, 12)}
+                  </span>
+                </>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
               <Button variant="ghost" size="icon" onClick={loadAll} title="Reload Data">
                 <RotateCw className="w-4 h-4" />
               </Button>
-              <Button variant="ghost" size="icon" onClick={onClose}>
+              <Button variant="ghost" size="icon" onClick={onClose} title="Close">
                 <X className="w-5 h-5" />
               </Button>
             </div>

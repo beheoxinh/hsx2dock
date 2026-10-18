@@ -143,7 +143,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
       {/* Action Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold tracking-tight text-white">Containers</h2>
           <p className="text-sm text-zinc-400 mt-1">

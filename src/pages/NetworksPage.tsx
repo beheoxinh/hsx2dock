@@ -95,7 +95,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold tracking-tight text-white">Networks</h2>
           <p className="text-sm text-zinc-400 mt-1">
@@ -224,7 +224,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
           >
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-lg text-white">Create Network</h3>
-              <Button variant="ghost" size="icon" onClick={() => setModalOpen(false)}>
+              <Button variant="ghost" size="icon" onClick={() => setModalOpen(false)} title="Close">
                 <X className="w-5 h-5" />
               </Button>
             </div>

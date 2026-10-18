@@ -8,7 +8,7 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
 }
 
 export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant = "secondary", size = "md", isLoading, children, disabled, ...props }, ref) => {
+  ({ className, variant = "secondary", size = "md", isLoading, children, disabled, title, ...props }, ref) => {
     const variants = {
       primary:
         "bg-blue-600 hover:bg-blue-500 text-white shadow-md shadow-blue-500/20 active:scale-[0.98]",
@@ -43,6 +43,11 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
           sizes[size],
           className
         )}
+        title={title}
+        // Icon-only buttons carry no text for assistive tech — reuse the
+        // hover tooltip as the accessible name (an explicit aria-label in
+        // props still wins, since {...props} is spread after this).
+        aria-label={size === "icon" ? (title ?? undefined) : undefined}
         {...props}
       >
         {isLoading ? (

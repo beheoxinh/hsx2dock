@@ -81,7 +81,7 @@ export const ComposePage: React.FC = () => {
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold tracking-tight text-white">Docker Compose</h2>
           <p className="text-sm text-zinc-400 mt-1">
@@ -107,7 +107,7 @@ export const ComposePage: React.FC = () => {
                 }`}
                 onClick={() => setSelectedProject(proj)}
               >
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <div className="w-9 h-9 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
                       <FileCode2 className="w-4 h-4" />

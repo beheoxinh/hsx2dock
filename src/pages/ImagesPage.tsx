@@ -16,11 +16,15 @@ import {
   Hammer,
   Upload,
   Hexagon,
+  Tag,
+  FileText,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { BuildImageModal } from "../components/images/BuildImageModal";
 import { LoadToKindModal } from "../components/images/LoadToKindModal";
+import { TagImageModal } from "../components/images/TagImageModal";
+import { ImageHistoryModal } from "../components/images/ImageHistoryModal";
 import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime, truncateId } from "../lib/utils";
 import type {
@@ -52,6 +56,8 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
   const [pushModalOpen, setPushModalOpen] = useState(false);
   const [pushTarget, setPushTarget] = useState("");
   const [loadTarget, setLoadTarget] = useState<string | null>(null);
+  const [tagTarget, setTagTarget] = useState<ImageItem | null>(null);
+  const [historyTarget, setHistoryTarget] = useState<string | null>(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
 
@@ -245,7 +251,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
       {/* Header & Actions */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold tracking-tight text-white">Images</h2>
           <p className="text-sm text-zinc-400 mt-1">
@@ -362,6 +368,24 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
                   <Button
                     variant="ghost"
                     size="icon"
+                    onClick={() => setTagTarget(img)}
+                    title="Add tag"
+                    className="text-zinc-400 hover:text-amber-400 hover:bg-amber-500/10"
+                  >
+                    <Tag className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setHistoryTarget(primaryTag(img))}
+                    title="Layer history"
+                    className="text-zinc-400 hover:text-purple-400 hover:bg-purple-500/10"
+                  >
+                    <FileText className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => openPush(img)}
                     title="Push to a registry"
                     className="text-zinc-400 hover:text-amber-400 hover:bg-amber-500/10"
@@ -414,6 +438,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
                 size="icon"
                 disabled={isPulling}
                 onClick={() => setPullModalOpen(false)}
+                title="Close"
               >
                 <X className="w-5 h-5" />
               </Button>
@@ -591,6 +616,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
                 size="icon"
                 disabled={isPushing}
                 onClick={() => setPushModalOpen(false)}
+                title="Close"
               >
                 <X className="w-5 h-5" />
               </Button>
@@ -706,6 +732,14 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
       />
 
       <LoadToKindModal image={loadTarget} onClose={() => setLoadTarget(null)} />
+
+      <TagImageModal
+        image={tagTarget}
+        onClose={() => setTagTarget(null)}
+        onSuccess={() => loadImages()}
+      />
+
+      <ImageHistoryModal image={historyTarget} onClose={() => setHistoryTarget(null)} />
     </div>
   );
 };

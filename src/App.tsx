@@ -78,8 +78,18 @@ const MainLayout: React.FC = () => {
       }
     }).then((u) => (unlisten = u));
 
+    // A different endpoint is a different daemon: every page must re-fetch,
+    // otherwise the UI keeps showing the previous engine's resources.
+    let unlistenEndpoint: (() => void) | undefined;
+    events
+      .onEndpointChanged(() => {
+        setRefreshKey((k) => k + 1);
+      })
+      .then((u) => (unlistenEndpoint = u));
+
     return () => {
       if (unlisten) unlisten();
+      if (unlistenEndpoint) unlistenEndpoint();
     };
   }, []);
 

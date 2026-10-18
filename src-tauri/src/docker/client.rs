@@ -988,16 +988,6 @@ impl DockerClient {
     }
 }
 
-impl Default for DockerClient {
-    fn default() -> Self {
-        Self::connect(None).unwrap_or_else(|_| Self {
-            docker: Docker::connect_with_socket_defaults().unwrap_or_else(|_| {
-                Docker::connect_with_unix("/var/run/docker.sock", 120, bollard::API_DEFAULT_VERSION)
-                    .expect("docker")
-            }),
-        })
-    }
-}
 
 fn container_details_from_inspect(
     info: &bollard::models::ContainerInspectResponse,

@@ -12,12 +12,15 @@ via [bollard](https://crates.io/crates/bollard).
   engine version, API version, OS/arch, CPU count, total memory, container and
   image counts. One-click Start / Stop of the Docker daemon.
 - **Containers** — list running + stopped, search/filter, start, stop,
-  restart, delete (force), open an interactive shell (`docker exec -it`,
-  bash with sh fallback) in your terminal, and view tailed logs with Follow.
+  restart, rename, delete (force), edit resource limits (memory / CPUs /
+  cpuset / pids), open an interactive shell (`docker exec -it`, bash with sh
+  fallback) in your terminal or a **Debug** shell that starts a stopped
+  container first, and view tailed logs with Follow.
 - **Monitoring** — per-container CPU % and memory usage/limit bars, refreshed
   every 3 seconds for running containers via the Docker stats API.
 - **Images** — list tags/size/age, search, pull new images with live progress
-  (streamed from the daemon), delete, prune unused.
+  (streamed from the daemon), delete, prune unused, **add a tag** to a local
+  image, and inspect the **layer history** of any image.
 - **Volumes** — list name/driver/mountpoint with **on-disk size** (symlinks are
   never followed; subtrees that deny permission are skipped and the row is
   flagged *partial* instead of silently under-counting), create (name +

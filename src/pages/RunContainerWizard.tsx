@@ -103,7 +103,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
               </div>
               <h3 className="font-semibold text-white">Run New Container</h3>
             </div>
-            <Button variant="ghost" size="icon" onClick={onClose}>
+            <Button variant="ghost" size="icon" onClick={onClose} title="Close">
               <X className="w-5 h-5" />
             </Button>
           </div>
@@ -189,6 +189,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                       variant="ghost"
                       size="icon"
                       onClick={() => handleRemovePort(idx)}
+                  title="Remove port"
                       className="text-zinc-500 hover:text-rose-400 h-9 w-9 shrink-0"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -247,6 +248,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                       variant="ghost"
                       size="icon"
                       onClick={() => handleRemoveEnv(idx)}
+                  title="Remove env var"
                       className="text-zinc-500 hover:text-rose-400 h-9 w-9 shrink-0"
                     >
                       <Trash2 className="w-4 h-4" />

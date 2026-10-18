@@ -69,7 +69,9 @@ where
     });
     engine_thread()
         .lock()
-        .unwrap()
+        // Recover from a poisoned mutex instead of panicking: a panic on
+        // this thread must not kill the caller's next engine operation.
+        .unwrap_or_else(|e| e.into_inner())
         .send(job)
         .expect("engine thread is gone");
     rx

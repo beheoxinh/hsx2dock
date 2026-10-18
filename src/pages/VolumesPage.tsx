@@ -215,7 +215,7 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
           >
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-lg text-white">Create Volume</h3>
-              <Button variant="ghost" size="icon" onClick={() => setModalOpen(false)}>
+              <Button variant="ghost" size="icon" onClick={() => setModalOpen(false)} title="Close">
                 <X className="w-5 h-5" />
               </Button>
             </div>

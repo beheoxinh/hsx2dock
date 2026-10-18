@@ -152,17 +152,34 @@ impl EngineManager {
         }
     }
 
+    /// Locks the child-process state, recovering from a poisoned mutex
+    /// instead of panicking: a panic anywhere else while the lock was held
+    /// must not cascade into killing the whole app on the next call.
+    fn inner_lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Same recovery for the paths lock (see [`Self::inner_lock`]).
+    fn paths_read(&self) -> std::sync::RwLockReadGuard<'_, EnginePaths> {
+        self.paths.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// See [`Self::paths_read`].
+    fn paths_write(&self) -> std::sync::RwLockWriteGuard<'_, EnginePaths> {
+        self.paths.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn paths(&self) -> EnginePaths {
-        self.paths.read().unwrap().clone()
+        self.paths_read().clone()
     }
 
     pub fn set_data_root(&self, custom_data_root: Option<&str>) {
-        let mut p = self.paths.write().unwrap();
+        let mut p = self.paths_write();
         *p = EnginePaths::with_custom_data_root(custom_data_root);
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.paths.read().unwrap().socket.clone()
+        self.paths_read().socket.clone()
     }
 
     /// True once a release has been fully downloaded, verified and extracted.
@@ -315,7 +332,7 @@ impl EngineManager {
         let child = cmd.spawn().context("failed to spawn rootlesskit")?;
         let _ = fs::write(&paths.pid_file, child.id().to_string());
         let pid = child.id();
-        self.inner.lock().unwrap().child = Some(child);
+        self.inner_lock().child = Some(child);
 
         // Verify the daemon actually reaches a live API socket. dockerd can
         // spawn fine and then die during init (e.g. buildkit/containerd
@@ -328,14 +345,14 @@ impl EngineManager {
                 return Ok(());
             }
             let exited = {
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self.inner_lock();
                 match guard.child.as_mut() {
                     Some(c) => matches!(c.try_wait(), Ok(Some(_))),
                     None => true,
                 }
             };
             if exited {
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self.inner_lock();
                 guard.child = None;
                 let _ = fs::remove_file(&paths.pid_file);
                 bail!(
@@ -345,7 +362,7 @@ impl EngineManager {
             }
             if Instant::now() >= deadline {
                 // Still alive but never opened the socket — kill and report.
-                if let Some(c) = self.inner.lock().unwrap().child.take() {
+                if let Some(c) = self.inner_lock().child.take() {
                     signal(c.id(), libc::SIGKILL);
                 }
                 let _ = fs::remove_file(&paths.pid_file);
@@ -360,7 +377,7 @@ impl EngineManager {
 
     /// SIGTERM → wait up to 15s → SIGKILL → reap. Never leaves a zombie.
     pub fn stop(&self) -> Result<()> {
-        let child = self.inner.lock().unwrap().child.take();
+        let child = self.inner_lock().child.take();
         if let Some(mut child) = child {
             signal(child.id(), libc::SIGTERM);
             let deadline = Instant::now() + Duration::from_secs(15);
@@ -415,7 +432,7 @@ impl Drop for EngineManager {
         if Arc::strong_count(&self.inner) != 1 {
             return;
         }
-        let child = self.inner.lock().unwrap().child.take();
+        let child = self.inner_lock().child.take();
         if let Some(mut child) = child {
             signal(child.id(), libc::SIGTERM);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -2028,6 +2045,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic while a lock is held poisons it; the accessors must recover
+    /// the guard instead of cascading the panic into the whole app.
+    #[test]
+    fn poisoned_locks_degrade_instead_of_panicking() {
+        let mgr = EngineManager::new(EnginePaths::with_custom_data_root(None));
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let inner_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = mgr.inner.lock().unwrap();
+            panic!("poison the child lock");
+        }))
+        .is_err();
+        let paths_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = mgr.paths.write().unwrap();
+            panic!("poison the paths lock");
+        }))
+        .is_err();
+        std::panic::set_hook(quiet);
+        assert!(inner_panicked && paths_panicked, "poisoning steps must panic");
+
+        // Every accessor recovers from the poisoned locks instead of panicking.
+        let g1 = mgr.inner_lock();
+        let g2 = mgr.paths_read();
+        drop(g1);
+        drop(g2);
+        let g3 = mgr.paths_write();
+        drop(g3);
+        let _paths = mgr.paths();
+        let _socket = mgr.socket();
+    }
 
     #[test]
     fn version_gt_compares_numeric_triples() {
