@@ -60,6 +60,8 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
         cpuset_cpus: limitsDraft.cpuset_cpus?.trim() || "",
         cpu_shares: limitsDraft.cpu_shares?.trim() || "",
         pids_limit: limitsDraft.pids_limit?.trim() || "",
+        restart_policy: limitsDraft.restart_policy?.trim() || "",
+        restart_max_retries: limitsDraft.restart_max_retries?.trim() || "",
       });
       toast.success("Resource limits updated");
       setLimitsDraft(null);
@@ -405,6 +407,8 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                               cpuset_cpus: "",
                               cpu_shares: "",
                               pids_limit: "",
+                              restart_policy: details?.restart_policy ?? "",
+                              restart_max_retries: "",
                             }
                           )
                         }
@@ -450,6 +454,16 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                         <dt className="text-zinc-500">PIDs</dt>
                         <dd className="text-zinc-200">
                           {details?.limits?.pids_limit || "unlimited"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">Restart policy</dt>
+                        <dd className="text-zinc-200">
+                          {details?.restart_policy || details?.limits?.restart_policy || "—"}
+                          {details?.limits?.restart_policy === "on-failure" &&
+                          details?.limits?.restart_max_retries
+                            ? ` (max ${details.limits.restart_max_retries})`
+                            : ""}
                         </dd>
                       </div>
                     </dl>
@@ -516,6 +530,38 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                             }
                             placeholder="256"
                             className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">Restart policy</span>
+                          <select
+                            value={limitsDraft.restart_policy ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, restart_policy: e.target.value })
+                            }
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 text-xs text-white outline-none focus:border-zinc-600"
+                          >
+                            <option value="">leave unchanged</option>
+                            <option value="no">no</option>
+                            <option value="always">always</option>
+                            <option value="unless-stopped">unless-stopped</option>
+                            <option value="on-failure">on-failure</option>
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">Restart retries (on-failure)</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.restart_max_retries ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({
+                                ...limitsDraft,
+                                restart_max_retries: e.target.value,
+                              })
+                            }
+                            placeholder="5"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                            disabled={(limitsDraft.restart_policy || "") !== "on-failure"}
                           />
                         </label>
                       </div>

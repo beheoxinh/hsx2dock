@@ -31,6 +31,11 @@ pub async fn toggle_engine(state: State<'_, AppState>) -> Result<DaemonState, St
                 .map_err(|e| e.to_string())?;
             // Wait briefly for socket to become live or let get_client connect
             let _ = state.get_client().await;
+            // Engine caps (Settings → Docker Engine) apply as soon as the
+            // daemon is up; a failure only logs — the engine keeps running.
+            if let Err(e) = apply_engine_limits_now(&state).await {
+                tracing::warn!("could not apply engine resource limits: {e}");
+            }
             Ok(state.daemon_state())
         }
         other => Ok(other),
@@ -103,7 +108,34 @@ pub async fn save_app_config(
     // moves the terminal with the UI.
     refresh_shim(&state, &config);
     *state.config.write().await = config;
+    // Caps changed on a running engine apply immediately; never reject the
+    // save over it (the next engine start re-applies them anyway).
+    if let Err(e) = apply_engine_limits_now(&state).await {
+        tracing::warn!("could not apply engine resource limits after save: {e}");
+    }
     Ok(())
+}
+
+/// Reads the configured engine caps and, when our engine is running, pushes
+/// them into its cgroup. Returns the engine's report, or `Ok("")` when there
+/// is nothing to apply (engine stopped, or limits disabled).
+pub async fn apply_engine_limits_now(state: &AppState) -> Result<String, String> {
+    let (memory_mb, cpu_cores) = {
+        let cfg = state.config.read().await;
+        (cfg.engine_memory_limit_mb, cfg.engine_cpu_limit()?)
+    };
+    if memory_mb == 0 && cpu_cores <= 0.0 {
+        return Ok(String::new());
+    }
+    if state.daemon_state() != DaemonState::Running {
+        return Ok(String::new());
+    }
+    state.engine.apply_resource_limits(memory_mb, cpu_cores)
+}
+
+#[tauri::command]
+pub async fn apply_engine_limits(state: State<'_, AppState>) -> Result<String, String> {
+    apply_engine_limits_now(&state).await
 }
 
 #[derive(Clone, serde::Serialize)]

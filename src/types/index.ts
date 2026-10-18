@@ -23,6 +23,18 @@ export interface ContainerItem {
   status: string;
   created: number;
   ports: string;
+  /** Compose project name from the container's labels; null for plain containers. */
+  compose_project?: string | null;
+  /** Compose service name from the container's labels. */
+  compose_service?: string | null;
+}
+
+/** A user-defined container group: bulk start/stop + optional engine-start auto-run. */
+export interface ContainerGroup {
+  id: string;
+  name: string;
+  container_ids: string[];
+  auto_start: boolean;
 }
 
 export interface ContainerStats {
@@ -49,6 +61,8 @@ export interface ContainerDetails {
   command: string;
   raw_json: string;
   limits: ResourceLimits;
+  /** Current restart policy as inspect reports it ("" when unknown). */
+  restart_policy?: string;
 }
 
 export interface ImageItem {
@@ -162,6 +176,12 @@ export interface AppConfig {
   kind_default_nodes?: number;
   /** Default node image pre-filled in the kind "Create cluster" form ("" = kind's own default). */
   kind_default_image?: string;
+  /** Saved container groups (bulk start/stop + optional auto-start). */
+  container_groups?: ContainerGroup[];
+  /** Engine memory cap in MiB applied to the engine cgroup (0 = unlimited). */
+  engine_memory_limit_mb?: number;
+  /** Engine CPU cap in cores as a string, e.g. "2.5" ("" = unlimited). */
+  engine_cpu_cores?: string;
 }
 
 /** Per-feature desktop-notification toggles (tray menu + Settings card). */
@@ -283,6 +303,10 @@ export interface ResourceLimits {
   cpuset_cpus?: string;
   cpu_shares?: string;
   pids_limit?: string;
+  /** Edit-only override: "" = leave unchanged, else no/always/unless-stopped/on-failure. */
+  restart_policy?: string;
+  /** Restart attempts for the on-failure policy; "" = engine default. */
+  restart_max_retries?: string;
 }
 
 export interface Healthcheck {

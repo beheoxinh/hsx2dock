@@ -30,6 +30,27 @@ fn start_background_monitoring(app_handle: AppHandle) {
                     let is_live = status == crate::docker::models::DaemonState::Running;
                     if is_live {
                         let _ = crate::commands::system::apply_cli_bridge(&state).await;
+                        // Every path that brings the engine up (app open with
+                        // auto-start, manual start, restart after crash) gets
+                        // the configured caps + group auto-start. Off the
+                        // monitor's critical path so a slow cgroup write or a
+                        // misbehaving container never stalls the tick.
+                        let handle2 = handle.clone();
+                        crate::runtime::spawn(async move {
+                            let Some(st) = handle2.try_state::<AppState>() else {
+                                return;
+                            };
+                            if let Err(e) =
+                                crate::commands::system::apply_engine_limits_now(&st).await
+                            {
+                                tracing::warn!("could not apply engine resource limits: {e}");
+                            }
+                            // Groups are this engine's lifecycle — never
+                            // auto-start them into a remote endpoint.
+                            if st.config.read().await.active_endpoint.is_none() {
+                                crate::commands::groups::auto_start_groups(&st).await;
+                            }
+                        });
                     }
                     let _ = handle.emit("engine-state-changed", status);
                 }
@@ -202,8 +223,15 @@ pub fn run() {
             compose::compose_up,
             compose::compose_down,
             compose::compose_logs,
+            compose::compose_project_action,
+            // Container groups
+            groups::list_container_groups,
+            groups::save_container_groups,
+            groups::start_container_group,
+            groups::stop_container_group,
             // System
             system::get_engine_status,
+            system::apply_engine_limits,
             system::toggle_engine,
             system::get_engine_info,
             system::get_disk_usage,

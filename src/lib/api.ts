@@ -37,6 +37,7 @@ import type {
   KindInstallStatus,
   KindProgressPayload,
   KindInstallProgressPayload,
+  ContainerGroup,
 } from "../types";
 
 export const api = {
@@ -185,6 +186,20 @@ export const api = {
   getKindKubeconfig: (name: string) => invoke<string>("get_kind_kubeconfig", { name }),
   loadImageToCluster: (cluster: string, image: string) =>
     invoke<void>("load_image_to_cluster", { cluster, image }),
+
+  // Container groups (bulk start/stop, optional auto-start with the engine)
+  listContainerGroups: () => invoke<ContainerGroup[]>("list_container_groups"),
+  saveContainerGroups: (groups: ContainerGroup[]) =>
+    invoke<void>("save_container_groups", { groups }),
+  startContainerGroup: (id: string) => invoke<string>("start_container_group", { id }),
+  stopContainerGroup: (id: string) => invoke<string>("stop_container_group", { id }),
+
+  // Compose project lifecycle addressed by project name (no compose file)
+  composeProjectAction: (project: string, action: "start" | "stop" | "restart") =>
+    invoke<string>("compose_project_action", { project, action }),
+
+  // Engine cgroup caps — returns the engine's report ("" = nothing to apply)
+  applyEngineLimits: () => invoke<string>("apply_engine_limits"),
 };
 
 // Event Listeners helper

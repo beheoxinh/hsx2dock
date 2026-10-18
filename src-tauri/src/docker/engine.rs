@@ -159,6 +159,26 @@ impl EngineManager {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Pid of the supervising engine process (rootlesskit) — everything the
+    /// engine runs (dockerd, containerd, containers) descends from it, so
+    /// caps applied to it cover the whole daemon.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.inner_lock().child.as_ref().map(|c| c.id())
+    }
+
+    /// Applies the configured cgroup caps to the running engine. Both limits
+    /// at zero is a no-op ("limits disabled").
+    pub fn apply_resource_limits(
+        &self,
+        memory_mb: u64,
+        cpu_cores: f64,
+    ) -> Result<String, String> {
+        let pid = self
+            .child_pid()
+            .ok_or_else(|| "the engine is not running".to_string())?;
+        apply_cgroup_limits(pid, memory_mb, cpu_cores)
+    }
+
     /// Same recovery for the paths lock (see [`Self::inner_lock`]).
     fn paths_read(&self) -> std::sync::RwLockReadGuard<'_, EnginePaths> {
         self.paths.read().unwrap_or_else(|e| e.into_inner())
@@ -895,6 +915,76 @@ fn which(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
+}
+
+/// Places the engine process into a dedicated cgroup v2 and applies the
+/// memory/CPU caps there, so a runaway daemon cannot starve the host.
+///
+/// Best-effort by design: the cgroup is created as a child of *our own*
+/// cgroup (which systemd already delegated to the user session), and any
+/// failure — non-cgroup-v2 kernel, read-only hierarchy, missing controllers —
+/// returns an error the caller logs and ignores rather than failing the
+/// engine start. Both limits at zero is a no-op.
+#[cfg(target_os = "linux")]
+pub fn apply_cgroup_limits(pid: u32, memory_mb: u64, cpu_cores: f64) -> Result<String, String> {
+    if memory_mb == 0 && cpu_cores <= 0.0 {
+        return Ok("engine resource limits are disabled".to_string());
+    }
+
+    // Our own cgroup path from the unified (`0::`) v2 hierarchy; creating the
+    // child cgroup under it inherits the session's delegation.
+    let self_cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("cannot read /proc/self/cgroup: {e}"))?;
+    let cg_rel = self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "/")
+        .ok_or_else(|| "the process is not running under a writable cgroup v2 scope".to_string())?;
+    let dir = std::path::PathBuf::from("/sys/fs/cgroup").join(cg_rel.trim_start_matches('/')).join("docker-manager-engine");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create cgroup {}: {e}", dir.display()))?;
+
+    // Move the engine (and, by inheritance, its whole process tree) in.
+    std::fs::write(dir.join("cgroup.procs"), pid.to_string())
+        .map_err(|e| format!("cannot move engine pid {pid} into {}: {e}", dir.display()))?;
+
+    // Always (re)write both controllers so dropping a limit back to
+    // "unlimited" clears a cap left over from a previous start.
+    let mem_value = if memory_mb > 0 {
+        memory_mb.saturating_mul(1024 * 1024).to_string()
+    } else {
+        "max".to_string()
+    };
+    std::fs::write(dir.join("memory.max"), &mem_value)
+        .map_err(|e| format!("cannot set memory.max to {mem_value}: {e}"))?;
+    // cgroup v2 cpu.max: quota (µs) per 100 ms period; cores * 100000.
+    let cpu_value = if cpu_cores > 0.0 {
+        format!("{} 100000", (cpu_cores * 100_000.0).round() as u64)
+    } else {
+        "max 100000".to_string()
+    };
+    std::fs::write(dir.join("cpu.max"), &cpu_value)
+        .map_err(|e| format!("cannot set cpu.max to '{cpu_value}': {e}"))?;
+
+    Ok(format!(
+        "engine capped at {} / {}",
+        if memory_mb > 0 {
+            format!("{memory_mb} MiB memory")
+        } else {
+            "unlimited memory".to_string()
+        },
+        if cpu_cores > 0.0 {
+            format!("{cpu_cores} CPU cores")
+        } else {
+            "unlimited CPU".to_string()
+        }
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_cgroup_limits(_pid: u32, _memory_mb: u64, _cpu_cores: f64) -> Result<String, String> {
+    Err("engine resource limits require cgroup v2 (Linux)".to_string())
 }
 
 #[cfg(target_os = "linux")]

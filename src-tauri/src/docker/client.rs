@@ -112,6 +112,15 @@ impl DockerClient {
         Ok(list
             .into_iter()
             .map(|c| {
+                let labels = c.labels.unwrap_or_default();
+                let compose_project = labels
+                    .get("com.docker.compose.project")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let compose_service = labels
+                    .get("com.docker.compose.service")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
                 let id = c.id.clone().unwrap_or_default();
                 let names = c.names.unwrap_or_default();
                 let name = names
@@ -136,6 +145,8 @@ impl DockerClient {
                         .as_deref()
                         .map(Self::format_ports_static)
                         .unwrap_or_default(),
+                    compose_project,
+                    compose_service,
                 }
             })
             .collect())
@@ -1055,7 +1066,7 @@ fn container_details_from_inspect(
             .as_ref()
             .and_then(|h| h.restart_policy.clone())
             .and_then(|r| r.name)
-            .map(|n| format!("{n:?}").to_lowercase())
+            .map(|n| crate::docker::models::RestartPolicy::from_bollard_name(&n).to_string())
             .unwrap_or_default(),
         command_vec: info
             .path
@@ -1140,6 +1151,23 @@ fn container_details_from_inspect(
                 .host_config
                 .as_ref()
                 .and_then(|h| h.pids_limit)
+                .filter(|v| *v > 0)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            restart_policy: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.restart_policy.clone())
+                .and_then(|r| r.name)
+                .map(|n| {
+                    crate::docker::models::RestartPolicy::from_bollard_name(&n).to_string()
+                })
+                .unwrap_or_default(),
+            restart_max_retries: info
+                .host_config
+                .as_ref()
+                .and_then(|h| h.restart_policy.clone())
+                .and_then(|r| r.maximum_retry_count)
                 .filter(|v| *v > 0)
                 .map(|v| v.to_string())
                 .unwrap_or_default(),

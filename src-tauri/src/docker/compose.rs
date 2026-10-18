@@ -52,6 +52,33 @@ pub async fn down(file: &Path) -> anyhow::Result<String> {
         .context("compose down task join")?
 }
 
+/// Run a project-scoped compose verb by *project name* (`compose -p NAME`),
+/// which works without the compose file as long as the project's containers
+/// carry the usual compose labels — this is how Docker Desktop drives
+/// Start/Stop/Restart of a compose project from the Containers view.
+pub async fn project_action(project: &str, subcommand: &str) -> anyhow::Result<String> {
+    let project = project.to_string();
+    let subcommand = subcommand.to_string();
+    tokio::task::spawn_blocking(move || {
+        let project = project.trim().to_string();
+        if project.is_empty() {
+            bail!("project name is required");
+        }
+        if !matches!(subcommand.as_str(), "start" | "stop" | "restart") {
+            bail!("unsupported compose project action '{subcommand}'");
+        }
+        let args = ["compose", "-p", project.as_str(), subcommand.as_str()];
+        let paths = crate::docker::engine::EnginePaths::new();
+        let out = crate::docker::engine::docker_command_resolved(&paths)
+            .args(&args)
+            .output()
+            .context("failed to run `docker compose`")?;
+        finish_output("compose", out)
+    })
+    .await
+    .context("compose project action task join")?
+}
+
 /// List the project's services via `ps --format json`.
 pub async fn ps(file: &Path) -> anyhow::Result<Vec<ComposeService>> {
     let file = file.to_path_buf();

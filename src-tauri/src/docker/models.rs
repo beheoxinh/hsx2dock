@@ -26,6 +26,13 @@ pub struct ContainerItem {
     pub created: i64,
     pub running: bool,
     pub ports: String,
+    /// Compose project name from the `com.docker.compose.project` label —
+    /// `None` for containers that were not created by docker compose.
+    #[serde(default)]
+    pub compose_project: Option<String>,
+    /// Compose service name from the `com.docker.compose.service` label.
+    #[serde(default)]
+    pub compose_service: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -846,6 +853,19 @@ impl RestartPolicy {
             _ => Self::No,
         }
     }
+
+    /// Canonical string for a policy name coming back from inspect — Debug
+    /// formatting would produce `unless_stopped`, which the update endpoint
+    /// rejects (it wants `unless-stopped`).
+    pub fn from_bollard_name(name: &bollard::models::RestartPolicyNameEnum) -> &'static str {
+        use bollard::models::RestartPolicyNameEnum as B;
+        match name {
+            B::ALWAYS => Self::Always.as_str(),
+            B::UNLESS_STOPPED => Self::UnlessStopped.as_str(),
+            B::ON_FAILURE => Self::OnFailure.as_str(),
+            B::NO | B::EMPTY => Self::No.as_str(),
+        }
+    }
 }
 
 /// Memory / CPU constraints for the container.
@@ -861,6 +881,13 @@ pub struct ResourceLimits {
     pub cpu_shares: String,
     /// Max process count; empty means unlimited.
     pub pids_limit: String,
+    /// Restart policy override for edits: empty = leave unchanged,
+    /// otherwise one of [`RestartPolicy::as_str`].
+    #[serde(default)]
+    pub restart_policy: String,
+    /// Restart attempts for the `on-failure` policy; empty = engine default.
+    #[serde(default)]
+    pub restart_max_retries: String,
 }
 
 impl ResourceLimits {
@@ -870,6 +897,7 @@ impl ResourceLimits {
             && self.cpuset_cpus.trim().is_empty()
             && self.cpu_shares.trim().is_empty()
             && self.pids_limit.trim().is_empty()
+            && self.restart_policy.trim().is_empty()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -1024,6 +1052,19 @@ pub fn limits_from_host_config(
         cpuset_cpus,
         cpu_shares,
         pids_limit,
+        restart_policy: host
+            .restart_policy
+            .as_ref()
+            .and_then(|r| r.name.as_ref())
+            .map(|n| RestartPolicy::from_bollard_name(n).to_string())
+            .unwrap_or_default(),
+        restart_max_retries: host
+            .restart_policy
+            .as_ref()
+            .and_then(|r| r.maximum_retry_count)
+            .filter(|v| *v > 0)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -1047,6 +1088,45 @@ pub fn update_body_from_limits(
     let cpuset = limits.cpuset_cpus.trim();
     if !cpuset.is_empty() {
         body.cpuset_cpus = Some(cpuset.to_string());
+    }
+    // Restart policy is editable through the same endpoint: an empty string
+    // means "leave unchanged", mirroring how the limit fields behave.
+    let rp = limits.restart_policy.trim();
+    if !rp.is_empty() {
+        if !RestartPolicy::ALL.iter().any(|p| p.as_str() == rp) {
+            return Err(format!(
+                "Invalid restart policy '{rp}' (expected no / always / unless-stopped / on-failure)"
+            ));
+        }
+        let policy = RestartPolicy::parse(rp);
+        let retries = if !limits.restart_max_retries.trim().is_empty() {
+            if policy != RestartPolicy::OnFailure {
+                return Err(
+                    "Restart retries only apply to the 'on-failure' policy".to_string(),
+                );
+            }
+            let raw = limits.restart_max_retries.trim();
+            let v: i64 = raw.parse().map_err(|_| {
+                format!("Invalid restart retries '{raw}' (expected a whole number)")
+            })?;
+            if v < 1 {
+                return Err("Restart retries must be at least 1".to_string());
+            }
+            Some(v)
+        } else {
+            None
+        };
+        body.restart_policy = Some(bollard::models::RestartPolicy {
+            name: Some(match policy {
+                RestartPolicy::No => bollard::models::RestartPolicyNameEnum::NO,
+                RestartPolicy::Always => bollard::models::RestartPolicyNameEnum::ALWAYS,
+                RestartPolicy::UnlessStopped => {
+                    bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED
+                }
+                RestartPolicy::OnFailure => bollard::models::RestartPolicyNameEnum::ON_FAILURE,
+            }),
+            maximum_retry_count: retries,
+        });
     }
     Ok(body)
 }
@@ -1598,6 +1678,7 @@ mod tests {
             cpuset_cpus: "0-2,4".to_string(),
             cpu_shares: "1024".to_string(),
             pids_limit: "200".to_string(),
+            ..Default::default()
         };
         assert!(r.validate().is_ok());
         assert_eq!(r.memory_bytes().unwrap(), Some(512 * 1024 * 1024));
@@ -2122,6 +2203,7 @@ mod tests {
             cpuset_cpus: "0-1".to_string(),
             cpu_shares: "1024".to_string(),
             pids_limit: "256".to_string(),
+            ..Default::default()
         };
         let body = update_body_from_limits(&limits).unwrap();
         assert_eq!(body.memory, Some(536_870_912));
@@ -2157,5 +2239,88 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("Memory limit"), "{err}");
+    }
+
+    #[test]
+    fn update_body_maps_restart_policy() {
+        let body = update_body_from_limits(&ResourceLimits {
+            restart_policy: "unless-stopped".to_string(),
+            ..Default::default()
+        })
+        .expect("policy-only update is valid");
+        let rp = body.restart_policy.expect("policy set");
+        assert_eq!(
+            rp.name,
+            Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
+        );
+        assert_eq!(rp.maximum_retry_count, None);
+
+        let body = update_body_from_limits(&ResourceLimits {
+            restart_policy: "on-failure".to_string(),
+            restart_max_retries: "5".to_string(),
+            ..Default::default()
+        })
+        .expect("on-failure with retries");
+        let rp = body.restart_policy.expect("policy set");
+        assert_eq!(
+            rp.name,
+            Some(bollard::models::RestartPolicyNameEnum::ON_FAILURE)
+        );
+        assert_eq!(rp.maximum_retry_count, Some(5));
+
+        // Unknown policy strings are rejected rather than silently becoming "no".
+        assert!(update_body_from_limits(&ResourceLimits {
+            restart_policy: "sometimes".to_string(),
+            ..Default::default()
+        })
+        .is_err());
+        // Retries only make sense with on-failure.
+        assert!(update_body_from_limits(&ResourceLimits {
+            restart_policy: "always".to_string(),
+            restart_max_retries: "3".to_string(),
+            ..Default::default()
+        })
+        .is_err());
+        // Unset policy leaves the body's policy absent ("leave unchanged").
+        let body = update_body_from_limits(&ResourceLimits {
+            cpus: "1".to_string(),
+            ..Default::default()
+        })
+        .expect("limits update");
+        assert!(body.restart_policy.is_none());
+    }
+
+    #[test]
+    fn restart_policy_only_update_is_not_empty() {
+        let limits = ResourceLimits {
+            restart_policy: "no".to_string(),
+            ..Default::default()
+        };
+        assert!(!limits.is_empty());
+        assert!(update_body_from_limits(&limits).is_ok());
+    }
+
+    #[test]
+    fn inspect_restart_policy_names_round_trip() {
+        use bollard::models::RestartPolicyNameEnum as B;
+        assert_eq!(RestartPolicy::from_bollard_name(&B::ALWAYS), "always");
+        assert_eq!(
+            RestartPolicy::from_bollard_name(&B::UNLESS_STOPPED),
+            "unless-stopped"
+        );
+        assert_eq!(
+            RestartPolicy::from_bollard_name(&B::ON_FAILURE),
+            "on-failure"
+        );
+        assert_eq!(RestartPolicy::from_bollard_name(&B::NO), "no");
+        assert_eq!(RestartPolicy::from_bollard_name(&B::EMPTY), "no");
+        // And every canonical string parses back through update.
+        for s in ["no", "always", "unless-stopped", "on-failure"] {
+            assert!(update_body_from_limits(&ResourceLimits {
+                restart_policy: s.to_string(),
+                ..Default::default()
+            })
+            .is_ok());
+        }
     }
 }

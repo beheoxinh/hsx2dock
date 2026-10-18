@@ -236,6 +236,11 @@ export const SettingsPage: React.FC = () => {
         compose_file: config.compose_file,
         terminal_shell: config.terminal_shell,
         terminal_font_size: config.terminal_font_size,
+        engine_memory_limit_mb: Math.max(
+          0,
+          Math.floor(Number(config.engine_memory_limit_mb) || 0)
+        ),
+        engine_cpu_cores: (config.engine_cpu_cores ?? "").trim(),
       };
       await api.saveAppConfig(merged);
       setConfig(merged);
@@ -513,6 +518,59 @@ export const SettingsPage: React.FC = () => {
               />
               <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
             </label>
+          </div>
+
+          {/* Resource limits */}
+          <div className="pt-3 mt-1 border-t border-zinc-800/60">
+            <span className="font-medium text-sm text-zinc-200 block">
+              Engine Resource Limits
+            </span>
+            <span className="text-xs text-zinc-400 block mt-0.5">
+              Caps host RAM/CPU dockerd and all its containers may use, so a
+              heavy build or runaway container cannot starve the OS. 0 / empty =
+              unlimited.
+            </span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+              <label className="space-y-1">
+                <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                  Memory cap (MiB)
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  step={128}
+                  value={config.engine_memory_limit_mb ?? 0}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      engine_memory_limit_mb: Math.max(
+                        0,
+                        Math.floor(Number(e.target.value) || 0)
+                      ),
+                    })
+                  }
+                  placeholder="0 = unlimited"
+                  aria-label="Engine memory cap in MiB"
+                  className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                  CPU cap (cores)
+                </span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={config.engine_cpu_cores ?? ""}
+                  onChange={(e) =>
+                    setConfig({ ...config, engine_cpu_cores: e.target.value })
+                  }
+                  placeholder="e.g. 2.5 — empty = unlimited"
+                  aria-label="Engine CPU cap in cores"
+                  className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
+                />
+              </label>
+            </div>
           </div>
 
           <div className="flex items-center justify-between gap-4">

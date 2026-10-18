@@ -272,23 +272,74 @@ pub async fn create_kind_cluster(
         return Err("kind is not installed yet".into());
     }
 
-    let mut args: Vec<String> = vec![
+    let n = nodes.unwrap_or(1).clamp(1, 10);
+    let image = image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // The node's containerd state lives on the engine's data root, and when
+    // that filesystem reports DT_UNKNOWN for every dirent (d_type-less ext4
+    // under fuse-overlayfs — see `ensure_snapshotter_compat`), containerd's
+    // overlayfs/erofs snapshotters refuse to load, the CRI plugin never
+    // registers, and kubeadm dies with "unknown service
+    // runtime.v1.RuntimeService". Bind-mounting a d_type-capable directory
+    // over /var/lib/containerd inside every node — the same fix the engine
+    // itself uses for its own containerd — keeps image layers and snapshotter
+    // state on a filesystem containerd accepts. Per-node dirs, or two nodes
+    // would share one content store on the host.
+    let dtype_root = crate::docker::engine::dtype_compat_root()
+        .ok_or_else(|| {
+            "no d_type-capable directory is available for the kind node containerd state"
+                .to_string()
+        })?;
+    let cluster_state = dtype_root.join("kind-nodes").join(&name);
+    let mut nodes_yaml = String::new();
+    for i in 0..n {
+        let role = if i == 0 { "control-plane" } else { "worker" };
+        let node_state = cluster_state.join(format!("node{i}"));
+        std::fs::create_dir_all(&node_state)
+            .map_err(|e| format!("cannot create {}: {e}", node_state.display()))?;
+        // Rootless engines may map the node's root to a subuid; 0777 keeps
+        // the mount writable either way, and the parent dirs stay private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&node_state, std::fs::Permissions::from_mode(0o777));
+        }
+        nodes_yaml.push_str(&format!("  - role: {role}"));
+        if let Some(img) = &image {
+            nodes_yaml.push_str(&format!("\n    image: {img}"));
+        }
+        nodes_yaml.push_str("\n    extraMounts:\n");
+        nodes_yaml.push_str(&format!("      - hostPath: {}\n", node_state.display()));
+        nodes_yaml.push_str("        containerPath: /var/lib/containerd\n");
+        nodes_yaml.push_str("        readOnly: false\n");
+    }
+    let config_yaml = format!(
+        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n{nodes_yaml}"
+    );
+    let config_path = paths
+        .kubeconfig
+        .parent()
+        .map(|d| d.join(format!("cluster-config-{name}.yaml")))
+        .ok_or_else(|| "kind data directory is unavailable".to_string())?;
+    std::fs::write(&config_path, config_yaml)
+        .map_err(|e| format!("failed to write kind cluster config: {e}"))?;
+
+    // The node layout lives in the config file now (`--config` conflicts with
+    // `--nodes`/`--image`); `--wait` is CLI-only, so keep it as a flag.
+    let args: Vec<String> = vec![
         "create".into(),
         "cluster".into(),
         "--name".into(),
         name.clone(),
+        "--config".into(),
+        config_path.display().to_string(),
+        "--wait".into(),
+        "120s".into(),
     ];
-    if let Some(img) = image.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.push("--image".into());
-        args.push(img.trim().to_string());
-    }
-    let n = nodes.unwrap_or(1).clamp(1, 10);
-    if n > 1 {
-        args.push("--wait".into());
-        args.push("120s".into());
-        args.push("--nodes".into());
-        args.push(n.to_string());
-    }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     let _ = app.emit(
@@ -326,6 +377,7 @@ pub async fn delete_kind_cluster(
         let result = delete_cluster_containers(&state, &name).await;
         if result.is_ok() {
             crate::tray::notify_kind_event(&app, false, &name);
+            cleanup_cluster_state(&name);
         }
         return result;
     }
@@ -337,8 +389,23 @@ pub async fn delete_kind_cluster(
     let result = run_kind_streaming(paths, &host, &args, &app, "kind-progress").await;
     if result.is_ok() {
         crate::tray::notify_kind_event(&app, false, &name);
+        cleanup_cluster_state(&name);
     }
     result
+}
+
+/// Removes the d_type-compat bind-mount dirs a created cluster left behind.
+/// Best-effort: image layers can be gigabytes, and a failure here must not
+/// fail the delete itself (the containers are already gone).
+fn cleanup_cluster_state(name: &str) {
+    if let Some(root) = crate::docker::engine::dtype_compat_root() {
+        let dir = root.join("kind-nodes").join(name);
+        if dir.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!("could not clean kind node state {}: {e}", dir.display());
+            }
+        }
+    }
 }
 
 async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), String> {

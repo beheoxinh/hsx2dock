@@ -64,3 +64,17 @@ pub async fn compose_logs(
         .await
         .map_err(|e| e.to_string())
 }
+
+/// Lifecycle for a compose project addressed by name only (`compose -p X
+/// start|stop|restart`) — this is what the Containers page's project headers
+/// use, and it needs no compose file because the containers carry the
+/// project's labels.
+#[tauri::command]
+pub async fn compose_project_action(
+    project: String,
+    action: String,
+) -> Result<String, String> {
+    compose::project_action(&project, &action)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}

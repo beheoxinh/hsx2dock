@@ -16,12 +16,14 @@ import {
   Copy,
   ExternalLink,
   Bug,
+  FileCode2,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
+import { ContainerGroupsBar } from "../components/ContainerGroupsBar";
 import { api, events } from "../lib/api";
 import { formatBytes, truncateId } from "../lib/utils";
 import type { ContainerItem, ContainerStats } from "../types";
@@ -140,6 +142,57 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
       c.id.toLowerCase().includes(search.toLowerCase())
   );
 
+  // Group compose-managed containers under a project header (Docker Desktop
+  // style); loose containers keep their original order after their project.
+  type Entry =
+    | { kind: "project"; project: string; count: number; running: number }
+    | { kind: "container"; c: ContainerItem };
+  const membersByProject = new Map<string, ContainerItem[]>();
+  for (const c of filteredContainers) {
+    if (!c.compose_project) continue;
+    const arr = membersByProject.get(c.compose_project);
+    if (arr) arr.push(c);
+    else membersByProject.set(c.compose_project, [c]);
+  }
+  const entries: Entry[] = [];
+  const emitted = new Set<string>();
+  for (const c of filteredContainers) {
+    const project = c.compose_project;
+    if (!project) {
+      entries.push({ kind: "container", c });
+      continue;
+    }
+    if (emitted.has(project)) continue;
+    emitted.add(project);
+    const members = membersByProject.get(project) ?? [];
+    entries.push({
+      kind: "project",
+      project,
+      count: members.length,
+      running: members.filter((m) => m.state === "running").length,
+    });
+    for (const m of members) entries.push({ kind: "container", c: m });
+  }
+
+  const handleProjectAction = async (
+    project: string,
+    action: "start" | "stop" | "restart"
+  ) => {
+    try {
+      setActionLoading((prev) => ({ ...prev, [`project:${project}`]: true }));
+      const out = await api.composeProjectAction(project, action);
+      toast.success(
+        `Project ${action}d`,
+        out.trim() ? `${project}: ${out.trim()}` : project
+      );
+      await loadContainers();
+    } catch (e) {
+      toast.error(`Compose ${action} failed`, String(e));
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [`project:${project}`]: false }));
+    }
+  };
+
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
       {/* Action Bar */}
@@ -170,10 +223,77 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         </div>
       </div>
 
+      {/* Groups: bulk start/stop + engine auto-start */}
+      <ContainerGroupsBar containers={containers} onChanged={loadContainers} />
+
       {/* Containers List / Cards */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
         <AnimatePresence>
-          {filteredContainers.map((c) => {
+          {entries.map((entry) => {
+            if (entry.kind === "project") {
+              const projectBusy = !!actionLoading[`project:${entry.project}`];
+              return (
+                <div
+                  key={`project:${entry.project}`}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 shrink-0 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
+                      <FileCode2 className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold text-white truncate">
+                          {entry.project}
+                        </span>
+                        <span className="text-[10px] uppercase tracking-wider text-blue-400/80">
+                          compose
+                        </span>
+                      </div>
+                      <p className="text-xs text-zinc-400">
+                        {entry.running}/{entry.count} running
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1.5 text-xs text-emerald-400 hover:text-emerald-300"
+                      onClick={() => handleProjectAction(entry.project, "start")}
+                      disabled={projectBusy}
+                      title="Start all project containers"
+                    >
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      Start
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1.5 text-xs text-rose-400 hover:text-rose-300"
+                      onClick={() => handleProjectAction(entry.project, "stop")}
+                      disabled={projectBusy}
+                      title="Stop all project containers"
+                    >
+                      <Square className="w-3.5 h-3.5 fill-current" />
+                      Stop
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1.5 text-xs text-amber-400 hover:text-amber-300"
+                      onClick={() => handleProjectAction(entry.project, "restart")}
+                      disabled={projectBusy}
+                      title="Restart all project containers"
+                    >
+                      <RotateCw className="w-3.5 h-3.5" />
+                      Restart
+                    </Button>
+                  </div>
+                </div>
+              );
+            }
+            const c = entry.c;
             const isRunning = c.state === "running";
             const stats = statsMap[c.id];
             const isBusy = !!actionLoading[c.id];

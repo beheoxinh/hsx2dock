@@ -79,6 +79,35 @@ pub struct AppConfig {
     /// Default node image for kind clusters; empty = kind's bundled default.
     #[serde(default)]
     pub kind_default_image: String,
+    /// User-defined container groups: bulk start/stop with an optional
+    /// auto-start-on-app-open flag (Docker Desktop-style groups).
+    #[serde(default)]
+    pub container_groups: Vec<ContainerGroup>,
+    /// Engine memory cap in MiB applied to the engine's cgroup on start.
+    /// `0` = unlimited. Keeps the bundled daemon from starving the host.
+    #[serde(default)]
+    pub engine_memory_limit_mb: u64,
+    /// Engine CPU cap in cores (e.g. `2.5`) applied with the memory cap.
+    /// Empty or `0` = unlimited.
+    #[serde(default)]
+    pub engine_cpu_cores: String,
+}
+
+/// A named set of containers that can be started/stopped together, optionally
+/// auto-started when the app (and its engine) comes up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContainerGroup {
+    /// Stable id used by the UI and auto-start; generated on save.
+    pub id: String,
+    /// Display name, unique among groups.
+    pub name: String,
+    /// Member container ids at save time. Members that no longer exist are
+    /// skipped at start/stop time rather than failing the whole group.
+    #[serde(default)]
+    pub container_ids: Vec<String>,
+    /// Start this group automatically when the engine comes up.
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 /// Which tray-driven desktop notifications to surface. Every category defaults
@@ -218,6 +247,9 @@ impl Default for AppConfig {
             notifications: NotificationPrefs::default(),
             kind_default_nodes: default_kind_nodes(),
             kind_default_image: String::new(),
+            container_groups: Vec::new(),
+            engine_memory_limit_mb: 0,
+            engine_cpu_cores: String::new(),
         }
     }
 }
@@ -229,6 +261,21 @@ impl AppConfig {
 
     pub fn config_path() -> Option<PathBuf> {
         Self::config_dir().map(|d| d.join("config.toml"))
+    }
+
+    /// Engine CPU cap in cores; empty or `0` is unlimited (reported as 0.0).
+    pub fn engine_cpu_limit(&self) -> Result<f64, String> {
+        let raw = self.engine_cpu_cores.trim();
+        if raw.is_empty() {
+            return Ok(0.0);
+        }
+        let cores: f64 = raw
+            .parse()
+            .map_err(|_| format!("Invalid engine CPU limit '{raw}' (expected e.g. 2.5)"))?;
+        if !cores.is_finite() || cores < 0.0 {
+            return Err(format!("Invalid engine CPU limit '{raw}'"));
+        }
+        Ok(cores)
     }
 
     pub async fn load() -> anyhow::Result<Self> {
@@ -364,6 +411,9 @@ mod tests {
             notifications: NotificationPrefs::default(),
             kind_default_nodes: default_kind_nodes(),
             kind_default_image: String::new(),
+            container_groups: Vec::new(),
+            engine_memory_limit_mb: 0,
+            engine_cpu_cores: String::new(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");
@@ -396,5 +446,41 @@ mod tests {
         // Configs written before this section existed deserialize to all-on.
         let from_toml: NotificationPrefs = toml::from_str("").expect("empty table parses");
         assert_eq!(from_toml, NotificationPrefs::default());
+    }
+
+    #[test]
+    fn container_groups_and_engine_limits_round_trip() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.container_groups.is_empty());
+        assert_eq!(cfg.engine_memory_limit_mb, 0);
+        assert_eq!(cfg.engine_cpu_limit().unwrap(), 0.0);
+
+        cfg.container_groups.push(ContainerGroup {
+            id: "g1".into(),
+            name: "Stack A".into(),
+            container_ids: vec!["abc".into()],
+            auto_start: true,
+        });
+        cfg.engine_memory_limit_mb = 2048;
+        cfg.engine_cpu_cores = "1.5".to_string();
+        let toml = toml::to_string(&cfg).expect("serializes");
+        let back: AppConfig = toml::from_str(&toml).expect("parses");
+        assert_eq!(back.container_groups, cfg.container_groups);
+        assert_eq!(back.engine_memory_limit_mb, 2048);
+        assert_eq!(back.engine_cpu_limit().unwrap(), 1.5);
+
+        // Files written before these keys existed parse to "off / empty".
+        let legacy: AppConfig = toml::from_str("auto_start_daemon = true\n").expect("parses");
+        assert!(legacy.container_groups.is_empty());
+        assert_eq!(legacy.engine_memory_limit_mb, 0);
+        assert_eq!(legacy.engine_cpu_cores, "");
+        assert_eq!(legacy.engine_cpu_limit().unwrap(), 0.0);
+
+        // Garbage CPU input errors instead of panicking or being ignored.
+        let mut bad = AppConfig::default();
+        bad.engine_cpu_cores = "lots".into();
+        assert!(bad.engine_cpu_limit().is_err());
+        bad.engine_cpu_cores = "-2".into();
+        assert!(bad.engine_cpu_limit().is_err());
     }
 }

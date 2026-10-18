@@ -375,12 +375,32 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
             <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
               kind output
             </span>
-            <button
-              onClick={() => setLogLines([])}
-              className="text-[11px] text-zinc-500 hover:text-zinc-300"
-            >
-              Clear
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={async () => {
+                  const text = logLines.map((l) => l.line).join("\n");
+                  if (!text) return;
+                  try {
+                    await navigator.clipboard.writeText(text);
+                    toast.success(
+                      "Kind output copied",
+                      `${logLines.length} line${logLines.length === 1 ? "" : "s"} on the clipboard.`
+                    );
+                  } catch (e) {
+                    toast.error("Copy failed", String(e));
+                  }
+                }}
+                className="text-[11px] text-zinc-500 hover:text-zinc-300"
+              >
+                Copy
+              </button>
+              <button
+                onClick={() => setLogLines([])}
+                className="text-[11px] text-zinc-500 hover:text-zinc-300"
+              >
+                Clear
+              </button>
+            </div>
           </div>
           <div
             ref={logRef}
