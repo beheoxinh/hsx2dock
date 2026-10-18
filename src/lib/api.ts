@@ -22,6 +22,21 @@ import type {
   CliBridgeStatus,
   DaemonState,
   RunConfig,
+  BuildRequest,
+  BuildProgressPayload,
+  BuildContextInfo,
+  EndpointStatus,
+  EndpointInput,
+  ResourceLimits,
+  ExecOutputPayload,
+  RegistryInput,
+  RegistryStatus,
+  RegistryTestResult,
+  PushProgressPayload,
+  KindCluster,
+  KindInstallStatus,
+  KindProgressPayload,
+  KindInstallProgressPayload,
 } from "../types";
 
 export const api = {
@@ -43,6 +58,23 @@ export const api = {
   saveAppConfig: (config: AppConfig) => invoke<void>("save_app_config", { config }),
   getCliBridgeStatus: () => invoke<CliBridgeStatus>("get_cli_bridge_status"),
   toggleCliBridge: (enabled: boolean) => invoke<CliBridgeStatus>("toggle_cli_bridge", { enabled }),
+
+  // Remote engine endpoints
+  listEndpoints: () => invoke<EndpointStatus[]>("list_endpoints"),
+  testEndpoint: (ep: EndpointInput) => invoke<EndpointStatus>("test_endpoint", { ep }),
+  saveEndpoint: (ep: EndpointInput) => invoke<void>("save_endpoint", { ep }),
+  removeEndpoint: (id: string) => invoke<void>("remove_endpoint", { id }),
+  setActiveEndpoint: (id: string) => invoke<void>("set_active_endpoint", { id }),
+  getActiveEndpoint: () => invoke<EndpointStatus | null>("get_active_endpoint"),
+
+  // Registry logins (Docker Hub, ghcr, GitLab, Harbor, custom)
+  listRegistries: () => invoke<RegistryStatus[]>("list_registries"),
+  testRegistryAuth: (input: RegistryInput) =>
+    invoke<RegistryTestResult>("test_registry_auth", { input }),
+  saveRegistryAuth: (input: RegistryInput) =>
+    invoke<void>("save_registry_auth", { input }),
+  removeRegistryAuth: (id: string) => invoke<void>("remove_registry_auth", { id }),
+  pushImage: (image: string) => invoke<void>("push_image", { image }),
   checkDataRootPath: (path: string) =>
     invoke<{
       exists: boolean;
@@ -71,7 +103,24 @@ export const api = {
   getContainerLogs: (id: string, tail: string = "200") => invoke<string>("get_container_logs", { id, tail }),
   getContainerStats: (id: string) => invoke<ContainerStats>("get_container_stats", { id }),
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),
-  execContainer: (id: string, cmd: string) => invoke<string>("exec_container", { id, cmd }),
+  updateContainerResources: (id: string, limits: ResourceLimits) =>
+    invoke<void>("update_container_resources", { id, limits }),
+
+  // Interactive exec / debug
+  startInteractiveExec: (
+    id: string,
+    cmd: string[] | null,
+    cols: number,
+    rows: number
+  ) => invoke<string>("start_interactive_exec", { id, cmd, cols, rows }),
+  debugContainer: (id: string, cmd: string[] | null, cols: number, rows: number) =>
+    invoke<string>("debug_container", { id, cmd, cols, rows }),
+  writeExecStdin: (sessionId: string, data: string) =>
+    invoke<void>("write_exec_stdin", { sessionId, data }),
+  resizeExecSession: (sessionId: string, cols: number, rows: number) =>
+    invoke<void>("resize_exec_session", { sessionId, cols, rows }),
+  stopExecSession: (sessionId: string) =>
+    invoke<void>("stop_exec_session", { sessionId }),
 
   // Images
   listImages: () => invoke<ImageItem[]>("list_images"),
@@ -81,6 +130,12 @@ export const api = {
   getImageHistory: (name: string) => invoke<ImageHistoryEntry[]>("get_image_history", { name }),
   searchHub: (term: string) => invoke<SearchResult[]>("search_hub", { term }),
   pullImage: (image: string) => invoke<void>("pull_image", { image }),
+  buildImage: (req: BuildRequest) => invoke<void>("build_image", { req }),
+  cancelImageBuild: () => invoke<void>("cancel_image_build"),
+  validateBuildContext: (path: string) =>
+    invoke<BuildContextInfo>("validate_build_context", { path }),
+  previewBuildCommand: (req: BuildRequest) =>
+    invoke<string>("preview_build_command", { req }),
 
   // Volumes
   listVolumes: () => invoke<VolumeItem[]>("list_volumes"),
@@ -117,6 +172,19 @@ export const api = {
   composeDown: (filePath: string) => invoke<string>("compose_down", { filePath }),
   composeLogs: (filePath: string, tail: string = "100") =>
     invoke<string>("compose_logs", { filePath, tail }),
+
+  // Kind (Kubernetes IN Docker) — isolated binary + app-managed kubeconfig
+  kindStatus: () => invoke<KindInstallStatus>("kind_status"),
+  installKind: () => invoke<void>("install_kind"),
+  listKindClusters: () => invoke<KindCluster[]>("list_kind_clusters"),
+  createKindCluster: (name: string, image?: string, nodes?: number) =>
+    invoke<void>("create_kind_cluster", { name, image, nodes }),
+  deleteKindCluster: (name: string) => invoke<void>("delete_kind_cluster", { name }),
+  startKindCluster: (name: string) => invoke<void>("start_kind_cluster", { name }),
+  stopKindCluster: (name: string) => invoke<void>("stop_kind_cluster", { name }),
+  getKindKubeconfig: (name: string) => invoke<string>("get_kind_kubeconfig", { name }),
+  loadImageToCluster: (cluster: string, image: string) =>
+    invoke<void>("load_image_to_cluster", { cluster, image }),
 };
 
 // Event Listeners helper
@@ -141,6 +209,24 @@ export const events = {
   onPullProgress: (cb: (payload: PullProgressPayload) => void): Promise<UnlistenFn> =>
     listen<PullProgressPayload>("pull-progress", (event) => cb(event.payload)),
 
+  onPushProgress: (cb: (payload: PushProgressPayload) => void): Promise<UnlistenFn> =>
+    listen<PushProgressPayload>("push-progress", (event) => cb(event.payload)),
+
+  onBuildProgress: (cb: (payload: BuildProgressPayload) => void): Promise<UnlistenFn> =>
+    listen<BuildProgressPayload>("build-progress", (event) => cb(event.payload)),
+
+  onEndpointChanged: (cb: (id: string) => void): Promise<UnlistenFn> =>
+    listen<string>("endpoint-changed", (event) => cb(event.payload)),
+
   onContainersTick: (cb: (containers: ContainerItem[]) => void): Promise<UnlistenFn> =>
     listen<ContainerItem[]>("containers-tick", (event) => cb(event.payload)),
+
+  onExecOutput: (cb: (payload: ExecOutputPayload) => void): Promise<UnlistenFn> =>
+    listen<ExecOutputPayload>("exec-output", (event) => cb(event.payload)),
+
+  onKindProgress: (cb: (payload: KindProgressPayload) => void): Promise<UnlistenFn> =>
+    listen<KindProgressPayload>("kind-progress", (event) => cb(event.payload)),
+
+  onKindInstallProgress: (cb: (payload: KindInstallProgressPayload) => void): Promise<UnlistenFn> =>
+    listen<KindInstallProgressPayload>("kind-install-progress", (event) => cb(event.payload)),
 };

@@ -43,6 +43,12 @@ pub struct VolumeItem {
     pub driver: String,
     pub mountpoint: String,
     pub created: Option<String>,
+    /// Total bytes of regular files under the mountpoint. `None` when the
+    /// mountpoint is unreadable or the driver exposes no host path.
+    pub size: Option<u64>,
+    /// Number of subtrees that could not be read (permissions). When > 0,
+    /// `size` is a lower bound.
+    pub restricted_dirs: u32,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -52,6 +58,318 @@ pub struct NetworkItem {
     pub driver: String,
     pub subnet: String,
     pub gateway: String,
+}
+
+/// One `--build-arg KEY=VALUE` pair collected by the build form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildArg {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Everything the build form collects before a build starts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildOptions {
+    /// Host directory that becomes the build context archive.
+    pub context_dir: String,
+    /// Dockerfile path, relative to the context (absolute paths are accepted
+    /// only when they live inside the context).
+    #[serde(default)]
+    pub dockerfile: String,
+    pub tag: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub no_cache: bool,
+    #[serde(default)]
+    pub pull: bool,
+    #[serde(default)]
+    pub build_args: Vec<BuildArg>,
+}
+
+/// One parsed event from the `/build` stream, handed to the progress sink.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BuildStep {
+    pub status: String,
+    pub log: Option<String>,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub is_error: bool,
+}
+
+/// The form payload for creating/updating a remote endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointInput {
+    /// Present when editing an existing endpoint; `None` creates a new one.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    /// `"tcp"` or `"ssh"`.
+    pub kind: String,
+    pub uri: String,
+}
+
+/// A saved remote endpoint, or the implicit local bundled engine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointStatus {
+    /// `"local"` for the built-in engine; otherwise the saved id.
+    pub id: String,
+    pub name: String,
+    /// `"local"`, `"tcp"` or `"ssh"`.
+    pub kind: String,
+    /// `unix:///…/docker.sock` for the local engine, else the saved URI.
+    pub uri: String,
+    pub is_active: bool,
+    pub reachable: bool,
+    pub version: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl EndpointStatus {
+    /// The row the UI always shows for the engine this app bundles.
+    pub fn local(socket: &str) -> Self {
+        Self {
+            id: "local".to_string(),
+            name: "Bundled engine".to_string(),
+            kind: "local".to_string(),
+            uri: format!("unix://{socket}"),
+            is_active: true,
+            reachable: false,
+            version: None,
+            latency_ms: None,
+            error: None,
+        }
+    }
+
+    /// The implicit local engine can never be renamed or removed.
+    pub fn is_local(&self) -> bool {
+        self.kind == "local"
+    }
+
+    /// Engine lifecycle controls address the daemon this app owns, so they are
+    /// only meaningful while the local endpoint is the active one.
+    pub fn engine_controls_available(&self) -> bool {
+        self.is_local()
+    }
+}
+
+/// `host:port` for a tcp endpoint, `user@host` for ssh — what the card shows
+/// and what a `DOCKER_HOST` value is built from.
+pub fn endpoint_host_port(kind: &str, uri: &str) -> String {
+    let trimmed = uri.trim();
+    let without_scheme = match trimmed.split_once("://") {
+        Some((_, rest)) => rest,
+        None => trimmed,
+    };
+    match kind {
+        "tcp" => {
+            if without_scheme.contains(':') {
+                without_scheme.to_string()
+            } else {
+                format!("{without_scheme}:2375")
+            }
+        }
+        _ => without_scheme.to_string(),
+    }
+}
+
+/// `DOCKER_HOST` for the CLI shim: the same daemon the UI talks to.
+pub fn endpoint_docker_host(kind: &str, uri: &str) -> Option<String> {
+    let host = endpoint_host_port(kind, uri);
+    if host.is_empty() {
+        return None;
+    }
+    match kind {
+        "tcp" => Some(format!("tcp://{host}")),
+        "ssh" => Some(format!("ssh://{host}")),
+        _ => None,
+    }
+}
+
+/// A stable, filesystem- and URL-safe id derived from a display name.
+pub fn endpoint_id_from_name(name: &str) -> String {
+    let mut id: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    let id = id.trim_matches('-').to_string();
+    if id.is_empty() {
+        "endpoint".to_string()
+    } else {
+        id
+    }
+}
+
+/// Extracts the registry host from an image reference. Docker Hub uses
+/// `docker.io` as the implicit registry.
+pub fn registry_host_for_image(image: &str) -> String {
+    let trimmed = image.trim();
+    // Local image names (no slash, or "localhost/...") have no external registry.
+    if !trimmed.contains('/') {
+        return "docker.io".to_string();
+    }
+    let first = trimmed.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return "docker.io".to_string();
+    }
+    // Handle official images like `library/nginx`? Docker Hub accepts both
+    // forms; when no registry is explicit, the engine treats it as docker.io.
+    // Names without a `.` or `:` in the first component are usually Docker Hub
+    // namespaces (e.g. "library", "username"), not registry hosts.
+    if !first.contains('.') && !first.contains(':') {
+        return "docker.io".to_string();
+    }
+    first.to_string()
+}
+
+/// Cheap structural check used before the reachability probe.
+pub fn validate_endpoint(kind: &str, uri: &str) -> Result<(), String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return Err("Address is required".to_string());
+    }
+    match kind {
+        "tcp" => {
+            if trimmed.starts_with("ssh://") || trimmed.starts_with("unix://") {
+                return Err("A TCP endpoint cannot use that scheme".to_string());
+            }
+            Ok(())
+        }
+        "ssh" => {
+            if trimmed.starts_with("tcp://")
+                || trimmed.starts_with("http://")
+                || trimmed.starts_with("unix://")
+            {
+                return Err("An SSH endpoint cannot use that scheme".to_string());
+            }
+            Ok(())
+        }
+        other => Err(format!("Unsupported endpoint kind: {other}")),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BuildContextInfo {
+    pub exists: bool,
+    pub is_dir: bool,
+    /// Top-level file names, capped by the command, for the quick-pick chips.
+    pub entries: Vec<String>,
+    /// Names of the Dockerfiles the command found in the context.
+    pub dockerfiles: Vec<String>,
+    pub suggested_tag: String,
+}
+
+/// Quote a value the way a POSIX shell would, so the command preview the UI
+/// shows is something the user could paste into a terminal and run.
+pub fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let plain = value.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '=' | '-' | '@')
+    });
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+impl BuildArg {
+    /// `KEY=VALUE` for `--build-arg`; empty keys are dropped.
+    pub fn as_pair(&self) -> Option<(String, String)> {
+        let key = self.key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        Some((key.to_string(), self.value.trim().to_string()))
+    }
+}
+
+impl BuildOptions {
+    /// The dockerfile value the daemon expects: a path relative to the
+    /// context root, never the host-absolute path.
+    pub fn dockerfile_arg(&self, context: &std::path::Path) -> String {
+        let raw = self.dockerfile.trim();
+        if raw.is_empty() {
+            return "Dockerfile".to_string();
+        }
+        let path = std::path::Path::new(raw);
+        if path.is_absolute() {
+            if let Ok(relative) = path.strip_prefix(context) {
+                return relative.to_string_lossy().into_owned();
+            }
+        }
+        raw.to_string()
+    }
+
+    /// Validates the request and returns `(context, dockerfile relative arg)`.
+    ///
+    /// Both paths are canonicalised, so a `..` escape or a Dockerfile outside
+    /// the context is rejected with a message the UI can show verbatim.
+    pub fn validate(&self) -> Result<(std::path::PathBuf, String), String> {
+        let raw_context = self.context_dir.trim();
+        if raw_context.is_empty() {
+            return Err("Build context is required".to_string());
+        }
+        if self.tag.trim().is_empty() {
+            return Err("Tag is required".to_string());
+        }
+        let context = std::path::PathBuf::from(raw_context);
+        if !context.exists() {
+            return Err(format!("Build context does not exist: {}", context.display()));
+        }
+        if !context.is_dir() {
+            return Err(format!("Build context is not a directory: {}", context.display()));
+        }
+        let dockerfile = self.dockerfile_arg(&context);
+        let context_real = context
+            .canonicalize()
+            .map_err(|_| format!("Build context does not exist: {}", context.display()))?;
+        let dockerfile_path = context.join(&dockerfile);
+        let dockerfile_real = dockerfile_path
+            .canonicalize()
+            .map_err(|_| format!("Dockerfile not found: {}", dockerfile_path.display()))?;
+        if !dockerfile_real.starts_with(&context_real) {
+            return Err("Dockerfile must live inside the build context".to_string());
+        }
+        Ok((context, dockerfile))
+    }
+
+    /// Build-arg pairs for `--build-arg`, in the order the user typed them.
+    pub fn build_arg_pairs(&self) -> Vec<(String, String)> {
+        self.build_args.iter().filter_map(BuildArg::as_pair).collect()
+    }
+
+    /// The `docker build …` line that mirrors this request, for the UI preview.
+    pub fn command_preview(&self) -> String {
+        let mut parts = vec!["docker build".to_string()];
+        parts.push(format!("-f {}", shell_quote(&self.dockerfile.trim().replace('\\', "/"))));
+        if !self.tag.trim().is_empty() {
+            parts.push(format!("-t {}", shell_quote(self.tag.trim())));
+        }
+        if let Some(target) = self.target.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            parts.push(format!("--target {}", shell_quote(target)));
+        }
+        if self.no_cache {
+            parts.push("--no-cache".to_string());
+        }
+        if self.pull {
+            parts.push("--pull".to_string());
+        }
+        for (key, value) in self.build_arg_pairs() {
+            parts.push(format!("--build-arg {}", shell_quote(&format!("{key}={value}"))));
+        }
+        parts.push(".".to_string());
+        parts.join(" ")
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -129,6 +447,8 @@ pub struct ContainerDetails {
     pub stdin_open: bool,
     pub auto_remove: bool,
     pub read_only_rootfs: bool,
+    /// Current resource limits, prefilled from the engine for editing.
+    pub limits: ResourceLimits,
 }
 
 /// Transport protocol for a published port.
@@ -655,6 +975,82 @@ fn is_valid_cpuset(s: &str) -> bool {
     })
 }
 
+/// Derives the editable limits snapshot from the engine's `HostConfig`.
+/// `None` (engine sent no HostConfig) means every limit is unset.
+pub fn limits_from_host_config(
+    host: Option<&bollard::models::HostConfig>,
+) -> ResourceLimits {
+    let Some(host) = host else {
+        return ResourceLimits::default();
+    };
+    let memory_mb = host
+        .memory
+        .filter(|&b| b > 0)
+        .map(|b| (b / (1024 * 1024)).to_string())
+        .unwrap_or_default();
+    let cpus = host
+        .nano_cpus
+        .filter(|&n| n > 0)
+        .map(|n| ((n as f64) / 1e9).to_string())
+        .or_else(|| {
+            match (host.cpu_quota, host.cpu_period) {
+                (Some(q), Some(p)) if q > 0 && p > 0 => {
+                    Some(((q as f64) / (p as f64)).to_string())
+                }
+                _ => None,
+            }
+        })
+        .unwrap_or_default();
+    let cpuset_cpus = host
+        .cpuset_cpus
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let cpu_shares = host
+        .cpu_shares
+        .filter(|&v| v > 0)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let pids_limit = host
+        .pids_limit
+        .filter(|&v| v > 0)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    ResourceLimits {
+        memory_mb,
+        cpus,
+        cpuset_cpus,
+        cpu_shares,
+        pids_limit,
+    }
+}
+
+/// Builds the update body for `POST /containers/{id}/update`.
+///
+/// The engine treats an absent field (or a zero value) as "leave unchanged",
+/// so unset fields are simply omitted here: the update endpoint can change a
+/// limit but cannot remove one.
+pub fn update_body_from_limits(
+    limits: &ResourceLimits,
+) -> Result<bollard::models::ContainerUpdateBody, String> {
+    limits.validate()?;
+    if limits.is_empty() {
+        return Err("No resource limits were provided".to_string());
+    }
+    let mut body = bollard::models::ContainerUpdateBody::default();
+    body.memory = limits.memory_bytes()?;
+    body.nano_cpus = limits.nano_cpus()?;
+    body.cpu_shares = limits.cpu_shares_value()?;
+    body.pids_limit = limits.pids_limit_value()?;
+    let cpuset = limits.cpuset_cpus.trim();
+    if !cpuset.is_empty() {
+        body.cpuset_cpus = Some(cpuset.to_string());
+    }
+    Ok(body)
+}
+
 /// Container health check. An empty `test` disables it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Healthcheck {
@@ -1051,6 +1447,27 @@ pub struct DfReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registry_host_is_docker_io_for_bare_and_hub_names() {
+        assert_eq!(registry_host_for_image("nginx"), "docker.io");
+        assert_eq!(registry_host_for_image("library/nginx:1.25"), "docker.io");
+        assert_eq!(registry_host_for_image("myuser/myapp"), "docker.io");
+    }
+
+    #[test]
+    fn registry_host_is_taken_from_qualified_references() {
+        assert_eq!(registry_host_for_image("ghcr.io/owner/img"), "ghcr.io");
+        assert_eq!(
+            registry_host_for_image("registry.gitlab.com/group/proj:tag"),
+            "registry.gitlab.com"
+        );
+        assert_eq!(
+            registry_host_for_image("harbor.example.com:8443/team/app@sha256:abc"),
+            "harbor.example.com:8443"
+        );
+        assert_eq!(registry_host_for_image("localhost:5000/dev/x"), "localhost:5000");
+    }
+
     fn cfg(image: &str, ports: &[&str], env: &[&str]) -> RunConfig {
         RunConfig {
             image: image.to_string(),
@@ -1421,5 +1838,324 @@ mod tests {
         assert_eq!(cfg.env_list(), vec!["A=1", "B=2"]);
         assert_eq!(cfg.label_list(), vec!["app=web"]);
         assert_eq!(cfg.healthcheck_body(), None);
+    }
+
+    /// Unique directory per test process — std only, matching the pattern the
+    /// other modules already use (no tempfile crate).
+    fn temp_context(test: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("dm-models-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn build_opts(dir: &std::path::Path) -> BuildOptions {
+        BuildOptions {
+            context_dir: dir.to_string_lossy().into_owned(),
+            tag: "app:dev".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_arg_pairs_collects_trimmed_pairs_and_drops_empty_keys() {
+        let opts = BuildOptions {
+            build_args: vec![
+                BuildArg {
+                    key: " NODE_ENV ".into(),
+                    value: " production ".into(),
+                },
+                BuildArg {
+                    key: String::new(),
+                    value: "ignored".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.build_arg_pairs(),
+            vec![("NODE_ENV".to_string(), "production".to_string())]
+        );
+    }
+
+    #[test]
+    fn command_preview_includes_tag_target_flags_and_build_args() {
+        let opts = BuildOptions {
+            context_dir: "/tmp".into(),
+            dockerfile: "Dockerfile".into(),
+            tag: "app:1".into(),
+            target: Some("prod".into()),
+            no_cache: true,
+            pull: true,
+            build_args: vec![BuildArg {
+                key: "FOO".into(),
+                value: "bar".into(),
+            }],
+            ..Default::default()
+        };
+        let preview = opts.command_preview();
+        assert!(preview.contains("-f Dockerfile"), "{preview}");
+        assert!(preview.contains("-t app:1"), "{preview}");
+        assert!(preview.contains("--target prod"), "{preview}");
+        assert!(preview.contains("--no-cache"), "{preview}");
+        assert!(preview.contains("--pull"), "{preview}");
+        assert!(preview.contains("--build-arg FOO=bar"), "{preview}");
+        assert!(preview.ends_with(" ."), "{preview}");
+    }
+
+    #[test]
+    fn command_preview_quotes_values_the_shell_would_split() {
+        let opts = BuildOptions {
+            context_dir: "/tmp".into(),
+            dockerfile: "docker/app file".into(),
+            tag: "app:1".into(),
+            build_args: vec![BuildArg {
+                key: "GREETING".into(),
+                value: "hello world".into(),
+            }],
+            ..Default::default()
+        };
+        let preview = opts.command_preview();
+        assert!(preview.contains("-f 'docker/app file'"), "{preview}");
+        assert!(
+            preview.contains("--build-arg 'GREETING=hello world'"),
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn validate_requires_a_tag() {
+        let dir = temp_context("validate-requires-tag");
+        let mut opts = build_opts(&dir);
+        opts.tag = "  ".into();
+        assert_eq!(opts.validate().unwrap_err(), "Tag is required");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_reports_a_context_that_does_not_exist() {
+        let mut opts = build_opts(std::path::Path::new("/definitely/not/here"));
+        opts.tag = "app:dev".into();
+        let err = opts.validate().unwrap_err();
+        assert!(err.starts_with("Build context does not exist"), "{err}");
+    }
+
+    #[test]
+    fn validate_reports_a_dockerfile_that_does_not_exist() {
+        let dir = temp_context("validate-df-missing");
+        let err = build_opts(&dir).validate().unwrap_err();
+        assert!(err.starts_with("Dockerfile not found"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_a_dockerfile_outside_the_context() {
+        // The context is a subdirectory; the Dockerfile sits beside it, so
+        // `../Dockerfile` escapes and must be refused.
+        let root = temp_context("validate-outside");
+        let context = root.join("ctx");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let opts = BuildOptions {
+            context_dir: context.to_string_lossy().into_owned(),
+            dockerfile: "../Dockerfile".into(),
+            tag: "app:dev".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.validate().unwrap_err(),
+            "Dockerfile must live inside the build context"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_accepts_a_real_context_and_dockerfile() {
+        let dir = temp_context("validate-ok");
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let (context, dockerfile) = build_opts(&dir).validate().unwrap();
+        assert!(context.is_dir());
+        assert_eq!(dockerfile, "Dockerfile");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dockerfile_arg_rewrites_a_host_absolute_path_inside_the_context() {
+        let context = std::path::Path::new("/tmp/ctx");
+        let opts = BuildOptions {
+            context_dir: "/tmp/ctx".into(),
+            dockerfile: "/tmp/ctx/build/Dockerfile".into(),
+            ..Default::default()
+        };
+        assert_eq!(opts.dockerfile_arg(context), "build/Dockerfile");
+        assert_eq!(
+            BuildOptions {
+                dockerfile: String::new(),
+                ..opts
+            }
+            .dockerfile_arg(context),
+            "Dockerfile"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_port_fills_the_default_tcp_port() {
+        assert_eq!(endpoint_host_port("tcp", "host:2376"), "host:2376");
+        assert_eq!(endpoint_host_port("tcp", "docker.example.com"), "docker.example.com:2375");
+        assert_eq!(endpoint_host_port("tcp", "tcp://host:2375"), "host:2375");
+        assert_eq!(endpoint_host_port("ssh", "user@host"), "user@host");
+        assert_eq!(endpoint_host_port("ssh", "ssh://user@host"), "user@host");
+    }
+
+    #[test]
+    fn endpoint_docker_host_only_exists_for_remotes() {
+        assert_eq!(
+            endpoint_docker_host("tcp", "10.0.0.5:2375"),
+            Some("tcp://10.0.0.5:2375".to_string())
+        );
+        assert_eq!(
+            endpoint_docker_host("ssh", "user@host"),
+            Some("ssh://user@host".to_string())
+        );
+        // The local endpoint has no DOCKER_HOST override.
+        assert_eq!(endpoint_docker_host("local", "unix:///run/docker.sock"), None);
+    }
+
+    #[test]
+    fn endpoint_id_from_name_is_slugged_and_never_empty() {
+        assert_eq!(endpoint_id_from_name("Prod Swarm"), "prod-swarm");
+        assert_eq!(endpoint_id_from_name("  Build  Box  "), "build-box");
+        assert_eq!(endpoint_id_from_name("!!!"), "endpoint");
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_a_scheme_from_the_other_kind() {
+        assert!(validate_endpoint("tcp", "host:2375").is_ok());
+        assert!(validate_endpoint("ssh", "user@host").is_ok());
+        assert!(validate_endpoint("tcp", "ssh://user@host").is_err());
+        assert!(validate_endpoint("ssh", "tcp://host:2375").is_err());
+        assert!(validate_endpoint("tcp", "   ").is_err());
+        assert!(validate_endpoint("carrier-pigeon", "host").is_err());
+    }
+
+    #[test]
+    fn only_the_local_endpoint_offers_engine_controls() {
+        let local = EndpointStatus::local("/run/user/1000/docker.sock");
+        assert!(local.is_local());
+        assert!(local.engine_controls_available());
+        assert!(local.uri.ends_with("docker.sock"));
+
+        let remote = EndpointStatus {
+            is_active: true,
+            ..local.clone()
+        };
+        let remote = EndpointStatus {
+            id: "prod".into(),
+            kind: "tcp".into(),
+            ..remote
+        };
+        assert!(!remote.is_local());
+        assert!(!remote.engine_controls_available());
+    }
+
+    #[test]
+    fn shell_quote_only_quotes_what_the_shell_would_split() {
+        assert_eq!(shell_quote("nginx:latest"), "nginx:latest");
+        assert_eq!(shell_quote("build/app.Dockerfile"), "build/app.Dockerfile");
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn limits_from_host_config_maps_engine_units_to_form_strings() {
+        let host = bollard::models::HostConfig {
+            memory: Some(536_870_912),
+            nano_cpus: Some(1_500_000_000),
+            cpuset_cpus: Some("0-2,4".to_string()),
+            cpu_shares: Some(512),
+            pids_limit: Some(128),
+            ..Default::default()
+        };
+        let limits = limits_from_host_config(Some(&host));
+        assert_eq!(limits.memory_mb, "512");
+        assert_eq!(limits.cpus, "1.5");
+        assert_eq!(limits.cpuset_cpus, "0-2,4");
+        assert_eq!(limits.cpu_shares, "512");
+        assert_eq!(limits.pids_limit, "128");
+    }
+
+    #[test]
+    fn limits_from_host_config_unmapped_values_read_as_empty() {
+        let host = bollard::models::HostConfig {
+            memory: Some(0),
+            nano_cpus: Some(0),
+            cpu_quota: Some(-1),
+            cpu_period: Some(100_000),
+            cpu_shares: Some(0),
+            pids_limit: Some(-1),
+            cpuset_cpus: Some("  ".to_string()),
+            ..Default::default()
+        };
+        let limits = limits_from_host_config(Some(&host));
+        assert!(limits.is_empty(), "{limits:?}");
+        assert_eq!(limits, ResourceLimits::default());
+        assert!(limits_from_host_config(None).is_empty());
+    }
+
+    #[test]
+    fn limits_from_host_config_falls_back_to_quota_period() {
+        let host = bollard::models::HostConfig {
+            cpu_quota: Some(150_000),
+            cpu_period: Some(100_000),
+            ..Default::default()
+        };
+        let limits = limits_from_host_config(Some(&host));
+        assert_eq!(limits.cpus, "1.5");
+    }
+
+    #[test]
+    fn update_body_maps_set_limits() {
+        let limits = ResourceLimits {
+            memory_mb: "512".to_string(),
+            cpus: "1.5".to_string(),
+            cpuset_cpus: "0-1".to_string(),
+            cpu_shares: "1024".to_string(),
+            pids_limit: "256".to_string(),
+        };
+        let body = update_body_from_limits(&limits).unwrap();
+        assert_eq!(body.memory, Some(536_870_912));
+        assert_eq!(body.nano_cpus, Some(1_500_000_000));
+        assert_eq!(body.cpu_shares, Some(1024));
+        assert_eq!(body.cpuset_cpus.as_deref(), Some("0-1"));
+        assert_eq!(body.pids_limit, Some(256));
+    }
+
+    #[test]
+    fn update_body_omits_unset_fields_and_rejects_nothing_to_do() {
+        let limits = ResourceLimits {
+            cpus: "2".to_string(),
+            ..Default::default()
+        };
+        let body = update_body_from_limits(&limits).unwrap();
+        assert_eq!(body.memory, None);
+        assert_eq!(body.cpu_shares, None);
+        assert_eq!(body.cpuset_cpus, None);
+        assert_eq!(body.nano_cpus, Some(2_000_000_000));
+
+        // An all-empty payload is refused instead of hitting the engine.
+        let err = update_body_from_limits(&ResourceLimits::default()).unwrap_err();
+        assert!(err.contains("No resource limits"), "{err}");
+    }
+
+    #[test]
+    fn update_body_rejects_invalid_limits() {
+        // Below the 6 MiB floor enforced by ResourceLimits::validate.
+        let err = update_body_from_limits(&ResourceLimits {
+            memory_mb: "2".to_string(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("Memory limit"), "{err}");
     }
 }

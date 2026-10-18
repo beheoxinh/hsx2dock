@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar, NavTab } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
+import { RemoteEndpointBanner } from "./components/layout/RemoteEndpointBanner";
 import { ToastProvider, useToast } from "./components/ui/Toast";
 import { ModalProvider } from "./components/ui/ModalContext";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -11,6 +12,7 @@ import { RunContainerWizard } from "./pages/RunContainerWizard";
 import { ImagesPage } from "./pages/ImagesPage";
 import { VolumesPage } from "./pages/VolumesPage";
 import { NetworksPage } from "./pages/NetworksPage";
+import { KubernetesPage } from "./pages/KubernetesPage";
 import { ComposePage } from "./pages/ComposePage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
@@ -23,6 +25,7 @@ const MainLayout: React.FC = () => {
   const [isTogglingEngine, setIsTogglingEngine] = useState(false);
   const [selectedContainerId, setSelectedContainerId] = useState<string | null>(null);
   const [drawerTab, setDrawerTab] = useState<"logs" | "inspect" | "stats" | "terminal">("logs");
+  const [drawerDebug, setDrawerDebug] = useState(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const toast = useToast();
@@ -105,9 +108,14 @@ const MainLayout: React.FC = () => {
     }
   };
 
-  const handleOpenDetails = (id: string, tab: "logs" | "inspect" | "stats" | "terminal" = "logs") => {
+  const handleOpenDetails = (
+    id: string,
+    tab: "logs" | "inspect" | "stats" | "terminal" = "logs",
+    debug = false
+  ) => {
     setSelectedContainerId(id);
     setDrawerTab(tab);
+    setDrawerDebug(debug);
   };
 
   return (
@@ -127,6 +135,8 @@ const MainLayout: React.FC = () => {
             toast.info("Data refreshed", "Updated dashboard state.");
           }}
         />
+
+        <RemoteEndpointBanner />
 
         {/* Dynamic Page Views with Smooth Framer Motion Spring Transitions */}
         <main className="flex-1 overflow-hidden relative">
@@ -154,6 +164,7 @@ const MainLayout: React.FC = () => {
               {activeTab === "images" && <ImagesPage refreshKey={refreshKey} />}
               {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} />}
               {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} />}
+              {activeTab === "kubernetes" && <KubernetesPage refreshKey={refreshKey} />}
               {activeTab === "compose" && <ComposePage />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>
@@ -166,7 +177,11 @@ const MainLayout: React.FC = () => {
         <ContainerDetailsDrawer
           containerId={selectedContainerId}
           initialTab={drawerTab}
-          onClose={() => setSelectedContainerId(null)}
+          debug={drawerDebug}
+          onClose={() => {
+            setSelectedContainerId(null);
+            setDrawerDebug(false);
+          }}
         />
       )}
 

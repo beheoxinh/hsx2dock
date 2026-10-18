@@ -2,10 +2,11 @@ import { useModal } from "../components/ui/ModalContext";
 import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { HardDrive, Plus, Trash2, Search, X } from "lucide-react";
+import { HardDrive, Plus, Trash2, Search, X, AlertTriangle } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
+import { formatBytes } from "../lib/utils";
 import type { VolumeItem } from "../types";
 
 interface VolumesPageProps {
@@ -67,8 +68,14 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
     }
   };
 
+  const totalSize = volumes.reduce((sum, v) => sum + (v.size ?? 0), 0);
+
   const handlePrune = async () => {
-    const confirmed = await modal.showConfirm("Are you sure you want to prune all unused Docker volumes?", "Prune Volumes", "warning");
+    const confirmed = await modal.showConfirm(
+      `Prune all unused Docker volumes?${totalSize > 0 ? `\n\nTotal size of all volumes (including in-use): ${formatBytes(totalSize)}. Only unused volumes are removed.` : ""}`,
+      "Prune Volumes",
+      "warning"
+    );
     if (!confirmed) return;
     try {
       const deletedCount = await api.pruneVolumes();
@@ -143,10 +150,24 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
                     <span className="font-semibold text-white tracking-tight text-sm">
                       {vol.name}
                     </span>
-                    <div className="flex items-center gap-2 text-xs text-zinc-400 mt-1 font-mono">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 mt-1 font-mono">
                       <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300">
                         {vol.driver}
                       </span>
+                      {typeof vol.size === "number" && (
+                        <span className="flex items-center gap-1 font-sans">
+                          {formatBytes(vol.size)}
+                          {vol.restricted_dirs && vol.restricted_dirs > 0 ? (
+                            <span
+                              className="flex items-center gap-1 text-amber-400"
+                              title={`Size is incomplete: ${vol.restricted_dirs} subtrees skipped due to restricted permissions`}
+                            >
+                              <AlertTriangle className="w-3 h-3" />
+                              partial
+                            </span>
+                          ) : null}
+                        </span>
+                      )}
                       <span className="truncate max-w-[450px]" title={vol.mountpoint}>
                         {vol.mountpoint}
                       </span>

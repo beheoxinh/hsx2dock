@@ -1,13 +1,41 @@
 use std::collections::HashMap;
+use std::path::Path;
 use tauri::State;
 
 use crate::docker::models::VolumeItem;
+use crate::fsutil::dir_size;
 use crate::state::AppState;
 
+/// Lists volumes and, for each one whose mountpoint is a readable local
+/// directory, attaches the on-disk size. Drivers that expose a non-local path
+/// (or an unreadable one) get `size: None` rather than failing the whole list.
 #[tauri::command]
 pub async fn list_volumes(state: State<'_, AppState>) -> Result<Vec<VolumeItem>, String> {
     let client = state.get_client().await?;
-    client.list_volumes().await.map_err(|e| e.to_string())
+    let mut volumes = client.list_volumes().await.map_err(|e| e.to_string())?;
+
+    // Size calculation walks the filesystem; keep it off the async runtime.
+    let sized = tokio::task::spawn_blocking(move || {
+        for v in volumes.iter_mut() {
+            let path = Path::new(&v.mountpoint).to_path_buf();
+            match dir_size(&path) {
+                Ok(ds) => {
+                    v.size = Some(ds.bytes);
+                    v.restricted_dirs = ds.restricted_dirs;
+                }
+                // Unreadable / non-local mountpoint: leave size unknown.
+                Err(_) => {
+                    v.size = None;
+                    v.restricted_dirs = 0;
+                }
+            }
+        }
+        volumes
+    })
+    .await
+    .map_err(|e| format!("size calculation task failed: {e}"))?;
+
+    Ok(sized)
 }
 
 #[tauri::command]

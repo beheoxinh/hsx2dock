@@ -48,6 +48,7 @@ export interface ContainerDetails {
   env: string[];
   command: string;
   raw_json: string;
+  limits: ResourceLimits;
 }
 
 export interface ImageItem {
@@ -88,6 +89,8 @@ export interface VolumeItem {
   driver: string;
   mountpoint: string;
   size?: number;
+  /** Number of subtrees skipped due to restricted permissions. */
+  restricted_dirs?: number;
 }
 
 export interface NetworkItem {
@@ -149,6 +152,37 @@ export interface AppConfig {
   /** Whether `~/.local/bin/docker` was installed to expose docker in a terminal. */
   cli_shim_enabled: boolean;
   schema_version: number;
+  /** Shell opened by the container terminal and the Debug action. */
+  terminal_shell?: string;
+  /** Font size (px) used by terminal panes. */
+  terminal_font_size?: number;
+  /** Desktop-notification toggles managed by the tray (see `NotificationPrefs`). */
+  notifications?: NotificationPrefs;
+  /** Default node count pre-filled in the kind "Create cluster" form. */
+  kind_default_nodes?: number;
+  /** Default node image pre-filled in the kind "Create cluster" form ("" = kind's own default). */
+  kind_default_image?: string;
+}
+
+/** Per-feature desktop-notification toggles (tray menu + Settings card). */
+export interface NotificationPrefs {
+  /** Image build finished (success or failure). */
+  build_done: boolean;
+  /** Image pull/push finished. */
+  transfer_done: boolean;
+  /** Engine started / stopped / died unexpectedly. */
+  engine_state: boolean;
+  /** kind cluster created / deleted. */
+  kind_events: boolean;
+}
+
+/** `exec-output` payload streamed while an interactive exec session runs. */
+export interface ExecOutputPayload {
+  session_id: string;
+  /** Base64 chunk of raw terminal output; `null` once the stream is done. */
+  data: string | null;
+  /** True once the exec stream has closed. */
+  eof: boolean;
 }
 
 export interface CliBridgeStatus {
@@ -285,4 +319,144 @@ export interface RunConfig {
   auto_remove?: boolean;
   read_only_rootfs?: boolean;
   detach?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Image build
+// ---------------------------------------------------------------------------
+
+export interface BuildArg {
+  key: string;
+  value: string;
+}
+
+/** Mirrors the Rust `BuildOptions` request. */
+export interface BuildRequest {
+  context_dir: string;
+  dockerfile: string;
+  tag: string;
+  target?: string | null;
+  no_cache: boolean;
+  pull: boolean;
+  build_args: BuildArg[];
+}
+
+export interface BuildProgressPayload {
+  tag: string;
+  status: string;
+  log: string | null;
+  current: number | null;
+  total: number | null;
+  error: string | null;
+  done: boolean;
+  cancelled: boolean;
+  image_id: string | null;
+}
+
+/** What the backend learned about a chosen build context. */
+export interface BuildContextInfo {
+  exists: boolean;
+  is_dir: boolean;
+  entries: string[];
+  dockerfiles: string[];
+  suggested_tag: string;
+}
+
+// ---------------------------------------------------------------------------
+// Remote engine endpoints
+// ---------------------------------------------------------------------------
+
+export type EndpointKind = "local" | "tcp" | "ssh";
+
+export interface EndpointStatus {
+  id: string;
+  name: string;
+  kind: string;
+  uri: string;
+  is_active: boolean;
+  reachable: boolean;
+  version: string | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
+export interface EndpointInput {
+  id?: string | null;
+  name: string;
+  kind: string;
+  uri: string;
+}
+
+/** A saved registry login (Docker Hub, ghcr, GitLab, Harbor, custom). */
+export interface RegistryStatus {
+  id: string;
+  name: string;
+  host: string;
+  username: string;
+  insecure: boolean;
+  /** Whether a secret is stored — never the secret itself. */
+  has_password: boolean;
+}
+
+export interface RegistryInput {
+  id?: string | null;
+  name: string;
+  host: string;
+  username: string;
+  /** Plain password/token; empty on edit keeps the stored secret. */
+  password: string;
+  insecure: boolean;
+}
+
+export interface RegistryTestResult {
+  ok: boolean;
+  message: string;
+  latency_ms: number;
+}
+
+/** `push-progress` payload streamed while an image pushes. */
+export interface PushProgressPayload {
+  image: string;
+  status: string;
+  progress: string | null;
+  current: number | null;
+  total: number | null;
+  done: boolean;
+  error: string | null;
+}
+
+/** One kind (Kubernetes-in-Docker) cluster, grouped from its node containers. */
+export interface KindCluster {
+  name: string;
+  running: boolean;
+  node_count: number;
+  running_nodes: number;
+  /** Unix seconds of the oldest node container, if known. */
+  created: number | null;
+  has_kubeconfig: boolean;
+}
+
+/** Install state of the app-managed (isolated) kind binary. */
+export interface KindInstallStatus {
+  installed: boolean;
+  version: string | null;
+  latest: string;
+  path: string | null;
+  /** False on platforms with no published kind binary. */
+  supported: boolean;
+}
+
+/** A streamed line from a kind subprocess (`kind-progress` event). */
+export interface KindProgressPayload {
+  action?: string;
+  name?: string;
+  line: string;
+}
+
+/** Download progress for the kind binary (`kind-install-progress` event). */
+export interface KindInstallProgressPayload {
+  done?: number;
+  total?: number;
+  finished?: boolean;
+  error?: string;
 }

@@ -3,7 +3,12 @@ import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
+import { EndpointsCard } from "../components/settings/EndpointsCard";
+import { RegistriesCard } from "../components/settings/RegistriesCard";
+import { NotificationsCard } from "../components/settings/NotificationsCard";
+import { KubernetesCard } from "../components/settings/KubernetesCard";
 import { api, events } from "../lib/api";
+import { invalidateTerminalSettings } from "../lib/terminalSettings";
 import type {
   AppConfig,
   CliBridgeStatus,
@@ -218,7 +223,23 @@ export const SettingsPage: React.FC = () => {
 
     try {
       setSaving(true);
-      await api.saveAppConfig(config);
+      // Registries and endpoints are managed by their own cards and saved
+      // independently — re-read the latest config so this save only touches
+      // the fields this form actually owns and never clobbers them.
+      const latest = await api.getAppConfig();
+      const merged: AppConfig = {
+        ...latest,
+        cli_bridge_enabled: config.cli_bridge_enabled,
+        cli_mode: config.cli_mode,
+        auto_start_daemon: config.auto_start_daemon,
+        theme: config.theme,
+        compose_file: config.compose_file,
+        terminal_shell: config.terminal_shell,
+        terminal_font_size: config.terminal_font_size,
+      };
+      await api.saveAppConfig(merged);
+      setConfig(merged);
+      invalidateTerminalSettings();
       setSaved(true);
       await checkDockerCli().catch(() => {});
       setTimeout(() => setSaved(false), 2000);
@@ -239,6 +260,14 @@ export const SettingsPage: React.FC = () => {
           Tune bundled engine parameters, CLI socket bridges, and default paths
         </p>
       </div>
+
+      <EndpointsCard />
+
+      <RegistriesCard />
+
+      <NotificationsCard />
+
+      <KubernetesCard />
 
       <form onSubmit={handleSave} className="space-y-6">
 
@@ -680,6 +709,71 @@ export const SettingsPage: React.FC = () => {
               value={config.compose_file}
               onChange={(e) => setConfig({ ...config, compose_file: e.target.value })}
               className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+            />
+          </div>
+        </Card>
+
+        {/* Interactive Terminal */}
+        <Card className="space-y-4">
+          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+            <Terminal className="w-5 h-5 text-emerald-400" />
+            <div>
+              <h3 className="font-semibold text-white">Interactive Terminal</h3>
+              <p className="text-xs text-zinc-400">
+                Shell and font used by the container terminal and the Debug action
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-zinc-200 block">
+              Default Shell
+            </label>
+            <span className="text-xs text-zinc-400 block -mt-1">
+              Opened when you attach a terminal or debug a stopped container. The
+              shell must exist inside the container — <code className="text-zinc-300">sh</code>{" "}
+              is the safe default for minimal images.
+            </span>
+            <input
+              list="terminal-shell-presets"
+              value={config.terminal_shell || "sh"}
+              onChange={(e) => setConfig({ ...config, terminal_shell: e.target.value })}
+              placeholder="sh"
+              className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+            />
+            <datalist id="terminal-shell-presets">
+              <option value="sh" />
+              <option value="bash" />
+              <option value="ash" />
+              <option value="zsh" />
+              <option value="fish" />
+            </datalist>
+          </div>
+
+          <div className="flex items-center justify-between py-1">
+            <div>
+              <span className="font-medium text-sm text-zinc-200 block">
+                Terminal Font Size
+              </span>
+              <span className="text-xs text-zinc-400 block mt-0.5">
+                Font size in pixels for terminal panes (8–32)
+              </span>
+            </div>
+            <input
+              type="number"
+              min={8}
+              max={32}
+              value={config.terminal_font_size ?? 12}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                setConfig({
+                  ...config,
+                  terminal_font_size: Number.isFinite(n)
+                    ? Math.min(Math.max(n, 8), 32)
+                    : 12,
+                });
+              }}
+              className="w-24 h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono text-center"
             />
           </div>
         </Card>

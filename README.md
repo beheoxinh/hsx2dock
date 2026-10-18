@@ -18,14 +18,29 @@ via [bollard](https://crates.io/crates/bollard).
   every 3 seconds for running containers via the Docker stats API.
 - **Images** — list tags/size/age, search, pull new images with live progress
   (streamed from the daemon), delete, prune unused.
-- **Volumes** — list name/driver/mountpoint, create (name + driver), delete,
-  prune unused.
+- **Volumes** — list name/driver/mountpoint with **on-disk size** (symlinks are
+  never followed; subtrees that deny permission are skipped and the row is
+  flagged *partial* instead of silently under-counting), create (name +
+  driver), delete, prune unused.
+- **Kubernetes (kind)** — full kind lifecycle with an **isolated in-app
+  binary**: pinned release downloaded and checksum-verified into the app's own
+  data directory (never your `PATH`), cluster create (custom node image/count)
+  / delete with live log streaming, per-cluster kubeconfig path (copied for
+  `KUBECONFIG=… kubectl`, always outside `~/.kube`), and one-click
+  *Load to cluster* from the Images page (`kind load docker-image`).
 - **Networks** — list name/driver/subnet/gateway, create (name + driver),
   delete, prune unused.
 - **Compose** — pick a compose file, Up/Down (Down confirmed), service list,
   per-service logs.
 - **Registries** — tag/push/history, build with live progress, Docker Hub
   search, login/logout via the `docker` CLI (no secrets stored in-app).
+- **System tray & notifications** — live tray icon colored by engine state
+  (blue running / gray stopped / amber transitioning) with a dynamic tooltip,
+  rich menu (engine status, container/image/cluster counts, Start/Stop engine,
+  Open Dashboard), a `Notifications ▸` submenu with recent history and
+  per-category toggles, and desktop notifications for build/pull/push
+  completion, engine transitions and kind cluster events — every category
+  configurable from Settings → Notifications.
 - **Polish** — `Ctrl+R` refresh / `Ctrl+,` preferences shortcuts, header
   working spinner, long-error dialog, copy-ID buttons on every row,
   confirm-before-every-prune/delete.

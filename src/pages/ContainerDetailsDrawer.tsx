@@ -9,23 +9,29 @@ import {
   Copy,
   Check,
   RotateCw,
+  Pencil,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { TerminalViewer } from "../components/ui/TerminalViewer";
+import { InteractiveTerminal } from "../components/terminal/InteractiveTerminal";
+import { useTerminalFontSize } from "../lib/terminalSettings";
 import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
-import type { ContainerDetails, ContainerStats } from "../types";
+import type { ContainerDetails, ContainerStats, ResourceLimits } from "../types";
 
 interface ContainerDetailsDrawerProps {
   containerId: string | null;
   initialTab?: "logs" | "inspect" | "stats" | "terminal";
+  /** true = the Debug flow: start the container if needed, then attach a shell. */
+  debug?: boolean;
   onClose: () => void;
 }
 
 export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   containerId,
   initialTab = "logs",
+  debug = false,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<"logs" | "inspect" | "stats" | "terminal">(initialTab);
@@ -35,27 +41,30 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   const [, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [logFilter, setLogFilter] = useState("");
-  const [execCmd, setExecCmd] = useState("");
-  const [terminalOutput, setTerminalOutput] = useState<string>(
-    "Connected to container terminal. Type commands (e.g. 'ls -la', 'ps aux', 'env', 'cat /etc/os-release') to execute:\n\n"
-  );
-  const [executing, setExecuting] = useState(false);
+  const [limitsDraft, setLimitsDraft] = useState<ResourceLimits | null>(null);
+  const [savingLimits, setSavingLimits] = useState(false);
   const toast = useToast();
+  const terminalFontSize = useTerminalFontSize();
+  const isRunning = details?.state === "running";
 
-  const handleExec = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!containerId || !execCmd.trim() || executing) return;
-    const commandToRun = execCmd.trim();
-    setExecCmd("");
-    setExecuting(true);
-    setTerminalOutput((prev) => prev + `$ ${commandToRun}\n`);
+  const handleSaveLimits = async () => {
+    if (!containerId || !limitsDraft) return;
     try {
-      const output = await api.execContainer(containerId, commandToRun);
-      setTerminalOutput((prev) => prev + (output || "(no output)") + "\n\n");
+      setSavingLimits(true);
+      await api.updateContainerResources(containerId, {
+        memory_mb: limitsDraft.memory_mb?.trim() || "",
+        cpus: limitsDraft.cpus?.trim() || "",
+        cpuset_cpus: limitsDraft.cpuset_cpus?.trim() || "",
+        cpu_shares: limitsDraft.cpu_shares?.trim() || "",
+        pids_limit: limitsDraft.pids_limit?.trim() || "",
+      });
+      toast.success("Resource limits updated");
+      setLimitsDraft(null);
+      await loadAll();
     } catch (err) {
-      setTerminalOutput((prev) => prev + `[error] ${err}\n\n`);
+      toast.error("Could not update limits", String(err));
     } finally {
-      setExecuting(false);
+      setSavingLimits(false);
     }
   };
 
@@ -299,6 +308,165 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                     <span>{copied ? "Copied" : "Copy JSON"}</span>
                   </Button>
                 </div>
+
+                {/* Resource limits snapshot + inline editor */}
+                <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-zinc-300">
+                      Resource limits
+                    </span>
+                    {!limitsDraft && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setLimitsDraft(
+                            details?.limits ?? {
+                              memory_mb: "",
+                              cpus: "",
+                              cpuset_cpus: "",
+                              cpu_shares: "",
+                              pids_limit: "",
+                            }
+                          )
+                        }
+                        className="gap-1.5 text-xs text-zinc-400 hover:text-white"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Edit
+                      </Button>
+                    )}
+                  </div>
+
+                  {!limitsDraft && (
+                    <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px] sm:grid-cols-3">
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">Memory</dt>
+                        <dd className="text-zinc-200">
+                          {details?.limits?.memory_mb
+                            ? `${details.limits.memory_mb} MiB`
+                            : "unlimited"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">CPU</dt>
+                        <dd className="text-zinc-200">
+                          {details?.limits?.cpus
+                            ? `${details.limits.cpus} cores`
+                            : "unlimited"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">CPU set</dt>
+                        <dd className="text-zinc-200">
+                          {details?.limits?.cpuset_cpus || "all"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">Shares</dt>
+                        <dd className="text-zinc-200">
+                          {details?.limits?.cpu_shares || "default"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <dt className="text-zinc-500">PIDs</dt>
+                        <dd className="text-zinc-200">
+                          {details?.limits?.pids_limit || "unlimited"}
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
+
+                  {limitsDraft && (
+                    <div className="mt-2 space-y-2">
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">Memory (MiB)</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.memory_mb ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, memory_mb: e.target.value })
+                            }
+                            placeholder="512"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">CPU (cores)</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.cpus ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, cpus: e.target.value })
+                            }
+                            placeholder="1.5"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">CPU set</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.cpuset_cpus ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, cpuset_cpus: e.target.value })
+                            }
+                            placeholder="0-2,4"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">CPU shares</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.cpu_shares ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, cpu_shares: e.target.value })
+                            }
+                            placeholder="1024"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] text-zinc-500">PIDs limit</span>
+                          <input
+                            type="text"
+                            value={limitsDraft.pids_limit ?? ""}
+                            onChange={(e) =>
+                              setLimitsDraft({ ...limitsDraft, pids_limit: e.target.value })
+                            }
+                            placeholder="256"
+                            className="h-8 w-full rounded-md border border-zinc-800 bg-zinc-950/60 px-2 font-mono text-xs text-white outline-none focus:border-zinc-600 placeholder:text-zinc-700"
+                          />
+                        </label>
+                      </div>
+                      <p className="text-[11px] text-zinc-600">
+                        Leaving a field empty keeps its current value — the engine can
+                        change a limit but cannot remove one.
+                      </p>
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setLimitsDraft(null)}
+                          disabled={savingLimits}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={handleSaveLimits}
+                          disabled={savingLimits}
+                        >
+                          {savingLimits ? "Saving…" : "Save"}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-4 overflow-hidden shadow-inner">
                   <pre className="h-full font-mono text-xs text-blue-300/90 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed">
                     {details?.raw_json || "Loading inspect JSON..."}
@@ -308,40 +476,51 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
             )}
 
             {activeTab === "terminal" && (
-              <div className="h-full flex flex-col space-y-3">
+              <div className="h-full flex flex-col space-y-3 min-h-0">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-zinc-500 font-mono">
-                    Direct Container Execution Shell
+                    {isRunning
+                      ? "Interactive shell — stdin is live"
+                      : debug
+                        ? "Debug — starting container & attaching…"
+                        : "Container is not running"}
                   </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      setTerminalOutput(
-                        "Console cleared.\nReady to execute commands inside container:\n\n"
-                      )
-                    }
-                  >
-                    Clear Console
-                  </Button>
+                  {isRunning && (
+                    <span className="text-[10px] text-zinc-600 font-mono">
+                      type to interact · exit ends the session
+                    </span>
+                  )}
                 </div>
 
-                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col">
-                  <TerminalViewer logs={terminalOutput} />
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col min-h-0">
+                  {isRunning || debug ? (
+                    <InteractiveTerminal
+                      key={containerId + (debug ? ":debug" : "")}
+                      containerId={containerId}
+                      debug={debug}
+                      fontSize={terminalFontSize}
+                      onSessionLive={() => {
+                        // the Debug flow may have just started the container
+                        void loadAll();
+                      }}
+                    />
+                  ) : (
+                    <div className="h-full flex flex-col items-center justify-center gap-3 text-center px-6">
+                      <p className="text-sm text-zinc-400">
+                        This container is{" "}
+                        <span className="font-semibold">
+                          {details?.state || "not running"}
+                        </span>
+                        .
+                      </p>
+                      <p className="text-xs text-zinc-600 max-w-sm">
+                        A shell needs a running container. Use the Debug action on
+                        the container row to start it and attach a shell
+                        automatically.
+                      </p>
+                    </div>
+                  )}
                 </div>
-
-                <form onSubmit={handleExec} className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Enter command inside container (e.g. sh, uname -a, ls /)..."
-                    value={execCmd}
-                    onChange={(e) => setExecCmd(e.target.value)}
-                    className="flex-1 h-10 px-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
-                  />
-                  <Button type="submit" variant="primary" isLoading={executing} className="px-5">
-                    Execute
-                  </Button>
-                </form>
               </div>
             )}
           </div>

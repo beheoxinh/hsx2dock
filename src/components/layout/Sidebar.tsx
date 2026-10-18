@@ -5,6 +5,7 @@ import {
   Layers,
   HardDrive,
   Network,
+  Hexagon,
   FileCode2,
   Settings,
   Activity,
@@ -18,6 +19,7 @@ export type NavTab =
   | "images"
   | "volumes"
   | "networks"
+  | "kubernetes"
   | "compose"
   | "settings";
 
@@ -43,6 +45,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: "images", label: "Images", icon: Layers },
     { id: "volumes", label: "Volumes", icon: HardDrive },
     { id: "networks", label: "Networks", icon: Network },
+    { id: "kubernetes", label: "Kubernetes", icon: Hexagon },
     { id: "compose", label: "Compose", icon: FileCode2 },
     { id: "settings", label: "Settings", icon: Settings },
   ];

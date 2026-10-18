@@ -54,6 +54,124 @@ pub struct AppConfig {
     /// `0` = written before the CLI bridge became on-by-default.
     #[serde(default)]
     pub schema_version: u32,
+    /// Saved remote daemons. The local bundled engine is implicit and is
+    /// never stored here.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointConfig>,
+    /// Id of the active endpoint. `None` = the local bundled engine.
+    #[serde(default)]
+    pub active_endpoint: Option<String>,
+    /// Shell opened by the container terminal and the Debug action.
+    #[serde(default = "default_shell")]
+    pub terminal_shell: String,
+    /// Font size (px) used by terminal panes.
+    #[serde(default = "default_terminal_font_size")]
+    pub terminal_font_size: u32,
+    /// Saved registry logins (Docker Hub, ghcr.io, GitLab, Harbor, custom).
+    #[serde(default)]
+    pub registries: Vec<RegistryConfig>,
+    /// Desktop-notification opt-outs, driven by the tray's Notifications submenu.
+    #[serde(default)]
+    pub notifications: NotificationPrefs,
+    /// Default node count pre-filled in the kind "Create cluster" form (1–5).
+    #[serde(default = "default_kind_nodes")]
+    pub kind_default_nodes: u32,
+    /// Default node image for kind clusters; empty = kind's bundled default.
+    #[serde(default)]
+    pub kind_default_image: String,
+}
+
+/// Which tray-driven desktop notifications to surface. Every category defaults
+/// to on: a fresh install should tell the user when long-running work ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationPrefs {
+    /// Image build finished (success or failure).
+    #[serde(default = "default_true")]
+    pub build_done: bool,
+    /// Pull/push transfer finished.
+    #[serde(default = "default_true")]
+    pub transfer_done: bool,
+    /// Engine started, stopped, or died.
+    #[serde(default = "default_true")]
+    pub engine_state: bool,
+    /// Kind cluster created or deleted.
+    #[serde(default = "default_true")]
+    pub kind_events: bool,
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self {
+            build_done: default_true(),
+            transfer_done: default_true(),
+            engine_state: default_true(),
+            kind_events: default_true(),
+        }
+    }
+}
+
+/// A saved registry login. Any host works: Docker Hub, ghcr.io,
+/// registry.gitlab.com, a personal Harbor, or a community registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RegistryConfig {
+    /// Stable id used by the UI; generated on save.
+    pub id: String,
+    /// Display name, e.g. "GitHub ghcr".
+    pub name: String,
+    /// Registry host, e.g. `ghcr.io`, `harbor.example.com:8443`.
+    pub host: String,
+    pub username: String,
+    /// base64(username:password) — the same obfuscation docker's own
+    /// `config.json` uses. Not encryption; the config file is user-private.
+    pub auth: String,
+    /// Accept self-signed TLS certs (personal Harbor installs).
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+impl RegistryConfig {
+    /// Builds the bollard credential for this login. `auth` holds
+    /// base64(username:password).
+    pub fn credentials(&self) -> bollard::auth::DockerCredentials {
+        use base64::Engine as _;
+        let password = base64::engine::general_purpose::STANDARD
+            .decode(self.auth.as_bytes())
+            .ok()
+            .and_then(|raw| {
+                let s = String::from_utf8(raw).ok()?;
+                let (_, pass) = s.split_once(':')?;
+                Some(pass.to_string())
+            })
+            .unwrap_or_default();
+        bollard::auth::DockerCredentials {
+            username: Some(self.username.clone()),
+            password: Some(password),
+            serveraddress: Some(server_address_for_host(&self.host)),
+            ..Default::default()
+        }
+    }
+}
+
+/// Docker's canonical server address for an index-style host. The daemon
+/// matches saved auth against this string for Docker Hub pulls/pushes.
+pub fn server_address_for_host(host: &str) -> String {
+    if matches!(host, "docker.io" | "index.docker.io" | "registry-1.docker.io") {
+        "https://index.docker.io/v1/".to_string()
+    } else {
+        format!("https://{host}")
+    }
+}
+
+/// A saved remote daemon (tcp or ssh). The local engine needs no entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EndpointConfig {
+    /// Stable id used by the UI; generated on save.
+    pub id: String,
+    pub name: String,
+    /// `"tcp"` or `"ssh"`.
+    pub kind: String,
+    /// `host:2375`, `tcp://host:2375`, `user@host`, `ssh://user@host`.
+    pub uri: String,
 }
 
 fn default_theme() -> String {
@@ -62,6 +180,18 @@ fn default_theme() -> String {
 
 fn default_cli_mode() -> String {
     "auto".to_string()
+}
+
+fn default_shell() -> String {
+    "sh".to_string()
+}
+
+fn default_terminal_font_size() -> u32 {
+    12
+}
+
+fn default_kind_nodes() -> u32 {
+    1
 }
 
 /// Current config schema. See [`AppConfig::schema_version`].
@@ -80,6 +210,14 @@ impl Default for AppConfig {
             cli_mode: default_cli_mode(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,
+            endpoints: Vec::new(),
+            active_endpoint: None,
+            terminal_shell: default_shell(),
+            terminal_font_size: default_terminal_font_size(),
+            registries: Vec::new(),
+            notifications: NotificationPrefs::default(),
+            kind_default_nodes: default_kind_nodes(),
+            kind_default_image: String::new(),
         }
     }
 }
@@ -218,6 +356,14 @@ mod tests {
             cli_mode: "auto".to_string(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,
+            endpoints: Vec::new(),
+            active_endpoint: None,
+            terminal_shell: default_shell(),
+            terminal_font_size: default_terminal_font_size(),
+            registries: Vec::new(),
+            notifications: NotificationPrefs::default(),
+            kind_default_nodes: default_kind_nodes(),
+            kind_default_image: String::new(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");
@@ -240,5 +386,15 @@ mod tests {
         // Second run is a no-op.
         cfg.migrate();
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn notification_prefs_default_all_on() {
+        // Every category ships enabled; the Settings UI only turns them off.
+        let p = NotificationPrefs::default();
+        assert!(p.build_done && p.transfer_done && p.engine_state && p.kind_events);
+        // Configs written before this section existed deserialize to all-on.
+        let from_toml: NotificationPrefs = toml::from_str("").expect("empty table parses");
+        assert_eq!(from_toml, NotificationPrefs::default());
     }
 }

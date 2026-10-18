@@ -5,9 +5,9 @@ use bollard::Docker;
 use futures_util::StreamExt;
 
 use super::models::{
-    ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo, EnvVar, Healthcheck,
-    ImageHistoryEntry, ImageItem, NetworkItem, PortMapping, PortProtocol, ResourceLimits,
-    RunConfig, VolumeItem, VolumeMount,
+    BuildOptions, BuildStep, ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo,
+    EnvVar, Healthcheck, ImageHistoryEntry, ImageItem, NetworkItem, PortMapping, PortProtocol,
+    ResourceLimits, RunConfig, VolumeItem, VolumeMount, limits_from_host_config,
 };
 
 #[derive(Clone)]
@@ -25,6 +25,46 @@ impl DockerClient {
             None => Docker::connect_with_socket_defaults()?,
         };
         Ok(Self { docker })
+    }
+
+    /// Connects to an explicit endpoint.
+    ///
+    /// `kind` is `"local"`, `"tcp"` or `"ssh"`; the local kind needs the
+    /// engine socket. TLS-terminated daemons are not supported yet, so a
+    /// failure here is reported rather than silently retried over plain HTTP.
+    pub fn connect_for_endpoint(
+        kind: &str,
+        uri: &str,
+        socket: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let docker = match kind {
+            "local" => match socket {
+                Some(p) => Docker::connect_with_unix(
+                    &format!("unix://{}", p.display()),
+                    120,
+                    bollard::API_DEFAULT_VERSION,
+                )?,
+                None => Docker::connect_with_socket_defaults()?,
+            },
+            "tcp" => {
+                let host = normalize_tcp_uri(uri)?;
+                Docker::connect_with_http(&host, 120, bollard::API_DEFAULT_VERSION)?
+            }
+            "ssh" => {
+                let host = normalize_ssh_uri(uri)?;
+                // No explicit keypair: bollard falls back to the agent and the
+                // user's default identity files, exactly like the ssh CLI.
+                Docker::connect_with_ssh(&host, 120, bollard::API_DEFAULT_VERSION, None)?
+            }
+            other => anyhow::bail!("Unsupported endpoint kind: {other}"),
+        };
+        Ok(Self { docker })
+    }
+
+    /// The daemon's reported version, used to label a reachable endpoint.
+    pub async fn version_string(&self) -> anyhow::Result<String> {
+        let v = self.docker.version().await?;
+        Ok(v.version.unwrap_or_default())
     }
 
     /// Real daemon health check: the Engine API must answer.
@@ -300,6 +340,10 @@ impl DockerClient {
                 driver: v.driver,
                 mountpoint: v.mountpoint,
                 created: v.created_at.map(|c| c.to_string()),
+                // Filled in by the `list_volumes` command after walking the
+                // mountpoint on disk; the raw API list leaves them unknown.
+                size: None,
+                restricted_dirs: 0,
             })
             .collect())
     }
@@ -510,48 +554,101 @@ impl DockerClient {
             .collect())
     }
 
+    /// Builds an image from a local context and streams every build step.
+    ///
+    /// `cancel` is polled on each stream item; flipping it drops the stream,
+    /// which aborts the build on the daemon. Returns the built image id when
+    /// the daemon reports one (`BuildInfo::aux`).
     pub async fn build_image<F>(
         &self,
-        context_dir: &std::path::Path,
-        dockerfile: &str,
-        tag: &str,
-        mut on_progress: F,
-    ) -> anyhow::Result<()>
+        options: &BuildOptions,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        mut on_step: F,
+    ) -> anyhow::Result<Option<String>>
     where
-        F: FnMut(String) + Send,
+        F: FnMut(BuildStep) + Send,
     {
-        let tarball = build_context_tarball(context_dir)?;
-        let dockerfile = if dockerfile.trim().is_empty() {
-            "Dockerfile".to_string()
-        } else {
-            dockerfile.trim().to_string()
-        };
+        let (context, dockerfile) = options.validate().map_err(anyhow::Error::msg)?;
+        let tarball = build_context_tarball(&context)?;
+
         let mut builder = bollard::query_parameters::BuildImageOptionsBuilder::default()
             .dockerfile(&dockerfile)
-            .rm(true);
-        if !tag.trim().is_empty() {
-            builder = builder.t(tag.trim());
+            .rm(true)
+            .forcerm(true);
+        let tag = options.tag.trim();
+        if !tag.is_empty() {
+            builder = builder.t(tag);
         }
+        if let Some(target) = options.target.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            builder = builder.target(target);
+        }
+        if options.no_cache {
+            builder = builder.nocache(true);
+        }
+        if options.pull {
+            builder = builder.pull("true");
+        }
+        let args = options.build_arg_pairs();
+        if !args.is_empty() {
+            builder = builder.buildargs(&args.into_iter().collect::<std::collections::HashMap<_, _>>());
+        }
+
         let opts = builder.build();
         let body = bollard::body_full(bytes::Bytes::from(tarball));
         let mut stream = self.docker.build_image(opts, None, Some(body));
+        let mut image_id: Option<String> = None;
+
         while let Some(chunk) = stream.next().await {
-            let info = chunk.map_err(|e| anyhow::anyhow!("{e}"))?;
-            if let Some(err) = info.error_detail.and_then(|e| e.message) {
-                anyhow::bail!("{err}");
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(image_id);
             }
+            let info = chunk.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if let Some(err) = info.error_detail.and_then(|e| e.message) {
+                let err = err.trim().to_string();
+                if !err.is_empty() {
+                    anyhow::bail!("{err}");
+                }
+            }
+            if let Some(id) = info.aux.and_then(|aux| aux.id) {
+                image_id = Some(id);
+            }
+
+            let (current, total) = info
+                .progress_detail
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.current.map(|v| v.max(0) as u64),
+                        d.total.map(|v| v.max(0) as u64),
+                    )
+                })
+                .unwrap_or((None, None));
+
             if let Some(line) = info.stream {
-                let line = line.trim().to_string();
-                if !line.is_empty() {
-                    on_progress(line);
+                let line = line.trim_end().to_string();
+                if !line.trim().is_empty() {
+                    on_step(BuildStep {
+                        status: line.clone(),
+                        log: Some(line),
+                        current,
+                        total,
+                        is_error: false,
+                    });
                 }
             } else if let Some(status) = info.status {
                 if !status.trim().is_empty() {
-                    on_progress(status);
+                    on_step(BuildStep {
+                        status,
+                        log: None,
+                        current,
+                        total,
+                        is_error: false,
+                    });
                 }
             }
         }
-        Ok(())
+        Ok(image_id)
     }
 
     pub async fn system_df(&self) -> anyhow::Result<DfReport> {
@@ -875,6 +972,20 @@ impl DockerClient {
     pub fn docker(&self) -> &Docker {
         &self.docker
     }
+
+    /// Applies new resource limits to an existing container via the engine's
+    /// update endpoint. Limits can be changed but not removed — the engine
+    /// treats zero/absent values as "leave unchanged".
+    pub async fn update_container_limits(
+        &self,
+        id: &str,
+        limits: &ResourceLimits,
+    ) -> anyhow::Result<()> {
+        let body = crate::docker::models::update_body_from_limits(limits)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.docker.update_container(id, body).await?;
+        Ok(())
+    }
 }
 
 impl Default for DockerClient {
@@ -1069,6 +1180,7 @@ fn container_details_from_inspect(
             .as_ref()
             .and_then(|h| h.readonly_rootfs)
             .unwrap_or(false),
+        limits: limits_from_host_config(info.host_config.as_ref()),
     }
 }
 
@@ -1200,6 +1312,38 @@ fn append_dir_all(
     Ok(())
 }
 
+
+fn normalize_tcp_uri(uri: &str) -> anyhow::Result<String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("TCP URI cannot be empty");
+    }
+    if trimmed.starts_with("tcp://") || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(trimmed.to_string());
+    }
+    if trimmed.contains("://") {
+        anyhow::bail!("Unsupported scheme for TCP endpoint: {trimmed}");
+    }
+    if trimmed.contains(":") {
+        return Ok(format!("tcp://{trimmed}"));
+    }
+    Ok(format!("tcp://{trimmed}:2375"))
+}
+
+fn normalize_ssh_uri(uri: &str) -> anyhow::Result<String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("SSH URI cannot be empty");
+    }
+    if trimmed.starts_with("ssh://") {
+        return Ok(trimmed.to_string());
+    }
+    if trimmed.contains("://") {
+        anyhow::bail!("Unsupported scheme for SSH endpoint: {trimmed}");
+    }
+    Ok(format!("ssh://{trimmed}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,5 +1387,30 @@ mod tests {
             },
         ];
         assert_eq!(DockerClient::format_ports_static(&ports), "8080:80, 443");
+    }
+
+    #[test]
+    fn tcp_uri_normalization_adds_scheme_and_default_port() {
+        assert_eq!(normalize_tcp_uri("localhost:2375").unwrap(), "tcp://localhost:2375");
+        assert_eq!(normalize_tcp_uri(" 10.0.0.5:2376 ").unwrap(), "tcp://10.0.0.5:2376");
+        assert_eq!(normalize_tcp_uri("docker.example.com").unwrap(), "tcp://docker.example.com:2375");
+        // An explicit scheme is passed through untouched.
+        assert_eq!(normalize_tcp_uri("tcp://host:2375").unwrap(), "tcp://host:2375");
+        assert_eq!(normalize_tcp_uri("http://host:9000").unwrap(), "http://host:9000");
+    }
+
+    #[test]
+    fn tcp_uri_normalization_rejects_an_empty_or_foreign_value() {
+        assert!(normalize_tcp_uri("   ").is_err());
+        assert!(normalize_tcp_uri("unix:///var/run/docker.sock").is_err());
+        assert!(normalize_tcp_uri("ssh://user@host").is_err());
+    }
+
+    #[test]
+    fn ssh_uri_normalization_adds_the_scheme() {
+        assert_eq!(normalize_ssh_uri("user@host").unwrap(), "ssh://user@host");
+        assert_eq!(normalize_ssh_uri("ssh://user@host:22").unwrap(), "ssh://user@host:22");
+        assert!(normalize_ssh_uri("").is_err());
+        assert!(normalize_ssh_uri("tcp://host:2375").is_err());
     }
 }

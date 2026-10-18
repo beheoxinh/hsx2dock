@@ -15,6 +15,7 @@ import {
   Pause,
   Copy,
   ExternalLink,
+  Bug,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -26,7 +27,11 @@ import { formatBytes, truncateId } from "../lib/utils";
 import type { ContainerItem, ContainerStats } from "../types";
 
 interface ContainersPageProps {
-  onOpenDetails: (id: string, tab?: "logs" | "inspect" | "stats" | "terminal") => void;
+  onOpenDetails: (
+    id: string,
+    tab?: "logs" | "inspect" | "stats" | "terminal",
+    debug?: boolean
+  ) => void;
   onOpenWizard: () => void;
 }
 
@@ -306,6 +311,16 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                           className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
                         >
                           <Play className="w-4 h-4 fill-current" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => onOpenDetails(c.id, "terminal", true)}
+                          disabled={isBusy}
+                          title="Debug — start the container and attach a shell"
+                          className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                        >
+                          <Bug className="w-4 h-4" />
                         </Button>
                       </>
                     )}

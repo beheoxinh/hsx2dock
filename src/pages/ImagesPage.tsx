@@ -13,12 +13,23 @@ import {
   X,
   CheckCircle,
   AlertCircle,
+  Hammer,
+  Upload,
+  Hexagon,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
+import { BuildImageModal } from "../components/images/BuildImageModal";
+import { LoadToKindModal } from "../components/images/LoadToKindModal";
 import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime, truncateId } from "../lib/utils";
-import type { ImageItem, SearchResult, PullProgressPayload } from "../types";
+import type {
+  ImageItem,
+  SearchResult,
+  PullProgressPayload,
+  PushProgressPayload,
+  RegistryStatus,
+} from "../types";
 
 interface ImagesPageProps {
   refreshKey?: number;
@@ -31,11 +42,18 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [pullModalOpen, setPullModalOpen] = useState(false);
+  const [buildModalOpen, setBuildModalOpen] = useState(false);
   const [imageToPull, setImageToPull] = useState("");
   const [pullStatus, setPullStatus] = useState<PullProgressPayload | null>(null);
   const [isPulling, setIsPulling] = useState(false);
   const [hubResults, setHubResults] = useState<SearchResult[]>([]);
   const [searchingHub, setSearchingHub] = useState(false);
+  const [registries, setRegistries] = useState<RegistryStatus[]>([]);
+  const [pushModalOpen, setPushModalOpen] = useState(false);
+  const [pushTarget, setPushTarget] = useState("");
+  const [loadTarget, setLoadTarget] = useState<string | null>(null);
+  const [isPushing, setIsPushing] = useState(false);
+  const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
 
   const loadImages = async () => {
     try {
@@ -51,6 +69,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
 
   useEffect(() => {
     loadImages();
+    api.listRegistries().then(setRegistries).catch(() => {});
 
     let unlistenPull: (() => void) | undefined;
     events.onPullProgress((payload) => {
@@ -61,8 +80,17 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
       }
     }).then((u) => (unlistenPull = u));
 
+    let unlistenPush: (() => void) | undefined;
+    events.onPushProgress((payload) => {
+      setPushStatus(payload);
+      if (payload.done) {
+        setIsPushing(false);
+      }
+    }).then((u) => (unlistenPush = u));
+
     return () => {
       if (unlistenPull) unlistenPull();
+      if (unlistenPush) unlistenPush();
     };
   }, [refreshKey]);
 
@@ -93,6 +121,82 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
         error: String(err),
       });
       setIsPulling(false);
+    }
+  };
+
+  /** Picks the first usable tag: fully-qualified, else first non-sha tag. */
+  const primaryTag = (img: ImageItem): string => {
+    const named = img.tags.find((t) => t && !t.startsWith("sha256:"));
+    return named ?? `${img.id.slice(0, 12)}:latest`;
+  };
+
+  /**
+   * Builds a sensible push target: an existing fully-qualified tag wins;
+   * otherwise the first saved registry + username + local repo name.
+   */
+  const suggestPushRefWith = (img: ImageItem, regs: RegistryStatus[]): string => {
+    const qualified = img.tags.find(
+      (t) =>
+        t.includes("/") &&
+        (t.includes(".") || t.includes(":") || t.startsWith("localhost"))
+    );
+    if (qualified) return qualified;
+
+    const base = primaryTag(img);
+    const colon = base.lastIndexOf(":");
+    const repo = colon > 0 ? base.slice(0, colon) : base;
+    const tag = colon > 0 ? base.slice(colon + 1) : "latest";
+    // Strip any docker.io/library prefix from the local name.
+    const shortRepo = repo.replace(/^docker\.io\/(library\/)?/, "");
+
+    const reg = regs[0];
+    if (!reg) return `docker.io/library/${shortRepo}:${tag}`;
+    if (reg.host === "docker.io") return `docker.io/${shortRepo}:${tag}`;
+    return `${reg.host}/${reg.username}/${shortRepo}:${tag}`;
+  };
+
+  const suggestPushRef = (img: ImageItem): string =>
+    suggestPushRefWith(img, registries);
+
+  const openPush = (img: ImageItem) => {
+    setPushStatus(null);
+    // Refresh logins first so the suggested ref uses the latest registry.
+    api
+      .listRegistries()
+      .then((regs) => {
+        setRegistries(regs);
+        setPushTarget(suggestPushRefWith(img, regs));
+      })
+      .catch(() => setPushTarget(suggestPushRef(img)));
+    setPushModalOpen(true);
+  };
+
+  const handlePush = async () => {
+    const target = pushTarget.trim();
+    if (!target || isPushing) return;
+    try {
+      setIsPushing(true);
+      setPushStatus({
+        image: target,
+        status: "Starting push…",
+        progress: null,
+        current: null,
+        total: null,
+        done: false,
+        error: null,
+      });
+      await api.pushImage(target);
+    } catch (err) {
+      setPushStatus({
+        image: target,
+        status: "Failed",
+        progress: null,
+        current: null,
+        total: null,
+        done: true,
+        error: String(err),
+      });
+      setIsPushing(false);
     }
   };
 
@@ -167,9 +271,20 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
           </Button>
 
           <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setBuildModalOpen(true)}
+          >
+            <Hammer className="w-4 h-4" />
+            <span>Build</span>
+          </Button>
+
+          <Button
             variant="primary"
             size="sm"
             onClick={() => {
+              // Re-read logins so a registry added in Settings shows up here.
+              api.listRegistries().then(setRegistries).catch(() => {});
               setPullModalOpen(true);
               setPullStatus(null);
               setHubResults([]);
@@ -234,6 +349,28 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
                   <Button
                     variant="ghost"
                     size="icon"
+                    onClick={() =>
+                      setLoadTarget(
+                        img.tags.find((t) => t && !t.startsWith("sha256:")) ?? img.id
+                      )
+                    }
+                    title="Load to kind cluster"
+                    className="text-zinc-400 hover:text-blue-400 hover:bg-blue-500/10"
+                  >
+                    <Hexagon className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => openPush(img)}
+                    title="Push to a registry"
+                    className="text-zinc-400 hover:text-amber-400 hover:bg-amber-500/10"
+                  >
+                    <Upload className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => handleRemove(img.id)}
                     title="Remove Image"
                     className="text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
@@ -284,6 +421,34 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
 
             {/* Input + Search */}
             <div className="space-y-3">
+              {registries.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-zinc-600">From registry:</span>
+                  {registries.map((reg) => (
+                    <button
+                      key={reg.id}
+                      type="button"
+                      disabled={isPulling}
+                      title={`Pull from ${reg.name} (login: ${reg.username})`}
+                      onClick={() => {
+                        const current = imageToPull.trim();
+                        if (!current) {
+                          setImageToPull(`${reg.host}/`);
+                          return;
+                        }
+                        // Swap the leading registry host if one is present.
+                        const stripped = current.includes("/")
+                          ? current.replace(/^[^/]+\//, "")
+                          : current;
+                        setImageToPull(`${reg.host}/${stripped}`);
+                      }}
+                      className="rounded-md border border-zinc-800 bg-zinc-900/50 px-2 py-0.5 text-[11px] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 transition-colors disabled:opacity-50"
+                    >
+                      {reg.host}
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -402,6 +567,145 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
           </motion.div>
         </div>
       )}
+
+      {/* Push Image Modal */}
+      {pushModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div
+            className="fixed inset-0 bg-black/70 backdrop-blur-md"
+            onClick={() => !isPushing && setPushModalOpen(false)}
+          />
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="relative w-full max-w-xl bg-zinc-950 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden p-6 z-10 space-y-5"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <Upload className="w-5 h-5 text-amber-400" />
+                Push Image
+              </h3>
+              <Button
+                variant="ghost"
+                size="icon"
+                disabled={isPushing}
+                onClick={() => setPushModalOpen(false)}
+              >
+                <X className="w-5 h-5" />
+              </Button>
+            </div>
+
+            <div className="space-y-3">
+              {registries.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-zinc-600">Push to:</span>
+                  {registries.map((reg) => (
+                    <button
+                      key={reg.id}
+                      type="button"
+                      disabled={isPushing}
+                      title={`${reg.name} (login: ${reg.username})`}
+                      onClick={() => {
+                        const current = pushTarget.trim();
+                        const stripped = current.includes("/")
+                          ? current.replace(/^[^/]+\//, "")
+                          : current;
+                        if (reg.host === "docker.io") {
+                          setPushTarget(`docker.io/${stripped}`);
+                        } else {
+                          setPushTarget(`${reg.host}/${reg.username}/${stripped}`);
+                        }
+                      }}
+                      className="rounded-md border border-zinc-800 bg-zinc-900/50 px-2 py-0.5 text-[11px] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 transition-colors disabled:opacity-50"
+                    >
+                      {reg.host}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {registries.length === 0 && (
+                <p className="text-[11px] text-amber-400/90">
+                  No registry logins saved — add one in Settings → Registries,
+                  or the push will be refused by the registry.
+                </p>
+              )}
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="ghcr.io/your-user/image:tag"
+                  value={pushTarget}
+                  onChange={(e) => setPushTarget(e.target.value)}
+                  disabled={isPushing}
+                  className="flex-1 h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white font-mono focus:outline-none focus:border-amber-500"
+                />
+                <Button
+                  variant="primary"
+                  onClick={handlePush}
+                  isLoading={isPushing}
+                  disabled={!pushTarget.trim() || isPushing}
+                >
+                  Push
+                </Button>
+              </div>
+            </div>
+
+            {/* Progress */}
+            {pushStatus && (
+              <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-mono text-zinc-400 truncate">
+                    {pushStatus.image}
+                  </span>
+                  {pushStatus.done ? (
+                    pushStatus.error ? (
+                      <span className="text-rose-400 flex items-center gap-1 font-semibold shrink-0">
+                        <AlertCircle className="w-3.5 h-3.5" /> Failed
+                      </span>
+                    ) : (
+                      <span className="text-emerald-400 flex items-center gap-1 font-semibold shrink-0">
+                        <CheckCircle className="w-3.5 h-3.5" /> Pushed
+                      </span>
+                    )
+                  ) : (
+                    <span className="text-amber-400 animate-pulse shrink-0">
+                      Pushing…
+                    </span>
+                  )}
+                </div>
+                {pushStatus.current && pushStatus.total ? (
+                  <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-amber-500 h-1.5 rounded-full transition-all"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          (pushStatus.current / pushStatus.total) * 100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <div className="text-[11px] text-zinc-500 font-mono">
+                    {pushStatus.status}
+                  </div>
+                )}
+                {pushStatus.error && (
+                  <p className="text-xs text-rose-400">{pushStatus.error}</p>
+                )}
+              </div>
+            )}
+          </motion.div>
+        </div>
+      )}
+
+      <BuildImageModal
+        isOpen={buildModalOpen}
+        onClose={() => setBuildModalOpen(false)}
+        onSuccess={() => loadImages()}
+      />
+
+      <LoadToKindModal image={loadTarget} onClose={() => setLoadTarget(null)} />
     </div>
   );
 };

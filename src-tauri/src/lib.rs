@@ -5,8 +5,10 @@ use tauri::{AppHandle, Emitter, Manager};
 pub mod commands;
 pub mod config;
 pub mod docker;
+pub mod fsutil;
 pub mod runtime;
 pub mod state;
+pub mod tray;
 
 use commands::*;
 use state::AppState;
@@ -65,6 +67,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state)
         .setup(|app| {
             let handle = app.handle().clone();
@@ -125,6 +128,12 @@ pub fn run() {
                 });
             }
 
+            // Tray + desktop notifications. AppState is managed on the builder
+            // so the tray can read daemon state immediately; a missing display
+            // bus must not take the whole app down, hence the warn-and-continue.
+            if let Err(e) = crate::tray::init_tray(&handle) {
+                tracing::warn!("system tray unavailable: {e}");
+            }
             start_background_monitoring(handle);
             Ok(())
         })
@@ -142,7 +151,13 @@ pub fn run() {
             containers::get_container_logs,
             containers::get_container_stats,
             containers::run_container,
-            containers::exec_container,
+            containers::update_container_resources,
+            // Interactive exec / debug
+            exec::start_interactive_exec,
+            exec::debug_container,
+            exec::write_exec_stdin,
+            exec::resize_exec_session,
+            exec::stop_exec_session,
             // Images
             images::list_images,
             images::remove_image,
@@ -150,12 +165,33 @@ pub fn run() {
             images::prune_images,
             images::get_image_history,
             images::search_hub,
+            images::build_image,
+            images::cancel_image_build,
+            images::validate_build_context,
+            images::preview_build_command,
             images::pull_image,
+            images::push_image,
             // Volumes
             volumes::list_volumes,
             volumes::create_volume,
             volumes::remove_volume,
             volumes::prune_volumes,
+            // Kind
+            kind::kind_status,
+            kind::install_kind,
+            kind::list_kind_clusters,
+            kind::create_kind_cluster,
+            kind::delete_kind_cluster,
+            kind::start_kind_cluster,
+            kind::stop_kind_cluster,
+            kind::get_kind_kubeconfig,
+            kind::load_image_to_cluster,
+
+            // Registries
+            registries::list_registries,
+            registries::test_registry_auth,
+            registries::save_registry_auth,
+            registries::remove_registry_auth,
             // Networks
             networks::list_networks,
             networks::create_network,
@@ -184,6 +220,13 @@ pub fn run() {
             system::toggle_cli_shim,
             system::check_compose_update,
             system::install_compose_update,
+            endpoints::list_endpoints,
+            endpoints::test_endpoint,
+            endpoints::save_endpoint,
+            endpoints::remove_endpoint,
+            endpoints::set_active_endpoint,
+            endpoints::get_active_endpoint,
+            endpoints::active_endpoint_host,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -63,6 +63,28 @@ pub async fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, Str
     Ok(state.config.read().await.clone())
 }
 
+/// Regenerates the CLI shim so it exports the `DOCKER_HOST` of the endpoint
+/// that is active in `config` — the local engine socket when none is.
+pub fn refresh_shim(state: &AppState, config: &crate::config::AppConfig) {
+    if !crate::docker::engine::shim_installed() {
+        return;
+    }
+    let host = config
+        .active_endpoint
+        .as_deref()
+        .filter(|id| *id != "local")
+        .and_then(|id| config.endpoints.iter().find(|e| e.id == id))
+        .and_then(|e| crate::docker::models::endpoint_docker_host(&e.kind, &e.uri));
+    let paths = state.engine.paths();
+    if let Err(e) = crate::docker::engine::ensure_shim_for(
+        &paths,
+        &config.cli_mode,
+        host.as_deref(),
+    ) {
+        tracing::warn!("could not refresh the docker shim: {e:#}");
+    }
+}
+
 #[tauri::command]
 pub async fn save_app_config(
     state: State<'_, AppState>,
@@ -77,13 +99,9 @@ pub async fn save_app_config(
     // A shim pins the binary it was generated for, so switching mode has to
     // rewrite it — otherwise `docker -v` in a terminal keeps reporting the old
     // CLI no matter what Settings says.
-    if crate::docker::engine::shim_installed() {
-        let paths = state.engine.paths();
-        let mode = config.cli_mode.clone();
-        if let Err(e) = crate::docker::engine::ensure_shim(&paths, &mode) {
-            tracing::warn!("could not refresh the docker shim after a mode change: {e:#}");
-        }
-    }
+    // The shim exports the active endpoint's DOCKER_HOST, so a remote switch
+    // moves the terminal with the UI.
+    refresh_shim(&state, &config);
     *state.config.write().await = config;
     Ok(())
 }
@@ -112,6 +130,7 @@ pub async fn toggle_cli_bridge(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<CliBridgeStatus, String> {
+    state.engine_control_guard().await?;
     {
         let mut config = state.config.write().await;
         config.cli_bridge_enabled = enabled;
@@ -207,6 +226,7 @@ pub async fn migrate_data_root(
     move_data: bool,
     clear_old: bool,
 ) -> Result<(), String> {
+    state.engine_control_guard().await?;
     let target = std::path::PathBuf::from(target_path.trim());
     if target.as_os_str().is_empty() {
         return Err("Target data root path cannot be empty".to_string());
@@ -327,6 +347,7 @@ pub async fn install_engine_update(
     state: State<'_, AppState>,
     version: String,
 ) -> Result<String, String> {
+    state.engine_control_guard().await?;
     let version = version.trim().trim_start_matches('v').to_string();
     if version.is_empty() {
         return Err("No engine version to install".to_string());
@@ -459,6 +480,7 @@ pub async fn toggle_cli_shim(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<CliShimStatus, String> {
+    state.engine_control_guard().await?;
     let paths = state.engine.paths();
     let mode = state.config.read().await.cli_mode.clone();
 
