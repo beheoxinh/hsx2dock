@@ -11,7 +11,6 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
-import { Card } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { useToast } from "../ui/Toast";
 import { useModal } from "../ui/ModalContext";
@@ -164,19 +163,28 @@ export const EndpointsCard: React.FC = () => {
   };
 
   return (
-    <Card className="p-6 space-y-4">
-      <div className="flex items-start justify-between gap-4">
+    <div
+      className="space-y-4 pb-4 border-b border-zinc-800"
+      onKeyDown={(e) => {
+        // This section lives inside the settings <form>: Enter pressed in one
+        // of its text inputs must not trigger the outer form's submit.
+        if (e.key === "Enter" && (e.target as HTMLElement).tagName === "INPUT") {
+          e.preventDefault();
+        }
+      }}
+    >
+      <div className="flex items-center justify-between gap-4">
         <div>
-          <h3 className="font-semibold text-white flex items-center gap-2">
+          <h4 className="text-sm font-semibold text-white flex items-center gap-2">
             <Server className="w-4 h-4 text-indigo-400" />
             Engine Endpoints
-          </h3>
+          </h4>
           <p className="text-xs text-zinc-500 mt-1">
             Manage the bundled engine and remote Docker daemons (TCP or SSH).
             Engine lifecycle controls stay disabled while a remote is active.
           </p>
         </div>
-        <Button variant="secondary" size="sm" onClick={openNew}>
+        <Button variant="secondary" size="sm" onClick={openNew} className="shrink-0 whitespace-nowrap">
           <Plus className="w-4 h-4" />
           Add endpoint
         </Button>
@@ -393,6 +401,6 @@ export const EndpointsCard: React.FC = () => {
           </div>
         </div>
       )}
-    </Card>
+    </div>
   );
 };

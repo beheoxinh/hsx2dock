@@ -32,9 +32,13 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     return (
       <button
         ref={ref}
+        // Default to type="button" so buttons inside a <form> never submit it
+        // by accident; forms that want submission pass type="submit" explicitly
+        // (it wins because {...props} is spread after this attribute).
+        type="button"
         disabled={disabled || isLoading}
         className={cn(
-          "inline-flex items-center justify-center font-medium transition-all duration-150 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50 disabled:pointer-events-none select-none cursor-pointer",
+          "inline-flex items-center justify-center font-medium transition-all duration-150 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50 disabled:pointer-events-none select-none cursor-pointer whitespace-nowrap",
           variants[variant],
           sizes[size],
           className

@@ -261,8 +261,6 @@ export const SettingsPage: React.FC = () => {
         </p>
       </div>
 
-      <EndpointsCard />
-
       <RegistriesCard />
 
       <NotificationsCard />
@@ -485,10 +483,14 @@ export const SettingsPage: React.FC = () => {
             <div>
               <h3 className="font-semibold text-white">Docker Engine</h3>
               <p className="text-xs text-zinc-400">
-                Manage the rootless engine: whether it starts automatically, and when to update it.
+                Which engine this app drives — the bundled one or a remote daemon —
+                plus auto-start and updates for the bundled engine.
               </p>
             </div>
           </div>
+
+          {/* Endpoints (bundled + remote) — the "which engine" half of this card. */}
+          <EndpointsCard />
 
           {/* Lifecycle: the one engine setting that is not an update. */}
           <div className="flex items-center justify-between py-2">

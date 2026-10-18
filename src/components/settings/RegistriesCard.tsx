@@ -178,7 +178,7 @@ export const RegistriesCard: React.FC = () => {
 
   return (
     <Card className="space-y-4">
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
             <KeyRound className="w-4 h-4 text-amber-400" />
@@ -190,7 +190,7 @@ export const RegistriesCard: React.FC = () => {
             from that host.
           </p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => openNew()}>
+        <Button variant="secondary" size="sm" onClick={() => openNew()} className="shrink-0 whitespace-nowrap">
           <Plus className="w-4 h-4" />
           Add login
         </Button>
