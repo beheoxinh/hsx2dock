@@ -208,6 +208,13 @@ pub fn run() {
             kind::stop_kind_cluster,
             kind::get_kind_kubeconfig,
             kind::load_image_to_cluster,
+            kind::get_cluster_nodes,
+            kind::get_cluster_pods,
+            kind::get_cluster_events,
+            kind::get_cluster_workloads,
+            kind::get_cluster_metrics,
+            kind::get_cluster_summary,
+            kind::install_metrics_server,
 
             // Registries
             registries::list_registries,

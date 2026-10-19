@@ -37,6 +37,12 @@ import type {
   KindInstallStatus,
   KindProgressPayload,
   KindInstallProgressPayload,
+  K8sNodeInfo,
+  K8sPodInfo,
+  K8sEventInfo,
+  K8sWorkloadInfo,
+  K8sMetrics,
+  K8sClusterSummary,
   ContainerGroup,
 } from "../types";
 
@@ -187,6 +193,22 @@ export const api = {
   getKindKubeconfig: (name: string) => invoke<string>("get_kind_kubeconfig", { name }),
   loadImageToCluster: (cluster: string, image: string) =>
     invoke<void>("load_image_to_cluster", { cluster, image }),
+
+  // Cluster monitoring (kubectl queries inside the control-plane node)
+  getClusterSummary: (cluster: string) =>
+    invoke<K8sClusterSummary>("get_cluster_summary", { cluster }),
+  getClusterNodes: (cluster: string) =>
+    invoke<K8sNodeInfo[]>("get_cluster_nodes", { cluster }),
+  getClusterPods: (cluster: string, namespace?: string) =>
+    invoke<K8sPodInfo[]>("get_cluster_pods", { cluster, namespace }),
+  getClusterEvents: (cluster: string) =>
+    invoke<K8sEventInfo[]>("get_cluster_events", { cluster }),
+  getClusterWorkloads: (cluster: string) =>
+    invoke<K8sWorkloadInfo[]>("get_cluster_workloads", { cluster }),
+  getClusterMetrics: (cluster: string) =>
+    invoke<K8sMetrics>("get_cluster_metrics", { cluster }),
+  installMetricsServer: (cluster: string) =>
+    invoke<void>("install_metrics_server", { cluster }),
 
   // Container groups (bulk start/stop, optional auto-start with the engine)
   listContainerGroups: () => invoke<ContainerGroup[]>("list_container_groups"),

@@ -20,6 +20,7 @@ import {
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
+import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime } from "../lib/utils";
 import type { KindCluster, KindInstallStatus, KindProgressPayload } from "../types";
@@ -55,6 +56,16 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
   const [busyOp, setBusyOp] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<KindProgressPayload[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
+
+  // Which running cluster the live monitoring panel watches (auto-picks the
+  // first running one; selector appears when several are up).
+  const [monitorFor, setMonitorFor] = useState<string | null>(null);
+  const runningClusters = clusters.filter((c) => c.running);
+  useEffect(() => {
+    if (monitorFor && clusters.some((c) => c.name === monitorFor && c.running)) return;
+    setMonitorFor(clusters.find((c) => c.running)?.name ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusters]);
 
   const loadAll = async () => {
     try {
@@ -564,6 +575,29 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
               <span>Create your first cluster</span>
             </Button>
           )}
+        </div>
+      )}
+
+      {/* Live monitoring for the selected running cluster */}
+      {monitorFor && (
+        <div className="mt-6 space-y-3">
+          {runningClusters.length > 1 && (
+            <div className="flex items-center gap-2 text-xs text-zinc-400">
+              <span>Watching cluster</span>
+              <select
+                value={monitorFor}
+                onChange={(e) => setMonitorFor(e.target.value)}
+                className="h-8 rounded-lg bg-zinc-950 border border-zinc-800 px-2 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
+              >
+                {runningClusters.map((c) => (
+                  <option key={c.name} value={c.name}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <ClusterMonitor key={monitorFor} cluster={monitorFor} />
         </div>
       )}
 

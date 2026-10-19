@@ -484,3 +484,86 @@ export interface KindInstallProgressPayload {
   finished?: boolean;
   error?: string;
 }
+
+// ---- Cluster monitoring (kubectl inside the kind control-plane node) ----
+
+export interface K8sNodeInfo {
+  name: string;
+  ready: boolean;
+  status: string;
+  roles: string[];
+  kubeletVersion: string;
+  osImage: string;
+  containerRuntime: string;
+  internalIp: string;
+  cpuCapacityM: number;
+  memCapacityBytes: number;
+  podsCapacity: number;
+  created: number | null;
+}
+
+export interface K8sPodInfo {
+  name: string;
+  namespace: string;
+  phase: string;
+  readyContainers: number;
+  totalContainers: number;
+  restarts: number;
+  node: string;
+  images: string[];
+  created: number | null;
+  reason: string | null;
+}
+
+export interface K8sEventInfo {
+  type: string;
+  reason: string;
+  message: string;
+  object: string;
+  namespace: string;
+  count: number;
+  lastTimestamp: number | null;
+}
+
+export interface K8sWorkloadInfo {
+  kind: string;
+  name: string;
+  namespace: string;
+  ready: number;
+  desired: number;
+  available: number;
+}
+
+export interface K8sNodeMetric {
+  name: string;
+  cpuM: number;
+  memBytes: number;
+}
+
+export interface K8sPodMetric {
+  namespace: string;
+  name: string;
+  cpuM: number;
+  memBytes: number;
+}
+
+export interface K8sMetrics {
+  nodes: K8sNodeMetric[];
+  pods: K8sPodMetric[];
+  /** Set when `kubectl top` failed (metrics-server not installed). */
+  error: string | null;
+}
+
+export interface K8sClusterSummary {
+  gitVersion: string;
+  platform: string;
+  ready: boolean;
+  readyMessage: string | null;
+  nodeCount: number;
+  readyNodes: number;
+  namespaceCount: number;
+  podRunning: number;
+  podPending: number;
+  podFailed: number;
+  podSucceeded: number;
+}

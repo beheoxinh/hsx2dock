@@ -123,6 +123,62 @@ impl DockerClient {
             .collect())
     }
 
+    /// One-shot exec: runs `cmd` inside `container`, returns combined stdout+stderr.
+    /// Errors on non-zero exit. Used for kubectl queries inside kind nodes.
+    pub async fn exec_capture(
+        &self,
+        container: &str,
+        cmd: Vec<String>,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context;
+        use bollard::container::LogOutput;
+        use bollard::exec::StartExecResults;
+        use bollard::models::ExecConfig;
+
+        let exec = self
+            .docker
+            .create_exec(
+                container,
+                ExecConfig {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(cmd),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("create exec in {container}"))?;
+        let id = exec.id;
+        let started = self
+            .docker
+            .start_exec(&id, None)
+            .await
+            .with_context(|| format!("start exec in {container}"))?;
+        let StartExecResults::Attached { mut output, .. } = started else {
+            anyhow::bail!("engine started this exec detached");
+        };
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(frame) = output.next().await {
+            match frame {
+                Ok(LogOutput::StdOut { message })
+                | Ok(LogOutput::StdErr { message })
+                | Ok(LogOutput::Console { message }) => out.extend_from_slice(&message),
+                Ok(_) => {}
+                Err(e) => anyhow::bail!("exec stream error: {e}"),
+            }
+        }
+        let inspect = self.docker.inspect_exec(&id).await?;
+        if let Some(code) = inspect.exit_code {
+            if code != 0 {
+                anyhow::bail!(
+                    "command exited with {code}: {}",
+                    String::from_utf8_lossy(&out).trim()
+                );
+            }
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
     pub async fn list_containers(&self, all: bool) -> anyhow::Result<Vec<ContainerItem>> {
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(all)
