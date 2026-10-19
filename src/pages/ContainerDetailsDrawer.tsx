@@ -10,6 +10,7 @@ import {
   Check,
   RotateCw,
   Pencil,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { TerminalViewer } from "../components/ui/TerminalViewer";
@@ -25,6 +26,8 @@ interface ContainerDetailsDrawerProps {
   initialTab?: "logs" | "inspect" | "stats" | "terminal";
   /** true = the Debug flow: start the container if needed, then attach a shell. */
   debug?: boolean;
+  /** Open straight into the resource-limits editor (row-level Edit button). */
+  editLimits?: boolean;
   onClose: () => void;
 }
 
@@ -32,6 +35,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   containerId,
   initialTab = "logs",
   debug = false,
+  editLimits = false,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<"logs" | "inspect" | "stats" | "terminal">(initialTab);
@@ -72,6 +76,40 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
       setSavingLimits(false);
     }
   };
+
+  /** Switch to the inspect tab and open the limits editor with a fresh draft
+      (empty advanced fields mean "leave unchanged" on save). */
+  const openLimitsEditor = () => {
+    if (!details) return;
+    setActiveTab("inspect");
+    setLimitsDraft({
+      ...details.limits,
+      cpuset_cpus: "",
+      cpu_shares: "",
+      pids_limit: "",
+      restart_policy: details.restart_policy ?? "",
+      restart_max_retries: "",
+    });
+  };
+
+  // Row-level Edit: once THIS container's details land, jump straight into
+  // the editor. Tracked per id so closing and re-opening still re-triggers.
+  const [autoEditFor, setAutoEditFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (!editLimits) setAutoEditFor(null);
+  }, [editLimits]);
+  useEffect(() => {
+    if (
+      editLimits &&
+      details &&
+      details.id === containerId &&
+      autoEditFor !== containerId
+    ) {
+      setAutoEditFor(containerId);
+      openLimitsEditor();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editLimits, details, containerId, autoEditFor]);
 
   const startRename = () => {
     setNameDraft((details?.name || "").replace(/^\//, ""));
@@ -229,6 +267,16 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
             <div className="flex items-center gap-2">
               <Button variant="ghost" size="icon" onClick={loadAll} title="Reload Data">
                 <RotateCw className="w-4 h-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={openLimitsEditor}
+                disabled={!details}
+                title="Edit resource limits & restart policy"
+                aria-label="Edit resource limits"
+              >
+                <SlidersHorizontal className="w-4 h-4" />
               </Button>
               <Button variant="ghost" size="icon" onClick={onClose} title="Close">
                 <X className="w-5 h-5" />

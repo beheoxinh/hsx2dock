@@ -26,6 +26,7 @@ const MainLayout: React.FC = () => {
   const [selectedContainerId, setSelectedContainerId] = useState<string | null>(null);
   const [drawerTab, setDrawerTab] = useState<"logs" | "inspect" | "stats" | "terminal">("logs");
   const [drawerDebug, setDrawerDebug] = useState(false);
+  const [drawerEdit, setDrawerEdit] = useState(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const toast = useToast();
@@ -121,11 +122,13 @@ const MainLayout: React.FC = () => {
   const handleOpenDetails = (
     id: string,
     tab: "logs" | "inspect" | "stats" | "terminal" = "logs",
-    debug = false
+    debug = false,
+    edit = false
   ) => {
     setSelectedContainerId(id);
     setDrawerTab(tab);
     setDrawerDebug(debug);
+    setDrawerEdit(edit);
   };
 
   return (
@@ -188,9 +191,11 @@ const MainLayout: React.FC = () => {
           containerId={selectedContainerId}
           initialTab={drawerTab}
           debug={drawerDebug}
+          editLimits={drawerEdit}
           onClose={() => {
             setSelectedContainerId(null);
             setDrawerDebug(false);
+            setDrawerEdit(false);
           }}
         />
       )}

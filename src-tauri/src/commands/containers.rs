@@ -102,6 +102,14 @@ pub async fn get_container_stats(
 }
 
 #[tauri::command]
+pub async fn get_container_sizes(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    let client = state.get_client().await?;
+    client.container_sizes().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn run_container(
     state: State<'_, AppState>,
     config: RunConfig,

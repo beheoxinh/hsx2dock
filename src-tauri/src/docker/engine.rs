@@ -305,6 +305,11 @@ impl EngineManager {
             .with_context(|| format!("open {}", paths.log_file.display()))?;
         let log_err = log.try_clone()?;
 
+        // Reachable host DNS servers, installed inside the netns by
+        // RESOLV_WRAPPER before dockerd starts (empty = leave the network
+        // driver's resolv.conf alone).
+        let (dns_servers, dns_search) = host_dns_upstreams();
+
         let mut cmd = Command::new(bin.join("rootlesskit"));
         cmd.arg("--state-dir")
             .arg(&paths.rootless_state)
@@ -316,6 +321,10 @@ impl EngineManager {
         cmd.arg("--copy-up=/etc")
             .arg("--copy-up=/run")
             .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg(RESOLV_WRAPPER)
+            .arg("dockerd-wrapper")
             .arg(bin.join("dockerd"))
             .arg(format!("--data-root={}", paths.data_root.display()))
             .arg(format!("--exec-root={}", paths.exec_root.display()))
@@ -332,6 +341,8 @@ impl EngineManager {
             .env("DOCKER_IGNORE_BR_NETFILTER_ERROR", "1")
             .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
             .env("PATH", prefixed_path(&bin))
+            .env("DM_DNS_SERVERS", dns_servers.join(" "))
+            .env("DM_DNS_SEARCH", dns_search.join(" "))
             .stdin(Stdio::null())
             // A `piped` stdout that nobody drains would fill the 64 KB pipe
             // buffer and block dockerd forever — always log to a file.
@@ -873,6 +884,60 @@ fn net_flags(net: &str) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+/// Host DNS servers and search domains that are safe to install inside the
+/// engine's netns. Loopback entries are skipped: inside the netns they would
+/// point at the engine's own (empty) loopback, and even host-side they are
+/// often a local proxy (AdGuard, systemd-stub) that may be down.
+fn parse_resolv_conf(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut servers = Vec::new();
+    let mut search = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("nameserver") => {
+                if servers.len() >= 3 {
+                    continue;
+                }
+                let addr = it.next().unwrap_or("");
+                let loopback = addr.starts_with("127.") || addr == "::1";
+                if addr.is_empty() || loopback || servers.iter().any(|s| s == addr) {
+                    continue;
+                }
+                servers.push(addr.to_string());
+            }
+            Some("search") | Some("domain") => {
+                for d in it {
+                    if !search.iter().any(|s| s == d) {
+                        search.push(d.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (servers, search)
+}
+
+fn host_dns_upstreams() -> (Vec<String>, Vec<String>) {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .map(|t| parse_resolv_conf(&t))
+        .unwrap_or_default()
+}
+
+/// Runs inside the rootlesskit netns (as the command before dockerd): rewrites
+/// `/etc/resolv.conf` with the reachable host nameservers the parent parsed,
+/// so dockerd, every container, and kind nodes resolve through real DNS even
+/// when the network driver's relay (10.0.2.3) or a local DNS proxy is dead.
+/// A no-op when `DM_DNS_SERVERS` is unset.
+const RESOLV_WRAPPER: &str = r#"if [ -n "$DM_DNS_SERVERS" ]; then
+    if [ -L /etc/resolv.conf ]; then rm -f /etc/resolv.conf; fi
+    {
+        printf 'nameserver %s\n' $DM_DNS_SERVERS
+        if [ -n "$DM_DNS_SEARCH" ]; then printf 'search %s\n' "$DM_DNS_SEARCH"; fi
+    } > /etc/resolv.conf || true
+fi
+exec "$@""#;
 
 /// Pick a rootless network driver: host `pasta`, else host `slirp4netns`, else
 /// the copy we ship alongside the engine. `pasta` is preferred — it is built
@@ -2135,6 +2200,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The netns resolv.conf we install must keep only reachable (non-loopback)
+    /// host servers, in order, capped at three, with search domains merged.
+    #[test]
+    fn parse_resolv_conf_filters_loops_and_limits_count() {
+        let txt = "nameserver 127.0.0.1\nnameserver ::1\nnameserver 10.15.16.70\nnameserver 10.15.16.68\nnameserver 10.15.16.69\nsearch fis.vn internal.example";
+        let (s, d) = parse_resolv_conf(txt);
+        assert_eq!(s.len(), 3);
+        assert!(!s.iter().any(|x| x.starts_with("127.")));
+        assert!(!s.iter().any(|x| x == "::1"));
+        assert_eq!(&s[0], "10.15.16.70");
+        assert_eq!(&s[1], "10.15.16.68");
+        assert_eq!(&s[2], "10.15.16.69");
+        assert!(d.contains(&"fis.vn".to_string()));
+        assert!(d.contains(&"internal.example".to_string()));
+    }
 
     /// A panic while a lock is held poisons it; the accessors must recover
     /// the guard instead of cascading the panic into the whole app.

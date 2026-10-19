@@ -103,6 +103,7 @@ export const api = {
   inspectContainer: (id: string) => invoke<ContainerDetails>("inspect_container", { id }),
   getContainerLogs: (id: string, tail: string = "200") => invoke<string>("get_container_logs", { id, tail }),
   getContainerStats: (id: string) => invoke<ContainerStats>("get_container_stats", { id }),
+  getContainerSizes: () => invoke<Record<string, number>>("get_container_sizes"),
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),
   updateContainerResources: (id: string, limits: ResourceLimits) =>
     invoke<void>("update_container_resources", { id, limits }),

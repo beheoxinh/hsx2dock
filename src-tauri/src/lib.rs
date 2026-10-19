@@ -171,6 +171,7 @@ pub fn run() {
             containers::inspect_container,
             containers::get_container_logs,
             containers::get_container_stats,
+            containers::get_container_sizes,
             containers::run_container,
             containers::update_container_resources,
             // Interactive exec / debug

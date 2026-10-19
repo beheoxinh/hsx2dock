@@ -104,6 +104,25 @@ impl DockerClient {
         })
     }
 
+    /// One-shot disk usage per container (bytes written to its RW layer).
+    /// `size=true` makes the daemon walk each container's layer, so this is
+    /// deliberately separate from the cheap `list_containers` the tick uses.
+    pub async fn container_sizes(&self) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+        let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+            .all(true)
+            .size(true)
+            .build();
+        let list = self.docker.list_containers(Some(opts)).await?;
+        Ok(list
+            .into_iter()
+            .filter_map(|c| {
+                let id = c.id?;
+                let bytes = c.size_rw.unwrap_or(0).max(0) as u64;
+                Some((id, bytes))
+            })
+            .collect())
+    }
+
     pub async fn list_containers(&self, all: bool) -> anyhow::Result<Vec<ContainerItem>> {
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(all)

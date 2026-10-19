@@ -17,6 +17,7 @@ import {
   ExternalLink,
   Bug,
   FileCode2,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -32,7 +33,8 @@ interface ContainersPageProps {
   onOpenDetails: (
     id: string,
     tab?: "logs" | "inspect" | "stats" | "terminal",
-    debug?: boolean
+    debug?: boolean,
+    edit?: boolean
   ) => void;
   onOpenWizard: () => void;
 }
@@ -224,7 +226,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
       </div>
 
       {/* Groups: bulk start/stop + engine auto-start */}
-      <ContainerGroupsBar containers={containers} onChanged={loadContainers} />
+      <ContainerGroupsBar containers={containers} statsMap={statsMap} onChanged={loadContainers} />
 
       {/* Containers List / Cards */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
@@ -307,7 +309,14 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                 exit={{ opacity: 0, scale: 0.98 }}
                 transition={{ duration: 0.2 }}
               >
-                <Card className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 p-4 hover:border-zinc-700/80 transition-all">
+                <Card
+                  className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 p-4 hover:border-zinc-700/80 transition-all cursor-grab active:cursor-grabbing"
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData("text/dm-container-id", c.id);
+                    e.dataTransfer.effectAllowed = "copy";
+                  }}
+                >
                   {/* Left: Container Basic Info */}
                   <div className="flex items-start gap-4 min-w-[280px]">
                     <div className="w-10 h-10 rounded-xl bg-zinc-800/80 border border-zinc-700/60 flex items-center justify-center text-zinc-300">
@@ -454,6 +463,17 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                       className="text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
                     >
                       <Copy className="w-3.5 h-3.5" />
+                    </Button>
+
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => onOpenDetails(c.id, "inspect", false, true)}
+                      title="Edit container limits & restart policy"
+                      aria-label="Edit container limits"
+                      className="text-zinc-400 hover:text-white"
+                    >
+                      <SlidersHorizontal className="w-4 h-4" />
                     </Button>
 
                     <Button
