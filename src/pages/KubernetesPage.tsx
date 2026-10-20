@@ -346,6 +346,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
       setBusyOp("delete");
       setLogLines([{ action: "delete", name, line: `Deleting cluster ${name}…` }]);
       await api.deleteKindCluster(name);
+      setLogLines((prev) => prev.filter((l) => l.name !== name));
       toast.success("Cluster deleted", `kind cluster '${name}' removed.`);
       await loadAll();
     } catch (err) {
@@ -415,6 +416,10 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
   })();
 
   const showLog = logLines.length > 0;
+  // Kind output lines whose cluster has no card yet (being created).
+  const orphanLogLines = logLines.filter(
+    (l) => !clusters.some((c) => c.name === l.name)
+  );
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col overflow-y-auto">
@@ -525,63 +530,70 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
         </Card>
       )}
 
-      {/* Live kind output */}
-      {showLog && (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
-          <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800/80 bg-zinc-900/50">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
-              kind output
-            </span>
-            <div className="flex items-center gap-3">
-              <button
-                onClick={async () => {
-                  const text = logLines.map((l) => l.line).join("\n");
-                  if (!text) return;
-                  try {
-                    await navigator.clipboard.writeText(text);
-                    toast.success(
-                      "Kind output copied",
-                      `${logLines.length} line${logLines.length === 1 ? "" : "s"} on the clipboard.`
-                    );
-                  } catch (e) {
-                    toast.error("Copy failed", String(e));
-                  }
-                }}
-                className="text-[11px] text-zinc-500 hover:text-zinc-300"
-              >
-                Copy
-              </button>
-              <button
-                onClick={() => setLogLines([])}
-                className="text-[11px] text-zinc-500 hover:text-zinc-300"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          <div
-            ref={logRef}
-            className="px-3.5 py-2.5 max-h-44 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5"
-          >
-            {logLines.map((l, i) => (
-              <div
-                key={i}
-                className={
-                  /error|failed|exit status/i.test(l.line)
-                    ? "text-rose-400"
-                    : "text-zinc-400"
-                }
-              >
-                {l.line}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* Live kind output for each cluster lives inside its card. */}
 
       {/* Cluster list — hidden while the full monitoring screen is open. */}
       {!detailFor && (
         <>
+          {/* Kind output for clusters with no card yet (still being created). */}
+          {logLines.some((l) => !clusters.some((c) => c.name === l.name)) && (
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
+              <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800/80 bg-zinc-900/50">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                  kind output —{" "}
+                  {orphanLogLines[0]?.name ?? "cluster"}
+                </span>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={async () => {
+                      const text = orphanLogLines.map((l) => l.line).join("\n");
+                      if (!text) return;
+                      try {
+                        await navigator.clipboard.writeText(text);
+                        toast.success(
+                          "Kind output copied",
+                          `${orphanLogLines.length} line${orphanLogLines.length === 1 ? "" : "s"} on the clipboard.`
+                        );
+                      } catch (e) {
+                        toast.error("Copy failed", String(e));
+                      }
+                    }}
+                    className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    onClick={() =>
+                      setLogLines((prev) =>
+                        prev.filter((l) => clusters.some((c) => c.name === l.name))
+                      )
+                    }
+                    className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div
+                ref={logRef}
+                className="px-3.5 py-2.5 max-h-44 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5"
+              >
+                {orphanLogLines.map((l, i) => (
+                  <div
+                    key={i}
+                    className={
+                      /error|failed|exit status/i.test(l.line)
+                        ? "text-rose-400"
+                        : "text-zinc-400"
+                    }
+                  >
+                    {l.line}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Search */}
           {clusters.length > 0 && (
         <div className="relative w-64">
@@ -597,7 +609,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
       )}
 
       {/* Cluster grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 gap-4">
         <AnimatePresence mode="popLayout">
           {filtered.map((c) => (
             <motion.div
@@ -659,34 +671,29 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                   </div>
                 </div>
 
-                <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
-                  <div className="rounded-lg bg-zinc-900/70 px-2.5 py-2">
-                    <p className="text-zinc-500">Nodes</p>
-                    <p className="text-white font-medium mt-0.5">
-                      {c.running_nodes}/{c.node_count} running
-                    </p>
-                  </div>
-                  <div className="rounded-lg bg-zinc-900/70 px-2.5 py-2">
-                    <p className="text-zinc-500">
-                      {c.running ? "Uptime" : c.last_started_at ? "Last run" : "Age"}
-                    </p>
-                    <p className="text-white font-medium mt-0.5">
-                      {c.running
-                        ? fmtUptime(c.uptime_seconds)
-                        : c.last_started_at
-                          ? formatRelativeTime(c.last_started_at)
-                          : c.created
-                            ? formatRelativeTime(c.created)
-                            : "—"}
-                    </p>
-                  </div>
-                </div>
+                <p className="mt-2 text-xs text-zinc-500">
+                  {c.running ? "Uptime" : c.last_started_at ? "Last run" : "Age"}{" "}
+                  <span className="font-mono text-zinc-300">
+                    {c.running
+                      ? fmtUptime(c.uptime_seconds)
+                      : c.last_started_at
+                        ? formatRelativeTime(c.last_started_at)
+                        : c.created
+                          ? formatRelativeTime(c.created)
+                          : "—"}
+                  </span>
+                  <span className="mx-2 text-zinc-700">·</span>
+                  Nodes{" "}
+                  <span className="font-mono text-zinc-300">
+                    {c.running_nodes}/{c.node_count}
+                  </span>
+                </p>
 
-                {/* Mini live monitor — only while the cluster is up. */}
+                {/* Live section — resource charts (left → right) + logs. */}
                 {c.running && (
-                  <div className="mt-3 rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 space-y-2.5">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="min-w-0">
+                  <div className="mt-3 space-y-2.5">
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-2.5">
+                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
                         <p className="text-[11px] text-zinc-500 truncate">
                           Pods running
                           {c.pod_count != null
@@ -702,7 +709,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                           max={Math.max(1, c.pod_count ?? 1)}
                         />
                       </div>
-                      <div className="min-w-0">
+                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
                         <p className="text-[11px] text-zinc-500 truncate">
                           CPU {c.cpu_percent != null ? "% of host" : ""}
                         </p>
@@ -711,19 +718,80 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                         </p>
                         <Sparkline data={history[c.name]?.cpu ?? []} color="#60a5fa" />
                       </div>
+                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
+                        <p className="text-[11px] text-zinc-500 truncate">
+                          Memory
+                          {c.mem_used_mb != null && c.mem_limit_mb
+                            ? ` of ${Math.round(c.mem_limit_mb)} MiB cap`
+                            : ""}
+                        </p>
+                        <p className="text-white text-sm font-mono font-medium">
+                          {c.mem_used_mb != null ? `${Math.round(c.mem_used_mb)} MiB` : "—"}
+                        </p>
+                        <Sparkline data={history[c.name]?.mem ?? []} color="#a78bfa" />
+                      </div>
                     </div>
-                    <div>
-                      <p className="text-[11px] text-zinc-500 truncate">
-                        Memory
-                        {c.mem_used_mb != null && c.mem_limit_mb
-                          ? ` of ${Math.round(c.mem_limit_mb)} MiB cap`
-                          : ""}
-                      </p>
-                      <p className="text-white text-sm font-mono font-medium">
-                        {c.mem_used_mb != null ? `${Math.round(c.mem_used_mb)} MiB` : "—"}
-                      </p>
-                      <Sparkline data={history[c.name]?.mem ?? []} color="#a78bfa" />
-                    </div>
+
+                    {/* Per-cluster kind output — streams while an operation runs. */}
+                    {logLines.some((l) => l.name === c.name) && (
+                      <div className="rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
+                        <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800/80 bg-zinc-900/50">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                            kind output — {c.name}
+                          </span>
+                          <div className="flex items-center gap-3">
+                            <button
+                              onClick={async () => {
+                                const text = logLines
+                                  .filter((l) => l.name === c.name)
+                                  .map((l) => l.line)
+                                  .join("\n");
+                                if (!text) return;
+                                try {
+                                  await navigator.clipboard.writeText(text);
+                                  toast.success(
+                                    "Kind output copied",
+                                    `${logLines.filter((l) => l.name === c.name).length} line(s) on the clipboard.`
+                                  );
+                                } catch (e) {
+                                  toast.error("Copy failed", String(e));
+                                }
+                              }}
+                              className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                            >
+                              Copy
+                            </button>
+                            <button
+                              onClick={() =>
+                                setLogLines((prev) => prev.filter((l) => l.name !== c.name))
+                              }
+                              className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                        </div>
+                        <div
+                          ref={logRef}
+                          className="px-3.5 py-2.5 max-h-40 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5"
+                        >
+                          {logLines
+                            .filter((l) => l.name === c.name)
+                            .map((l, i) => (
+                              <div
+                                key={i}
+                                className={
+                                  /error|failed|exit status/i.test(l.line)
+                                    ? "text-rose-400"
+                                    : "text-zinc-400"
+                                }
+                              >
+                                {l.line}
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -732,7 +800,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                     variant="outline"
                     size="sm"
                     onClick={() => setDetailFor(c.name)}
-                    disabled={!c.running}
+                    disabled={!!busyOp || !c.running}
                     title={
                       c.running
                         ? "Open the full monitoring screen for this cluster"
@@ -753,7 +821,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                         ? "Stop all node containers (data is kept)"
                         : "Start this cluster's node containers"
                     }
-                    className="gap-1.5 flex-1"
+                    className="gap-1.5"
                   >
                     {busyOp === "power" ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -768,9 +836,9 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                     variant="outline"
                     size="sm"
                     onClick={() => handleKubeconfig(c.name)}
-                    disabled={!!busyOp || !status?.installed}
+                    disabled={!!busyOp || !status?.installed || !c.has_kubeconfig}
                     title="Copy KUBECONFIG path for this cluster"
-                    className="gap-1.5 flex-1"
+                    className="gap-1.5"
                   >
                     <Copy className="w-3.5 h-3.5" />
                     <span>Kubeconfig</span>
