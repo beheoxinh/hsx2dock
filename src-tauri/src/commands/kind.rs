@@ -810,6 +810,9 @@ pub struct K8sClusterSummary {
     pub pod_pending: usize,
     pub pod_failed: usize,
     pub pod_succeeded: usize,
+    /// Failures of individual sub-queries (pods/nodes/ns/…), surfaced in the
+    /// UI so a partial summary explains itself instead of showing zeros.
+    pub errors: Vec<String>,
 }
 
 // ---- Pure parsers (unit-tested) ----
@@ -1167,6 +1170,36 @@ fn parse_pod_metrics(json: &serde_json::Value) -> Vec<K8sPodMetric> {
 
 // ---- Commands ----
 
+/// Interprets `kubectl get --raw /readyz[?verbose]` output.
+/// Success = no failing check; accepts plain "ok", verbose `[+]check ok`
+/// lines, and bare lines ending in "ok".
+fn readyz_verdict(out: &str) -> (bool, Option<String>) {
+    let trimmed = out.trim();
+    let failed_line = trimmed
+        .lines()
+        .find(|l| l.trim_start().starts_with("[-]") || l.contains("fail"));
+    if let Some(l) = failed_line {
+        return (false, Some(l.trim().to_string()));
+    }
+    let ok = trimmed.starts_with("ok")
+        || trimmed.contains("[+]")
+        || trimmed.lines().any(|l| l.trim().ends_with(" ok"));
+    if ok {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(
+                trimmed
+                    .lines()
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("not ready")
+                    .to_string(),
+            ),
+        )
+    }
+}
+
 #[tauri::command]
 pub async fn get_cluster_nodes(
     state: State<'_, AppState>,
@@ -1281,7 +1314,8 @@ pub async fn get_cluster_summary(
         .unwrap_or("")
         .to_string();
 
-    // /readyz is plain text ("ok" or a failure list) — not JSON.
+    // /readyz is plain text: non-verbose = "ok" or a failure list; verbose
+    // = one `[+]check ok` / `[-]check failed: …` line per check.
     let (ready, ready_message) = match kubectl_raw(
         &state,
         &cluster,
@@ -1289,19 +1323,24 @@ pub async fn get_cluster_summary(
     )
     .await
     {
-        Ok(out) if out.trim_start().starts_with("ok") => (true, None),
-        Ok(out) => (false, Some(out.trim().lines().next().unwrap_or("not ready").to_string())),
+        Ok(out) => readyz_verdict(&out),
         Err(e) => (false, Some(e)),
     };
 
-    let pods = kubectl_json(
+    let mut errors: Vec<String> = Vec::new();
+    let pods = match kubectl_json(
         &state,
         &cluster,
         &["get", "pods", "--all-namespaces", "-o", "json"],
     )
     .await
-    .map(|v| parse_pods(&v))
-    .unwrap_or_default();
+    {
+        Ok(v) => parse_pods(&v),
+        Err(e) => {
+            errors.push(format!("pods: {e}"));
+            vec![]
+        }
+    };
     let (mut pod_running, mut pod_pending, mut pod_failed, mut pod_succeeded) = (0, 0, 0, 0);
     for p in &pods {
         match p.phase.as_str() {
@@ -1313,16 +1352,19 @@ pub async fn get_cluster_summary(
         }
     }
 
-    let nodes = kubectl_json(&state, &cluster, &["get", "nodes", "-o", "json"])
-        .await
-        .map(|v| parse_nodes(&v))
-        .unwrap_or_default();
+    let nodes = match kubectl_json(&state, &cluster, &["get", "nodes", "-o", "json"]).await {
+        Ok(v) => parse_nodes(&v),
+        Err(e) => {
+            errors.push(format!("nodes: {e}"));
+            vec![]
+        }
+    };
     let ready_nodes = nodes.iter().filter(|n| n.ready).count();
 
-    let namespace_count = kubectl_json(&state, &cluster, &["get", "namespaces", "-o", "json"])
-        .await
-        .map(|v| {
-            v.get("items")
+    let namespace_count =
+        match kubectl_json(&state, &cluster, &["get", "namespaces", "-o", "json"]).await {
+            Ok(v) => v
+                .get("items")
                 .and_then(|i| i.as_array())
                 .map(|a| {
                     a.iter()
@@ -1334,9 +1376,12 @@ pub async fn get_cluster_summary(
                         })
                         .count()
                 })
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
+                .unwrap_or(0),
+            Err(e) => {
+                errors.push(format!("namespaces: {e}"));
+                0
+            }
+        };
 
     Ok(K8sClusterSummary {
         git_version,
@@ -1350,6 +1395,7 @@ pub async fn get_cluster_summary(
         pod_pending,
         pod_failed,
         pod_succeeded,
+        errors,
     })
 }
 
@@ -1377,6 +1423,27 @@ pub async fn install_metrics_server(
 mod monitor_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn readyz_verdict_accepts_all_formats() {
+        // plain non-verbose success
+        assert_eq!(readyz_verdict("ok"), (true, None));
+        // verbose success (what kind clusters actually return)
+        assert_eq!(
+            readyz_verdict("[+]ping ok\n[+]log ok\n[+]etcd ok"),
+            (true, None)
+        );
+        // verbose failure keeps the failing line
+        let (r, msg) = readyz_verdict("[+]ping ok\n[-]etcd failed: timeout");
+        assert!(!r);
+        assert_eq!(msg.as_deref(), Some("[-]etcd failed: timeout"));
+        // non-verbose failure list
+        let (r, msg) = readyz_verdict("ping failed: connection refused");
+        assert!(!r);
+        assert!(msg.unwrap().contains("failed"));
+        // garbage → not ready, not a panic
+        assert!(!readyz_verdict("").0);
+    }
 
     #[test]
     fn cpu_quantity_variants_to_millicores() {
@@ -1528,3 +1595,101 @@ mod monitor_tests {
         assert_eq!(pm[0].mem_bytes, 300 * 1024 * 1024);
     }
 }
+
+    /// Debug: exec_capture against the live engine + cluster (opt-in via
+    /// `cargo test -- --ignored`). Not part of the suite — needs a running cluster.
+    #[tokio::test]
+    #[ignore]
+    async fn exec_capture_real_cluster_roundtrip() {
+        let sock = std::path::Path::new("/run/user/1000/docker-manager/docker.sock");
+        if !sock.exists() {
+            eprintln!("engine socket absent, skipping");
+            return;
+        }
+        let client = crate::docker::client::DockerClient::connect(Some(sock)).unwrap();
+        async fn kjson(
+            client: &crate::docker::client::DockerClient,
+            args: &[&str],
+        ) -> serde_json::Value {
+            let mut cmd = vec![
+                "kubectl".to_string(),
+                "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+            ];
+            cmd.extend(args.iter().map(|s| s.to_string()));
+            let out = client
+                .exec_capture("cluster-control-plane", cmd)
+                .await
+                .expect("exec");
+            serde_json::from_str(out.trim()).expect("json")
+        }
+        let nodes_v = kjson(&client, &["get", "nodes", "-o", "json"]).await;
+        let nodes = parse_nodes(&nodes_v);
+        eprintln!(
+            "parsed nodes: {} (ready flags: {:?})",
+            nodes.len(),
+            nodes.iter().map(|n| (n.name.clone(), n.ready)).collect::<Vec<_>>()
+        );
+        let pods_v = kjson(&client, &["get", "pods", "--all-namespaces", "-o", "json"]).await;
+        let pods = parse_pods(&pods_v);
+        eprintln!(
+            "parsed pods: {} (phases: {:?})",
+            pods.len(),
+            pods.iter()
+                .map(|p| format!("{}/{}", p.namespace, p.phase))
+                .collect::<Vec<_>>()
+        );
+        let ns_v = kjson(&client, &["get", "namespaces", "-o", "json"]).await;
+        let active = ns_v["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|n| n["status"]["phase"] == "Active")
+                    .count()
+            })
+            .unwrap_or(0);
+        eprintln!("parsed active namespaces: {active}");
+        let out = client
+            .exec_capture(
+                "cluster-control-plane",
+                vec![
+                    "kubectl".to_string(),
+                    "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+                    "get".into(),
+                    "--raw".into(),
+                    "/readyz?verbose".into(),
+                ],
+            )
+            .await
+            .expect("readyz");
+        eprintln!(
+            "readyz starts_with_ok={} contains_failed={} first_line={:?}",
+            out.trim_start().starts_with("ok"),
+            out.contains("failed"),
+            out.trim().lines().next().unwrap_or("")
+        );
+
+        // Hammer: 10 back-to-back poll rounds like the UI does (summary-ish
+        // burst: 5 execs per round, overlapping rounds allowed) to catch
+        // intermittent failures under load.
+        let mut fails = 0;
+        for round in 0..10 {
+            for args in [
+                vec!["version", "-o", "json"],
+                vec!["get", "nodes", "-o", "json"],
+                vec!["get", "pods", "--all-namespaces", "-o", "json"],
+                vec!["get", "namespaces", "-o", "json"],
+                vec!["get", "events", "--all-namespaces", "--sort-by=.lastTimestamp", "-o", "json"],
+            ] {
+                let mut cmd = vec![
+                    "kubectl".to_string(),
+                    "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+                ];
+                cmd.extend(args.iter().map(|s| s.to_string()));
+                if let Err(e) = client.exec_capture("cluster-control-plane", cmd).await {
+                    fails += 1;
+                    eprintln!("round {round} FAIL {:?} -> {e:#}", args.first());
+                }
+            }
+        }
+        eprintln!("hammer: {fails} failures / 50 execs");
+    }

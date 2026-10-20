@@ -566,4 +566,6 @@ export interface K8sClusterSummary {
   podPending: number;
   podFailed: number;
   podSucceeded: number;
+  /** Failures of individual sub-queries (pods/nodes/ns) that produced zeros. */
+  errors: string[];
 }

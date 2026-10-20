@@ -216,6 +216,21 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
 
   const warnings = useMemo(() => events.filter((e) => e.type === "Warning").slice(0, 6), [events]);
 
+  // Live counts from the polled lists — used instead of the summary's numbers
+  // whenever the lists loaded, so one flaky sub-query can't zero out the tiles.
+  const phaseCounts = useMemo(() => {
+    if (pods.length === 0) return null;
+    const c = { Running: 0, Pending: 0, Failed: 0, Succeeded: 0 };
+    for (const p of pods) {
+      if (p.phase in c) c[p.phase as keyof typeof c] += 1;
+    }
+    return c;
+  }, [pods]);
+  const liveReadyNodes = useMemo(() => {
+    if (nodes.length === 0) return null;
+    return `${nodes.filter((n) => n.ready).length}/${nodes.length}`;
+  }, [nodes]);
+
   const installMetricsServer = async () => {
     try {
       setInstallingMs(true);
@@ -263,6 +278,13 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
         </div>
       )}
 
+      {summary?.errors && summary.errors.length > 0 && (
+        <div className="mx-5 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+          <span className="font-semibold">Partial data:</span>{" "}
+          {summary.errors.join(" · ")}
+        </div>
+      )}
+
       {/* Tabs */}
       <div className="flex items-center gap-1 px-4 pt-2 border-b border-zinc-800/60">
         {TABS.map(({ id, label, icon: Icon }) => (
@@ -302,22 +324,24 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                 label="Nodes"
                 icon={Server}
                 value={
-                  summary ? `${summary.readyNodes}/${summary.nodeCount}` : "—"
+                  liveReadyNodes ??
+                  (summary ? `${summary.readyNodes}/${summary.nodeCount}` : "—")
                 }
                 sub="ready / total"
               />
               <StatTile
                 label="Namespaces"
                 icon={Boxes}
-                value={summary?.namespaceCount ?? "—"}
+                value={namespaces.length || summary?.namespaceCount || "—"}
               />
               <StatTile
                 label="Pods"
                 icon={Package}
                 value={
-                  summary
+                  pods.length ||
+                  (summary
                     ? summary.podRunning + summary.podPending + summary.podFailed
-                    : "—"
+                    : "—")
                 }
                 sub="active (excluding completed)"
               />
@@ -347,10 +371,10 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 {(
                   [
-                    ["Running", summary?.podRunning, "text-emerald-300"],
-                    ["Pending", summary?.podPending, "text-amber-300"],
-                    ["Failed", summary?.podFailed, "text-rose-300"],
-                    ["Succeeded", summary?.podSucceeded, "text-sky-300"],
+                    ["Running", phaseCounts?.Running ?? summary?.podRunning, "text-emerald-300"],
+                    ["Pending", phaseCounts?.Pending ?? summary?.podPending, "text-amber-300"],
+                    ["Failed", phaseCounts?.Failed ?? summary?.podFailed, "text-rose-300"],
+                    ["Succeeded", phaseCounts?.Succeeded ?? summary?.podSucceeded, "text-sky-300"],
                   ] as const
                 ).map(([label, count, tone]) => (
                   <div key={label} className="rounded-lg bg-zinc-950/60 border border-zinc-800/60 px-3 py-2">
