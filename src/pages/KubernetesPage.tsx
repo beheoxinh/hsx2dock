@@ -18,6 +18,7 @@ import {
   Square,
   Settings2,
   Activity,
+  ArrowLeft,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -35,6 +36,66 @@ import type {
 interface KubernetesPageProps {
   refreshKey?: number;
 }
+
+/** Formats a seconds duration as a compact uptime string. */
+const fmtUptime = (secs: number | null | undefined): string => {
+  if (secs == null || secs < 0) return "—";
+  const s = Math.floor(secs);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+};
+
+/** A single-series inline sparkline (change over time) drawn as a thin line. */
+const Sparkline: React.FC<{
+  data: number[];
+  color: string;
+  max?: number;
+  className?: string;
+}> = ({ data, color, max, className }) => {
+  if (data.length < 2) {
+    return <div className={`h-8 ${className ?? ""}`} aria-hidden="true" />;
+  }
+  const hi = max ?? Math.max(...data, 1);
+  const lo = Math.min(...data, 0);
+  const span = hi - lo || 1;
+  const w = 100;
+  const h = 32;
+  const step = w / (data.length - 1);
+  const pts = data.map((v, i) => {
+    const x = i * step;
+    const y = h - ((v - lo) / span) * h;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      preserveAspectRatio="none"
+      className={`h-8 w-full ${className ?? ""}`}
+      aria-hidden="true"
+    >
+      <polyline
+        points={`0,${h} ${pts.join(" ")} ${w},${h}`}
+        fill={color}
+        fillOpacity="0.12"
+        stroke="none"
+      />
+      <polyline
+        points={pts.join(" ")}
+        fill="none"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
+      />
+    </svg>
+  );
+};
 
 export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) => {
   const modal = useModal();
@@ -64,18 +125,14 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
   const [logLines, setLogLines] = useState<KindProgressPayload[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
 
-  // Which running cluster the live monitoring panel watches (auto-picks the
-  // first running one; selector appears when several are up).
-  const [monitorFor, setMonitorFor] = useState<string | null>(null);
-  const runningClusters = clusters.filter((c) => c.running);
-  useEffect(() => {
-    if (monitorFor && clusters.some((c) => c.name === monitorFor && c.running)) return;
-    setMonitorFor(clusters.find((c) => c.running)?.name ?? null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusters]);
+  // Per-cluster mini-monitor history for the card sparklines (capped ring).
+  const [history, setHistory] = useState<
+    Record<string, { pods: number[]; cpu: number[]; mem: number[] }>
+  >({});
 
-  // Page-level split: manage clusters vs watch/manage their internals.
-  const [pageTab, setPageTab] = useState<"clusters" | "monitor">("clusters");
+  // Full monitoring screen for the selected cluster (null = cluster list).
+  const [detailFor, setDetailFor] = useState<string | null>(null);
+  const detailCluster = clusters.find((c) => c.name === detailFor) ?? null;
 
   // Per-cluster prefs (auto-start, per-node caps) mirrored from the config.
   const [prefsByName, setPrefsByName] = useState<Record<string, KindClusterPrefs>>({});
@@ -136,6 +193,46 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
     loadAll();
     loadPrefs();
   }, [refreshKey]);
+
+  // Silent cluster refresh (no loading spinner) for the background card poll.
+  const refreshClusters = async () => {
+    try {
+      const list = await api.listKindClusters();
+      setClusters(list);
+      setLoadError(null);
+    } catch {
+      /* keep last-known list; cards simply stop updating until the next poll */
+    }
+  };
+
+  // Running-cluster cards need fresh uptime/pods/usage — poll gently so the
+  // stats and sparklines stay alive without user interaction.
+  const hasRunning = clusters.some((c) => c.running);
+  useEffect(() => {
+    if (!hasRunning) return;
+    const t = window.setInterval(() => {
+      refreshClusters();
+    }, 10_000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasRunning]);
+
+  // Track per-cluster samples for the card sparklines (capped ring buffer).
+  useEffect(() => {
+    setHistory((prev) => {
+      const next: typeof prev = { ...prev };
+      for (const c of clusters) {
+        if (!c.running || c.pod_count == null) continue;
+        const cur = next[c.name] ?? { pods: [], cpu: [], mem: [] };
+        next[c.name] = {
+          pods: [...cur.pods, c.running_pod_count ?? 0].slice(-40),
+          cpu: [...cur.cpu, c.cpu_percent ?? 0].slice(-40),
+          mem: [...cur.mem, c.mem_used_mb ?? 0].slice(-40),
+        };
+      }
+      return next;
+    });
+  }, [clusters]);
 
   // Pre-fill the create form from Settings → Kubernetes defaults.
   useEffect(() => {
@@ -482,24 +579,8 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
         </div>
       )}
 
-      {/* Tabs: Clusters / Monitoring */}
-      <div className="flex items-center gap-2 border-b border-zinc-800/80">
-        {(["clusters", "monitor"] as const).map((k) => (
-          <button
-            key={k}
-            onClick={() => setPageTab(k)}
-            className={`px-3 py-1.5 text-xs font-medium transition-colors ${
-              pageTab === k
-                ? "text-white border-b-2 border-indigo-400"
-                : "text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            {k === "clusters" ? "Clusters" : "Monitoring"}
-          </button>
-        ))}
-      </div>
-
-      {pageTab === "clusters" && (
+      {/* Cluster list — hidden while the full monitoring screen is open. */}
+      {!detailFor && (
         <>
           {/* Search */}
           {clusters.length > 0 && (
@@ -586,14 +667,82 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                     </p>
                   </div>
                   <div className="rounded-lg bg-zinc-900/70 px-2.5 py-2">
-                    <p className="text-zinc-500">Age</p>
+                    <p className="text-zinc-500">
+                      {c.running ? "Uptime" : c.last_started_at ? "Last run" : "Age"}
+                    </p>
                     <p className="text-white font-medium mt-0.5">
-                      {c.created ? formatRelativeTime(c.created) : "—"}
+                      {c.running
+                        ? fmtUptime(c.uptime_seconds)
+                        : c.last_started_at
+                          ? formatRelativeTime(c.last_started_at)
+                          : c.created
+                            ? formatRelativeTime(c.created)
+                            : "—"}
                     </p>
                   </div>
                 </div>
 
+                {/* Mini live monitor — only while the cluster is up. */}
+                {c.running && (
+                  <div className="mt-3 rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 space-y-2.5">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[11px] text-zinc-500 truncate">
+                          Pods running
+                          {c.pod_count != null
+                            ? ` (${c.running_pod_count ?? 0}/${c.pod_count})`
+                            : ""}
+                        </p>
+                        <p className="text-white text-sm font-mono font-medium">
+                          {c.pod_count != null ? c.running_pod_count ?? 0 : "—"}
+                        </p>
+                        <Sparkline
+                          data={history[c.name]?.pods ?? []}
+                          color="#34d399"
+                          max={Math.max(1, c.pod_count ?? 1)}
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-[11px] text-zinc-500 truncate">
+                          CPU {c.cpu_percent != null ? "% of host" : ""}
+                        </p>
+                        <p className="text-white text-sm font-mono font-medium">
+                          {c.cpu_percent != null ? `${c.cpu_percent.toFixed(1)}%` : "—"}
+                        </p>
+                        <Sparkline data={history[c.name]?.cpu ?? []} color="#60a5fa" />
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-zinc-500 truncate">
+                        Memory
+                        {c.mem_used_mb != null && c.mem_limit_mb
+                          ? ` of ${Math.round(c.mem_limit_mb)} MiB cap`
+                          : ""}
+                      </p>
+                      <p className="text-white text-sm font-mono font-medium">
+                        {c.mem_used_mb != null ? `${Math.round(c.mem_used_mb)} MiB` : "—"}
+                      </p>
+                      <Sparkline data={history[c.name]?.mem ?? []} color="#a78bfa" />
+                    </div>
+                  </div>
+                )}
+
                 <div className="mt-4 flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDetailFor(c.name)}
+                    disabled={!c.running}
+                    title={
+                      c.running
+                        ? "Open the full monitoring screen for this cluster"
+                        : "Start the cluster to open monitoring"
+                    }
+                    className="gap-1.5"
+                  >
+                    <Activity className="w-3.5 h-3.5" />
+                    <span>Details</span>
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
@@ -693,37 +842,27 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
         </>
       )}
 
-      {/* Live monitoring for the selected running cluster */}
-      {pageTab === "monitor" && !monitorFor && (
-        <div className="py-16 text-center text-zinc-500">
-          <Activity className="w-10 h-10 mx-auto text-zinc-600 mb-3" />
-          <p className="text-sm text-zinc-300 font-medium">
-            No running cluster to monitor
-          </p>
-          <p className="text-xs mt-1">
-            Start a cluster from the Clusters tab to see live health, pods and resources.
-          </p>
-        </div>
-      )}
-      {pageTab === "monitor" && monitorFor && (
-        <div className="mt-2 space-y-3">
-          {runningClusters.length > 1 && (
-            <div className="flex items-center gap-2 text-xs text-zinc-400">
-              <span>Watching cluster</span>
-              <select
-                value={monitorFor}
-                onChange={(e) => setMonitorFor(e.target.value)}
-                className="h-8 rounded-lg bg-zinc-950 border border-zinc-800 px-2 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
-              >
-                {runningClusters.map((c) => (
-                  <option key={c.name} value={c.name}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <ClusterMonitor key={monitorFor} cluster={monitorFor} />
+      {/* Detail monitoring — full ClusterMonitor with a back link. */}
+      {detailFor && detailCluster && (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDetailFor(null)}
+              className="gap-1.5"
+              title="Back to the cluster list"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>Back to list</span>
+            </Button>
+            <StatusBadge
+              status={detailCluster.running ? "Running" : "Stopped"}
+              pulse={detailCluster.running}
+            />
+            <span className="text-white font-medium">{detailCluster.name}</span>
+          </div>
+          <ClusterMonitor key={detailFor} cluster={detailFor} />
         </div>
       )}
 

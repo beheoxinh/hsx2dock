@@ -65,7 +65,10 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   const { samples, push, reset } = useSeries<StatSample>(MAX_SAMPLES);
 
-  const runningCount = containers.filter((c) => c.state === "running").length;
+  // Kind node containers live on the Kubernetes tab — exclude them so the
+  // dashboard reflects the user's own containers.
+  const appContainers = containers.filter((c) => !c.kind_cluster);
+  const runningCount = appContainers.filter((c) => c.state === "running").length;
   const isRunning = daemonState === "Running";
 
   const loadData = async () => {
@@ -493,7 +496,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </Button>
           </div>
           <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
-            {containers.slice(0, 8).map((c) => {
+            {appContainers.slice(0, 8).map((c) => {
               const s = stats[c.id];
               return (
                 <div
@@ -517,7 +520,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 </div>
               );
             })}
-            {containers.length === 0 && (
+            {appContainers.length === 0 && (
               <div className="py-6 text-center text-xs text-zinc-600">
                 No containers yet — run one from the Containers page.
               </div>

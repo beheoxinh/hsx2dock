@@ -27,6 +27,8 @@ export interface ContainerItem {
   compose_project?: string | null;
   /** Compose service name from the container's labels. */
   compose_service?: string | null;
+  /** Kind cluster this node container belongs to; null for ordinary containers. */
+  kind_cluster?: string | null;
 }
 
 /** A user-defined container group: bulk start/stop + optional engine-start auto-run. */
@@ -464,6 +466,22 @@ export interface KindCluster {
   /** Unix seconds of the oldest node container, if known. */
   created: number | null;
   has_kubeconfig: boolean;
+  /** Seconds since the oldest running node started. */
+  uptime_seconds: number | null;
+  /** Unix seconds of the most recent node start, if known. */
+  last_started_at: number | null;
+  /** Total pods across all namespaces, if the control-plane responded. */
+  pod_count: number | null;
+  /** Pods in `Running` phase. */
+  running_pod_count: number | null;
+  /** Cluster CPU usage summed across nodes, as % of the host. */
+  cpu_percent: number | null;
+  /** Cluster memory usage summed across nodes, in MiB. */
+  mem_used_mb: number | null;
+  /** Applied per-node CPU cap summed across nodes (millicores), if capped. */
+  cpu_quota_m: number | null;
+  /** Applied per-node memory cap summed across nodes (MiB), if capped. */
+  mem_limit_mb: number | null;
 }
 
 /** Install state of the app-managed (isolated) kind binary. */

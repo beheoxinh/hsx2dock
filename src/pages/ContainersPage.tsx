@@ -137,11 +137,14 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     }
   };
 
+  // Kind node containers are managed entirely on the Kubernetes tab, so they
+  // are hidden from this generic container list.
   const filteredContainers = containers.filter(
     (c) =>
-      c.name.toLowerCase().includes(search.toLowerCase()) ||
-      c.image.toLowerCase().includes(search.toLowerCase()) ||
-      c.id.toLowerCase().includes(search.toLowerCase())
+      !c.kind_cluster &&
+      (c.name.toLowerCase().includes(search.toLowerCase()) ||
+        c.image.toLowerCase().includes(search.toLowerCase()) ||
+        c.id.toLowerCase().includes(search.toLowerCase()))
   );
 
   // Group compose-managed containers under a project header (Docker Desktop

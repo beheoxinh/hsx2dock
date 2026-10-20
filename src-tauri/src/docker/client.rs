@@ -222,6 +222,10 @@ impl DockerClient {
                     .get("com.docker.compose.service")
                     .filter(|s| !s.is_empty())
                     .cloned();
+                let kind_cluster = labels
+                    .get("io.x-k8s.kind.cluster")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
                 let id = c.id.clone().unwrap_or_default();
                 let names = c.names.unwrap_or_default();
                 let name = names
@@ -248,6 +252,7 @@ impl DockerClient {
                         .unwrap_or_default(),
                     compose_project,
                     compose_service,
+                    kind_cluster,
                 }
             })
             .collect())

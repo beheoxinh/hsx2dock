@@ -33,6 +33,9 @@ pub struct ContainerItem {
     /// Compose service name from the `com.docker.compose.service` label.
     #[serde(default)]
     pub compose_service: Option<String>,
+    /// Kind cluster this container belongs to (from label `io.x-k8s.kind.cluster`).
+    #[serde(default)]
+    pub kind_cluster: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

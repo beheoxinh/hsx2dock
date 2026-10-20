@@ -29,6 +29,25 @@ pub struct KindCluster {
     pub created: Option<i64>,
     /// True when the isolated kubeconfig for this cluster exists.
     pub has_kubeconfig: bool,
+    #[serde(default)]
+    pub uptime_seconds: Option<i64>,
+    #[serde(default)]
+    pub last_started_at: Option<i64>,
+    #[serde(default)]
+    pub pod_count: Option<u32>,
+    #[serde(default)]
+    pub running_pod_count: Option<u32>,
+    /// Summed one-shot docker stats across node containers: CPU as % of the
+    /// host, memory in MiB actually used by the cluster right now.
+    #[serde(default)]
+    pub cpu_percent: Option<f64>,
+    #[serde(default)]
+    pub mem_used_mb: Option<f64>,
+    /// Node resource caps applied to this cluster (None = uncapped).
+    #[serde(default)]
+    pub cpu_quota_m: Option<u64>,
+    #[serde(default)]
+    pub mem_limit_mb: Option<f64>,
 }
 
 #[tauri::command]
@@ -111,6 +130,14 @@ pub async fn list_kind_clusters(
             running_nodes: 0,
             created: None,
             has_kubeconfig: false,
+            uptime_seconds: None,
+            last_started_at: None,
+            pod_count: None,
+            running_pod_count: None,
+            cpu_percent: None,
+            mem_used_mb: None,
+            cpu_quota_m: None,
+            mem_limit_mb: None,
         });
         entry.node_count += 1;
         if running {
@@ -128,9 +155,165 @@ pub async fn list_kind_clusters(
     let mut list: Vec<KindCluster> = map.into_values().collect();
     for cluster in list.iter_mut() {
         cluster.has_kubeconfig = kubeconfig_has_context(&state.kind, &cluster.name).await;
+        enrich_cluster_card(&client, cluster).await;
     }
     list.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(list)
+}
+
+/// Fills the card-level monitoring fields (uptime, pods, live resource usage)
+/// of a running cluster from node inspect data, one-shot docker stats, and a
+/// single `kubectl get pods` exec. Best-effort: any failure leaves fields
+/// `None` so the list still renders without the stats.
+async fn enrich_cluster_card(
+    client: &crate::docker::client::DockerClient,
+    cluster: &mut KindCluster,
+) {
+    let Ok(ids) = cluster_node_ids(client, &cluster.name).await else {
+        return;
+    };
+    if ids.is_empty() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Uptime = now - oldest StartedAt among running nodes; caps from HostConfig.
+    let mut started_times: Vec<i64> = Vec::new();
+    let mut last_end_times: Vec<i64> = Vec::new();
+    let mut cpu_quota_m = 0u64;
+    let mut mem_limit_bytes = 0i64;
+    for id in &ids {
+        let Ok(details) = client
+            .docker()
+            .inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+        else {
+            continue;
+        };
+        let Some(state) = details.state else { continue; };
+        if state.running.unwrap_or(false) {
+            if let Some(started) = state.started_at.as_deref().and_then(parse_docker_ts) {
+                started_times.push(started);
+            }
+        } else if let Some(finished) = state.finished_at.as_deref().and_then(parse_docker_ts) {
+            last_end_times.push(finished);
+        }
+        if let Some(host) = details.host_config {
+            if let Some(q) = host.cpu_quota.filter(|q| *q > 0) {
+                cpu_quota_m += (q / 100) as u64;
+            }
+            if let Some(m) = host.memory.filter(|m| *m > 0) {
+                mem_limit_bytes += m;
+            }
+        }
+    }
+    if let Some(&oldest) = started_times.iter().min() {
+        cluster.last_started_at = Some(oldest);
+        cluster.uptime_seconds = Some((now - oldest).max(0));
+    } else if let Some(&latest_end) = last_end_times.iter().max() {
+        // Stopped cluster: surface when it last ran (latest node finish time).
+        cluster.last_started_at = Some(latest_end);
+    }
+    if cpu_quota_m > 0 {
+        cluster.cpu_quota_m = Some(cpu_quota_m);
+    }
+    if mem_limit_bytes > 0 {
+        cluster.mem_limit_mb = Some(mem_limit_bytes as f64 / (1024.0 * 1024.0));
+    }
+
+    if !cluster.running {
+        return;
+    }
+
+    // Live usage: one-shot docker stats per node, summed (CPU as % of host).
+    let mut cpu_pct = 0.0f64;
+    let mut mem_mb = 0.0f64;
+    let mut any_stats = false;
+    for id in &ids {
+        if let Ok(s) = client.container_stats(id).await {
+            cpu_pct += s.cpu_percent;
+            mem_mb += s.mem_usage as f64 / (1024.0 * 1024.0);
+            any_stats = true;
+        }
+    }
+    if any_stats {
+        cluster.cpu_percent = Some(cpu_pct);
+        cluster.mem_used_mb = Some(mem_mb);
+    }
+
+    // Pod counts via the control-plane node's bundled kubectl.
+    let cp = format!("{}-control-plane", cluster.name);
+    if let Ok(out) = client
+        .exec_capture(
+            &cp,
+            vec![
+                "kubectl".into(),
+                "--kubeconfig=/etc/kubernetes/admin.conf".into(),
+                "get".into(),
+                "pods".into(),
+                "-A".into(),
+                "--no-headers".into(),
+            ],
+        )
+        .await
+    {
+        let (total, running) = count_pods(&out);
+        cluster.pod_count = Some(total);
+        cluster.running_pod_count = Some(running);
+    }
+}
+
+/// Parses Docker's RFC3339 timestamps ("2026-10-20T01:02:03.123456789Z").
+/// Docker's zero value ("0001-01-01T00:00:00Z", i.e. never started/stopped)
+/// yields `None`.
+fn parse_docker_ts(ts: &str) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_rfc3339(ts).ok()?.timestamp();
+    (t > 0).then_some(t)
+}
+
+/// Counts pods in `kubectl get pods -A --no-headers` output: (total, running).
+/// Status is the 4th whitespace-separated column (NS NAME READY STATUS ...).
+fn count_pods(out: &str) -> (u32, u32) {
+    let mut total = 0u32;
+    let mut running = 0u32;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        if line.split_whitespace().nth(3) == Some("Running") {
+            running += 1;
+        }
+    }
+    (total, running)
+}
+
+#[cfg(test)]
+mod cluster_card_tests {
+    use super::*;
+
+    #[test]
+    fn parse_docker_ts_reads_rfc3339_and_rejects_zero_or_garbage() {
+        assert_eq!(parse_docker_ts("1970-01-01T00:00:10Z"), Some(10));
+        assert_eq!(parse_docker_ts("1970-01-01T00:00:10.500Z"), Some(10));
+        assert_eq!(parse_docker_ts("0001-01-01T00:00:00Z"), None);
+        assert_eq!(parse_docker_ts(""), None);
+        assert_eq!(parse_docker_ts("not-a-date"), None);
+    }
+
+    #[test]
+    fn count_pods_tallies_total_and_running() {
+        let out = "default       nginx-abc     1/1     Running   0          2m\n\
+                   kube-system   coredns-xyz   1/1     Running   0          5m\n\
+                   default       job-1         0/1     Completed 0          1m\n\
+                   default       pending-1     0/1     Pending   0          1m\n\n";
+        assert_eq!(count_pods(out), (4, 2));
+        assert_eq!(count_pods(""), (0, 0));
+    }
 }
 
 /// Distinct cluster names currently known to the engine — same label query as
