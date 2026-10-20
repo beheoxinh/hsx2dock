@@ -32,9 +32,13 @@ import type {
   KindInstallStatus,
   KindProgressPayload,
 } from "../types";
+import type { DaemonState } from "../types";
+import { EngineGate } from "../components/ui/EngineGate";
 
 interface KubernetesPageProps {
   refreshKey?: number;
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
 }
 
 /** Formats a seconds duration as a compact uptime string. */
@@ -97,7 +101,10 @@ const Sparkline: React.FC<{
   );
 };
 
-export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) => {
+export const KubernetesPage: React.FC<KubernetesPageProps> = ({
+  refreshKey,
+  daemonState = "Running",
+}) => {
   const modal = useModal();
   const toast = useToast();
   const [status, setStatus] = useState<KindInstallStatus | null>(null);
@@ -420,6 +427,16 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
   const orphanLogLines = logLines.filter(
     (l) => !clusters.some((c) => c.name === l.name)
   );
+
+  // Engine off → clusters are unreachable by definition; show the designed
+  // engine panel (with a start button) instead of empty lists and fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="Kubernetes clusters">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col overflow-y-auto">

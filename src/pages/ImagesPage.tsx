@@ -34,12 +34,19 @@ import type {
   PushProgressPayload,
   RegistryStatus,
 } from "../types";
+import type { DaemonState } from "../types";
+import { EngineGate } from "../components/ui/EngineGate";
 
 interface ImagesPageProps {
   refreshKey?: number;
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
 }
 
-export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
+export const ImagesPage: React.FC<ImagesPageProps> = ({
+  refreshKey,
+  daemonState = "Running",
+}) => {
   const modal = useModal();
   const toast = useToast();
   const [images, setImages] = useState<ImageItem[]>([]);
@@ -247,6 +254,15 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({ refreshKey }) => {
     const q = search.toLowerCase();
     return tagsStr.includes(q) || img.id.toLowerCase().includes(q);
   });
+
+  // Engine off → designed feature panel instead of fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="images">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">

@@ -72,6 +72,9 @@ const MainLayout: React.FC = () => {
     let unlisten: (() => void) | undefined;
     events.onEngineStateChanged((state) => {
       setDaemonState(state);
+      // Every engine-backed page re-fetches: data appears/disappears with the
+      // daemon instead of lingering stale or erroring behind the scenes.
+      setRefreshKey((k) => k + 1);
       if (state === "Running") {
         toast.success("Docker Daemon Ready", "Rootless engine daemon is running.");
       } else if (state === "Stopped") {
@@ -170,15 +173,16 @@ const MainLayout: React.FC = () => {
               )}
               {activeTab === "containers" && (
                 <ContainersPage
+                  daemonState={daemonState}
                   onOpenDetails={handleOpenDetails}
                   onOpenWizard={() => setIsWizardOpen(true)}
                 />
               )}
-              {activeTab === "images" && <ImagesPage refreshKey={refreshKey} />}
-              {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} />}
-              {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} />}
-              {activeTab === "kubernetes" && <KubernetesPage refreshKey={refreshKey} />}
-              {activeTab === "compose" && <ComposePage />}
+              {activeTab === "images" && <ImagesPage refreshKey={refreshKey} daemonState={daemonState} />}
+              {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} daemonState={daemonState} />}
+              {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} daemonState={daemonState} />}
+              {activeTab === "kubernetes" && <KubernetesPage refreshKey={refreshKey} daemonState={daemonState} />}
+              {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>
           </AnimatePresence>

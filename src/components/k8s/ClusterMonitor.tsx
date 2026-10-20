@@ -2,10 +2,12 @@ import React, { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  Bell,
   Boxes,
   CheckCircle2,
   Copy,
   Download,
+  FileCode2,
   FileText,
   Folder,
   Hexagon,
@@ -15,12 +17,14 @@ import {
   RotateCw,
   Search,
   Server,
+  Terminal,
   Trash2,
   X,
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { useModal } from "../ui/ModalContext";
 import { useToast } from "../ui/Toast";
+import { InteractiveTerminal } from "../terminal/InteractiveTerminal";
 import { api } from "../../lib/api";
 import { formatBytes, formatRelativeTime } from "../../lib/utils";
 import type {
@@ -139,8 +143,10 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   const [configs, setConfigs] = useState<K8sConfigInfo[]>([]);
   const [pvcs, setPvcs] = useState<K8sPvcInfo[]>([]);
 
-  // Pod logs viewer.
-  const [logsFor, setLogsFor] = useState<{ ns: string; name: string } | null>(null);
+  // Pod / workload logs viewer (workloadKind set → aggregated workload logs).
+  const [logsFor, setLogsFor] = useState<
+    { ns: string; name: string; workloadKind?: string } | null
+  >(null);
   const [logsText, setLogsText] = useState<string>("");
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<string | null>(null);
@@ -150,6 +156,23 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     { kind: string; ns: string; name: string; current: number } | null
   >(null);
   const [scaleValue, setScaleValue] = useState(1);
+
+  // Resource YAML / events viewers + pod terminal.
+  const [yamlFor, setYamlFor] = useState<
+    { kind: string; ns: string; name: string } | null
+  >(null);
+  const [yamlText, setYamlText] = useState("");
+  const [yamlLoading, setYamlLoading] = useState(false);
+  const [yamlError, setYamlError] = useState<string | null>(null);
+  const [eventsFor, setEventsFor] = useState<
+    { kind: string; ns: string; name: string } | null
+  >(null);
+  const [eventsList, setEventsList] = useState<K8sEventInfo[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+  const [terminalFor, setTerminalFor] = useState<
+    { ns: string; name: string } | null
+  >(null);
 
   useEffect(() => {
     setTab("overview");
@@ -168,6 +191,9 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     setMonitorError(null);
     setPodNs("all");
     setPodSearch("");
+    setYamlFor(null);
+    setEventsFor(null);
+    setTerminalFor(null);
   }, [cluster]);
 
   useEffect(() => {
@@ -299,11 +325,20 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
 
   // ---- Pod / workload / resource actions ----
 
-  const loadLogs = async (ns: string, name: string, tail = 300) => {
+  const loadLogs = async (
+    ns: string,
+    name: string,
+    tail = 300,
+    workloadKind?: string
+  ) => {
     setLogsLoading(true);
     setLogsError(null);
     try {
-      setLogsText(await api.getPodLogs(cluster, ns, name, tail));
+      setLogsText(
+        workloadKind
+          ? await api.getWorkloadLogs(cluster, workloadKind, ns, name, tail)
+          : await api.getPodLogs(cluster, ns, name, tail)
+      );
     } catch (e) {
       setLogsText("");
       setLogsError(String(e));
@@ -313,9 +348,71 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   };
 
   useEffect(() => {
-    if (logsFor) loadLogs(logsFor.ns, logsFor.name);
+    if (logsFor) loadLogs(logsFor.ns, logsFor.name, 300, logsFor.workloadKind);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [logsFor?.ns, logsFor?.name, cluster]);
+  }, [logsFor?.ns, logsFor?.name, logsFor?.workloadKind, cluster]);
+
+  /** Opens the YAML or events viewer for a resource. */
+  const openResourceView = (
+    kind: string,
+    ns: string,
+    name: string,
+    mode: "yaml" | "events" = "yaml"
+  ) => {
+    if (mode === "events") setEventsFor({ kind, ns, name });
+    else setYamlFor({ kind, ns, name });
+  };
+
+  /** Streams aggregated workload logs through the shared logs modal. */
+  const openWorkloadLogs = (kind: string, ns: string, name: string) => {
+    setLogsFor({ ns, name, workloadKind: kind });
+  };
+
+  useEffect(() => {
+    if (!yamlFor) return;
+    let alive = true;
+    setYamlLoading(true);
+    setYamlError(null);
+    setYamlText("");
+    api
+      .getResourceYaml(cluster, yamlFor.kind, yamlFor.ns, yamlFor.name)
+      .then((y) => {
+        if (alive) setYamlText(y);
+      })
+      .catch((e) => {
+        if (alive) setYamlError(String(e));
+      })
+      .finally(() => {
+        if (alive) setYamlLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [yamlFor?.kind, yamlFor?.ns, yamlFor?.name, cluster]);
+
+  useEffect(() => {
+    if (!eventsFor) return;
+    let alive = true;
+    setEventsLoading(true);
+    setEventsError(null);
+    setEventsList([]);
+    api
+      .getResourceEvents(cluster, eventsFor.ns, eventsFor.name)
+      .then((ev) => {
+        if (alive) setEventsList(ev);
+      })
+      .catch((e) => {
+        if (alive) setEventsError(String(e));
+      })
+      .finally(() => {
+        if (alive) setEventsLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventsFor?.ns, eventsFor?.name, cluster]);
 
   const handleDeletePod = async (p: K8sPodInfo) => {
     const ok = await modal.showConfirm(
@@ -716,6 +813,26 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
         {/* ============ PODS ============ */}
         {tab === "podlist" && (
           <div className="space-y-3">
+            {/* Pod usage comes from metrics-server — offer the install inline. */}
+            {metrics?.error && (
+              <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-amber-300">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                <span>
+                  metrics-server is not installed — pod CPU/memory columns stay empty
+                  until it is (~1 min after install).
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={installMetricsServer}
+                  disabled={installingMs}
+                  className="gap-1.5 ml-auto"
+                >
+                  {installingMs && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Install metrics-server
+                </Button>
+              </div>
+            )}
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
@@ -819,6 +936,43 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                             <Button
                               variant="ghost"
                               size="icon"
+                              title="Open an interactive shell in this pod"
+                              aria-label="Open pod terminal"
+                              disabled={p.phase !== "Running"}
+                              onClick={() =>
+                                setTerminalFor({ ns: p.namespace, name: p.name })
+                              }
+                              className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-40"
+                            >
+                              <Terminal className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="View pod YAML"
+                              aria-label="View pod YAML"
+                              onClick={() =>
+                                openResourceView("pod", p.namespace, p.name)
+                              }
+                              className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                            >
+                              <FileCode2 className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="View pod events"
+                              aria-label="View pod events"
+                              onClick={() =>
+                                openResourceView("pod", p.namespace, p.name, "events")
+                              }
+                              className="h-6 w-6 text-zinc-400 hover:text-amber-300"
+                            >
+                              <Bell className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
                               title="Delete pod"
                               aria-label="Delete pod"
                               onClick={() => handleDeletePod(p)}
@@ -910,6 +1064,47 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                             className="h-6 w-6 text-zinc-400 hover:text-white"
                           >
                             <RotateCw className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Stream workload logs"
+                            aria-label="Stream workload logs"
+                            onClick={() =>
+                              openWorkloadLogs(w.kind.toLowerCase(), w.namespace, w.name)
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-white"
+                          >
+                            <FileText className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="View YAML"
+                            aria-label="View workload YAML"
+                            onClick={() =>
+                              openResourceView(w.kind.toLowerCase(), w.namespace, w.name)
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                          >
+                            <FileCode2 className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="View events"
+                            aria-label="View workload events"
+                            onClick={() =>
+                              openResourceView(
+                                w.kind.toLowerCase(),
+                                w.namespace,
+                                w.name,
+                                "events"
+                              )
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-amber-300"
+                          >
+                            <Bell className="h-3.5 w-3.5" />
                           </Button>
                           <Button
                             variant="ghost"
@@ -1029,6 +1224,28 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                       <Button
                         variant="ghost"
                         size="icon"
+                        title="View YAML"
+                        aria-label="View service YAML"
+                        onClick={() => openResourceView("service", s.namespace, s.name)}
+                        className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                      >
+                        <FileCode2 className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="View events"
+                        aria-label="View service events"
+                        onClick={() =>
+                          openResourceView("service", s.namespace, s.name, "events")
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-amber-300"
+                      >
+                        <Bell className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
                         title="Delete service"
                         onClick={() => handleDeleteResource("service", s.namespace, s.name, "Service")}
                         className="h-6 w-6 text-zinc-400 hover:text-rose-400"
@@ -1093,6 +1310,39 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                       {c.created ? formatRelativeTime(c.created) : "-"}
                     </td>
                     <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="View YAML"
+                        aria-label="View resource YAML"
+                        onClick={() =>
+                          openResourceView(
+                            c.resourceKind === "Secret" ? "secret" : "configmap",
+                            c.namespace,
+                            c.name
+                          )
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                      >
+                        <FileCode2 className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="View events"
+                        aria-label="View resource events"
+                        onClick={() =>
+                          openResourceView(
+                            c.resourceKind === "Secret" ? "secret" : "configmap",
+                            c.namespace,
+                            c.name,
+                            "events"
+                          )
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-amber-300"
+                      >
+                        <Bell className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"
@@ -1171,6 +1421,18 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                       <Button
                         variant="ghost"
                         size="icon"
+                        title="View YAML"
+                        aria-label="View PVC YAML"
+                        onClick={() =>
+                          openResourceView("persistentvolumeclaim", p.namespace, p.name)
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                      >
+                        <FileCode2 className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
                         title="Delete PVC"
                         onClick={() =>
                           handleDeleteResource(
@@ -1205,6 +1467,7 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
             <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-3">
               <FileText className="h-4 w-4 text-zinc-400" />
               <span className="text-sm font-semibold text-white">
+                {logsFor.workloadKind ? `${logsFor.workloadKind}/` : ""}
                 {logsFor.ns}/{logsFor.name}
               </span>
               <span className="text-[11px] text-zinc-500">logs (last 300 lines)</span>
@@ -1213,7 +1476,9 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   variant="ghost"
                   size="icon"
                   title="Reload logs"
-                  onClick={() => loadLogs(logsFor.ns, logsFor.name)}
+                  onClick={() =>
+                    loadLogs(logsFor.ns, logsFor.name, 300, logsFor.workloadKind)
+                  }
                   className="h-7 w-7 text-zinc-400 hover:text-white"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${logsLoading ? "animate-spin" : ""}`} />
@@ -1248,6 +1513,191 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   {logsText || "(empty)"}
                 </pre>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Resource YAML modal */}
+      {yamlFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+          <div className="w-full max-w-3xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  {yamlFor.kind} · {yamlFor.name}
+                </p>
+                <p className="text-[11px] text-zinc-500">namespace {yamlFor.ns}</p>
+              </div>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Copy YAML"
+                  aria-label="Copy YAML"
+                  disabled={!yamlText}
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(yamlText);
+                      toast.success("YAML copied");
+                    } catch (e) {
+                      toast.error("Copy failed", String(e));
+                    }
+                  }}
+                  className="h-7 w-7 text-zinc-400"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Close"
+                  aria-label="Close YAML viewer"
+                  onClick={() => setYamlFor(null)}
+                  className="h-7 w-7 text-zinc-400"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+            <div className="flex-1 min-h-0 overflow-auto px-4 py-3">
+              {yamlLoading ? (
+                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading manifest…
+                </div>
+              ) : yamlError ? (
+                <p className="text-xs text-rose-400">{yamlError}</p>
+              ) : (
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300">
+                  {yamlText}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Resource events modal */}
+      {eventsFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+          <div className="w-full max-w-3xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  Events · {eventsFor.kind} {eventsFor.name}
+                </p>
+                <p className="text-[11px] text-zinc-500">namespace {eventsFor.ns}</p>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                title="Close"
+                aria-label="Close events viewer"
+                onClick={() => setEventsFor(null)}
+                className="h-7 w-7 text-zinc-400"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <div className="flex-1 min-h-0 overflow-auto">
+              {eventsLoading ? (
+                <div className="flex items-center gap-2 px-4 py-3 text-xs text-zinc-500">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading events…
+                </div>
+              ) : eventsError ? (
+                <p className="px-4 py-3 text-xs text-rose-400">{eventsError}</p>
+              ) : eventsList.length === 0 ? (
+                <p className="px-4 py-6 text-center text-xs text-zinc-500">
+                  No events recorded for this resource.
+                </p>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                      <th className="px-3 py-2 font-medium">Type</th>
+                      <th className="px-3 py-2 font-medium">Reason</th>
+                      <th className="px-3 py-2 font-medium">Object</th>
+                      <th className="px-3 py-2 font-medium">Message</th>
+                      <th className="px-3 py-2 font-medium">Count</th>
+                      <th className="px-3 py-2 font-medium">Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {eventsList.map((ev, i) => (
+                      <tr key={i} className="hover:bg-zinc-800/30">
+                        <td className="px-3 py-2">
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                              ev.type === "Warning"
+                                ? "bg-rose-500/10 text-rose-300 border-rose-500/30"
+                                : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                            }`}
+                          >
+                            {ev.type}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 font-mono text-zinc-300">{ev.reason}</td>
+                        <td className="px-3 py-2 font-mono text-zinc-500">{ev.object}</td>
+                        <td
+                          className="px-3 py-2 text-zinc-400 max-w-md truncate"
+                          title={ev.message}
+                        >
+                          {ev.message}
+                        </td>
+                        <td className="px-3 py-2 font-mono text-zinc-400">{ev.count}</td>
+                        <td className="px-3 py-2 text-zinc-500">
+                          {ev.lastTimestamp ? formatRelativeTime(ev.lastTimestamp) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pod terminal modal */}
+      {terminalFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+          <div className="w-full max-w-4xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  Terminal · {terminalFor.name}
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  {cluster} · namespace {terminalFor.ns} · sh
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                title="Close terminal"
+                aria-label="Close terminal"
+                onClick={() => setTerminalFor(null)}
+                className="h-7 w-7 text-zinc-400"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <div className="flex-1 min-h-0">
+              <InteractiveTerminal
+                containerId={`${cluster}-control-plane`}
+                cmd={[
+                  "kubectl",
+                  "--kubeconfig=/etc/kubernetes/admin.conf",
+                  "exec",
+                  "-n",
+                  terminalFor.ns,
+                  terminalFor.name,
+                  "-i",
+                  "-t",
+                  "--",
+                  "sh",
+                ]}
+              />
             </div>
           </div>
         </div>

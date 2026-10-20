@@ -22,12 +22,13 @@ import {
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
+import { EngineGate } from "../components/ui/EngineGate";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
 import { ContainerGroupsBar } from "../components/ContainerGroupsBar";
 import { api, events } from "../lib/api";
 import { formatBytes, truncateId } from "../lib/utils";
-import type { ContainerItem, ContainerStats } from "../types";
+import type { ContainerItem, ContainerStats, DaemonState } from "../types";
 
 interface ContainersPageProps {
   onOpenDetails: (
@@ -37,11 +38,14 @@ interface ContainersPageProps {
     edit?: boolean
   ) => void;
   onOpenWizard: () => void;
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
 }
 
 export const ContainersPage: React.FC<ContainersPageProps> = ({
   onOpenDetails,
   onOpenWizard,
+  daemonState = "Running",
 }) => {
   const [containers, setContainers] = useState<ContainerItem[]>([]);
   const [statsMap, setStatsMap] = useState<Record<string, ContainerStats>>({});
@@ -197,6 +201,15 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
       setActionLoading((prev) => ({ ...prev, [`project:${project}`]: false }));
     }
   };
+
+  // Engine off → designed feature panel instead of fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="containers">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">

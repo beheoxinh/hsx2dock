@@ -5,9 +5,17 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { api } from "../lib/api";
-import type { ComposeProjectInfo } from "../types";
+import type { ComposeProjectInfo, DaemonState } from "../types";
+import { EngineGate } from "../components/ui/EngineGate";
 
-export const ComposePage: React.FC = () => {
+interface ComposePageProps {
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
+}
+
+export const ComposePage: React.FC<ComposePageProps> = ({
+  daemonState = "Running",
+}) => {
   const toast = useToast();
   const [projects, setProjects] = useState<ComposeProjectInfo[]>([]);
   const [, setLoading] = useState(true);
@@ -78,6 +86,15 @@ export const ComposePage: React.FC = () => {
       setActionLoading(false);
     }
   };
+
+  // Engine off → designed feature panel instead of fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="compose projects">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">

@@ -7,13 +7,19 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
 import { truncateId } from "../lib/utils";
-import type { NetworkItem } from "../types";
+import type { NetworkItem, DaemonState } from "../types";
+import { EngineGate } from "../components/ui/EngineGate";
 
 interface NetworksPageProps {
   refreshKey?: number;
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
 }
 
-export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
+export const NetworksPage: React.FC<NetworksPageProps> = ({
+  refreshKey,
+  daemonState = "Running",
+}) => {
   const modal = useModal();
   const toast = useToast();
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
@@ -92,6 +98,15 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({ refreshKey }) => {
   const filteredNetworks = networks.filter((n) =>
     n.name.toLowerCase().includes(search.toLowerCase())
   );
+
+  // Engine off → designed feature panel instead of fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="networks">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">

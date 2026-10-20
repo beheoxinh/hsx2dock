@@ -1794,6 +1794,154 @@ pub async fn get_pod_logs(
     .await
 }
 
+/// Resource kinds `get_resource_yaml` will fetch (singular and plural forms,
+/// mirroring what `kubectl get` accepts). Anything else is rejected before the
+/// exec so the allowlist stays an auditable constant.
+const YAML_RESOURCE_KINDS: &[&str] = &[
+    "pod",
+    "pods",
+    "deployment",
+    "deployments",
+    "statefulset",
+    "statefulsets",
+    "daemonset",
+    "daemonsets",
+    "replicaset",
+    "replicasets",
+    "job",
+    "jobs",
+    "cronjob",
+    "cronjobs",
+    "service",
+    "services",
+    "configmap",
+    "configmaps",
+    "secret",
+    "secrets",
+    "persistentvolumeclaim",
+    "persistentvolumeclaims",
+    "namespace",
+    "namespaces",
+    "node",
+    "nodes",
+    "ingress",
+    "ingresses",
+];
+
+/// True when `kind` is on the [`YAML_RESOURCE_KINDS`] allowlist.
+fn is_yaml_kind(kind: &str) -> bool {
+    YAML_RESOURCE_KINDS.contains(&kind.trim().to_lowercase().as_str())
+}
+
+/// Full manifest (`-o yaml`) of a single namespaced/cluster-scoped resource.
+/// `namespace` is ignored for cluster-scoped kinds (node, namespace).
+#[tauri::command]
+pub async fn get_resource_yaml(
+    state: State<'_, AppState>,
+    cluster: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<String, String> {
+    k8s_name_check(&name)?;
+    if !is_yaml_kind(&kind) {
+        return Err(format!(
+            "resource kind '{kind}' is not supported for YAML viewing"
+        ));
+    }
+    if let Some(ns) = namespace.as_deref().filter(|s| !s.is_empty()) {
+        k8s_name_check(ns)?;
+    }
+    let kind_l = kind.trim().to_lowercase();
+    let mut args: Vec<&str> = vec!["get", kind_l.as_str(), &name];
+    if let Some(ns) = namespace.as_deref().filter(|s| !s.is_empty()) {
+        args.extend(["-n", ns]);
+    }
+    args.extend(["-o", "yaml"]);
+    kubectl_raw(&state, &cluster, &args).await
+}
+
+/// Events whose `involvedObject` is the given object (oldest first).
+#[tauri::command]
+pub async fn get_resource_events(
+    state: State<'_, AppState>,
+    cluster: String,
+    namespace: String,
+    name: String,
+) -> Result<Vec<K8sEventInfo>, String> {
+    k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    let selector = format!("involvedObject.name={name}");
+    let v = kubectl_json(
+        &state,
+        &cluster,
+        &[
+            "get",
+            "events",
+            "-n",
+            &namespace,
+            "--field-selector",
+            &selector,
+            "--sort-by=.lastTimestamp",
+        ],
+    )
+    .await?;
+    Ok(parse_events(&v))
+}
+
+/// Aggregated logs of a workload (`kubectl logs deployment/name` picks one of
+/// its pods) across all containers.
+#[tauri::command]
+pub async fn get_workload_logs(
+    state: State<'_, AppState>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    tail: Option<u32>,
+) -> Result<String, String> {
+    k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    let kind_l = kind.trim().to_lowercase();
+    if !["deployment", "statefulset", "daemonset"].contains(&kind_l.as_str()) {
+        return Err(format!(
+            "logs are not available for {kind_l} resources — select a workload"
+        ));
+    }
+    let tail = tail.unwrap_or(300).clamp(10, 5000);
+    let target = format!("{kind_l}/{name}");
+    kubectl_raw(
+        &state,
+        &cluster,
+        &[
+            "logs",
+            &target,
+            "-n",
+            &namespace,
+            "--all-containers=true",
+            &format!("--tail={tail}"),
+        ],
+    )
+    .await
+}
+
+#[cfg(test)]
+mod resource_view_tests {
+    use super::*;
+
+    #[test]
+    fn yaml_kind_allowlist_accepts_singular_and_plural_only() {
+        assert!(is_yaml_kind("pod"));
+        assert!(is_yaml_kind("pods"));
+        assert!(is_yaml_kind("Deployment")); // case-insensitive
+        assert!(is_yaml_kind("statefulsets"));
+        assert!(is_yaml_kind("persistentvolumeclaims"));
+        assert!(!is_yaml_kind("clusterrole"));
+        assert!(!is_yaml_kind(""));
+        assert!(!is_yaml_kind("pods; rm -rf /"));
+    }
+}
+
 /// Deletes a pod (the owning controller recreates it unless it's bare).
 #[tauri::command]
 pub async fn delete_pod(

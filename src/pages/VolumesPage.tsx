@@ -7,13 +7,19 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
-import type { VolumeItem } from "../types";
+import type { VolumeItem, DaemonState } from "../types";
+import { EngineGate } from "../components/ui/EngineGate";
 
 interface VolumesPageProps {
   refreshKey?: number;
+  /** Engine state — the page renders an EngineGate panel unless Running. */
+  daemonState?: DaemonState;
 }
 
-export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
+export const VolumesPage: React.FC<VolumesPageProps> = ({
+  refreshKey,
+  daemonState = "Running",
+}) => {
   const modal = useModal();
   const toast = useToast();
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
@@ -89,6 +95,15 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({ refreshKey }) => {
   const filteredVolumes = volumes.filter((v) =>
     v.name.toLowerCase().includes(search.toLowerCase())
   );
+
+  // Engine off → designed feature panel instead of fetch errors.
+  if (daemonState !== "Running") {
+    return (
+      <EngineGate state={daemonState} resource="volumes">
+        {null}
+      </EngineGate>
+    );
+  }
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">

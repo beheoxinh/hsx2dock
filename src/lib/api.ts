@@ -207,6 +207,21 @@ export const api = {
     invoke<void>("set_cluster_prefs", { cluster, prefs }),
   getPodLogs: (cluster: string, namespace: string, name: string, tail?: number) =>
     invoke<string>("get_pod_logs", { cluster, namespace, name, tail }),
+  getResourceYaml: (
+    cluster: string,
+    kind: string,
+    namespace: string | null,
+    name: string
+  ) => invoke<string>("get_resource_yaml", { cluster, kind, namespace, name }),
+  getResourceEvents: (cluster: string, namespace: string, name: string) =>
+    invoke<K8sEventInfo[]>("get_resource_events", { cluster, namespace, name }),
+  getWorkloadLogs: (
+    cluster: string,
+    kind: string,
+    namespace: string,
+    name: string,
+    tail?: number
+  ) => invoke<string>("get_workload_logs", { cluster, kind, namespace, name, tail }),
   deletePod: (cluster: string, namespace: string, name: string, force = false) =>
     invoke<void>("delete_pod", { cluster, namespace, name, force }),
   deleteK8sResource: (cluster: string, kind: string, namespace: string | null, name: string) =>
