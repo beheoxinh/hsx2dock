@@ -17,6 +17,8 @@ export const KubernetesCard: React.FC = () => {
   const [nodes, setNodes] = useState(1);
   const [image, setImage] = useState("");
   const [saving, setSaving] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
+  const [startDelay, setStartDelay] = useState(5);
 
   useEffect(() => {
     api.kindStatus().then(setStatus).catch(() => {});
@@ -25,6 +27,8 @@ export const KubernetesCard: React.FC = () => {
       .then((cfg) => {
         setNodes(Math.min(5, Math.max(1, cfg.kind_default_nodes ?? 1)));
         setImage(cfg.kind_default_image ?? "");
+        setAutoStart(cfg.kind_auto_start ?? false);
+        setStartDelay(Math.min(120, Math.max(0, cfg.kind_auto_start_delay ?? 5)));
       })
       .catch(() => {});
   }, []);
@@ -37,6 +41,8 @@ export const KubernetesCard: React.FC = () => {
         ...latest,
         kind_default_nodes: nodes,
         kind_default_image: image.trim(),
+        kind_auto_start: autoStart,
+        kind_auto_start_delay: startDelay,
       });
       toast.success("Kubernetes defaults saved", "Used by the Create-cluster form.");
     } catch (e) {
@@ -93,6 +99,40 @@ export const KubernetesCard: React.FC = () => {
             className="w-full h-9 px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-blue-500"
           />
         </div>
+      </div>
+
+      <div className="border-t border-white/5 pt-4 space-y-3">
+        <label className="flex items-start gap-2 text-sm text-zinc-300 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={autoStart}
+            onChange={(e) => setAutoStart(e.target.checked)}
+            className="mt-0.5 rounded border-zinc-700 bg-zinc-950"
+          />
+          <span>Auto-start clusters when the engine comes up</span>
+        </label>
+        <p className="text-xs text-zinc-500 leading-relaxed">
+          Only clusters with per-cluster auto-start enabled (Kubernetes page → ⚙) are
+          started, one after another with the delay below — so the host CPU/RAM is never
+          slammed by every cluster booting at once.
+        </p>
+        {autoStart && (
+          <div className="max-w-[220px]">
+            <label className="block text-xs font-medium text-zinc-400 mb-1.5">
+              Delay between starts (seconds)
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={120}
+              value={startDelay}
+              onChange={(e) =>
+                setStartDelay(Math.min(120, Math.max(0, Number(e.target.value) || 0)))
+              }
+              className="w-full h-9 px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500"
+            />
+          </div>
+        )}
       </div>
 
       <div className="flex justify-end">

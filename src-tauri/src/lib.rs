@@ -51,6 +51,22 @@ fn start_background_monitoring(app_handle: AppHandle) {
                                 crate::commands::groups::auto_start_groups(&st).await;
                             }
                         });
+                        // Kind clusters flagged auto-start come up after the
+                        // engine, staggered and capped (see auto_start_kind_clusters).
+                        {
+                            let app = handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let Some(st2) = app.try_state::<AppState>() else {
+                                    return;
+                                };
+                                if let Err(e) =
+                                    crate::commands::kind::auto_start_kind_clusters(app.clone(), &st2)
+                                        .await
+                                {
+                                    tracing::warn!("kind auto-start failed: {e}");
+                                }
+                            });
+                        }
                     }
                     let _ = handle.emit("engine-state-changed", status);
                 }
@@ -212,6 +228,17 @@ pub fn run() {
             kind::get_cluster_pods,
             kind::get_cluster_events,
             kind::get_cluster_workloads,
+            kind::get_cluster_prefs,
+            kind::set_cluster_prefs,
+            kind::get_pod_logs,
+            kind::delete_pod,
+            kind::delete_k8s_resource,
+            kind::scale_workload,
+            kind::restart_workload,
+            kind::create_namespace,
+            kind::get_cluster_services,
+            kind::get_cluster_config_resources,
+            kind::get_cluster_pvcs,
             kind::get_cluster_metrics,
             kind::get_cluster_summary,
             kind::install_metrics_server,

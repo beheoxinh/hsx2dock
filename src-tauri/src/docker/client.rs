@@ -179,6 +179,32 @@ impl DockerClient {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
+    /// Applies CPU/memory caps to an existing (running or stopped) container.
+    /// `cpu_m` in millicores, `mem_mb` in MiB; `None` leaves the field alone.
+    /// Used to cap kind node containers so clusters can't starve the host.
+    pub async fn update_container_caps(
+        &self,
+        id: &str,
+        cpu_m: Option<u32>,
+        mem_mb: Option<u32>,
+    ) -> anyhow::Result<()> {
+        use bollard::models::ContainerUpdateBody;
+
+        let mut body = ContainerUpdateBody::default();
+        if let Some(m) = cpu_m.filter(|v| *v > 0) {
+            // quota = cores × 100_000 µs per 100 ms period; millicores → ×100
+            body.cpu_quota = Some((m as i64) * 100);
+        }
+        if let Some(mb) = mem_mb.filter(|v| *v > 0) {
+            let bytes = mb as i64 * 1024 * 1024;
+            body.memory = Some(bytes);
+            // memory_swap must be >= memory or some daemons reject the update
+            body.memory_swap = Some(bytes * 2);
+        }
+        self.docker.update_container(id, body).await?;
+        Ok(())
+    }
+
     pub async fn list_containers(&self, all: bool) -> anyhow::Result<Vec<ContainerItem>> {
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(all)

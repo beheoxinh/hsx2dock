@@ -91,6 +91,37 @@ pub struct AppConfig {
     /// Empty or `0` = unlimited.
     #[serde(default)]
     pub engine_cpu_cores: String,
+    /// Master switch for auto-starting kind clusters with the engine.
+    #[serde(default)]
+    pub kind_auto_start: bool,
+    /// Seconds to wait between cluster starts so several clusters don't
+    /// hammer the host at once. `0` = back-to-back.
+    #[serde(default = "default_kind_start_delay")]
+    pub kind_auto_start_delay: u32,
+    /// Per-cluster prefs (auto-start flag, per-node resource caps), keyed by
+    /// cluster name. Clusters without an entry use the defaults (manual
+    /// start, unlimited nodes).
+    #[serde(default)]
+    pub kind_cluster_prefs: std::collections::BTreeMap<String, KindClusterPrefs>,
+}
+
+fn default_kind_start_delay() -> u32 {
+    5
+}
+
+/// Per-cluster preferences persisted in the app config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KindClusterPrefs {
+    /// Start this cluster together with the engine (staggered, capped).
+    #[serde(default)]
+    pub auto_start: bool,
+    /// Per-node CPU cap in millicores (`0`/unset = unlimited).
+    #[serde(default)]
+    pub node_cpu_m: u32,
+    /// Per-node memory cap in MiB (`0`/unset = unlimited).
+    #[serde(default)]
+    pub node_memory_mb: u32,
 }
 
 /// A named set of containers that can be started/stopped together, optionally
@@ -250,6 +281,9 @@ impl Default for AppConfig {
             container_groups: Vec::new(),
             engine_memory_limit_mb: 0,
             engine_cpu_cores: String::new(),
+            kind_auto_start: false,
+            kind_auto_start_delay: default_kind_start_delay(),
+            kind_cluster_prefs: Default::default(),
         }
     }
 }
@@ -414,6 +448,9 @@ mod tests {
             container_groups: Vec::new(),
             engine_memory_limit_mb: 0,
             engine_cpu_cores: String::new(),
+            kind_auto_start: false,
+            kind_auto_start_delay: default_kind_start_delay(),
+            kind_cluster_prefs: Default::default(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");

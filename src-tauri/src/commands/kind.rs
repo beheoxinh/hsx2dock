@@ -447,7 +447,7 @@ pub async fn start_kind_cluster(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
-    set_cluster_power(&app, &state, &name, true).await
+    set_cluster_power(&app, &*state, &name, true).await
 }
 
 /// Stops every node container of a cluster (state persists; Start resumes it).
@@ -457,18 +457,36 @@ pub async fn stop_kind_cluster(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
-    set_cluster_power(&app, &state, &name, false).await
+    set_cluster_power(&app, &*state, &name, false).await
 }
 
 async fn set_cluster_power(
     app: &AppHandle,
-    state: &State<'_, AppState>,
+    state: &AppState,
     name: &str,
     start: bool,
 ) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Cluster name is required".into());
+    }
+    if start {
+        // Re-apply the cluster's per-node caps so a resumed cluster starts
+        // under the same limits (docker keeps them across stop/start, but a
+        // user may have edited prefs while the cluster was down).
+        let prefs = state
+            .config
+            .read()
+            .await
+            .kind_cluster_prefs
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if prefs.node_cpu_m > 0 || prefs.node_memory_mb > 0 {
+            if let Err(e) = apply_cluster_limits(state, name, &prefs).await {
+                tracing::warn!("could not apply node limits for {name}: {e}");
+            }
+        }
     }
     let client = local_client(state).await?;
     let mut filters = HashMap::new();
@@ -1419,6 +1437,534 @@ pub async fn install_metrics_server(
     Ok(())
 }
 
+
+// ==================== Cluster prefs: auto-start + per-node caps ====================
+
+use crate::config::KindClusterPrefs;
+
+/// Reads a cluster's persisted prefs (defaults when none were set).
+#[tauri::command]
+pub async fn get_cluster_prefs(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<KindClusterPrefs, String> {
+    Ok(state
+        .config
+        .read()
+        .await
+        .kind_cluster_prefs
+        .get(cluster.trim())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Saves a cluster's prefs and applies the node caps immediately.
+#[tauri::command]
+pub async fn set_cluster_prefs(
+    state: State<'_, AppState>,
+    cluster: String,
+    prefs: KindClusterPrefs,
+) -> Result<(), String> {
+    let cluster = cluster.trim().to_string();
+    if cluster.is_empty() {
+        return Err("Cluster name is required".into());
+    }
+    {
+        let mut cfg = state.config.write().await;
+        cfg.kind_cluster_prefs.insert(cluster.clone(), prefs.clone());
+        cfg.save().await.map_err(|e| e.to_string())?;
+    }
+    if prefs.node_cpu_m > 0 || prefs.node_memory_mb > 0 {
+        let capped = apply_cluster_limits(&state, &cluster, &prefs).await?;
+        tracing::info!("applied node caps to {capped} container(s) of '{cluster}'");
+    }
+    Ok(())
+}
+
+/// CPU/memory-caps every node container of `cluster` via `docker update`.
+/// Returns how many containers were capped.
+async fn apply_cluster_limits(
+    state: &AppState,
+    cluster: &str,
+    prefs: &KindClusterPrefs,
+) -> Result<u32, String> {
+    let client = local_client(state).await?;
+    let ids = cluster_node_ids(&client, cluster).await?;
+    let mut capped = 0u32;
+    for id in ids {
+        let cpu = Some(prefs.node_cpu_m).filter(|v| *v > 0);
+        let mem = Some(prefs.node_memory_mb).filter(|v| *v > 0);
+        if client.update_container_caps(&id, cpu, mem).await.is_ok() {
+            capped += 1;
+        }
+    }
+    Ok(capped)
+}
+
+/// Ids of every (running or stopped) node container of a cluster.
+async fn cluster_node_ids(
+    client: &crate::docker::client::DockerClient,
+    cluster: &str,
+) -> Result<Vec<String>, String> {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("{CLUSTER_LABEL}={cluster}")],
+    );
+    let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let list = client
+        .docker()
+        .list_containers(Some(opts))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(list.into_iter().filter_map(|c| c.id).collect())
+}
+
+/// Auto-starts every cluster flagged `auto_start` when the engine comes up.
+/// Starts are sequential with a configurable pause so N clusters don't hit
+/// the host at once; caps are applied before each start.
+pub async fn auto_start_kind_clusters(app: AppHandle, state: &AppState) -> Result<u32, String> {
+    let (names, delay) = {
+        let cfg = state.config.read().await;
+        if !cfg.kind_auto_start {
+            return Ok(0);
+        }
+        let mut names: Vec<String> = cfg
+            .kind_cluster_prefs
+            .iter()
+            .filter(|(_, p)| p.auto_start)
+            .map(|(k, _)| k.clone())
+            .collect();
+        names.sort();
+        (names, cfg.kind_auto_start_delay)
+    };
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let mut started = 0u32;
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 && delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+        }
+        // Skip clusters whose node containers are gone (deleted outside the app).
+        let exists = {
+            let Ok(client) = local_client(state).await else { break };
+            matches!(cluster_node_ids(&client, name).await, Ok(ids) if !ids.is_empty())
+        };
+        if !exists {
+            continue;
+        }
+        match set_cluster_power(&app, state, name, true).await {
+            Ok(()) => started += 1,
+            Err(e) => tracing::warn!("auto-start cluster '{name}' failed: {e}"),
+        }
+    }
+    if started > 0 {
+        let _ = app.emit(
+            "kind-progress",
+            serde_json::json!({
+                "action": "auto-start",
+                "name": "",
+                "line": format!("Auto-started {started} cluster(s)"),
+            }),
+        );
+    }
+    Ok(started)
+}
+
+// ==================== Pod & resource management ====================
+
+fn k8s_name_check(s: &str) -> Result<(), String> {
+    let s = s.trim();
+    if s.is_empty() || s.contains(char::is_whitespace) {
+        return Err("invalid name".into());
+    }
+    Ok(())
+}
+
+/// Container logs of a pod (its first container). `tail` lines, default 200.
+#[tauri::command]
+pub async fn get_pod_logs(
+    state: State<'_, AppState>,
+    cluster: String,
+    namespace: String,
+    name: String,
+    tail: Option<u32>,
+) -> Result<String, String> {
+    k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    let tail = tail.unwrap_or(200).clamp(10, 5000);
+    kubectl_raw(
+        &state,
+        &cluster,
+        &[
+            "logs",
+            &name,
+            "-n",
+            &namespace,
+            &format!("--tail={tail}"),
+        ],
+    )
+    .await
+}
+
+/// Deletes a pod (the owning controller recreates it unless it's bare).
+#[tauri::command]
+pub async fn delete_pod(
+    state: State<'_, AppState>,
+    cluster: String,
+    namespace: String,
+    name: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    let mut args = vec!["delete", "pod", name.trim(), "-n", namespace.trim()];
+    if force.unwrap_or(false) {
+        args.push("--force");
+        args.push("--grace-period=0");
+    }
+    kubectl_raw(&state, &cluster, &args).await.map(|_| ())
+}
+
+/// Generic delete for services/configmaps/secrets/PVCs/namespaces/workloads.
+#[tauri::command]
+pub async fn delete_k8s_resource(
+    state: State<'_, AppState>,
+    cluster: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    k8s_name_check(&name)?;
+    let allowed = [
+        "service",
+        "configmap",
+        "secret",
+        "persistentvolumeclaim",
+        "deployment",
+        "statefulset",
+        "daemonset",
+        "namespace",
+    ];
+    if !allowed.contains(&kind.as_str()) {
+        return Err(format!("kind '{kind}' is not deletable from the UI"));
+    }
+    let ns_owned = namespace.filter(|n| !n.is_empty() && n != "all");
+    if let Some(ns) = &ns_owned {
+        k8s_name_check(ns)?;
+    }
+    let mut args = vec!["delete", kind.trim(), name.trim()];
+    if let Some(ns) = &ns_owned {
+        args.push("-n");
+        args.push(ns.trim());
+    }
+    kubectl_raw(&state, &cluster, &args).await.map(|_| ())
+}
+
+/// Scales a Deployment/StatefulSet to `replicas`.
+#[tauri::command]
+pub async fn scale_workload(
+    state: State<'_, AppState>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    replicas: u32,
+) -> Result<(), String> {
+    k8s_name_check(&name)?;
+    if !["deployment", "statefulset"].contains(&kind.as_str()) {
+        return Err("only deployments and statefulsets are scalable".into());
+    }
+    kubectl_raw(
+        &state,
+        &cluster,
+        &[
+            "scale",
+            &kind,
+            &name,
+            "-n",
+            &namespace,
+            &format!("--replicas={replicas}"),
+        ],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Rolling-restarts a workload (`kubectl rollout restart`).
+#[tauri::command]
+pub async fn restart_workload(
+    state: State<'_, AppState>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<(), String> {
+    k8s_name_check(&name)?;
+    kubectl_raw(
+        &state,
+        &cluster,
+        &["rollout", "restart", &kind, &name, "-n", &namespace],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Creates a namespace.
+#[tauri::command]
+pub async fn create_namespace(
+    state: State<'_, AppState>,
+    cluster: String,
+    name: String,
+) -> Result<(), String> {
+    k8s_name_check(&name)?;
+    kubectl_raw(&state, &cluster, &["create", "namespace", name.trim()])
+        .await
+        .map(|_| ())
+}
+
+// ---- Service / ConfigMap+Secret / PVC listings ----
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sServiceInfo {
+    pub name: String,
+    pub namespace: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub cluster_ip: String,
+    pub ports: String,
+    pub created: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sConfigInfo {
+    pub name: String,
+    pub namespace: String,
+    /// "ConfigMap" or "Secret".
+    pub resource_kind: String,
+    pub keys: Vec<String>,
+    pub created: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sPvcInfo {
+    pub name: String,
+    pub namespace: String,
+    pub status: String,
+    pub capacity: String,
+    pub access_modes: String,
+    pub storage_class: String,
+    pub created: Option<i64>,
+}
+
+fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|s| {
+            let meta = s.get("metadata")?;
+            let ports = s
+                .get("spec")
+                .and_then(|sp| sp.get("ports"))
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|p| {
+                            let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let proto =
+                                p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+                            let node = p
+                                .get("nodePort")
+                                .and_then(|v| v.as_u64())
+                                .map(|np| format!(":{np}"))
+                                .unwrap_or_default();
+                            format!("{port}{node}/{proto}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            Some(K8sServiceInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                namespace: meta
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                kind: s
+                    .get("spec")
+                    .and_then(|sp| sp.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ClusterIP")
+                    .to_string(),
+                cluster_ip: s
+                    .get("spec")
+                    .and_then(|sp| sp.get("clusterIP"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                ports,
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+fn parse_config_resources(json: &serde_json::Value, resource_kind: &str) -> Vec<K8sConfigInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|c| {
+            let meta = c.get("metadata")?;
+            let keys = c
+                .get("data")
+                .and_then(|d| d.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            Some(K8sConfigInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                namespace: meta
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                resource_kind: resource_kind.to_string(),
+                keys,
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+fn parse_pvcs(json: &serde_json::Value) -> Vec<K8sPvcInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|p| {
+            let meta = p.get("metadata")?;
+            let spec = p.get("spec")?;
+            let status = p.get("status")?;
+            Some(K8sPvcInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                namespace: meta
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                status: status
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                capacity: status
+                    .get("capacity")
+                    .and_then(|c| c.get("storage"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                access_modes: spec
+                    .get("accessModes")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+                storage_class: spec
+                    .get("storageClassName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn get_cluster_services(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<Vec<K8sServiceInfo>, String> {
+    let v = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "services", "--all-namespaces", "-o", "json"],
+    )
+    .await?;
+    Ok(parse_services(&v))
+}
+
+#[tauri::command]
+pub async fn get_cluster_config_resources(
+    state: State<'_, AppState>,
+    cluster: String,
+    include_secrets: Option<bool>,
+) -> Result<Vec<K8sConfigInfo>, String> {
+    let mut out = Vec::new();
+    let cm = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "configmaps", "--all-namespaces", "-o", "json"],
+    )
+    .await?;
+    out.extend(parse_config_resources(&cm, "ConfigMap"));
+    if include_secrets.unwrap_or(true) {
+        let sec = kubectl_json(
+            &state,
+            &cluster,
+            &["get", "secrets", "--all-namespaces", "-o", "json"],
+        )
+        .await?;
+        out.extend(parse_config_resources(&sec, "Secret"));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn get_cluster_pvcs(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<Vec<K8sPvcInfo>, String> {
+    let v = kubectl_json(
+        &state,
+        &cluster,
+        &[
+            "get",
+            "persistentvolumeclaims",
+            "--all-namespaces",
+            "-o",
+            "json",
+        ],
+    )
+    .await?;
+    Ok(parse_pvcs(&v))
+}
+
 #[cfg(test)]
 mod monitor_tests {
     use super::*;
@@ -1570,6 +2116,56 @@ mod monitor_tests {
         assert_eq!(w.len(), 2);
         assert_eq!((w[0].ready, w[0].desired, w[0].available), (2, 3, 2));
         assert_eq!((w[1].ready, w[1].desired), (1, 0));
+    }
+
+    #[test]
+    fn parse_services_config_and_pvcs() {
+        let svcs = serde_json::json!({
+            "items": [{
+                "metadata": { "name": "web", "namespace": "prod",
+                              "creationTimestamp": "2025-10-19T07:00:00Z" },
+                "spec": {
+                    "type": "NodePort",
+                    "clusterIP": "10.96.0.10",
+                    "ports": [{ "port": 80, "protocol": "TCP", "nodePort": 30080 }]
+                }
+            }]
+        });
+        let s = parse_services(&svcs);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].kind, "NodePort");
+        assert_eq!(s[0].ports, "80:30080/TCP");
+        assert_eq!(s[0].cluster_ip, "10.96.0.10");
+
+        let cms = serde_json::json!({
+            "items": [{
+                "metadata": { "name": "cfg", "namespace": "default" },
+                "data": { "KEY_A": "1", "KEY_B": "2" }
+            }]
+        });
+        let c = parse_config_resources(&cms, "ConfigMap");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].keys.len(), 2);
+        assert_eq!(c[0].resource_kind, "ConfigMap");
+
+        let pvcs = serde_json::json!({
+            "items": [{
+                "metadata": { "name": "data", "namespace": "app" },
+                "spec": {
+                    "storageClassName": "standard",
+                    "accessModes": ["ReadWriteOnce"]
+                },
+                "status": {
+                    "phase": "Bound",
+                    "capacity": { "storage": "1Gi" }
+                }
+            }]
+        });
+        let p = parse_pvcs(&pvcs);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].status, "Bound");
+        assert_eq!(p[0].capacity, "1Gi");
+        assert_eq!(p[0].storage_class, "standard");
     }
 
     #[test]

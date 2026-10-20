@@ -43,6 +43,10 @@ import type {
   K8sWorkloadInfo,
   K8sMetrics,
   K8sClusterSummary,
+  K8sServiceInfo,
+  K8sConfigInfo,
+  K8sPvcInfo,
+  KindClusterPrefs,
   ContainerGroup,
 } from "../types";
 
@@ -197,6 +201,28 @@ export const api = {
   // Cluster monitoring (kubectl queries inside the control-plane node)
   getClusterSummary: (cluster: string) =>
     invoke<K8sClusterSummary>("get_cluster_summary", { cluster }),
+  getClusterPrefs: (cluster: string) =>
+    invoke<KindClusterPrefs>("get_cluster_prefs", { cluster }),
+  setClusterPrefs: (cluster: string, prefs: KindClusterPrefs) =>
+    invoke<void>("set_cluster_prefs", { cluster, prefs }),
+  getPodLogs: (cluster: string, namespace: string, name: string, tail?: number) =>
+    invoke<string>("get_pod_logs", { cluster, namespace, name, tail }),
+  deletePod: (cluster: string, namespace: string, name: string, force = false) =>
+    invoke<void>("delete_pod", { cluster, namespace, name, force }),
+  deleteK8sResource: (cluster: string, kind: string, namespace: string | null, name: string) =>
+    invoke<void>("delete_k8s_resource", { cluster, kind, namespace, name }),
+  scaleWorkload: (cluster: string, kind: string, namespace: string, name: string, replicas: number) =>
+    invoke<void>("scale_workload", { cluster, kind, namespace, name, replicas }),
+  restartWorkload: (cluster: string, kind: string, namespace: string, name: string) =>
+    invoke<void>("restart_workload", { cluster, kind, namespace, name }),
+  createNamespace: (cluster: string, name: string) =>
+    invoke<void>("create_namespace", { cluster, name }),
+  getClusterServices: (cluster: string) =>
+    invoke<K8sServiceInfo[]>("get_cluster_services", { cluster }),
+  getClusterConfigResources: (cluster: string, includeSecrets = true) =>
+    invoke<K8sConfigInfo[]>("get_cluster_config_resources", { cluster, includeSecrets }),
+  getClusterPvcs: (cluster: string) =>
+    invoke<K8sPvcInfo[]>("get_cluster_pvcs", { cluster }),
   getClusterNodes: (cluster: string) =>
     invoke<K8sNodeInfo[]>("get_cluster_nodes", { cluster }),
   getClusterPods: (cluster: string, namespace?: string) =>

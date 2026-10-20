@@ -182,6 +182,12 @@ export interface AppConfig {
   engine_memory_limit_mb?: number;
   /** Engine CPU cap in cores as a string, e.g. "2.5" ("" = unlimited). */
   engine_cpu_cores?: string;
+  /** Master switch: auto-start kind clusters with the engine. */
+  kind_auto_start?: boolean;
+  /** Seconds between cluster starts (stagger). */
+  kind_auto_start_delay?: number;
+  /** Per-cluster prefs keyed by cluster name (camelCase values). */
+  kind_cluster_prefs?: Record<string, KindClusterPrefs>;
 }
 
 /** Per-feature desktop-notification toggles (tray menu + Settings card). */
@@ -568,4 +574,42 @@ export interface K8sClusterSummary {
   podSucceeded: number;
   /** Failures of individual sub-queries (pods/nodes/ns) that produced zeros. */
   errors: string[];
+}
+
+export interface K8sServiceInfo {
+  name: string;
+  namespace: string;
+  type: string;
+  clusterIp: string;
+  ports: string;
+  created: number | null;
+}
+
+export interface K8sConfigInfo {
+  name: string;
+  namespace: string;
+  /** "ConfigMap" or "Secret". */
+  resourceKind: string;
+  keys: string[];
+  created: number | null;
+}
+
+export interface K8sPvcInfo {
+  name: string;
+  namespace: string;
+  status: string;
+  capacity: string;
+  accessModes: string;
+  storageClass: string;
+  created: number | null;
+}
+
+/** Per-cluster prefs persisted in the app config. */
+export interface KindClusterPrefs {
+  /** Start together with the engine (staggered, capped). */
+  autoStart: boolean;
+  /** Per-node CPU cap in millicores (0 = unlimited). */
+  nodeCpuM: number;
+  /** Per-node memory cap in MiB (0 = unlimited). */
+  nodeMemoryMb: number;
 }

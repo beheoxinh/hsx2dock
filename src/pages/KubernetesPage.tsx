@@ -16,6 +16,8 @@ import {
   Rocket,
   Play,
   Square,
+  Settings2,
+  Activity,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -23,7 +25,12 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime } from "../lib/utils";
-import type { KindCluster, KindInstallStatus, KindProgressPayload } from "../types";
+import type {
+  KindCluster,
+  KindClusterPrefs,
+  KindInstallStatus,
+  KindProgressPayload,
+} from "../types";
 
 interface KubernetesPageProps {
   refreshKey?: number;
@@ -67,6 +74,46 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clusters]);
 
+  // Page-level split: manage clusters vs watch/manage their internals.
+  const [pageTab, setPageTab] = useState<"clusters" | "monitor">("clusters");
+
+  // Per-cluster prefs (auto-start, per-node caps) mirrored from the config.
+  const [prefsByName, setPrefsByName] = useState<Record<string, KindClusterPrefs>>({});
+  const [prefsEdit, setPrefsEdit] = useState<
+    (KindClusterPrefs & { name: string; isNew?: boolean }) | null
+  >(null);
+  const [prefsSaving, setPrefsSaving] = useState(false);
+  const loadPrefs = async () => {
+    try {
+      const cfg = await api.getAppConfig();
+      setPrefsByName(cfg.kind_cluster_prefs ?? {});
+    } catch (e) {
+      console.error(e);
+    }
+  };
+  const savePrefs = async () => {
+    if (!prefsEdit) return;
+    const trimmed = {
+      autoStart: prefsEdit.autoStart,
+      nodeCpuM: Math.max(0, Math.round(prefsEdit.nodeCpuM || 0)),
+      nodeMemoryMb: Math.max(0, Math.round(prefsEdit.nodeMemoryMb || 0)),
+    };
+    try {
+      setPrefsSaving(true);
+      await api.setClusterPrefs(prefsEdit.name, trimmed);
+      setPrefsByName((p) => ({ ...p, [prefsEdit.name]: trimmed }));
+      toast.success("Cluster prefs saved", prefsEdit.name);
+      setPrefsEdit(null);
+      await loadAll();
+    } catch (e) {
+      toast.error("Could not save prefs", String(e));
+    } finally {
+      setPrefsSaving(false);
+    }
+  };
+  const prefsFor = (name: string): KindClusterPrefs =>
+    prefsByName[name] ?? { autoStart: false, nodeCpuM: 0, nodeMemoryMb: 0 };
+
   const loadAll = async () => {
     try {
       setLoading(true);
@@ -82,10 +129,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
     } finally {
       setLoading(false);
     }
+    loadPrefs();
   };
 
   useEffect(() => {
     loadAll();
+    loadPrefs();
   }, [refreshKey]);
 
   // Pre-fill the create form from Settings → Kubernetes defaults.
@@ -433,8 +482,27 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
         </div>
       )}
 
-      {/* Search */}
-      {clusters.length > 0 && (
+      {/* Tabs: Clusters / Monitoring */}
+      <div className="flex items-center gap-2 border-b border-zinc-800/80">
+        {(["clusters", "monitor"] as const).map((k) => (
+          <button
+            key={k}
+            onClick={() => setPageTab(k)}
+            className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+              pageTab === k
+                ? "text-white border-b-2 border-indigo-400"
+                : "text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            {k === "clusters" ? "Clusters" : "Monitoring"}
+          </button>
+        ))}
+      </div>
+
+      {pageTab === "clusters" && (
+        <>
+          {/* Search */}
+          {clusters.length > 0 && (
         <div className="relative w-64">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
           <input
@@ -477,6 +545,32 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                         {c.has_kubeconfig && (
                           <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/60 font-mono">
                             kubeconfig
+                          </span>
+                        )}
+                        {prefsFor(c.name).autoStart && (
+                          <span
+                            title="Starts with the engine (staggered)"
+                            className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30"
+                          >
+                            auto-start
+                          </span>
+                        )}
+                        {(prefsFor(c.name).nodeCpuM > 0 ||
+                          prefsFor(c.name).nodeMemoryMb > 0) && (
+                          <span
+                            title="Per-node resource caps"
+                            className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 font-mono"
+                          >
+                            {prefsFor(c.name).nodeCpuM > 0
+                              ? `${(prefsFor(c.name).nodeCpuM / 1000).toFixed(1)} cpu`
+                              : ""}
+                            {prefsFor(c.name).nodeCpuM > 0 &&
+                            prefsFor(c.name).nodeMemoryMb > 0
+                              ? " · "
+                              : ""}
+                            {prefsFor(c.name).nodeMemoryMb > 0
+                              ? `${prefsFor(c.name).nodeMemoryMb} MB`
+                              : ""}
                           </span>
                         )}
                       </div>
@@ -535,6 +629,24 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
                   <Button
                     variant="ghost"
                     size="icon"
+                    onClick={() => {
+                      const p = prefsFor(c.name);
+                      setPrefsEdit({
+                        name: c.name,
+                        autoStart: p.autoStart,
+                        nodeCpuM: p.nodeCpuM,
+                        nodeMemoryMb: p.nodeMemoryMb,
+                      });
+                    }}
+                    disabled={!!busyOp}
+                    title="Cluster auto-start & per-node resource caps"
+                    className="text-zinc-400 hover:text-white"
+                  >
+                    <Settings2 className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     onClick={() => handleDelete(c.name)}
                     disabled={!!busyOp}
                     title="Delete Cluster"
@@ -578,9 +690,23 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
         </div>
       )}
 
+        </>
+      )}
+
       {/* Live monitoring for the selected running cluster */}
-      {monitorFor && (
-        <div className="mt-6 space-y-3">
+      {pageTab === "monitor" && !monitorFor && (
+        <div className="py-16 text-center text-zinc-500">
+          <Activity className="w-10 h-10 mx-auto text-zinc-600 mb-3" />
+          <p className="text-sm text-zinc-300 font-medium">
+            No running cluster to monitor
+          </p>
+          <p className="text-xs mt-1">
+            Start a cluster from the Clusters tab to see live health, pods and resources.
+          </p>
+        </div>
+      )}
+      {pageTab === "monitor" && monitorFor && (
+        <div className="mt-2 space-y-3">
           {runningClusters.length > 1 && (
             <div className="flex items-center gap-2 text-xs text-zinc-400">
               <span>Watching cluster</span>
@@ -600,6 +726,112 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({ refreshKey }) =>
           <ClusterMonitor key={monitorFor} cluster={monitorFor} />
         </div>
       )}
+
+      {/* Cluster prefs modal (auto-start + per-node caps) */}
+      <AnimatePresence>
+        {prefsEdit && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 8 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 8 }}
+              className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl"
+            >
+              <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
+                <div>
+                  <span className="text-sm font-semibold text-white">
+                    Cluster settings: {prefsEdit.name}
+                  </span>
+                  <p className="text-[11px] text-zinc-500 mt-0.5">
+                    Auto-start & per-node caps keep clusters from starving the host.
+                  </p>
+                </div>
+                <button
+                  onClick={() => setPrefsEdit(null)}
+                  className="text-zinc-400 hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="px-5 py-4 space-y-4">
+                <label className="flex items-center justify-between gap-3 text-sm text-zinc-200">
+                  <span>Auto-start with engine</span>
+                  <input
+                    type="checkbox"
+                    checked={prefsEdit.autoStart}
+                    onChange={(e) =>
+                      setPrefsEdit({ ...prefsEdit, autoStart: e.target.checked })
+                    }
+                    className="rounded border-zinc-700 w-4 h-4"
+                  />
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-zinc-400 mb-1">
+                      CPU per node (cores, 0 = unlimited)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.5}
+                      value={prefsEdit.nodeCpuM / 1000}
+                      onChange={(e) =>
+                        setPrefsEdit({
+                          ...prefsEdit,
+                          nodeCpuM: Math.max(0, Math.round((Number(e.target.value) || 0) * 1000)),
+                        })
+                      }
+                      className="h-9 w-full px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-zinc-400 mb-1">
+                      Memory per node (MB, 0 = unlimited)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={prefsEdit.nodeMemoryMb}
+                      onChange={(e) =>
+                        setPrefsEdit({
+                          ...prefsEdit,
+                          nodeMemoryMb: Math.max(0, Number(e.target.value) || 0),
+                        })
+                      }
+                      className="h-9 w-full px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                </div>
+                <p className="text-[11px] text-zinc-600">
+                  Caps apply immediately (running nodes update via docker update) and
+                  re-apply on every start. The auto-start master switch and stagger
+                  delay live in Settings → Kubernetes.
+                </p>
+              </div>
+              <div className="flex justify-end gap-2 px-5 py-4 border-t border-zinc-800">
+                <Button variant="ghost" size="sm" onClick={() => setPrefsEdit(null)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={savePrefs}
+                  disabled={prefsSaving}
+                  className="gap-2"
+                >
+                  {prefsSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  Save
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Create cluster modal */}
       <AnimatePresence>

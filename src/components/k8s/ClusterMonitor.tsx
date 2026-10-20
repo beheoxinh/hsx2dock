@@ -4,34 +4,55 @@ import {
   AlertTriangle,
   Boxes,
   CheckCircle2,
+  Copy,
   Download,
+  FileText,
+  Folder,
   Hexagon,
   Loader2,
   Package,
   RefreshCw,
+  RotateCw,
   Search,
   Server,
+  Trash2,
+  X,
 } from "lucide-react";
 import { Button } from "../ui/Button";
+import { useModal } from "../ui/ModalContext";
 import { useToast } from "../ui/Toast";
 import { api } from "../../lib/api";
 import { formatBytes, formatRelativeTime } from "../../lib/utils";
 import type {
   K8sClusterSummary,
+  K8sConfigInfo,
   K8sEventInfo,
   K8sMetrics,
   K8sNodeInfo,
   K8sPodInfo,
+  K8sPvcInfo,
+  K8sServiceInfo,
   K8sWorkloadInfo,
 } from "../../types";
 
-type MonitorTab = "overview" | "nodes" | "podlist" | "workloads" | "events";
+type MonitorTab =
+  | "overview"
+  | "nodes"
+  | "podlist"
+  | "workloads"
+  | "services"
+  | "config"
+  | "pvcs"
+  | "events";
 
 const TABS: { id: MonitorTab; label: string; icon: React.ElementType }[] = [
   { id: "overview", label: "Overview", icon: Activity },
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "podlist", label: "Pods", icon: Package },
   { id: "workloads", label: "Workloads", icon: Boxes },
+  { id: "services", label: "Services", icon: Folder },
+  { id: "config", label: "Config/Secrets", icon: FileText },
+  { id: "pvcs", label: "PVCs", icon: Package },
   { id: "events", label: "Events", icon: AlertTriangle },
 ];
 
@@ -111,6 +132,24 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   const [podNs, setPodNs] = useState("all");
   const [podSearch, setPodSearch] = useState("");
   const [installingMs, setInstallingMs] = useState(false);
+  const modal = useModal();
+
+  // Extra resource listings (tab-scoped, polled with the slow tick).
+  const [services, setServices] = useState<K8sServiceInfo[]>([]);
+  const [configs, setConfigs] = useState<K8sConfigInfo[]>([]);
+  const [pvcs, setPvcs] = useState<K8sPvcInfo[]>([]);
+
+  // Pod logs viewer.
+  const [logsFor, setLogsFor] = useState<{ ns: string; name: string } | null>(null);
+  const [logsText, setLogsText] = useState<string>("");
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
+
+  // Workload scale prompt.
+  const [scaleFor, setScaleFor] = useState<
+    { kind: string; ns: string; name: string; current: number } | null
+  >(null);
+  const [scaleValue, setScaleValue] = useState(1);
 
   useEffect(() => {
     setTab("overview");
@@ -119,6 +158,12 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     setPods([]);
     setEvents([]);
     setWorkloads([]);
+    setServices([]);
+    setConfigs([]);
+    setPvcs([]);
+    setLogsFor(null);
+    setLogsText("");
+    setScaleFor(null);
     setMetrics(null);
     setMonitorError(null);
     setPodNs("all");
@@ -146,15 +191,21 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     };
     const slow = async () => {
       try {
-        const [n, ev, w] = await Promise.all([
+        const [n, ev, w, sv, cf, pv] = await Promise.all([
           api.getClusterNodes(cluster),
           api.getClusterEvents(cluster),
           api.getClusterWorkloads(cluster),
+          api.getClusterServices(cluster),
+          api.getClusterConfigResources(cluster),
+          api.getClusterPvcs(cluster),
         ]);
         if (!alive) return;
         setNodes(n);
         setEvents(ev);
         setWorkloads(w);
+        setServices(sv);
+        setConfigs(cf);
+        setPvcs(pv);
       } catch {
         /* fast poll surfaces connectivity errors */
       }
@@ -244,6 +295,104 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     } finally {
       setInstallingMs(false);
     }
+  };
+
+  // ---- Pod / workload / resource actions ----
+
+  const loadLogs = async (ns: string, name: string, tail = 300) => {
+    setLogsLoading(true);
+    setLogsError(null);
+    try {
+      setLogsText(await api.getPodLogs(cluster, ns, name, tail));
+    } catch (e) {
+      setLogsText("");
+      setLogsError(String(e));
+    } finally {
+      setLogsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (logsFor) loadLogs(logsFor.ns, logsFor.name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logsFor?.ns, logsFor?.name, cluster]);
+
+  const handleDeletePod = async (p: K8sPodInfo) => {
+    const ok = await modal.showConfirm(
+      `Delete pod '${p.name}' in ${p.namespace}? Its controller will recreate it.`,
+      "Delete Pod",
+      "danger"
+    );
+    if (!ok) return;
+    try {
+      await api.deletePod(cluster, p.namespace, p.name);
+      toast.success("Pod deleted", `${p.namespace}/${p.name}`);
+      api.getClusterPods(cluster).then(setPods).catch(() => {});
+    } catch (e) {
+      toast.error("Delete failed", String(e));
+    }
+  };
+
+  const handleDeleteResource = async (
+    kind: string,
+    ns: string,
+    name: string,
+    label: string
+  ) => {
+    const ok = await modal.showConfirm(
+      `Delete ${label} '${name}' in ${ns}?`,
+      `Delete ${label}`,
+      "danger"
+    );
+    if (!ok) return;
+    try {
+      await api.deleteK8sResource(cluster, kind, ns, name);
+      toast.success(`${label} deleted`, `${ns}/${name}`);
+      slowRefresh();
+    } catch (e) {
+      toast.error("Delete failed", String(e));
+    }
+  };
+
+  const handleRestart = async (w: K8sWorkloadInfo) => {
+    try {
+      await api.restartWorkload(cluster, w.kind.toLowerCase(), w.namespace, w.name);
+      toast.success("Rolling restart started", `${w.kind} ${w.namespace}/${w.name}`);
+    } catch (e) {
+      toast.error("Restart failed", String(e));
+    }
+  };
+
+  const handleScaleSubmit = async () => {
+    if (!scaleFor) return;
+    try {
+      await api.scaleWorkload(
+        cluster,
+        scaleFor.kind.toLowerCase(),
+        scaleFor.ns,
+        scaleFor.name,
+        Math.max(0, scaleValue)
+      );
+      toast.success(
+        "Scaled",
+        `${scaleFor.name} → ${Math.max(0, scaleValue)} replica(s)`
+      );
+      setScaleFor(null);
+      api.getClusterWorkloads(cluster).then(setWorkloads).catch(() => {});
+    } catch (e) {
+      toast.error("Scale failed", String(e));
+    }
+  };
+
+  const slowRefresh = () => {
+    api.getClusterNodes(cluster).then(setNodes).catch(() => {});
+    api.getClusterEvents(cluster).then(setEvents).catch(() => {});
+    api.getClusterWorkloads(cluster).then(setWorkloads).catch(() => {});
+    api.getClusterServices(cluster).then(setServices).catch(() => {});
+    api.getClusterConfigResources(cluster).then(setConfigs).catch(() => {});
+    api.getClusterPvcs(cluster).then(setPvcs).catch(() => {});
+    api.getClusterPods(cluster).then(setPods).catch(() => {});
+    api.getClusterSummary(cluster).then(setSummary).catch(() => {});
   };
 
   const cpuPct = totalCpuCap > 0 ? (totalCpuUsed / totalCpuCap) * 100 : 0;
@@ -607,6 +756,7 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                     <th className="px-3 py-2 min-w-28">CPU</th>
                     <th className="px-3 py-2 min-w-28">Memory</th>
                     <th className="px-3 py-2">Age</th>
+                    <th className="px-3 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -654,12 +804,36 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                         <td className="px-3 py-2 text-zinc-500">
                           {p.created ? formatRelativeTime(p.created) : "-"}
                         </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center justify-end gap-1">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="View logs"
+                              aria-label="View pod logs"
+                              onClick={() => setLogsFor({ ns: p.namespace, name: p.name })}
+                              className="h-6 w-6 text-zinc-400 hover:text-white"
+                            >
+                              <FileText className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Delete pod"
+                              aria-label="Delete pod"
+                              onClick={() => handleDeletePod(p)}
+                              className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </td>
                       </tr>
                     );
                   })}
                   {filteredPods.length === 0 && (
                     <tr>
-                      <td colSpan={9} className="px-3 py-8 text-center text-zinc-500">
+                      <td colSpan={10} className="px-3 py-8 text-center text-zinc-500">
                         {monitorError ? "Cluster unreachable" : "No pods match."}
                       </td>
                     </tr>
@@ -682,11 +856,13 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   <th className="px-3 py-2">Ready / Desired</th>
                   <th className="px-3 py-2">Available</th>
                   <th className="px-3 py-2 min-w-32">Health</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {workloads.map((w) => {
                   const healthy = w.desired > 0 && w.ready >= w.desired;
+                  const wk = w.kind.toLowerCase();
                   return (
                     <tr
                       key={`${w.kind}/${w.namespace}/${w.name}`}
@@ -706,12 +882,54 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                           <UsageBar pct={(w.ready / w.desired) * 100} danger={!healthy} />
                         )}
                       </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center justify-end gap-1">
+                          {(wk === "deployment" || wk === "statefulset") && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Scale"
+                              onClick={() =>
+                                setScaleFor({
+                                  kind: w.kind,
+                                  ns: w.namespace,
+                                  name: w.name,
+                                  current: w.desired,
+                                })
+                              }
+                              className="h-6 w-6 text-zinc-400 hover:text-white"
+                            >
+                              <Activity className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Rolling restart"
+                            onClick={() => handleRestart(w)}
+                            className="h-6 w-6 text-zinc-400 hover:text-white"
+                          >
+                            <RotateCw className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Delete workload"
+                            onClick={() =>
+                              handleDeleteResource(wk, w.namespace, w.name, w.kind)
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </td>
                     </tr>
                   );
                 })}
                 {workloads.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-3 py-8 text-center text-zinc-500">
+                    <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No workloads yet."}
                     </td>
                   </tr>
@@ -777,6 +995,302 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
           </div>
         )}
       </div>
+
+        {/* ============ SERVICES ============ */}
+        {tab === "services" && (
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                  <th className="px-3 py-2">Namespace</th>
+                  <th className="px-3 py-2">Name</th>
+                  <th className="px-3 py-2">Type</th>
+                  <th className="px-3 py-2">Cluster IP</th>
+                  <th className="px-3 py-2">Ports</th>
+                  <th className="px-3 py-2">Age</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {services.map((s) => (
+                  <tr
+                    key={`${s.namespace}/${s.name}`}
+                    className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                  >
+                    <td className="px-3 py-2 text-zinc-500">{s.namespace}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-200">{s.name}</td>
+                    <td className="px-3 py-2 text-zinc-400">{s.type}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-400">{s.clusterIp}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-400">{s.ports}</td>
+                    <td className="px-3 py-2 text-zinc-500">
+                      {s.created ? formatRelativeTime(s.created) : "-"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Delete service"
+                        onClick={() => handleDeleteResource("service", s.namespace, s.name, "Service")}
+                        className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+                {services.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
+                      {monitorError ? "Cluster unreachable" : "No services."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* ============ CONFIG MAPS & SECRETS ============ */}
+        {tab === "config" && (
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                  <th className="px-3 py-2">Namespace</th>
+                  <th className="px-3 py-2">Name</th>
+                  <th className="px-3 py-2">Kind</th>
+                  <th className="px-3 py-2">Keys</th>
+                  <th className="px-3 py-2">Age</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {configs.map((c) => (
+                  <tr
+                    key={`${c.resourceKind}/${c.namespace}/${c.name}`}
+                    className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                  >
+                    <td className="px-3 py-2 text-zinc-500">{c.namespace}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-200">{c.name}</td>
+                    <td className="px-3 py-2">
+                      <span
+                        className={`inline-flex rounded-md border px-1.5 py-0.5 text-[10px] ${
+                          c.resourceKind === "Secret"
+                            ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                            : "border-zinc-700 text-zinc-400"
+                        }`}
+                      >
+                        {c.resourceKind}
+                      </span>
+                    </td>
+                    <td
+                      className="px-3 py-2 font-mono text-zinc-400 max-w-64 truncate"
+                      title={c.keys.join(", ")}
+                    >
+                      {c.keys.length ? c.keys.join(", ") : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-zinc-500">
+                      {c.created ? formatRelativeTime(c.created) : "-"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title={`Delete ${c.resourceKind.toLowerCase()}`}
+                        onClick={() =>
+                          handleDeleteResource(
+                            c.resourceKind === "Secret" ? "secret" : "configmap",
+                            c.namespace,
+                            c.name,
+                            c.resourceKind
+                          )
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+                {configs.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-3 py-8 text-center text-zinc-500">
+                      {monitorError ? "Cluster unreachable" : "No config maps or secrets."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* ============ PVCs ============ */}
+        {tab === "pvcs" && (
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                  <th className="px-3 py-2">Namespace</th>
+                  <th className="px-3 py-2">Name</th>
+                  <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Capacity</th>
+                  <th className="px-3 py-2">Access</th>
+                  <th className="px-3 py-2">Class</th>
+                  <th className="px-3 py-2">Age</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pvcs.map((p) => (
+                  <tr
+                    key={`${p.namespace}/${p.name}`}
+                    className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                  >
+                    <td className="px-3 py-2 text-zinc-500">{p.namespace}</td>
+                    <td className="px-3 py-2 font-mono text-zinc-200">{p.name}</td>
+                    <td className="px-3 py-2">
+                      <span
+                        className={`inline-flex rounded-md border px-1.5 py-0.5 text-[10px] ${
+                          p.status === "Bound"
+                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                            : p.status === "Pending"
+                              ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                              : "border-zinc-700 text-zinc-400"
+                        }`}
+                      >
+                        {p.status}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-zinc-300">{p.capacity || "—"}</td>
+                    <td className="px-3 py-2 text-zinc-500">{p.accessModes}</td>
+                    <td className="px-3 py-2 text-zinc-500">{p.storageClass || "—"}</td>
+                    <td className="px-3 py-2 text-zinc-500">
+                      {p.created ? formatRelativeTime(p.created) : "-"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Delete PVC"
+                        onClick={() =>
+                          handleDeleteResource(
+                            "persistentvolumeclaim",
+                            p.namespace,
+                            p.name,
+                            "PVC"
+                          )
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+                {pvcs.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="px-3 py-8 text-center text-zinc-500">
+                      {monitorError ? "Cluster unreachable" : "No persistent volume claims."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      {/* Pod logs modal */}
+      {logsFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="flex w-full max-w-3xl flex-col rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl max-h-[80vh]">
+            <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-3">
+              <FileText className="h-4 w-4 text-zinc-400" />
+              <span className="text-sm font-semibold text-white">
+                {logsFor.ns}/{logsFor.name}
+              </span>
+              <span className="text-[11px] text-zinc-500">logs (last 300 lines)</span>
+              <div className="ml-auto flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Reload logs"
+                  onClick={() => loadLogs(logsFor.ns, logsFor.name)}
+                  className="h-7 w-7 text-zinc-400 hover:text-white"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${logsLoading ? "animate-spin" : ""}`} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Copy logs"
+                  onClick={() => navigator.clipboard.writeText(logsText).catch(() => {})}
+                  className="h-7 w-7 text-zinc-400 hover:text-white"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Close"
+                  onClick={() => setLogsFor(null)}
+                  className="h-7 w-7 text-zinc-400 hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-auto bg-zinc-950/60 px-4 py-3">
+              {logsLoading ? (
+                <p className="text-xs text-zinc-500">Loading logs…</p>
+              ) : logsError ? (
+                <p className="text-xs text-rose-400">{logsError}</p>
+              ) : (
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300">
+                  {logsText || "(empty)"}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Scale modal */}
+      {scaleFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-sm rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl">
+            <div className="border-b border-zinc-800 px-4 py-3">
+              <span className="text-sm font-semibold text-white">
+                Scale {scaleFor.kind}: {scaleFor.name}
+              </span>
+              <p className="text-[11px] text-zinc-500 mt-0.5">
+                {scaleFor.ns} · currently {scaleFor.current} replica(s)
+              </p>
+            </div>
+            <div className="px-4 py-4">
+              <label className="block text-xs text-zinc-400 mb-1">Replicas</label>
+              <input
+                type="number"
+                min={0}
+                value={scaleValue}
+                onChange={(e) => setScaleValue(Math.max(0, Number(e.target.value) || 0))}
+                className="h-9 w-full px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-indigo-500"
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleScaleSubmit();
+                  if (e.key === "Escape") setScaleFor(null);
+                }}
+              />
+            </div>
+            <div className="flex justify-end gap-2 border-t border-zinc-800 px-4 py-3">
+              <Button variant="ghost" size="sm" onClick={() => setScaleFor(null)}>
+                Cancel
+              </Button>
+              <Button variant="primary" size="sm" onClick={handleScaleSubmit}>
+                Scale
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer: manual refresh */}
       <div className="flex items-center justify-end gap-2 border-t border-zinc-800/80 px-5 py-2.5">
