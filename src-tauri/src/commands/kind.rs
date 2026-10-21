@@ -3160,7 +3160,7 @@ mod monitor_tests {
     #[tokio::test]
     #[ignore]
     async fn exec_capture_real_cluster_roundtrip() {
-        let sock = std::path::Path::new("/run/user/1000/docker-manager/docker.sock");
+        let sock = std::path::Path::new("/run/user/1000/hsx2dock/docker.sock");
         if !sock.exists() {
             eprintln!("engine socket absent, skipping");
             return;

@@ -50,17 +50,17 @@ the two, so `docker ...` in any terminal talks to this app's engine.
 
 - Turn the **Docker CLI** switch on. The app then, and every 10s while on:
   - creates `$XDG_RUNTIME_DIR/docker.sock` as a symlink to the engine socket;
-  - creates a `docker-manager-engine` context pointing at the engine.
+  - creates a `hsx2dock-engine` context pointing at the engine.
   It never touches `/var/run/docker.sock` or any other context, and nothing is
   written when the switch is off.
 - With the switch on, use either:
-  - `docker --context docker-manager-engine ps`, or
+  - `docker --context hsx2dock-engine ps`, or
   - enable **Set as default context** in Preferences (Engine group) so plain
     `docker ps` works.
 - The status pill shows **Connected** (context active), **Partial** (mapped but
   not the active context) or **Disconnected**.
 - Turning the switch off leaves an existing symlink/context in place; remove
-  them with `docker context rm docker-manager-engine` and `rm
+  them with `docker context rm hsx2dock-engine` and `rm
   $XDG_RUNTIME_DIR/docker.sock` if you want a clean slate.
 
 Since the link only points at the engine socket, a stopped engine makes

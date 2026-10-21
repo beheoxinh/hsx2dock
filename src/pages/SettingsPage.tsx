@@ -674,7 +674,7 @@ export const SettingsPage: React.FC = () => {
                 type="text"
                 readOnly
                 disabled
-                value={config.data_root || "Default: ~/.local/share/docker-manager/data"}
+                value={config.data_root || "Default: ~/.local/share/hsx2dock/data"}
                 className="flex-1 h-10 px-3.5 rounded-xl bg-zinc-950/80 border border-zinc-800 text-sm text-zinc-300 font-mono cursor-not-allowed select-text opacity-90"
               />
               <Button

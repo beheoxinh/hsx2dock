@@ -6,6 +6,7 @@ pub mod commands;
 pub mod config;
 pub mod docker;
 pub mod fsutil;
+pub mod migrate;
 pub mod runtime;
 pub mod state;
 pub mod tray;
@@ -118,6 +119,9 @@ fn start_background_monitoring(app_handle: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Rename any pre-rebrand (`docker-manager`) tree before anything reads a
+    // path, so `AppState`/`EnginePaths` only ever see the new identity.
+    crate::migrate::migrate_legacy_identity();
     let app_state = crate::runtime::runtime().block_on(AppState::new());
 
     tauri::Builder::default()
@@ -136,6 +140,15 @@ pub fn run() {
                     let mode = crate::runtime::runtime()
                         .block_on(async { state.config.read().await.cli_mode.clone() });
                     docker::engine::set_cli_mode(&mode);
+                }
+                // The shim hardcodes the engine socket and DOCKER_CONFIG paths.
+                // Rewrite it on every launch so it follows the current layout
+                // (including a tree just migrated from the old names) instead
+                // of pointing at a socket that no longer exists.
+                {
+                    let config = crate::runtime::runtime()
+                        .block_on(async { state.config.read().await.clone() });
+                    crate::commands::system::refresh_shim(&state, &config);
                 }
                 let should_autostart = crate::runtime::runtime().block_on(async {
                     state.config.read().await.auto_start_daemon

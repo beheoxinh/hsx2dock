@@ -75,7 +75,7 @@ impl KindPaths {
     /// storage is migrated).
     pub fn for_app() -> Self {
         let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        Self::new(&data.join("docker-manager"))
+        Self::new(&data.join(crate::migrate::APP_DIR))
     }
 
     /// Builds paths under the shared app data root (same base the engine uses).

@@ -68,7 +68,7 @@ pub struct EnginePaths {
     pub log_file: PathBuf,
     pub pid_file: PathBuf,
     pub socket: PathBuf,
-    /// `XDG_RUNTIME_DIR/docker-manager` — passed to the child as its runtime dir.
+    /// `XDG_RUNTIME_DIR/hsx2dock` — passed to the child as its runtime dir.
     pub runtime_dir: PathBuf,
     pub exec_root: PathBuf,
     pub rootless_state: PathBuf,
@@ -89,8 +89,8 @@ impl EnginePaths {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let data = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
         let runtime = dirs::runtime_dir().unwrap_or_else(|| home.join(".local/state"));
-        let base = data.join("docker-manager");
-        let rt = runtime.join("docker-manager");
+        let base = data.join(crate::migrate::APP_DIR);
+        let rt = runtime.join(crate::migrate::APP_DIR);
         let data_root = match custom_data_root {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p.trim()),
             _ => base.join("data"),
@@ -761,8 +761,10 @@ pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
 pub fn dtype_compat_root() -> Option<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let candidates = [
-        home.join(".local/share/docker-manager/dtype-compat"),
-        PathBuf::from("/tmp/docker-manager-dtype-compat"),
+        home.join(".local/share")
+            .join(crate::migrate::APP_DIR)
+            .join("dtype-compat"),
+        PathBuf::from("/tmp").join(crate::migrate::DTYPE_COMPAT_DIR),
     ];
 
     candidates.into_iter().find(|candidate| {
@@ -1006,7 +1008,9 @@ pub fn apply_cgroup_limits(pid: u32, memory_mb: u64, cpu_cores: f64) -> Result<S
         .map(str::trim)
         .filter(|p| !p.is_empty() && *p != "/")
         .ok_or_else(|| "the process is not running under a writable cgroup v2 scope".to_string())?;
-    let dir = std::path::PathBuf::from("/sys/fs/cgroup").join(cg_rel.trim_start_matches('/')).join("docker-manager-engine");
+    let dir = std::path::PathBuf::from("/sys/fs/cgroup")
+        .join(cg_rel.trim_start_matches('/'))
+        .join("hsx2dock-engine");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create cgroup {}: {e}", dir.display()))?;
 
@@ -1816,14 +1820,22 @@ pub fn shim_path() -> Option<PathBuf> {
 
 /// Marker so we never delete a shim we did not write, and can tell an old
 /// shim from a real binary.
-const SHIM_MARKER: &str = "# docker-manager shim";
+const SHIM_MARKER: &str = "# hsx2dock shim";
+
+/// Marker written by builds before the rename to Hsx2Dock. Still recognised as
+/// ours so the shim can be regenerated in place instead of being refused.
+const LEGACY_SHIM_MARKER: &str = "# docker-manager shim";
 
 /// True when `path` is the script we generate, not a real binary the user
 /// installed (nor someone else's file that merely mentions us).
 fn is_our_shim(path: &Path) -> bool {
     // The marker sits on the second line, after the `/bin/sh` shebang.
     fs::read_to_string(path)
-        .map(|c| c.lines().take(3).any(|l| l.trim() == SHIM_MARKER))
+        .map(|c| {
+            c.lines()
+                .take(3)
+                .any(|l| l.trim() == SHIM_MARKER || l.trim() == LEGACY_SHIM_MARKER)
+        })
         .unwrap_or(false)
 }
 
@@ -2622,7 +2634,7 @@ mod tests {
             p.socket.as_os_str().len() < 100,
             "unix socket path too long"
         );
-        assert!(p.data_root.to_string_lossy().contains("docker-manager"));
+        assert!(p.data_root.to_string_lossy().contains("hsx2dock"));
         assert!(p.bin_dir().ends_with("bin"));
         assert!(p.compose_plugin().ends_with("docker-compose"));
     }
@@ -2924,18 +2936,30 @@ mod tests {
     }
 
     #[test]
+    fn pre_rebrand_shim_is_still_ours() {
+        // The rebrand changed the marker; an installed shim from an older
+        // build must still be recognised so startup can rewrite it instead of
+        // refusing to overwrite it as a foreign file.
+        let tmp = std::env::temp_dir().join(format!("dm_shim_legacy_{}", std::process::id()));
+        std::fs::write(&tmp, "#!/bin/sh\n# docker-manager shim\nexec /bin/true \"$@\"\n")
+            .expect("write legacy shim");
+        assert!(is_our_shim(&tmp));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
     fn parse_shim_exec_reads_the_target() {
-        let body = "#!/bin/sh\n# docker-manager shim\nexec /usr/bin/docker \"$@\"\n";
+        let body = "#!/bin/sh\n# hsx2dock shim\nexec /usr/bin/docker \"$@\"\n";
         assert_eq!(parse_shim_exec(body), Some(PathBuf::from("/usr/bin/docker")));
-        let quoted = "#!/bin/sh\n# docker-manager shim\nexec \"/usr/bin/docker\" \"$@\"\n";
+        let quoted = "#!/bin/sh\n# hsx2dock shim\nexec \"/usr/bin/docker\" \"$@\"\n";
         assert_eq!(parse_shim_exec(quoted), Some(PathBuf::from("/usr/bin/docker")));
-        let args = "#!/bin/sh\n# docker-manager shim\nexec /usr/local/bin/docker $*\n";
+        let args = "#!/bin/sh\n# hsx2dock shim\nexec /usr/local/bin/docker $*\n";
         assert_eq!(
             parse_shim_exec(args),
             Some(PathBuf::from("/usr/local/bin/docker"))
         );
         // No exec line → nothing to report, so the caller cannot claim staleness.
-        assert!(parse_shim_exec("#!/bin/sh\n# docker-manager shim\n").is_none());
+        assert!(parse_shim_exec("#!/bin/sh\n# hsx2dock shim\n").is_none());
     }
 }
 

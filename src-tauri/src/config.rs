@@ -18,11 +18,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub compose_file: String,
     /// Create/repair `$XDG_RUNTIME_DIR/docker.sock -> engine socket` (and the
-    /// `docker-manager-engine` context) so the system `docker` CLI reaches our
+    /// `hsx2dock-engine` context) so the system `docker` CLI reaches our
     /// engine. On by default: it is the feature this app exists for.
     #[serde(default = "default_true")]
     pub cli_bridge_enabled: bool,
-    /// Also run `docker context use docker-manager-engine` so plain `docker`
+    /// Also run `docker context use hsx2dock-engine` so plain `docker`
     /// works without `--context`. Ignored unless `cli_bridge_enabled`.
     /// On by default, so a fresh install "just works".
     #[serde(default = "default_true")]
@@ -33,7 +33,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub cli_bridge_prev_context: String,
     /// Custom storage directory for containers, images, and volumes.
-    /// If empty, defaults to `$XDG_DATA_HOME/docker-manager/data`.
+    /// If empty, defaults to `$XDG_DATA_HOME/hsx2dock/data`.
     #[serde(default)]
     pub data_root: String,
     /// UI Theme preference: "system" | "dark" | "light"
@@ -290,7 +290,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("docker-manager"))
+        dirs::config_dir().map(|d| d.join("hsx2dock"))
     }
 
     pub fn config_path() -> Option<PathBuf> {

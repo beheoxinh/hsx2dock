@@ -6,7 +6,7 @@
 //! 1. **Symlink** `$XDG_RUNTIME_DIR/docker.sock -> <engine socket>` — where
 //!    rootless/XDG-convention tools look. Never touches `/var/run/docker.sock`
 //!    (root-owned; stealing it would break a system docker daemon).
-//! 2. **Docker context** `docker-manager-engine` pointing at the engine socket.
+//! 2. **Docker context** `hsx2dock-engine` pointing at the engine socket.
 //!    `docker context use` makes the system CLI default to it. We create/repair
 //!    only our own context and never modify any other.
 //!
@@ -22,7 +22,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Context name this app owns. Namespaced, so it never collides by accident.
-pub const CONTEXT_NAME: &str = "docker-manager-engine";
+pub const CONTEXT_NAME: &str = "hsx2dock-engine";
+
+/// Context name written by builds before the rename to Hsx2Dock. Still removed
+/// on sight: it points at the old runtime socket, which no longer exists.
+const LEGACY_CONTEXT_NAME: &str = "docker-manager-engine";
 
 /// `$XDG_RUNTIME_DIR/docker.sock` — the conventional rootless socket path.
 pub fn xdg_socket() -> PathBuf {
@@ -90,8 +94,13 @@ pub fn ensure_xdg_symlink(engine_socket: &Path) -> anyhow::Result<bool> {
             // a path under our own runtime dir, it is a stale link of ours —
             // repoint it. Anything else is foreign: leave alone.
             if let Ok(target) = std::fs::read_link(&link) {
+                // `docker-manager` is the pre-rebrand runtime dir: a link there
+                // is still ours (just stale) and must be repointed, not kept.
                 let ours = dirs::runtime_dir()
-                    .map(|r| target.starts_with(r.join("docker-manager")))
+                    .map(|r| {
+                        target.starts_with(r.join("hsx2dock"))
+                            || target.starts_with(r.join("docker-manager"))
+                    })
                     .unwrap_or(false);
                 if ours {
                     let _ = std::fs::remove_file(&link);
@@ -191,6 +200,75 @@ pub fn set_context_default_named(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(ok, "docker context use {name} failed");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Legacy (pre-rebrand) context cleanup
+// ---------------------------------------------------------------------------
+
+/// Delete the context left behind by the `docker-manager`-named build.
+///
+/// Done at the file level on purpose: the legacy context points at a runtime
+/// socket that no longer exists, and the cleanup must work even when no
+/// `docker` binary is on `PATH`.
+pub fn migrate_legacy_context() {
+    let removed = remove_context_named(LEGACY_CONTEXT_NAME);
+    // A dangling `currentContext` makes *every* `docker` call fail with
+    // "context does not exist", so clear it even when the files were already
+    // gone.
+    let cleared = clear_current_context_if(LEGACY_CONTEXT_NAME);
+    if removed || cleared {
+        tracing::info!("removed the pre-rebrand docker context `{LEGACY_CONTEXT_NAME}`");
+    }
+}
+
+/// Remove context `name` from `<DOCKER_CONFIG>/contexts` (meta + tls).
+///
+/// Returns `true` when something was actually deleted. Contexts are stored
+/// under a sha256 of their name, so the name is read back from `meta.json`
+/// instead of recomputing the hash.
+fn remove_context_named(name: &str) -> bool {
+    let meta_root = contexts_meta_dir();
+    let Ok(entries) = std::fs::read_dir(&meta_root) else {
+        return false;
+    };
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("meta.json")) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if meta.get("Name").and_then(|n| n.as_str()) != Some(name) {
+            continue;
+        }
+        let id = entry.file_name();
+        let _ = std::fs::remove_dir_all(entry.path());
+        let _ = std::fs::remove_dir_all(docker_config_dir().join("contexts").join("tls").join(&id));
+        removed = true;
+    }
+    removed
+}
+
+/// Reset `currentContext` in `<DOCKER_CONFIG>/config.json` when it names
+/// `name`, leaving every other key of the user's config untouched.
+fn clear_current_context_if(name: &str) -> bool {
+    let path = docker_config_dir().join("config.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    if json.get("currentContext").and_then(|v| v.as_str()) != Some(name) {
+        return false;
+    }
+    json["currentContext"] = serde_json::Value::String(String::new());
+    match serde_json::to_string_pretty(&json) {
+        Ok(out) => std::fs::write(&path, out).is_ok(),
+        Err(_) => false,
+    }
+}
 /// Names of the contexts the CLI currently knows about, from `config.json`'s
 /// sibling `contexts/meta/*/meta.json` files. No `docker` spawn.
 pub fn available_context_names() -> Vec<String> {
@@ -235,7 +313,7 @@ pub enum CliLink {
     /// Context exists and is the active default → plain `docker` works.
     Connected,
     /// Mapped somewhere (symlink and/or context) but not the active default →
-    /// `docker --context docker-manager-engine ...` or `-H` needed.
+    /// `docker --context hsx2dock-engine ...` or `-H` needed.
     Partial,
     /// Nothing maps the CLI to our engine.
     Disconnected,
@@ -421,7 +499,7 @@ mod tests {
     /// this, a test would read the developer's real `~/.docker/config.json`,
     /// so its result depended on whatever context the machine happened to have
     /// selected — `teardown_at_ignores_foreign_symlink` failed whenever the
-    /// live context was `docker-manager-engine`.
+    /// live context was `hsx2dock-engine`.
     fn isolate_docker_config(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
         let guard = CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DOCKER_CONFIG", dir);
@@ -541,5 +619,64 @@ mod tests {
             resolve_restore_target(Some(CONTEXT_NAME), &avail),
             "default"
         );
+    }
+
+    #[test]
+    fn legacy_context_is_removed_with_its_default_entry() {
+        let dir = tmpdir("legacyctx");
+        let _g = isolate_docker_config(&dir);
+        let meta = dir.join("contexts/meta/abc123");
+        let tls = dir.join("contexts/tls/abc123");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::create_dir_all(&tls).unwrap();
+        std::fs::write(
+            meta.join("meta.json"),
+            format!(r#"{{"Name":"{LEGACY_CONTEXT_NAME}","Metadata":{{}},"Endpoints":{{}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"currentContext":"{LEGACY_CONTEXT_NAME}","auths":{{}}}}"#),
+        )
+        .unwrap();
+
+        migrate_legacy_context();
+
+        assert!(!meta.exists(), "legacy metadata must be gone");
+        assert!(!tls.exists(), "legacy tls dir must be gone");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["currentContext"], "",
+            "must fall back to the CLI default"
+        );
+        assert!(cfg.get("auths").is_some(), "other keys must survive");
+    }
+
+    #[test]
+    fn legacy_cleanup_leaves_foreign_contexts_alone() {
+        let dir = tmpdir("foreignctx");
+        let _g = isolate_docker_config(&dir);
+        let meta = dir.join("contexts/meta/target");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("meta.json"),
+            r#"{"Name":"desktop-linux","Metadata":{},"Endpoints":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"currentContext":"desktop-linux"}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_context();
+
+        assert!(meta.exists(), "foreign contexts are never touched");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["currentContext"], "desktop-linux");
     }
 }

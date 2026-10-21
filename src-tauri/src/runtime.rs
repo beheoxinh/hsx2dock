@@ -13,7 +13,7 @@ pub fn runtime() -> &'static Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
-            .thread_name("docker-manager-rt")
+            .thread_name("hsx2dock-rt")
             .build()
             .expect("failed to build shared Tokio runtime")
     })

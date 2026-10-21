@@ -3,7 +3,7 @@
 Hsx2Dock reads a TOML file (override with `--config <path>`):
 
 ```toml
-# ~/.config/docker-manager/config.toml
+# ~/.config/hsx2dock/config.toml
 socket = "/var/run/docker.sock"   # optional: force a socket path
 daemon_unit = "docker.service"    # systemd user unit for Start/Stop
 terminal = "ptyxis"               # ptyxis | gnome-terminal | auto
@@ -32,5 +32,5 @@ the entry widget afterwards.
 ## CLI flags
 
 ```sh
-hsx2dock --socket /var/run/docker.sock --config ~/.config/docker-manager/config.toml
+hsx2dock --socket /var/run/docker.sock --config ~/.config/hsx2dock/config.toml
 ```

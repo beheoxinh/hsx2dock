@@ -49,12 +49,12 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   history, and per-category desktop notifications (build/pull/push, engine
   transitions, kind events), configurable from Settings → Notifications.
 - **Bundled engine** — the app downloads its own Docker Engine (official
-  static rootless binaries) into `~/.local/share/docker-manager` on first run
+  static rootless binaries) into `~/.local/share/hsx2dock` on first run
   and runs `dockerd` rootless as a child process on a private socket. Fully
   isolated: the system's Docker install is neither required nor touched.
 - **Docker CLI bridge** — optional switch on the Engine page makes the system
   `docker` command talk to this bundled engine: creates
-  `$XDG_RUNTIME_DIR/docker.sock` and a `docker-manager-engine` context, with an
+  `$XDG_RUNTIME_DIR/docker.sock` and a `hsx2dock-engine` context, with an
   optional "set as default". Re-applied every 10s while enabled; never touches
   `/var/run/docker.sock` or other contexts.
 
@@ -82,7 +82,7 @@ pnpm tauri dev
 
 ## Configuration
 
-Config lives at `~/.config/docker-manager/config.toml` (created on demand):
+Config lives at `~/.config/hsx2dock/config.toml` (created on demand):
 
 ```toml
 auto_start_daemon = true
@@ -94,9 +94,11 @@ compose_file = ""
 - `data_root` — where containers/images/volumes live (survives engine updates).
 - `kind_auto_start` / `kind_cluster_prefs` — cluster auto-start switches.
 
-The internal directory names (`docker-manager`) are kept for backwards
-compatibility with existing installs; the public identity of the app is
-**Hsx2Dock** / `com.github.hsx2dock`.
+The internal directories are named `hsx2dock` too. An install created by an
+older build keeps working: on first launch the app renames the former
+`docker-manager` config/data/runtime trees to `hsx2dock` and leaves the old
+paths behind as symlinks, so engine state, kind clusters and the old
+`docker-manager-engine` context are migrated rather than lost.
 
 ## Engine layout
 
@@ -104,14 +106,14 @@ The bundled engine lives entirely under the app's own directories — nothing is
 written outside them and the host's Docker is never touched.
 
 ```
-~/.local/share/docker-manager/
+~/.local/share/hsx2dock/
   current/bin/            dockerd, docker CLI, rootlesskit, containerd, runc…
   current/cli-plugins/    docker-compose
   current/.complete       written only after checksums verified + extracted
   data/                   containers, images, volumes (survives engine updates)
   log/engine.log          engine stdout/stderr
   engine.pid              pidfile for orphan cleanup
-$XDG_RUNTIME_DIR/docker-manager/
+$XDG_RUNTIME_DIR/hsx2dock/
   docker.sock             the private API socket the app talks to
 ```
 
