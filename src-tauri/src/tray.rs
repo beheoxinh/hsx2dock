@@ -1,19 +1,19 @@
-//! System tray: live engine-state icon, quick actions, and the desktop
-//! notification plumbing (history + prefs) behind them.
+//! System tray: live engine-state icon, Docker/cluster telemetry, and quick
+//! actions.
 //!
 //! All async work funnels through one monitor task fed by a signal channel —
-//! menu handlers and event listeners are sync closures, but toggling prefs or
-//! the engine needs `AppState`'s async locks, so they only enqueue signals.
+//! menu handlers and event listeners are sync closures, but toggling the engine
+//! needs `AppState`'s async locks, so they only enqueue signals.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::image::Image;
-use tauri::{AppHandle, Listener, Manager, Wry};
+use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::docker::models::DaemonState;
@@ -24,19 +24,17 @@ use crate::state::AppState;
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(15);
 /// Menu + tooltip refresh cadence when nothing else is happening.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-/// History entries kept for the Notifications submenu.
-const HISTORY_CAP: usize = 20;
-/// Disabled history rows rendered under the "Last:" line.
-const HISTORY_ROWS: usize = 5;
+/// Running clusters shown in the tray; the rest collapse into a "more" row.
+const MAX_CLUSTER_ROWS: usize = 5;
 
 // Menu ids — matched in the tray's `on_menu_event` handler.
 const ID_TOGGLE: &str = "engine-toggle";
 const ID_OPEN: &str = "open-dashboard";
+const ID_NAV_CONTAINERS: &str = "nav-containers";
+const ID_NAV_IMAGES: &str = "nav-images";
+const ID_NAV_CLUSTERS: &str = "nav-kubernetes";
 const ID_QUIT: &str = "quit";
-const ID_PREF_BUILD: &str = "pref-build";
-const ID_PREF_TRANSFER: &str = "pref-transfer";
-const ID_PREF_ENGINE: &str = "pref-engine";
-const ID_PREF_KIND: &str = "pref-kind";
+const CLUSTER_ROW_PREFIX: &str = "cluster-row-";
 
 enum Signal {
     Engine(DaemonState),
@@ -57,11 +55,6 @@ enum Signal {
     Menu(String),
 }
 
-struct Notice {
-    title: String,
-    ts: i64,
-}
-
 /// Everything needed to mutate the tray in place. Menu items are `Clone`
 /// (Arc-backed), so callers snapshot out of the mutex and never hold the
 /// guard across an `.await`.
@@ -71,14 +64,10 @@ struct TrayParts {
     engine_header: MenuItem<Wry>,
     containers_row: MenuItem<Wry>,
     images_row: MenuItem<Wry>,
-    kind_row: MenuItem<Wry>,
+    /// One row per running cluster, plus a trailing "and N more" row.
+    cluster_rows: Vec<MenuItem<Wry>>,
+    clusters_more: MenuItem<Wry>,
     toggle: MenuItem<Wry>,
-    last_row: MenuItem<Wry>,
-    hist_rows: Vec<MenuItem<Wry>>,
-    checks: [CheckMenuItem<Wry>; 4],
-    /// Newest-first notification history, shared so the "Last:" row stays
-    /// accurate no matter which code path toasted (monitor or menu action).
-    history: Arc<Mutex<VecDeque<Notice>>>,
     tx: tokio::sync::mpsc::UnboundedSender<Signal>,
 }
 
@@ -126,76 +115,53 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     let containers_row =
         MenuItem::with_id(app, "stats-containers", "Containers: —", false, None::<&str>)?;
     let images_row = MenuItem::with_id(app, "stats-images", "Images: —", false, None::<&str>)?;
-    let kind_row = MenuItem::with_id(app, "stats-kind", "Kind clusters: —", false, None::<&str>)?;
+    // One disabled row per cluster. `refresh` rewrites them from the same
+    // container list the Docker stats come from, so repainting the tray never
+    // triggers a kubectl round trip.
+    let cluster_rows: Vec<MenuItem<Wry>> = (0..MAX_CLUSTER_ROWS)
+        .map(|i| {
+            MenuItem::with_id(
+                app,
+                format!("{CLUSTER_ROW_PREFIX}{i}"),
+                "·",
+                false,
+                None::<&str>,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let clusters_more =
+        MenuItem::with_id(app, "clusters-more", "No kind clusters", false, None::<&str>)?;
     let toggle = MenuItem::with_id(app, ID_TOGGLE, "Start Engine", true, None::<&str>)?;
     let open = MenuItem::with_id(app, ID_OPEN, "Open Dashboard", true, None::<&str>)?;
+    let nav_containers =
+        MenuItem::with_id(app, ID_NAV_CONTAINERS, "Containers", true, None::<&str>)?;
+    let nav_images = MenuItem::with_id(app, ID_NAV_IMAGES, "Images", true, None::<&str>)?;
+    let nav_clusters =
+        MenuItem::with_id(app, ID_NAV_CLUSTERS, "Manage Kubernetes", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
-    let last_row =
-        MenuItem::with_id(app, "notif-last", "No notifications yet", false, None::<&str>)?;
-    let hist_rows: Vec<MenuItem<Wry>> = (0..HISTORY_ROWS)
-        .map(|i| MenuItem::with_id(app, format!("notif-hist-{i}"), "·", false, None::<&str>))
-        .collect::<Result<_, _>>()?;
-    // Read prefs synchronously: setup runs on the main thread before the
-    // window exists, and `AppConfig` is already loaded into `AppState`.
-    let prefs = app
-        .try_state::<AppState>()
-        .and_then(|s| s.config.try_read().ok().map(|c| c.notifications.clone()))
-        .unwrap_or_default();
-    let checks = [
-        CheckMenuItem::with_id(
-            app,
-            ID_PREF_BUILD,
-            "Build finished",
-            true,
-            prefs.build_done,
-            None::<&str>,
-        )?,
-        CheckMenuItem::with_id(
-            app,
-            ID_PREF_TRANSFER,
-            "Pull / push finished",
-            true,
-            prefs.transfer_done,
-            None::<&str>,
-        )?,
-        CheckMenuItem::with_id(
-            app,
-            ID_PREF_ENGINE,
-            "Engine state changes",
-            true,
-            prefs.engine_state,
-            None::<&str>,
-        )?,
-        CheckMenuItem::with_id(
-            app,
-            ID_PREF_KIND,
-            "Kind cluster events",
-            true,
-            prefs.kind_events,
-            None::<&str>,
-        )?,
-    ];
-
-    let notifications = Submenu::with_id(app, "notifications", "Notifications", true)?;
-    notifications.append(&last_row)?;
-    for row in &hist_rows {
-        notifications.append(row)?;
-    }
-    notifications.append(&PredefinedMenuItem::separator(app)?)?;
-    for check in &checks {
-        notifications.append(check)?;
-    }
 
     let menu = Menu::new(app)?;
     menu.append(&header)?;
     menu.append(&containers_row)?;
     menu.append(&images_row)?;
-    menu.append(&kind_row)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "clusters-title",
+        "Kubernetes clusters",
+        false,
+        None::<&str>,
+    )?)?;
+    for row in &cluster_rows {
+        menu.append(row)?;
+    }
+    menu.append(&clusters_more)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&toggle)?;
     menu.append(&open)?;
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&notifications)?;
+    menu.append(&nav_containers)?;
+    menu.append(&nav_images)?;
+    menu.append(&nav_clusters)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&quit)?;
 
@@ -223,12 +189,9 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             engine_header: header,
             containers_row,
             images_row,
-            kind_row,
+            cluster_rows,
+            clusters_more,
             toggle,
-            last_row,
-            hist_rows,
-            checks,
-            history: Arc::new(Mutex::new(VecDeque::new())),
             tx: tx.clone(),
         }),
     });
@@ -440,34 +403,21 @@ async fn handle_menu(app: &AppHandle, id: &str) {
             }
         }
         ID_QUIT => app.exit(0),
-        ID_PREF_BUILD | ID_PREF_TRANSFER | ID_PREF_ENGINE | ID_PREF_KIND => {
-            let Some(state) = app.try_state::<AppState>() else { return };
-            let checked = {
-                let mut cfg = state.config.write().await;
-                let p = &mut cfg.notifications;
-                let value = match id {
-                    ID_PREF_BUILD => &mut p.build_done,
-                    ID_PREF_TRANSFER => &mut p.transfer_done,
-                    ID_PREF_ENGINE => &mut p.engine_state,
-                    _ => &mut p.kind_events,
-                };
-                *value = !*value;
-                *value
+        // Quick navigation: reveal the window, then let the React shell pick
+        // the page. The tray stays a thin shell — navigation state lives in the
+        // frontend, so it owns the actual switch.
+        ID_NAV_CONTAINERS | ID_NAV_IMAGES | ID_NAV_CLUSTERS => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+            let target = match id {
+                ID_NAV_CONTAINERS => "containers",
+                ID_NAV_IMAGES => "images",
+                _ => "kubernetes",
             };
-            if let Err(e) = state.save_config().await {
-                tracing::warn!("failed to persist notification prefs: {e}");
-            }
-            // The platform may already have flipped the checkmark; pin it so
-            // config and menu can't drift apart.
-            if let Some(parts) = app.try_state::<TrayState>().and_then(|t| t.parts()) {
-                let idx = match id {
-                    ID_PREF_BUILD => 0,
-                    ID_PREF_TRANSFER => 1,
-                    ID_PREF_ENGINE => 2,
-                    _ => 3,
-                };
-                let _ = parts.checks[idx].set_checked(checked);
-            }
+            let _ = app.emit("tray-navigate", target);
         }
         _ => {}
     }
@@ -514,20 +464,9 @@ async fn notification_prefs(app: &AppHandle) -> crate::config::NotificationPrefs
         .unwrap_or_default()
 }
 
-/// Records into the shared history and shows the toast. Callers check prefs
-/// first; interactive failures (guard errors, start/stop failures) bypass.
+/// Shows a desktop notification. Callers check the Settings prefs first;
+/// interactive failures (guard errors, start/stop failures) bypass them.
 fn record_notice(app: &AppHandle, title: &str, body: &str) {
-    if let Some(parts) = app.try_state::<TrayState>().and_then(|t| t.parts()) {
-        if let Ok(mut history) = parts.history.lock() {
-            history.push_front(Notice {
-                title: title.to_string(),
-                ts: chrono::Local::now().timestamp(),
-            });
-            while history.len() > HISTORY_CAP {
-                history.pop_back();
-            }
-        }
-    }
     show_toast(app, title, body);
 }
 
@@ -564,6 +503,14 @@ struct TrayStats {
     running: usize,
     images: usize,
     kinds: usize,
+    clusters: Vec<ClusterStat>,
+}
+
+/// One kind cluster as the tray menu reports it.
+struct ClusterStat {
+    name: String,
+    nodes: usize,
+    running: usize,
 }
 
 async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
@@ -600,12 +547,10 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
                 s.containers, s.running
             ));
             let _ = parts.images_row.set_text(format!("Images: {}", s.images));
-            let _ = parts.kind_row.set_text(format!("Kind clusters: {}", s.kinds));
         }
         None => {
             let _ = parts.containers_row.set_text("Containers: —");
             let _ = parts.images_row.set_text("Images: —");
-            let _ = parts.kind_row.set_text("Kind clusters: —");
         }
     }
 
@@ -616,36 +561,36 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
     };
     let _ = parts.toggle.set_text(toggle_label);
 
-    // Snapshot the history under the lock, then format without holding it.
-    let snapshot: Vec<(String, i64)> = parts
-        .history
-        .lock()
-        .map(|h| h.iter().map(|n| (n.title.clone(), n.ts)).collect())
-        .unwrap_or_default();
-    match snapshot.first() {
-        Some((title, ts)) => {
-            let _ = parts
-                .last_row
-                .set_text(format!("Last: {title} ({})", format_ts(*ts)));
-        }
-        None => {
-            let _ = parts.last_row.set_text("No notifications yet");
-        }
-    }
-    for (i, row) in parts.hist_rows.iter().enumerate() {
-        // Row 0 of history is the "Last:" line, so the list starts at 1.
-        let text = match snapshot.get(i + 1) {
-            Some((title, ts)) => format!("· {}  {title}", format_ts(*ts)),
-            None => "·".to_string(),
+    // Cluster rows: a cluster is running while at least one node container is.
+    let clusters: &[ClusterStat] = stats
+        .as_ref()
+        .map(|s| s.clusters.as_slice())
+        .unwrap_or(&[]);
+    for (i, row) in parts.cluster_rows.iter().enumerate() {
+        let text = match clusters.get(i) {
+            Some(c) => {
+                let phase = if c.running == 0 {
+                    "stopped"
+                } else if c.running == c.nodes {
+                    "running"
+                } else {
+                    "degraded"
+                };
+                format!("{} · {}/{} nodes · {}", c.name, c.running, c.nodes, phase)
+            }
+            None => String::new(),
         };
         let _ = row.set_text(text);
+        let _ = row.set_enabled(i < clusters.len());
     }
-}
-
-fn format_ts(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|| "--:--".to_string())
+    let more = if clusters.is_empty() {
+        "No kind clusters".to_string()
+    } else if clusters.len() > MAX_CLUSTER_ROWS {
+        format!("…and {} more", clusters.len() - MAX_CLUSTER_ROWS)
+    } else {
+        format!("{} cluster(s)", clusters.len())
+    };
+    let _ = parts.clusters_more.set_text(more);
 }
 
 async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats> {
@@ -657,15 +602,37 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
     let total = containers.len();
     let running = containers.iter().filter(|c| c.running).count();
     let images = client.list_images().await.ok()?.len();
-    // Degrade to 0 rather than dropping every stat because kind is absent.
-    let kinds = crate::commands::kind::count_kind_clusters(state)
-        .await
-        .unwrap_or(0);
+    // Group kind node containers into a compact per-cluster line. The container
+    // list already carries the cluster label, so the tray never shells out to
+    // kubectl just to redraw its menu.
+    let mut grouped: HashMap<String, (usize, usize)> = HashMap::new();
+    for c in &containers {
+        if let Some(name) = &c.kind_cluster {
+            let entry = grouped.entry(name.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            if c.running {
+                entry.1 += 1;
+            }
+        }
+    }
+    let mut clusters: Vec<ClusterStat> = grouped
+        .into_iter()
+        .map(|(name, (nodes, running))| ClusterStat {
+            name,
+            nodes,
+            running,
+        })
+        .collect();
+    // Running cluster first, then alphabetical: the menu is a monitor, not a
+    // directory.
+    clusters.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| a.name.cmp(&b.name)));
+    let kinds = clusters.len();
     Some(TrayStats {
         containers: total,
         running,
         images,
         kinds,
+        clusters,
     })
 }
 

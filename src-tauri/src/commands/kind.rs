@@ -993,6 +993,8 @@ pub struct K8sNodeInfo {
     pub cpu_capacity_m: f64,
     pub mem_capacity_bytes: u64,
     pub pods_capacity: u32,
+    /// `spec.unschedulable` — true after `kubectl cordon`.
+    pub unschedulable: bool,
     pub created: Option<i64>,
 }
 
@@ -1184,6 +1186,10 @@ fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
                     .get("podsCapacity")
                     .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
                     .unwrap_or(0) as u32,
+                unschedulable: n
+                    .pointer("/spec/unschedulable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 created,
             })
         })
@@ -1472,6 +1478,62 @@ pub async fn get_cluster_nodes(
 ) -> Result<Vec<K8sNodeInfo>, String> {
     let v = kubectl_json(&state, &cluster, &["get", "nodes", "-o", "json"]).await?;
     Ok(parse_nodes(&v))
+}
+
+/// Cordon (`schedulable = false`) or uncordon a node.
+///
+/// Patches `spec.unschedulable`, the same field `kubectl cordon/uncordon`
+/// writes. Reversible, so it needs no confirmation beyond the button itself.
+#[tauri::command]
+pub async fn set_node_schedulable(
+    state: State<'_, AppState>,
+    cluster: String,
+    node: String,
+    schedulable: bool,
+) -> Result<(), String> {
+    let node = node.trim();
+    if node.is_empty() || node.chars().any(|c| c.is_whitespace()) {
+        return Err("Invalid node name".to_string());
+    }
+    let unschedulable = if schedulable { "false" } else { "true" };
+    let patch = format!(r#"{{"spec":{{"unschedulable":{unschedulable}}}}}"#);
+    kubectl_raw(
+        &state,
+        &cluster,
+        &["patch", "node", node, "--type", "merge", "-p", &patch],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// `kubectl drain` — evicts pods and cordons the node.
+///
+/// The UI asks for confirmation first. DaemonSet pods are ignored and
+/// `emptyDir` data is discarded, which matches what "take this kind node out
+/// of rotation" means in practice.
+#[tauri::command]
+pub async fn drain_node(
+    state: State<'_, AppState>,
+    cluster: String,
+    node: String,
+) -> Result<String, String> {
+    let node = node.trim();
+    if node.is_empty() || node.chars().any(|c| c.is_whitespace()) {
+        return Err("Invalid node name".to_string());
+    }
+    kubectl_raw(
+        &state,
+        &cluster,
+        &[
+            "drain",
+            node,
+            "--ignore-daemonsets",
+            "--delete-emptydir-data",
+            "--force",
+            "--timeout=120s",
+        ],
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2742,6 +2804,8 @@ const YAML_RESOURCE_KINDS: &[&str] = &[
     "secrets",
     "persistentvolumeclaim",
     "persistentvolumeclaims",
+    "persistentvolume",
+    "persistentvolumes",
     "namespace",
     "namespaces",
     "node",
@@ -2884,6 +2948,7 @@ mod resource_view_tests {
         assert!(is_yaml_kind("Deployment")); // case-insensitive
         assert!(is_yaml_kind("statefulsets"));
         assert!(is_yaml_kind("persistentvolumeclaims"));
+        assert!(is_yaml_kind("persistentvolume"));
         assert!(!is_yaml_kind("clusterrole"));
         assert!(!is_yaml_kind(""));
         assert!(!is_yaml_kind("pods; rm -rf /"));
@@ -3244,6 +3309,244 @@ pub async fn get_cluster_pvcs(
     Ok(parse_pvcs(&v))
 }
 
+// ---- Namespaces / Ingresses / PersistentVolumes ----
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sNamespaceInfo {
+    pub name: String,
+    pub status: String,
+    pub created: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sIngressInfo {
+    pub name: String,
+    pub namespace: String,
+    pub class_name: String,
+    /// Comma-separated host rules (`*` when a rule has no host).
+    pub hosts: String,
+    /// `status.loadBalancer.ingress` address, if the controller assigned one.
+    pub address: String,
+    pub tls: bool,
+    pub created: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct K8sPvInfo {
+    pub name: String,
+    pub capacity: String,
+    pub access_modes: String,
+    pub reclaim_policy: String,
+    pub status: String,
+    pub storage_class: String,
+    /// `namespace/name` of the bound claim (`""` when unbound).
+    pub claim: String,
+    pub created: Option<i64>,
+}
+
+fn parse_namespaces(json: &serde_json::Value) -> Vec<K8sNamespaceInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|n| {
+            let meta = n.get("metadata")?;
+            Some(K8sNamespaceInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                status: n
+                    .get("status")
+                    .and_then(|s| s.get("phase"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Active")
+                    .to_string(),
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+fn parse_ingresses(json: &serde_json::Value) -> Vec<K8sIngressInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|ing| {
+            let meta = ing.get("metadata")?;
+            let spec = ing.get("spec");
+            let mut hosts: Vec<String> = spec
+                .and_then(|s| s.get("rules"))
+                .and_then(|r| r.as_array())
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|r| {
+                            r.get("host")
+                                .and_then(|h| h.as_str())
+                                .filter(|h| !h.is_empty())
+                                .unwrap_or("*")
+                                .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Preserve rule order while dropping repeats: the same host usually
+            // appears once per path, and the column must not repeat it.
+            let mut seen = std::collections::HashSet::new();
+            hosts.retain(|h| seen.insert(h.clone()));
+            let tls = spec
+                .and_then(|s| s.get("tls"))
+                .and_then(|t| t.as_array())
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            let address = ing
+                .pointer("/status/loadBalancer/ingress")
+                .and_then(|i| i.as_array())
+                .and_then(|a| a.first())
+                .and_then(|a| {
+                    a.get("ip")
+                        .or_else(|| a.get("hostname"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            Some(K8sIngressInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                namespace: meta
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                class_name: spec
+                    .and_then(|s| s.get("ingressClassName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                hosts: if hosts.is_empty() {
+                    "*".to_string()
+                } else {
+                    hosts.join(", ")
+                },
+                address,
+                tls,
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+fn parse_pvs(json: &serde_json::Value) -> Vec<K8sPvInfo> {
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|pv| {
+            let meta = pv.get("metadata")?;
+            let spec = pv.get("spec");
+            let claim = spec
+                .and_then(|s| s.get("claimRef"))
+                .map(|c| {
+                    let ns = c.get("namespace").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if ns.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{ns}/{name}")
+                    }
+                })
+                .unwrap_or_default();
+            let access_modes = spec
+                .and_then(|s| s.get("accessModes"))
+                .and_then(|m| m.as_array())
+                .map(|modes| {
+                    modes
+                        .iter()
+                        .filter_map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            Some(K8sPvInfo {
+                name: meta.get("name")?.as_str()?.to_string(),
+                capacity: pv
+                    .pointer("/spec/capacity/storage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                access_modes,
+                reclaim_policy: spec
+                    .and_then(|s| s.get("persistentVolumeReclaimPolicy"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                status: pv
+                    .pointer("/status/phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                storage_class: spec
+                    .and_then(|s| s.get("storageClassName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                claim,
+                created: meta
+                    .get("creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(rfc3339_to_epoch),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn get_cluster_namespaces(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<Vec<K8sNamespaceInfo>, String> {
+    let v = kubectl_json(&state, &cluster, &["get", "namespaces", "-o", "json"]).await?;
+    Ok(parse_namespaces(&v))
+}
+
+#[tauri::command]
+pub async fn get_cluster_ingresses(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<Vec<K8sIngressInfo>, String> {
+    let v = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "ingresses", "--all-namespaces", "-o", "json"],
+    )
+    .await?;
+    Ok(parse_ingresses(&v))
+}
+
+#[tauri::command]
+pub async fn get_cluster_pvs(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<Vec<K8sPvInfo>, String> {
+    let v = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "persistentvolumes", "-o", "json"],
+    )
+    .await?;
+    Ok(parse_pvs(&v))
+}
+
 #[cfg(test)]
 mod monitor_tests {
     use super::*;
@@ -3582,6 +3885,109 @@ mod monitor_tests {
         }
         eprintln!("hammer: {fails} failures / 50 execs");
     }
+
+#[cfg(test)]
+mod listing_parsers_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn namespaces_default_phase_and_parse_age() {
+        let v = json!({
+            "items": [
+                {
+                    "metadata": { "name": "default", "creationTimestamp": "2026-01-02T03:04:05Z" },
+                    "status": { "phase": "Terminating" }
+                },
+                { "metadata": { "name": "kube-system" } }
+            ]
+        });
+        let out = parse_namespaces(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "default");
+        assert_eq!(out[0].status, "Terminating");
+        assert!(out[0].created.is_some(), "a timestamp must become an epoch");
+        // A namespace whose status has not been reported yet is Active.
+        assert_eq!(out[1].name, "kube-system");
+        assert_eq!(out[1].status, "Active");
+        assert_eq!(out[1].created, None);
+    }
+
+    #[test]
+    fn ingresses_collect_hosts_address_tls() {
+        let v = json!({
+            "items": [{
+                "metadata": {
+                    "name": "web",
+                    "namespace": "shop",
+                    "creationTimestamp": "2026-01-02T03:04:05Z"
+                },
+                "spec": {
+                    "ingressClassName": "nginx",
+                    "rules": [
+                        { "host": "a.example.com" },
+                        { "host": "" },
+                        { "host": "a.example.com" }
+                    ],
+                    "tls": [{ "secretName": "tls" }]
+                },
+                "status": { "loadBalancer": { "ingress": [{ "ip": "10.0.0.9" }] } }
+            }]
+        });
+        let out = parse_ingresses(&v);
+        assert_eq!(out.len(), 1);
+        let ing = &out[0];
+        assert_eq!(ing.name, "web");
+        assert_eq!(ing.namespace, "shop");
+        assert_eq!(ing.class_name, "nginx");
+        // A host-less rule is "*"; repeats collapse but order is kept.
+        assert_eq!(ing.hosts, "a.example.com, *");
+        assert_eq!(ing.address, "10.0.0.9");
+        assert!(ing.tls);
+        assert!(ing.created.is_some());
+    }
+
+    #[test]
+    fn pvs_join_claim_and_read_capacity() {
+        let v = json!({
+            "items": [
+                {
+                    "metadata": { "name": "pv-a" },
+                    "spec": {
+                        "capacity": { "storage": "10Gi" },
+                        "accessModes": ["ReadWriteOnce", "ReadOnlyMany"],
+                        "persistentVolumeReclaimPolicy": "Delete",
+                        "storageClassName": "standard",
+                        "claimRef": { "namespace": "app", "name": "data" }
+                    },
+                    "status": { "phase": "Bound" }
+                },
+                {
+                    "metadata": { "name": "pv-b" },
+                    "spec": {
+                        "capacity": { "storage": "5Gi" },
+                        "accessModes": ["ReadWriteOnce"],
+                        "persistentVolumeReclaimPolicy": "Retain"
+                    },
+                    "status": { "phase": "Available" }
+                }
+            ]
+        });
+        let out = parse_pvs(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "pv-a");
+        assert_eq!(out[0].claim, "app/data");
+        assert_eq!(out[0].capacity, "10Gi");
+        assert_eq!(out[0].access_modes, "ReadWriteOnce, ReadOnlyMany");
+        assert_eq!(out[0].reclaim_policy, "Delete");
+        assert_eq!(out[0].storage_class, "standard");
+        assert_eq!(out[0].status, "Bound");
+        // An unbound volume has no claim and no storage class.
+        assert_eq!(out[1].claim, "");
+        assert_eq!(out[1].status, "Available");
+        assert_eq!(out[1].storage_class, "");
+    }
+}
 
 #[cfg(test)]
 mod auto_start_tests {

@@ -47,6 +47,9 @@ import type {
   K8sServiceInfo,
   K8sConfigInfo,
   K8sPvcInfo,
+  K8sNamespaceInfo,
+  K8sIngressInfo,
+  K8sPvInfo,
   KindClusterPrefs,
   ContainerGroup,
 } from "../types";
@@ -239,6 +242,16 @@ export const api = {
     invoke<K8sConfigInfo[]>("get_cluster_config_resources", { cluster, includeSecrets }),
   getClusterPvcs: (cluster: string) =>
     invoke<K8sPvcInfo[]>("get_cluster_pvcs", { cluster }),
+  getClusterNamespaces: (cluster: string) =>
+    invoke<K8sNamespaceInfo[]>("get_cluster_namespaces", { cluster }),
+  getClusterIngresses: (cluster: string) =>
+    invoke<K8sIngressInfo[]>("get_cluster_ingresses", { cluster }),
+  getClusterPvs: (cluster: string) =>
+    invoke<K8sPvInfo[]>("get_cluster_pvs", { cluster }),
+  setNodeSchedulable: (cluster: string, node: string, schedulable: boolean) =>
+    invoke<void>("set_node_schedulable", { cluster, node, schedulable }),
+  drainNode: (cluster: string, node: string) =>
+    invoke<string>("drain_node", { cluster, node }),
   getClusterNodes: (cluster: string) =>
     invoke<K8sNodeInfo[]>("get_cluster_nodes", { cluster }),
   getClusterPods: (cluster: string, namespace?: string) =>
@@ -323,4 +336,8 @@ export const events = {
 
   onKindInstallProgress: (cb: (payload: KindInstallProgressPayload) => void): Promise<UnlistenFn> =>
     listen<KindInstallProgressPayload>("kind-install-progress", (event) => cb(event.payload)),
+
+  /** Tray quick actions ask the shell to switch pages (`tray-navigate`). */
+  onTrayNavigate: (cb: (tab: string) => void): Promise<UnlistenFn> =>
+    listen<string>("tray-navigate", (event) => cb(event.payload)),
 };

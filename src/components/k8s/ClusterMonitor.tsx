@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertTriangle,
-  Bell,
+  ArrowDownToLine,
+  Ban,
   Boxes,
   CheckCircle2,
   Copy,
@@ -13,8 +14,10 @@ import {
   Hexagon,
   Loader2,
   Package,
+  Plus,
   RefreshCw,
   RotateCw,
+  ScrollText,
   Search,
   Server,
   Terminal,
@@ -35,6 +38,9 @@ import type {
   K8sNodeInfo,
   K8sPodInfo,
   K8sPvcInfo,
+  K8sNamespaceInfo,
+  K8sIngressInfo,
+  K8sPvInfo,
   K8sServiceInfo,
   K8sWorkloadInfo,
   KindCluster,
@@ -49,6 +55,7 @@ type MonitorTab =
   | "services"
   | "config"
   | "pvcs"
+  | "namespaces"
   | "events";
 
 const TABS: { id: MonitorTab; label: string; icon: React.ElementType }[] = [
@@ -56,10 +63,11 @@ const TABS: { id: MonitorTab; label: string; icon: React.ElementType }[] = [
   { id: "nodes", label: "Nodes", icon: Server },
   { id: "podlist", label: "Pods", icon: Package },
   { id: "workloads", label: "Workloads", icon: Boxes },
-  { id: "services", label: "Services", icon: Folder },
+  { id: "services", label: "Network", icon: Folder },
   { id: "config", label: "Config/Secrets", icon: FileText },
-  { id: "pvcs", label: "PVCs", icon: Package },
-  { id: "events", label: "Events", icon: AlertTriangle },
+  { id: "pvcs", label: "Storage", icon: Package },
+  { id: "namespaces", label: "Namespaces", icon: Hexagon },
+  { id: "events", label: "Events", icon: ScrollText },
 ];
 
 /** "1250m" → "1.25 cores"; "90m" → "90m". */
@@ -143,7 +151,9 @@ export const ClusterMonitor: React.FC<{
   const [workloads, setWorkloads] = useState<K8sWorkloadInfo[]>([]);
   const [metrics, setMetrics] = useState<K8sMetrics | null>(null);
   const [monitorError, setMonitorError] = useState<string | null>(null);
-  const [podNs, setPodNs] = useState("all");
+  // One namespace filter for every tab (Lens-style); pods keeps its own
+  // search box on top of it.
+  const [nsFilter, setNsFilter] = useState("all");
   const [podSearch, setPodSearch] = useState("");
   const [installingMs, setInstallingMs] = useState(false);
   // Real metrics-server state (deployment/pods/`kubectl top`), polled with the
@@ -155,6 +165,11 @@ export const ClusterMonitor: React.FC<{
   const [services, setServices] = useState<K8sServiceInfo[]>([]);
   const [configs, setConfigs] = useState<K8sConfigInfo[]>([]);
   const [pvcs, setPvcs] = useState<K8sPvcInfo[]>([]);
+  const [ingresses, setIngresses] = useState<K8sIngressInfo[]>([]);
+  const [pvs, setPvs] = useState<K8sPvInfo[]>([]);
+  const [namespaceList, setNamespaceList] = useState<K8sNamespaceInfo[]>([]);
+  // Node name while a cordon/uncordon/drain request is in flight.
+  const [nodeBusy, setNodeBusy] = useState<string | null>(null);
 
   // Pod / workload logs viewer (workloadKind set → aggregated workload logs).
   const [logsFor, setLogsFor] = useState<
@@ -172,13 +187,13 @@ export const ClusterMonitor: React.FC<{
 
   // Resource YAML / events viewers + pod terminal.
   const [yamlFor, setYamlFor] = useState<
-    { kind: string; ns: string; name: string } | null
+    { kind: string; ns: string | null; name: string } | null
   >(null);
   const [yamlText, setYamlText] = useState("");
   const [yamlLoading, setYamlLoading] = useState(false);
   const [yamlError, setYamlError] = useState<string | null>(null);
   const [eventsFor, setEventsFor] = useState<
-    { kind: string; ns: string; name: string } | null
+    { kind: string; ns: string | null; name: string } | null
   >(null);
   const [eventsList, setEventsList] = useState<K8sEventInfo[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
@@ -199,17 +214,21 @@ export const ClusterMonitor: React.FC<{
     setServices([]);
     setConfigs([]);
     setPvcs([]);
+    setIngresses([]);
+    setPvs([]);
+    setNamespaceList([]);
     setLogsFor(null);
     setLogsText("");
     setScaleFor(null);
     setMetrics(null);
     setMonitorError(null);
-    setPodNs("all");
+    setNsFilter("all");
     setPodSearch("");
     setYamlFor(null);
     setEventsFor(null);
     setTerminalFor(null);
     setMsStatus(null);
+    setNodeBusy(null);
   }, [cluster]);
 
   useEffect(() => {
@@ -235,13 +254,16 @@ export const ClusterMonitor: React.FC<{
     const slow = async () => {
       // Independent again: a failing sub-query (e.g. PVC listing on an old
       // apiserver) must not wipe the tabs that answered fine.
-      const [n, ev, w, sv, cf, pv] = await Promise.allSettled([
+      const [n, ev, w, sv, cf, pv, ing, pvol, ns] = await Promise.allSettled([
         api.getClusterNodes(cluster),
         api.getClusterEvents(cluster),
         api.getClusterWorkloads(cluster),
         api.getClusterServices(cluster),
         api.getClusterConfigResources(cluster),
         api.getClusterPvcs(cluster),
+        api.getClusterIngresses(cluster),
+        api.getClusterPvs(cluster),
+        api.getClusterNamespaces(cluster),
       ]);
       if (!alive) return;
       if (n.status === "fulfilled") setNodes(n.value);
@@ -250,36 +272,73 @@ export const ClusterMonitor: React.FC<{
       if (sv.status === "fulfilled") setServices(sv.value);
       if (cf.status === "fulfilled") setConfigs(cf.value);
       if (pv.status === "fulfilled") setPvcs(pv.value);
+      if (ing.status === "fulfilled") setIngresses(ing.value);
+      if (pvol.status === "fulfilled") setPvs(pvol.value);
+      if (ns.status === "fulfilled") setNamespaceList(ns.value);
     };
-    const ms = () => {
+    fast();
+    slow();
+    const t1 = window.setInterval(fast, 6000);
+    const t2 = window.setInterval(slow, 15000);
+    return () => {
+      alive = false;
+      window.clearInterval(t1);
+      window.clearInterval(t2);
+    };
+  }, [cluster]);
+
+  // Metrics-server is a *post-start* check. A freshly started cluster needs
+  // roughly a minute before the addon has had a chance to become ready; probing
+  // sooner turns a warming component into a "install metrics-server" prompt.
+  // Once the cluster is up we wait out that first minute, then re-check every
+  // 60s so a genuine failure still gets surfaced.
+  useEffect(() => {
+    let alive = true;
+    let timeout: number | undefined;
+    let interval: number | undefined;
+
+    if (clusterStats?.api_ready !== true) {
+      // Stopped (or still booting): nothing to probe and no stale prompt.
+      setMsStatus(null);
+      return;
+    }
+
+    const startedAtMs = clusterStats?.last_started_at
+      ? clusterStats.last_started_at * 1000
+      : null;
+    const waitMs = startedAtMs ? Math.max(0, 60_000 - (Date.now() - startedAtMs)) : 0;
+
+    const probe = () => {
       api
         .metricsServerStatus(cluster)
         .then((s) => {
           if (alive) setMsStatus(s);
         })
         .catch(() => {
-          /* unreachable cluster is reported by the fast poll */
+          /* an unreachable cluster is already reported by the fast poll */
         });
     };
 
-    fast();
-    slow();
-    ms();
-    const t1 = window.setInterval(fast, 6000);
-    const t2 = window.setInterval(slow, 15000);
-    const t3 = window.setInterval(ms, 20000);
+    timeout = window.setTimeout(() => {
+      if (!alive) return;
+      probe();
+      interval = window.setInterval(probe, 60_000);
+    }, waitMs);
+
     return () => {
       alive = false;
-      window.clearInterval(t1);
-      window.clearInterval(t2);
-      window.clearInterval(t3);
+      if (timeout) window.clearTimeout(timeout);
+      if (interval) window.clearInterval(interval);
     };
-  }, [cluster]);
+  }, [cluster, clusterStats?.api_ready, clusterStats?.last_started_at]);
 
   const namespaces = useMemo(() => {
-    const set = new Set(pods.map((p) => p.namespace));
+    // Pod namespaces alone would hide kube-system from the filter until a pod
+    // exists there; the namespace list keeps the picker complete.
+    const set = new Set<string>(namespaceList.map((n) => n.name));
+    for (const p of pods) set.add(p.namespace);
     return Array.from(set).sort();
-  }, [pods]);
+  }, [pods, namespaceList]);
 
   const nodeMetricsByName = useMemo(() => {
     const m = new Map(metrics?.nodes.map((n) => [n.name, n]) ?? []);
@@ -294,7 +353,7 @@ export const ClusterMonitor: React.FC<{
   const filteredPods = useMemo(() => {
     const q = podSearch.trim().toLowerCase();
     return pods.filter((p) => {
-      if (podNs !== "all" && p.namespace !== podNs) return false;
+      if (nsFilter !== "all" && p.namespace !== nsFilter) return false;
       if (!q) return true;
       return (
         p.name.toLowerCase().includes(q) ||
@@ -303,7 +362,36 @@ export const ClusterMonitor: React.FC<{
         p.images.some((i) => i.toLowerCase().includes(q))
       );
     });
-  }, [pods, podNs, podSearch]);
+  }, [pods, nsFilter, podSearch]);
+
+  // Lens-style namespace scope shared by every namespaced tab. Lists stay raw
+  // in state and are filtered at render time, so switching the selector never
+  // costs a round trip.
+  const inScope = (ns: string) => nsFilter === "all" || ns === nsFilter;
+  const filteredWorkloads = useMemo(
+    () => workloads.filter((w) => inScope(w.namespace)),
+    [workloads, nsFilter]
+  );
+  const filteredEvents = useMemo(
+    () => events.filter((e) => inScope(e.namespace)),
+    [events, nsFilter]
+  );
+  const filteredServices = useMemo(
+    () => services.filter((s) => inScope(s.namespace)),
+    [services, nsFilter]
+  );
+  const filteredConfigs = useMemo(
+    () => configs.filter((c) => inScope(c.namespace)),
+    [configs, nsFilter]
+  );
+  const filteredPvcs = useMemo(
+    () => pvcs.filter((p) => inScope(p.namespace)),
+    [pvcs, nsFilter]
+  );
+  const filteredIngresses = useMemo(
+    () => ingresses.filter((i) => inScope(i.namespace)),
+    [ingresses, nsFilter]
+  );
 
   const totalCpuCap = useMemo(() => nodes.reduce((a, n) => a + n.cpuCapacityM, 0), [nodes]);
   const totalMemCap = useMemo(
@@ -398,7 +486,7 @@ export const ClusterMonitor: React.FC<{
   /** Opens the YAML or events viewer for a resource. */
   const openResourceView = (
     kind: string,
-    ns: string,
+    ns: string | null,
     name: string,
     mode: "yaml" | "events" = "yaml"
   ) => {
@@ -468,7 +556,7 @@ export const ClusterMonitor: React.FC<{
     setEventsError(null);
     setEventsList([]);
     api
-      .getResourceEvents(cluster, eventsFor.ns, eventsFor.name)
+      .getResourceEvents(cluster, eventsFor.ns ?? "", eventsFor.name)
       .then((ev) => {
         if (alive) setEventsList(ev);
       })
@@ -502,19 +590,20 @@ export const ClusterMonitor: React.FC<{
 
   const handleDeleteResource = async (
     kind: string,
-    ns: string,
+    ns: string | null,
     name: string,
     label: string
   ) => {
+    const target = ns ? `${ns}/${name}` : name;
     const ok = await modal.showConfirm(
-      `Delete ${label} '${name}' in ${ns}?`,
+      `Delete ${label} '${target}'?`,
       `Delete ${label}`,
       "danger"
     );
     if (!ok) return;
     try {
       await api.deleteK8sResource(cluster, kind, ns, name);
-      toast.success(`${label} deleted`, `${ns}/${name}`);
+      toast.success(`${label} deleted`, target);
       slowRefresh();
     } catch (e) {
       toast.error("Delete failed", String(e));
@@ -551,6 +640,86 @@ export const ClusterMonitor: React.FC<{
     }
   };
 
+  // Kubernetes spells this `spec.unschedulable`; the UI uses the familiar
+  // Cordon/Uncordon wording so it matches what `kubectl cordon` reports.
+  const handleToggleCordon = async (n: K8sNodeInfo) => {
+    if (nodeBusy) return;
+    const cordon = !n.unschedulable;
+    setNodeBusy(n.name);
+    try {
+      await api.setNodeSchedulable(cluster, n.name, !cordon);
+      toast.success(cordon ? "Node cordoned" : "Node uncordoned", n.name);
+      api.getClusterNodes(cluster).then(setNodes).catch(() => {});
+    } catch (e) {
+      toast.error(cordon ? "Cordon failed" : "Uncordon failed", String(e));
+    } finally {
+      setNodeBusy(null);
+    }
+  };
+
+  const handleDrain = async (n: K8sNodeInfo) => {
+    if (nodeBusy) return;
+    const ok = await modal.showConfirm(
+      `Drain '${n.name}'? Its pods are evicted, then the node is cordoned so nothing new is scheduled.`,
+      "Drain Node",
+      "danger"
+    );
+    if (!ok) return;
+    setNodeBusy(n.name);
+    try {
+      const out = await api.drainNode(cluster, n.name);
+      toast.success("Node drained", n.name);
+      // kubectl warns about unmanaged pods on stderr; keep that visible in the
+      // dev console without turning a completed drain into an error toast.
+      if (out.trim()) console.info("drain:", out.trim());
+      api.getClusterNodes(cluster).then(setNodes).catch(() => {});
+      api.getClusterPods(cluster).then(setPods).catch(() => {});
+    } catch (e) {
+      toast.error("Drain failed", String(e));
+    } finally {
+      setNodeBusy(null);
+    }
+  };
+
+  const handleCreateNamespace = async () => {
+    const input = await modal.showPrompt(
+      "Namespace name (DNS-1123 label: lowercase letters, digits and dashes)",
+      "",
+      "Create Namespace"
+    );
+    if (input === null) return;
+    const name = input.trim();
+    if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) || name.length > 63) {
+      toast.error("Invalid name", "Use lowercase letters, digits and dashes.");
+      return;
+    }
+    try {
+      await api.createNamespace(cluster, name);
+      toast.success("Namespace created", name);
+      api.getClusterNamespaces(cluster).then(setNamespaceList).catch(() => {});
+    } catch (e) {
+      toast.error("Create failed", String(e));
+    }
+  };
+
+  const handleDeleteNamespace = async (n: K8sNamespaceInfo) => {
+    // Deleting a namespace cascades to everything inside it, so this prompt
+    // spells that out instead of reusing the generic resource wording.
+    const ok = await modal.showConfirm(
+      `Delete namespace '${n.name}'? Every resource inside it is deleted.`,
+      "Delete Namespace",
+      "danger"
+    );
+    if (!ok) return;
+    try {
+      await api.deleteK8sResource(cluster, "namespace", null, n.name);
+      toast.success("Namespace deleted", n.name);
+      slowRefresh();
+    } catch (e) {
+      toast.error("Delete failed", String(e));
+    }
+  };
+
   const slowRefresh = () => {
     api.getClusterNodes(cluster).then(setNodes).catch(() => {});
     api.getClusterEvents(cluster).then(setEvents).catch(() => {});
@@ -558,6 +727,9 @@ export const ClusterMonitor: React.FC<{
     api.getClusterServices(cluster).then(setServices).catch(() => {});
     api.getClusterConfigResources(cluster).then(setConfigs).catch(() => {});
     api.getClusterPvcs(cluster).then(setPvcs).catch(() => {});
+    api.getClusterIngresses(cluster).then(setIngresses).catch(() => {});
+    api.getClusterPvs(cluster).then(setPvs).catch(() => {});
+    api.getClusterNamespaces(cluster).then(setNamespaceList).catch(() => {});
     api.getClusterPods(cluster).then(setPods).catch(() => {});
     api.getClusterSummary(cluster).then(setSummary).catch(() => {});
   };
@@ -642,6 +814,27 @@ export const ClusterMonitor: React.FC<{
             )}
           </button>
         ))}
+        {(tab === "podlist" ||
+          tab === "workloads" ||
+          tab === "services" ||
+          tab === "config" ||
+          tab === "pvcs" ||
+          tab === "events") && (
+          <select
+            value={nsFilter}
+            onChange={(e) => setNsFilter(e.target.value)}
+            title="Filter by namespace"
+            aria-label="Filter by namespace"
+            className="ml-auto mb-1 h-7 max-w-52 rounded-lg bg-zinc-950 border border-zinc-800 px-2 text-[11px] text-zinc-200 focus:outline-none focus:border-indigo-500"
+          >
+            <option value="all">All namespaces ({pods.length} pods)</option>
+            {namespaces.map((ns) => (
+              <option key={ns} value={ns}>
+                {ns} ({pods.filter((p) => p.namespace === ns).length})
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       <div className="p-5">
@@ -913,7 +1106,7 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ NODES ============ */}
         {tab === "nodes" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -926,6 +1119,7 @@ export const ClusterMonitor: React.FC<{
                   <th className="px-3 py-2">Runtime</th>
                   <th className="px-3 py-2">IP</th>
                   <th className="px-3 py-2">Age</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -987,12 +1181,43 @@ export const ClusterMonitor: React.FC<{
                       <td className="px-3 py-2 text-zinc-500">
                         {n.created ? formatRelativeTime(n.created) : "-"}
                       </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center justify-end gap-1">
+                          {n.unschedulable && (
+                            <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300">
+                              Cordoned
+                            </span>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title={n.unschedulable ? "Uncordon node" : "Cordon node"}
+                            disabled={nodeBusy === n.name}
+                            onClick={() => void handleToggleCordon(n)}
+                          >
+                            {nodeBusy === n.name ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Ban className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Drain node"
+                            disabled={nodeBusy === n.name}
+                            onClick={() => void handleDrain(n)}
+                          >
+                            <ArrowDownToLine className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </td>
                     </tr>
                   );
                 })}
                 {nodes.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-3 py-8 text-center text-zinc-500">
+                    <td colSpan={10} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "Loading nodes…"}
                     </td>
                   </tr>
@@ -1005,45 +1230,6 @@ export const ClusterMonitor: React.FC<{
         {/* ============ PODS ============ */}
         {tab === "podlist" && (
           <div className="space-y-3">
-            {/* Pod usage comes from metrics-server — offer the install inline. */}
-            {noMetrics && msStatus && (
-              <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-amber-300">
-                {msStatus.installed ? (
-                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                ) : (
-                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                )}
-                <span>
-                  {msStatus.installed
-                    ? `metrics-server installed (${
-                        msStatus.ready ? "ready" : "starting"
-                      } ${msStatus.available_replicas}/${msStatus.desired_replicas}) — ${
-                      msStatus.message ?? "usage columns fill in automatically."
-                    }`
-                    : "metrics-server is not installed — pod CPU/memory columns stay empty until it is."}
-                </span>
-                {msStatus.pods.length ? (
-                  <span className="font-mono text-amber-200/70">
-                    {msStatus.pods
-                      .map(
-                        (p) =>
-                          `${p.name}:${p.phase}${p.ready ? "" : "!"}${p.reason ? `(${p.reason})` : ""}`
-                      )
-                      .join(" | ")}
-                  </span>
-                ) : null}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={installMetricsServer}
-                  disabled={installingMs}
-                  className="gap-1.5 ml-auto"
-                >
-                  {installingMs && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  {msStatus.installed ? "Repair & restart" : "Install metrics-server"}
-                </Button>
-              </div>
-            )}
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
@@ -1054,24 +1240,12 @@ export const ClusterMonitor: React.FC<{
                   className="h-8 w-64 rounded-lg bg-zinc-950 border border-zinc-800 pl-8 pr-3 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-indigo-500"
                 />
               </div>
-              <select
-                value={podNs}
-                onChange={(e) => setPodNs(e.target.value)}
-                className="h-8 rounded-lg bg-zinc-950 border border-zinc-800 px-2 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
-              >
-                <option value="all">All namespaces ({pods.length})</option>
-                {namespaces.map((ns) => (
-                  <option key={ns} value={ns}>
-                    {ns} ({pods.filter((p) => p.namespace === ns).length})
-                  </option>
-                ))}
-              </select>
               <span className="ml-auto text-[11px] text-zinc-500">
                 {filteredPods.length} pods
               </span>
             </div>
 
-            <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+            <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1181,7 +1355,7 @@ export const ClusterMonitor: React.FC<{
                               }
                               className="h-6 w-6 text-zinc-400 hover:text-amber-300"
                             >
-                              <Bell className="h-3.5 w-3.5" />
+                              <ScrollText className="h-3.5 w-3.5" />
                             </Button>
                             <Button
                               variant="ghost"
@@ -1213,7 +1387,7 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ WORKLOADS ============ */}
         {tab === "workloads" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1227,7 +1401,7 @@ export const ClusterMonitor: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {workloads.map((w) => {
+                {filteredWorkloads.map((w) => {
                   const healthy = w.desired > 0 && w.ready >= w.desired;
                   const wk = w.kind.toLowerCase();
                   return (
@@ -1317,7 +1491,7 @@ export const ClusterMonitor: React.FC<{
                             }
                             className="h-6 w-6 text-zinc-400 hover:text-amber-300"
                           >
-                            <Bell className="h-3.5 w-3.5" />
+                            <ScrollText className="h-3.5 w-3.5" />
                           </Button>
                           <Button
                             variant="ghost"
@@ -1335,7 +1509,7 @@ export const ClusterMonitor: React.FC<{
                     </tr>
                   );
                 })}
-                {workloads.length === 0 && (
+                {filteredWorkloads.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No workloads yet."}
@@ -1363,7 +1537,7 @@ export const ClusterMonitor: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {events.map((e, i) => (
+                {filteredEvents.map((e, i) => (
                   <tr
                     key={i}
                     className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
@@ -1391,7 +1565,7 @@ export const ClusterMonitor: React.FC<{
                     </td>
                   </tr>
                 ))}
-                {events.length === 0 && (
+                {filteredEvents.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No events."}
@@ -1406,7 +1580,8 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ SERVICES ============ */}
         {tab === "services" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="space-y-5">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1420,7 +1595,7 @@ export const ClusterMonitor: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {services.map((s) => (
+                {filteredServices.map((s) => (
                   <tr
                     key={`${s.namespace}/${s.name}`}
                     className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
@@ -1454,7 +1629,7 @@ export const ClusterMonitor: React.FC<{
                         }
                         className="h-6 w-6 text-zinc-400 hover:text-amber-300"
                       >
-                        <Bell className="h-3.5 w-3.5" />
+                        <ScrollText className="h-3.5 w-3.5" />
                       </Button>
                       <Button
                         variant="ghost"
@@ -1468,7 +1643,7 @@ export const ClusterMonitor: React.FC<{
                     </td>
                   </tr>
                 ))}
-                {services.length === 0 && (
+                {filteredServices.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No services."}
@@ -1478,11 +1653,100 @@ export const ClusterMonitor: React.FC<{
               </tbody>
             </table>
           </div>
-        )}
 
-        {/* ============ CONFIG MAPS & SECRETS ============ */}
+          <div>
+            <div className="mb-2 flex items-center gap-2 px-1">
+              <Folder className="h-3.5 w-3.5 text-zinc-500" />
+              <h3 className="text-xs font-semibold text-zinc-300">Ingresses</h3>
+              <span className="text-[11px] text-zinc-500">{filteredIngresses.length}</span>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                    <th className="px-3 py-2">Namespace</th>
+                    <th className="px-3 py-2">Name</th>
+                    <th className="px-3 py-2">Class</th>
+                    <th className="px-3 py-2">Hosts</th>
+                    <th className="px-3 py-2">Address</th>
+                    <th className="px-3 py-2">TLS</th>
+                    <th className="px-3 py-2">Age</th>
+                    <th className="px-3 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredIngresses.map((i) => (
+                    <tr
+                      key={`${i.namespace}/${i.name}`}
+                      className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                    >
+                      <td className="px-3 py-2 text-zinc-500">{i.namespace}</td>
+                      <td className="px-3 py-2 font-mono text-zinc-200">{i.name}</td>
+                      <td className="px-3 py-2 text-zinc-400">{i.className || "—"}</td>
+                      <td
+                        className="px-3 py-2 font-mono text-zinc-300 max-w-64 truncate"
+                        title={i.hosts}
+                      >
+                        {i.hosts || "—"}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-zinc-400">{i.address || "—"}</td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`inline-flex rounded-md border px-1.5 py-0.5 text-[10px] ${
+                            i.tls
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                              : "border-zinc-700 text-zinc-500"
+                          }`}
+                        >
+                          {i.tls ? "TLS" : "—"}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-zinc-500">
+                        {i.created ? formatRelativeTime(i.created) : "-"}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="View YAML"
+                            aria-label="View ingress YAML"
+                            onClick={() => openResourceView("ingress", i.namespace, i.name)}
+                            className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                          >
+                            <FileCode2 className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Delete ingress"
+                            aria-label="Delete ingress"
+                            onClick={() =>
+                              handleDeleteResource("ingress", i.namespace, i.name, "Ingress")
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredIngresses.length === 0 && (
+                    <tr>
+                      <td colSpan={8} className="px-3 py-8 text-center text-zinc-500">
+                        {monitorError ? "Cluster unreachable" : "No ingresses."}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          </div>
+        )}
         {tab === "config" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1495,7 +1759,7 @@ export const ClusterMonitor: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {configs.map((c) => (
+                {filteredConfigs.map((c) => (
                   <tr
                     key={`${c.resourceKind}/${c.namespace}/${c.name}`}
                     className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
@@ -1554,7 +1818,7 @@ export const ClusterMonitor: React.FC<{
                         }
                         className="h-6 w-6 text-zinc-400 hover:text-amber-300"
                       >
-                        <Bell className="h-3.5 w-3.5" />
+                        <ScrollText className="h-3.5 w-3.5" />
                       </Button>
                       <Button
                         variant="ghost"
@@ -1575,7 +1839,7 @@ export const ClusterMonitor: React.FC<{
                     </td>
                   </tr>
                 ))}
-                {configs.length === 0 && (
+                {filteredConfigs.length === 0 && (
                   <tr>
                     <td colSpan={6} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No config maps or secrets."}
@@ -1589,7 +1853,8 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ PVCs ============ */}
         {tab === "pvcs" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="space-y-5">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1604,7 +1869,7 @@ export const ClusterMonitor: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {pvcs.map((p) => (
+                {filteredPvcs.map((p) => (
                   <tr
                     key={`${p.namespace}/${p.name}`}
                     className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
@@ -1662,7 +1927,7 @@ export const ClusterMonitor: React.FC<{
                     </td>
                   </tr>
                 ))}
-                {pvcs.length === 0 && (
+                {filteredPvcs.length === 0 && (
                   <tr>
                     <td colSpan={8} className="px-3 py-8 text-center text-zinc-500">
                       {monitorError ? "Cluster unreachable" : "No persistent volume claims."}
@@ -1672,11 +1937,198 @@ export const ClusterMonitor: React.FC<{
               </tbody>
             </table>
           </div>
+
+          <div>
+            <div className="mb-2 flex items-center gap-2 px-1">
+              <Package className="h-3.5 w-3.5 text-zinc-500" />
+              <h3 className="text-xs font-semibold text-zinc-300">Persistent Volumes</h3>
+              <span className="text-[11px] text-zinc-500">{pvs.length}</span>
+              <span className="text-[10px] text-zinc-600">cluster-scoped</span>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                    <th className="px-3 py-2">Name</th>
+                    <th className="px-3 py-2">Capacity</th>
+                    <th className="px-3 py-2">Access</th>
+                    <th className="px-3 py-2">Reclaim</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Class</th>
+                    <th className="px-3 py-2">Claim</th>
+                    <th className="px-3 py-2">Age</th>
+                    <th className="px-3 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pvs.map((v) => (
+                    <tr
+                      key={v.name}
+                      className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                    >
+                      <td className="px-3 py-2 font-mono text-zinc-200">{v.name}</td>
+                      <td className="px-3 py-2 font-mono text-zinc-300">{v.capacity || "—"}</td>
+                      <td className="px-3 py-2 text-zinc-500">{v.accessModes}</td>
+                      <td className="px-3 py-2 text-zinc-400">{v.reclaimPolicy}</td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`inline-flex rounded-md border px-1.5 py-0.5 text-[10px] ${
+                            v.status === "Bound"
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                              : v.status === "Available"
+                                ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                                : "border-zinc-700 text-zinc-400"
+                          }`}
+                        >
+                          {v.status}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-zinc-500">{v.storageClass || "—"}</td>
+                      <td className="px-3 py-2 font-mono text-zinc-400">{v.claim || "—"}</td>
+                      <td className="px-3 py-2 text-zinc-500">
+                        {v.created ? formatRelativeTime(v.created) : "-"}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="View YAML"
+                            aria-label="View persistent volume YAML"
+                            onClick={() => openResourceView("persistentvolume", null, v.name)}
+                            className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                          >
+                            <FileCode2 className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title="Delete persistent volume"
+                            aria-label="Delete persistent volume"
+                            onClick={() =>
+                              handleDeleteResource("persistentvolume", null, v.name, "PersistentVolume")
+                            }
+                            className="h-6 w-6 text-zinc-400 hover:text-rose-400"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {pvs.length === 0 && (
+                    <tr>
+                      <td colSpan={9} className="px-3 py-8 text-center text-zinc-500">
+                        {monitorError ? "Cluster unreachable" : "No persistent volumes."}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          </div>
+        )}
+
+        {/* ============ NAMESPACES ============ */}
+        {tab === "namespaces" && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] text-zinc-500">
+                {namespaceList.length} namespaces
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleCreateNamespace()}
+                className="ml-auto gap-1.5"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Create namespace
+              </Button>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
+                    <th className="px-3 py-2">Name</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Age</th>
+                    <th className="px-3 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {namespaceList.map((n) => {
+                    const system = ["default", "kube-system", "kube-public", "kube-node-lease"].includes(
+                      n.name
+                    );
+                    return (
+                      <tr
+                        key={n.name}
+                        className="border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/20"
+                      >
+                        <td className="px-3 py-2 font-mono text-zinc-200">{n.name}</td>
+                        <td className="px-3 py-2">
+                          <span
+                            className={`inline-flex rounded-md border px-1.5 py-0.5 text-[10px] ${
+                              n.status === "Active"
+                                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                                : "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                            }`}
+                          >
+                            {n.status}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-zinc-500">
+                          {n.created ? formatRelativeTime(n.created) : "-"}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center justify-end gap-1">
+                            {system && (
+                              <span className="mr-1 text-[10px] text-zinc-600">system</span>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="View YAML"
+                              aria-label="View namespace YAML"
+                              onClick={() => openResourceView("namespace", null, n.name)}
+                              className="h-6 w-6 text-zinc-400 hover:text-sky-300"
+                            >
+                              <FileCode2 className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title={system ? "System namespaces cannot be deleted here" : "Delete namespace"}
+                              aria-label="Delete namespace"
+                              disabled={system}
+                              onClick={() => void handleDeleteNamespace(n)}
+                              className="h-6 w-6 text-zinc-400 hover:text-rose-400 disabled:opacity-30"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {namespaceList.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="px-3 py-8 text-center text-zinc-500">
+                        {monitorError ? "Cluster unreachable" : "No namespaces."}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         )}
       {/* Pod logs modal */}
       {logsFor && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="flex w-full max-w-3xl flex-col rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl max-h-[80vh]">
+          <div className="flex w-[80vw] h-[90vh] flex-col rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl">
             <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-3">
               <FileText className="h-4 w-4 text-zinc-400" />
               <span className="text-sm font-semibold text-white">
@@ -1734,13 +2186,15 @@ export const ClusterMonitor: React.FC<{
       {/* Resource YAML modal */}
       {yamlFor && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-          <div className="w-full max-w-3xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
+          <div className="w-[80vw] h-[90vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
             <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-white truncate">
                   {yamlFor.kind} · {yamlFor.name}
                 </p>
-                <p className="text-[11px] text-zinc-500">namespace {yamlFor.ns}</p>
+                <p className="text-[11px] text-zinc-500">
+                  {yamlFor.ns ? `namespace ${yamlFor.ns}` : "cluster-scoped"}
+                </p>
               </div>
               <div className="flex items-center gap-1">
                 <Button
@@ -1793,13 +2247,15 @@ export const ClusterMonitor: React.FC<{
       {/* Resource events modal */}
       {eventsFor && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-          <div className="w-full max-w-3xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
+          <div className="w-[80vw] h-[90vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
             <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-white truncate">
                   Events · {eventsFor.kind} {eventsFor.name}
                 </p>
-                <p className="text-[11px] text-zinc-500">namespace {eventsFor.ns}</p>
+                <p className="text-[11px] text-zinc-500">
+                  {eventsFor.ns ? `namespace ${eventsFor.ns}` : "cluster-scoped"}
+                </p>
               </div>
               <div className="flex items-center gap-1">
                 <Button
@@ -1900,7 +2356,7 @@ export const ClusterMonitor: React.FC<{
       {/* Pod terminal modal */}
       {terminalFor && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-          <div className="w-full max-w-4xl h-[70vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl">
+          <div className="w-[80vw] h-[90vh] flex flex-col rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl">
             <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-white truncate">

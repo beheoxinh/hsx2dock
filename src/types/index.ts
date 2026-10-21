@@ -527,6 +527,8 @@ export interface K8sNodeInfo {
   cpuCapacityM: number;
   memCapacityBytes: number;
   podsCapacity: number;
+  /** `spec.unschedulable` — true after a cordon. */
+  unschedulable: boolean;
   created: number | null;
 }
 
@@ -654,6 +656,36 @@ export interface K8sPvcInfo {
   capacity: string;
   accessModes: string;
   storageClass: string;
+  created: number | null;
+}
+
+export interface K8sNamespaceInfo {
+  name: string;
+  status: string;
+  created: number | null;
+}
+
+export interface K8sIngressInfo {
+  name: string;
+  namespace: string;
+  className: string;
+  /** Comma-separated host rules (`*` when a rule has no host). */
+  hosts: string;
+  /** Load-balancer address assigned by the controller, if any. */
+  address: string;
+  tls: boolean;
+  created: number | null;
+}
+
+export interface K8sPvInfo {
+  name: string;
+  capacity: string;
+  accessModes: string;
+  reclaimPolicy: string;
+  status: string;
+  storageClass: string;
+  /** `namespace/name` of the bound claim ("" when unbound). */
+  claim: string;
   created: number | null;
 }
 

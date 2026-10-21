@@ -91,9 +91,30 @@ const MainLayout: React.FC = () => {
       })
       .then((u) => (unlistenEndpoint = u));
 
+    // Tray quick actions ("Containers", "Images", "Manage Kubernetes").
+    // Validate the payload: the backend and the shell must stay in sync even
+    // if an old build sends a tab this build no longer has.
+    let unlistenTray: (() => void) | undefined;
+    const NAV_TABS: NavTab[] = [
+      "dashboard",
+      "containers",
+      "images",
+      "volumes",
+      "networks",
+      "kubernetes",
+      "compose",
+      "settings",
+    ];
+    events
+      .onTrayNavigate((tab) => {
+        if (NAV_TABS.includes(tab as NavTab)) setActiveTab(tab as NavTab);
+      })
+      .then((u) => (unlistenTray = u));
+
     return () => {
       if (unlisten) unlisten();
       if (unlistenEndpoint) unlistenEndpoint();
+      if (unlistenTray) unlistenTray();
     };
   }, []);
 
