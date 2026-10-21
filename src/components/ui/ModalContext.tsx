@@ -133,8 +133,8 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
               </div>
 
               {/* Body */}
-              <div className="px-6 py-3 space-y-4">
-                <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">
+              <div className="px-6 py-3 space-y-4 select-text">
+                <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap select-text">
                   {currentOptions?.message}
                 </p>
 

@@ -652,7 +652,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
               </div>
               <div
                 ref={logRef}
-                className="px-3.5 py-2.5 max-h-44 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5"
+                className="px-3.5 py-2.5 max-h-44 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5 select-text"
               >
                 {orphanLogLines.map((l, i) => (
                   <div
@@ -857,7 +857,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                         </div>
                         <div
                           ref={logRef}
-                          className="px-3.5 py-2.5 max-h-40 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5"
+                          className="px-3.5 py-2.5 max-h-40 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5 select-text"
                         >
                           {logLines
                             .filter((l) => l.name === c.name)
@@ -1243,7 +1243,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                   </div>
 
                   {creating && showLog && (
-                    <div className="rounded-lg bg-zinc-950 border border-zinc-800 px-3 py-2 max-h-32 overflow-y-auto font-mono text-[11px] space-y-0.5">
+                    <div className="rounded-lg bg-zinc-950 border border-zinc-800 px-3 py-2 max-h-32 overflow-y-auto font-mono text-[11px] space-y-0.5 select-text">
                       {logLines.slice(-12).map((l, i) => (
                         <div
                           key={i}

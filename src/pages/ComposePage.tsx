@@ -1,9 +1,9 @@
-import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
-import { FileCode2, Play, Square, Terminal, RefreshCw } from "lucide-react";
+import { FileCode2, Play, Square, Terminal, RefreshCw, Copy } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
+import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
 import type { ComposeProjectInfo, DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
@@ -197,16 +197,33 @@ export const ComposePage: React.FC<ComposePageProps> = ({
                   Logs: {selectedProject?.name}
                 </span>
               </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => selectedProject && loadLogs(selectedProject.path)}
-                isLoading={logsLoading}
-                className="text-xs gap-1.5"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Refresh</span>
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={!logs}
+                  onClick={() => {
+                    if (!logs) return;
+                    navigator.clipboard.writeText(logs);
+                    toast.success("Logs copied", "Compose logs copied to clipboard.");
+                  }}
+                  className="text-xs gap-1.5"
+                  title="Copy logs"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy</span>
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => selectedProject && loadLogs(selectedProject.path)}
+                  isLoading={logsLoading}
+                  className="text-xs gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Refresh</span>
+                </Button>
+              </div>
             </div>
 
             <div className="flex-1 bg-zinc-950 rounded-xl border border-zinc-800/80 p-4 mt-3 overflow-hidden flex flex-col">

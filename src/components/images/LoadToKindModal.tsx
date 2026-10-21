@@ -173,7 +173,7 @@ export const LoadToKindModal: React.FC<LoadToKindModalProps> = ({ image, onClose
               )}
 
               {(lines.length > 0 || loading || done) && (
-                <div className="rounded-lg bg-zinc-950 border border-zinc-800 px-3 py-2 max-h-28 overflow-y-auto font-mono text-[11px] space-y-0.5">
+                <div className="rounded-lg bg-zinc-950 border border-zinc-800 px-3 py-2 max-h-28 overflow-y-auto font-mono text-[11px] space-y-0.5 select-text">
                   {lines.map((l, i) => (
                     <div
                       key={i}

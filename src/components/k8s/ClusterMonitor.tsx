@@ -1302,7 +1302,7 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ EVENTS ============ */}
         {tab === "events" && (
-          <div className="overflow-x-auto rounded-xl border border-zinc-800/80">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-zinc-800 bg-zinc-900/80 text-left text-[10px] uppercase tracking-wider text-zinc-500">
@@ -1669,13 +1669,13 @@ export const ClusterMonitor: React.FC<{
                 </Button>
               </div>
             </div>
-            <div className="flex-1 overflow-auto bg-zinc-950/60 px-4 py-3">
+            <div className="flex-1 overflow-auto bg-zinc-950/60 px-4 py-3 select-text">
               {logsLoading ? (
                 <p className="text-xs text-zinc-500">Loading logs…</p>
               ) : logsError ? (
                 <p className="text-xs text-rose-400">{logsError}</p>
               ) : (
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300">
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300 select-text">
                   {logsText || "(empty)"}
                 </pre>
               )}
@@ -1726,7 +1726,7 @@ export const ClusterMonitor: React.FC<{
                 </Button>
               </div>
             </div>
-            <div className="flex-1 min-h-0 overflow-auto px-4 py-3">
+            <div className="flex-1 min-h-0 overflow-auto px-4 py-3 select-text">
               {yamlLoading ? (
                 <div className="flex items-center gap-2 text-xs text-zinc-500">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading manifest…
@@ -1734,7 +1734,7 @@ export const ClusterMonitor: React.FC<{
               ) : yamlError ? (
                 <p className="text-xs text-rose-400">{yamlError}</p>
               ) : (
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300">
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300 select-text">
                   {yamlText}
                 </pre>
               )}
@@ -1754,18 +1754,44 @@ export const ClusterMonitor: React.FC<{
                 </p>
                 <p className="text-[11px] text-zinc-500">namespace {eventsFor.ns}</p>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                title="Close"
-                aria-label="Close events viewer"
-                onClick={() => setEventsFor(null)}
-                className="h-7 w-7 text-zinc-400"
-              >
-                <X className="h-4 w-4" />
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Copy events"
+                  aria-label="Copy events"
+                  disabled={eventsList.length === 0}
+                  onClick={async () => {
+                    const text = eventsList
+                      .map(
+                        (e) =>
+                          `[${e.type}] ${e.reason} on ${e.object}: ${e.message} (count: ${e.count})`
+                      )
+                      .join("\n");
+                    try {
+                      await navigator.clipboard.writeText(text);
+                      toast.success("Events copied", `${eventsList.length} event(s) copied.`);
+                    } catch (err) {
+                      toast.error("Copy failed", String(err));
+                    }
+                  }}
+                  className="h-7 w-7 text-zinc-400"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Close"
+                  aria-label="Close events viewer"
+                  onClick={() => setEventsFor(null)}
+                  className="h-7 w-7 text-zinc-400"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
-            <div className="flex-1 min-h-0 overflow-auto">
+            <div className="flex-1 min-h-0 overflow-auto select-text">
               {eventsLoading ? (
                 <div className="flex items-center gap-2 px-4 py-3 text-xs text-zinc-500">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading events…

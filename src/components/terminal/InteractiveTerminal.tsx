@@ -94,6 +94,19 @@ export const InteractiveTerminal: React.FC<InteractiveTerminalProps> = ({
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
+    // Support keyboard copy (Ctrl+Shift+C, Cmd+C, or Ctrl+C when text is selected)
+    term.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+      const isCopy = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c";
+      if (isCopy && term.hasSelection()) {
+        const text = term.getSelection();
+        if (text) {
+          navigator.clipboard.writeText(text).catch(() => {});
+        }
+        return false; // don't send SIGINT to the container when copying selected text
+      }
+      return true;
+    });
+
     try {
       fitAddon.fit();
     } catch {

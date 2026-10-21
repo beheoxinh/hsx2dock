@@ -12,6 +12,7 @@ import {
   Upload,
   X,
   XCircle,
+  Copy,
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { TerminalViewer } from "../ui/TerminalViewer";
@@ -557,6 +558,20 @@ export const BuildImageModal: React.FC<BuildImageModalProps> = ({
                     <span className="tabular-nums text-zinc-500">{formatElapsed(elapsed)}</span>
                   )}
                   {pct !== null && <span className="tabular-nums text-zinc-400">{pct}%</span>}
+                  <button
+                    type="button"
+                    title="Copy build logs"
+                    onClick={() => {
+                      const all = lines.map((l) => l.text).join("\n");
+                      if (!all) return;
+                      navigator.clipboard.writeText(all);
+                      toast.success("Logs copied", "Build logs copied to clipboard.");
+                    }}
+                    className="flex items-center gap-1 text-[11px] text-zinc-400 hover:text-white transition-colors"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    <span>Copy</span>
+                  </button>
                 </div>
               </div>
               {pct !== null && (

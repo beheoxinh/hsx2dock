@@ -85,7 +85,7 @@ export const ImageHistoryModal: React.FC<ImageHistoryModalProps> = ({
 
               <p className="text-xs text-zinc-500 mb-3 font-mono truncate">{image}</p>
 
-              <div className="flex-1 overflow-y-auto -mx-2">
+              <div className="flex-1 overflow-y-auto -mx-2 select-text">
                 {loading ? (
                   <div className="flex items-center justify-center gap-2 py-10 text-xs text-zinc-500">
                     <Loader2 className="w-4 h-4 animate-spin" />

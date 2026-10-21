@@ -44,6 +44,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   const [logs, setLogs] = useState<string>("");
   const [, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [logsCopied, setLogsCopied] = useState(false);
   const [logFilter, setLogFilter] = useState("");
   const [limitsDraft, setLimitsDraft] = useState<ResourceLimits | null>(null);
   const [savingLimits, setSavingLimits] = useState(false);
@@ -184,6 +185,15 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     setCopied(true);
     toast.success("Copied to clipboard", "Raw container inspect JSON copied.");
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleCopyLogs = () => {
+    const textToCopy = filteredLogs || logs;
+    if (!textToCopy) return;
+    navigator.clipboard.writeText(textToCopy);
+    setLogsCopied(true);
+    toast.success("Logs copied", "Container logs copied to clipboard.");
+    setTimeout(() => setLogsCopied(false), 2000);
   };
 
   if (!containerId) return null;
@@ -347,10 +357,16 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                       className="w-full h-8 pl-8 pr-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500"
                     />
                   </div>
-                  <span className="text-xs text-zinc-500 font-mono">ANSI Interactive Shell</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-zinc-500 font-mono hidden sm:inline">ANSI Interactive Shell</span>
+                    <Button variant="outline" size="sm" onClick={handleCopyLogs} className="gap-2">
+                      {logsCopied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{logsCopied ? "Copied" : "Copy logs"}</span>
+                    </Button>
+                  </div>
                 </div>
 
-                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col">
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-2xl p-3 overflow-hidden shadow-inner flex flex-col select-text">
                   <TerminalViewer logs={filteredLogs || "No logs output recorded."} />
                 </div>
               </div>

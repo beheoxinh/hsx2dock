@@ -101,6 +101,46 @@ select:focus {
   outline: none !important;
 }
 
+/* ==========================================================================
+   Text Selection & Clipboard Support for Logs, Terminals, Code, Events
+   ========================================================================== */
+
+/* Allow selection across all logs, terminal outputs, code snippets and tables */
+pre,
+code,
+kbd,
+samp,
+.select-text,
+[data-selectable="true"] {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+}
+
+/* Allow selection inside xterm rows and screens */
+.xterm,
+.xterm .xterm-screen,
+.xterm .xterm-rows,
+.xterm .xterm-rows > div {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.xterm-viewport {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+::selection {
+  background-color: rgba(59, 130, 246, 0.4);
+  color: #ffffff;
+}
+
+.light ::selection {
+  background-color: rgba(59, 130, 246, 0.3);
+  color: #0f172a;
+}
+
 
 /* ==========================================================================
    Comprehensive Light Theme Support

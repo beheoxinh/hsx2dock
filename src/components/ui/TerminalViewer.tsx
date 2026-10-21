@@ -50,6 +50,18 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ logs }) => {
     term.open(containerRef.current);
     fitAddon.fit();
 
+    // Support keyboard copy (Ctrl+C / Ctrl+Shift+C / Cmd+C) when text is selected
+    term.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c" && term.hasSelection()) {
+        const text = term.getSelection();
+        if (text) {
+          navigator.clipboard.writeText(text).catch(() => {});
+        }
+        return false;
+      }
+      return true;
+    });
+
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
