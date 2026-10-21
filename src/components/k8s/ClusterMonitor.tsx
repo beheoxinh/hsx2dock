@@ -37,6 +37,7 @@ import type {
   K8sPvcInfo,
   K8sServiceInfo,
   K8sWorkloadInfo,
+  MetricsServerStatus,
 } from "../../types";
 
 type MonitorTab =
@@ -136,6 +137,9 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   const [podNs, setPodNs] = useState("all");
   const [podSearch, setPodSearch] = useState("");
   const [installingMs, setInstallingMs] = useState(false);
+  // Real metrics-server state (deployment/pods/`kubectl top`), polled with the
+  // slow tick — keeps "installed but warming up" distinct from "not installed".
+  const [msStatus, setMsStatus] = useState<MetricsServerStatus | null>(null);
   const modal = useModal();
 
   // Extra resource listings (tab-scoped, polled with the slow tick).
@@ -171,8 +175,10 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   const [eventsLoading, setEventsLoading] = useState(false);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [terminalFor, setTerminalFor] = useState<
-    { ns: string; name: string } | null
+    { ns: string; name: string; shell: string; mode: "shell" | "debug" } | null
   >(null);
+  // "ns/name" while a shell probe is in flight (prevents double-clicks).
+  const [terminalBusy, setTerminalBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setTab("overview");
@@ -194,6 +200,7 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     setYamlFor(null);
     setEventsFor(null);
     setTerminalFor(null);
+    setMsStatus(null);
   }, [cluster]);
 
   useEffect(() => {
@@ -236,15 +243,28 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
         /* fast poll surfaces connectivity errors */
       }
     };
+    const ms = () => {
+      api
+        .metricsServerStatus(cluster)
+        .then((s) => {
+          if (alive) setMsStatus(s);
+        })
+        .catch(() => {
+          /* unreachable cluster is reported by the fast poll */
+        });
+    };
 
     fast();
     slow();
+    ms();
     const t1 = window.setInterval(fast, 6000);
     const t2 = window.setInterval(slow, 15000);
+    const t3 = window.setInterval(ms, 20000);
     return () => {
       alive = false;
       window.clearInterval(t1);
       window.clearInterval(t2);
+      window.clearInterval(t3);
     };
   }, [cluster]);
 
@@ -311,11 +331,26 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   const installMetricsServer = async () => {
     try {
       setInstallingMs(true);
-      await api.installMetricsServer(cluster);
-      toast.success(
-        "metrics-server applied",
-        "Pods schedule in ~1 min — usage pills fill in automatically."
-      );
+      // The command applies the manifest, patches --kubelet-insecure-tls,
+      // waits for the rollout and for `kubectl top` — up to ~4 minutes.
+      const status = await api.installMetricsServer(cluster);
+      setMsStatus(status);
+      // Fresh usage numbers as soon as the API answers.
+      api.getClusterMetrics(cluster).then(setMetrics).catch(() => {});
+      if (status.top_works) {
+        toast.success(
+          "metrics-server ready",
+          "Pod CPU/memory pills will fill in on the next poll."
+        );
+      } else if (status.installed) {
+        toast.info(
+          "metrics-server installed",
+          status.message ??
+            "Usage data usually shows up within a minute — this tab re-checks automatically."
+        );
+      } else {
+        toast.error("Install incomplete", status.message ?? "Check the pod list in kube-system.");
+      }
     } catch (e) {
       toast.error("Install failed", String(e));
     } finally {
@@ -366,6 +401,33 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
   /** Streams aggregated workload logs through the shared logs modal. */
   const openWorkloadLogs = (kind: string, ns: string, name: string) => {
     setLogsFor({ ns, name, workloadKind: kind });
+  };
+
+  /**
+   * Opens a terminal in a pod. The image may have no shell at all (distroless
+   * — `exec: "sh": executable file not found in $PATH`), so the shell is probed
+   * first and, when none exists, the user can inject a busybox debug container.
+   */
+  const openPodTerminal = async (ns: string, name: string) => {
+    if (terminalBusy) return;
+    try {
+      setTerminalBusy(`${ns}/${name}`);
+      const shell = await api.detectPodShell(cluster, ns, name);
+      if (shell) {
+        setTerminalFor({ ns, name, shell, mode: "shell" });
+        return;
+      }
+      const useDebug = await modal.showConfirm(
+        `No shell was found in '${name}' — its image ships no /bin/sh (distroless/scratch), so a normal exec cannot start. Open a debug container instead? A busybox ephemeral container is injected into the pod and removed when the pod is deleted.`,
+        "No shell in this image",
+        "info"
+      );
+      if (useDebug) setTerminalFor({ ns, name, shell: "/bin/sh", mode: "debug" });
+    } catch (e) {
+      toast.error("Terminal unavailable", String(e));
+    } finally {
+      setTerminalBusy(null);
+    }
   };
 
   useEffect(() => {
@@ -494,7 +556,8 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
 
   const cpuPct = totalCpuCap > 0 ? (totalCpuUsed / totalCpuCap) * 100 : 0;
   const memPct = totalMemCap > 0 ? (totalMemUsed / totalMemCap) * 100 : 0;
-  const noMetrics = !!metrics?.error;
+  const noMetrics =
+    !!metrics?.error || (msStatus?.installed && !msStatus.top_works);
 
   return (
     <section className="rounded-2xl border border-zinc-800/80 bg-zinc-900/40 overflow-hidden">
@@ -672,10 +735,37 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   </div>
                   <div className="mt-2">
                     {noMetrics || cap === 0 ? (
-                      <div className="flex items-center justify-between text-[11px] text-zinc-500">
+                      <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-500">
                         <span>
-                          metrics-server not installed — usage numbers unavailable
+                          {msStatus?.installed
+                            ? msStatus.message ??
+                              "metrics-server installed — usage data appears within a minute."
+                            : msStatus?.message ?? "metrics-server not installed."}
                         </span>
+                        {msStatus?.pods.length ? (
+                          <span className="font-mono text-zinc-400">
+                            {msStatus.pods
+                              .map(
+                                (p) =>
+                                  `${p.name}:${p.phase}${p.ready ? "" : "!"}${p.reason ? `(${p.reason})` : ""}`
+                              )
+                              .join(" | ")}
+                          </span>
+                        ) : null}
+                        {msStatus && !msStatus.installed && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={installMetricsServer}
+                            disabled={installingMs}
+                            className="gap-1.5 ml-auto"
+                          >
+                            {installingMs && (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            )}
+                            Install metrics-server
+                          </Button>
+                        )}
                       </div>
                     ) : (
                       <>
@@ -814,13 +904,32 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
         {tab === "podlist" && (
           <div className="space-y-3">
             {/* Pod usage comes from metrics-server — offer the install inline. */}
-            {metrics?.error && (
+            {noMetrics && msStatus && (
               <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-amber-300">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                {msStatus.installed ? (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                ) : (
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                )}
                 <span>
-                  metrics-server is not installed — pod CPU/memory columns stay empty
-                  until it is (~1 min after install).
+                  {msStatus.installed
+                    ? `metrics-server installed (${
+                        msStatus.ready ? "ready" : "starting"
+                      } ${msStatus.available_replicas}/${msStatus.desired_replicas}) — ${
+                      msStatus.message ?? "usage columns fill in automatically."
+                    }`
+                    : "metrics-server is not installed — pod CPU/memory columns stay empty until it is."}
                 </span>
+                {msStatus.pods.length ? (
+                  <span className="font-mono text-amber-200/70">
+                    {msStatus.pods
+                      .map(
+                        (p) =>
+                          `${p.name}:${p.phase}${p.ready ? "" : "!"}${p.reason ? `(${p.reason})` : ""}`
+                      )
+                      .join(" | ")}
+                  </span>
+                ) : null}
                 <Button
                   variant="outline"
                   size="sm"
@@ -829,7 +938,7 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   className="gap-1.5 ml-auto"
                 >
                   {installingMs && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Install metrics-server
+                  {msStatus.installed ? "Repair & restart" : "Install metrics-server"}
                 </Button>
               </div>
             )}
@@ -938,13 +1047,15 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                               size="icon"
                               title="Open an interactive shell in this pod"
                               aria-label="Open pod terminal"
-                              disabled={p.phase !== "Running"}
-                              onClick={() =>
-                                setTerminalFor({ ns: p.namespace, name: p.name })
-                              }
+                              disabled={p.phase !== "Running" || terminalBusy !== null}
+                              onClick={() => openPodTerminal(p.namespace, p.name)}
                               className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-40"
                             >
-                              <Terminal className="h-3.5 w-3.5" />
+                              {terminalBusy === `${p.namespace}/${p.name}` ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Terminal className="h-3.5 w-3.5" />
+                              )}
                             </Button>
                             <Button
                               variant="ghost"
@@ -1668,7 +1779,10 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                   Terminal · {terminalFor.name}
                 </p>
                 <p className="text-[11px] text-zinc-500">
-                  {cluster} · namespace {terminalFor.ns} · sh
+                  {cluster} · namespace {terminalFor.ns} ·{" "}
+                  {terminalFor.mode === "debug"
+                    ? "busybox debug container"
+                    : terminalFor.shell}
                 </p>
               </div>
               <Button
@@ -1685,18 +1799,34 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
             <div className="flex-1 min-h-0">
               <InteractiveTerminal
                 containerId={`${cluster}-control-plane`}
-                cmd={[
-                  "kubectl",
-                  "--kubeconfig=/etc/kubernetes/admin.conf",
-                  "exec",
-                  "-n",
-                  terminalFor.ns,
-                  terminalFor.name,
-                  "-i",
-                  "-t",
-                  "--",
-                  "sh",
-                ]}
+                cmd={
+                  terminalFor.mode === "debug"
+                    ? [
+                        // Ephemeral busybox container for images with no shell.
+                        "kubectl",
+                        "--kubeconfig=/etc/kubernetes/admin.conf",
+                        "debug",
+                        "-it",
+                        terminalFor.name,
+                        "-n",
+                        terminalFor.ns,
+                        "--image=busybox:1.36",
+                        "--",
+                        "/bin/sh",
+                      ]
+                    : [
+                        "kubectl",
+                        "--kubeconfig=/etc/kubernetes/admin.conf",
+                        "exec",
+                        "-n",
+                        terminalFor.ns,
+                        terminalFor.name,
+                        "-i",
+                        "-t",
+                        "--",
+                        terminalFor.shell,
+                      ]
+                }
               />
             </div>
           </div>

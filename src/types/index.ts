@@ -578,6 +578,31 @@ export interface K8sMetrics {
   error: string | null;
 }
 
+/** One metrics-server pod, as reported by the cluster. */
+export interface MetricsPodStatus {
+  name: string;
+  phase: string;
+  ready: boolean;
+  restarts: number;
+  reason: string | null;
+}
+
+/**
+ * Real metrics-server state. `installed` (the deployment exists) and
+ * `topWorks` (kubectl top answers) diverge while it warms up — the UI keeps
+ * them apart so a started install never reads as "not installed".
+ */
+export interface MetricsServerStatus {
+  installed: boolean;
+  desired_replicas: number;
+  available_replicas: number;
+  ready: boolean;
+  kubelet_insecure_tls: boolean;
+  pods: MetricsPodStatus[];
+  top_works: boolean;
+  message: string | null;
+}
+
 export interface K8sClusterSummary {
   gitVersion: string;
   platform: string;

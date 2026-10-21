@@ -245,6 +245,8 @@ pub fn run() {
             kind::get_cluster_metrics,
             kind::get_cluster_summary,
             kind::install_metrics_server,
+            kind::metrics_server_status,
+            kind::detect_pod_shell,
 
             // Registries
             registries::list_registries,

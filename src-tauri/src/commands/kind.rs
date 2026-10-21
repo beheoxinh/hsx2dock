@@ -1600,24 +1600,448 @@ pub async fn get_cluster_summary(
     })
 }
 
-/// Installs the upstream metrics-server manifests into the cluster so
-/// `kubectl top` (and the monitoring UI's CPU/memory pills) start working.
+/// Where the upstream metrics-server manifest lives.
+const METRICS_SERVER_MANIFEST: &str =
+    "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml";
+
+/// One metrics-server pod as the UI reports it.
+#[derive(Clone, serde::Serialize)]
+pub struct MetricsPodStatus {
+    pub name: String,
+    pub phase: String,
+    pub ready: bool,
+    pub restarts: i64,
+    /// `state.waiting.reason` / `state.terminated.reason` when the pod is stuck.
+    pub reason: Option<String>,
+}
+
+/// Real state of metrics-server in a cluster. `installed` is about the
+/// deployment existing at all; `top_works` is about `kubectl top` succeeding —
+/// they diverge for the first ~minute after install, which is exactly what a
+/// `kubectl top`-only heuristic used to get wrong.
+#[derive(Clone, serde::Serialize)]
+pub struct MetricsServerStatus {
+    pub installed: bool,
+    pub desired_replicas: i64,
+    pub available_replicas: i64,
+    pub ready: bool,
+    /// True when the container args carry `--kubelet-insecure-tls` (required on
+    /// kind, whose kubelet serving certs are self-signed).
+    pub kubelet_insecure_tls: bool,
+    pub pods: Vec<MetricsPodStatus>,
+    pub top_works: bool,
+    /// Human-readable diagnosis when something needs attention.
+    pub message: Option<String>,
+}
+
+/// True when the deployment's first container already passes `arg`.
+fn deployment_has_arg(deployment: &serde_json::Value, arg: &str) -> bool {
+    deployment
+        .pointer("/spec/template/spec/containers/0/args")
+        .and_then(|a| a.as_array())
+        .map(|args| args.iter().any(|v| v.as_str() == Some(arg)))
+        .unwrap_or(false)
+}
+
+fn deployment_available_replicas(deployment: &serde_json::Value) -> i64 {
+    deployment
+        .pointer("/status/availableReplicas")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
+fn deployment_desired_replicas(deployment: &serde_json::Value) -> i64 {
+    deployment
+        .pointer("/spec/replicas")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1)
+}
+
+/// Parses `kubectl get pods -n kube-system -l k8s-app=metrics-server -o json`.
+fn parse_metrics_pods(json: &serde_json::Value) -> Vec<MetricsPodStatus> {
+    json.get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|p| {
+                    let status = p.get("status");
+                    let cs = status
+                        .and_then(|s| s.get("containerStatuses"))
+                        .and_then(|c| c.as_array());
+                    let ready = cs
+                        .map(|list| {
+                            !list.is_empty()
+                                && list
+                                    .iter()
+                                    .all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
+                        })
+                        .unwrap_or(false);
+                    let restarts = cs
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|c| c.get("restartCount").and_then(|r| r.as_i64()))
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    // A stuck pod explains itself in waiting/terminated.reason
+                    // (ImagePullBackOff, CrashLoopBackOff, ...).
+                    let reason = cs
+                        .and_then(|list| list.first())
+                        .and_then(|c| c.get("state"))
+                        .and_then(|s| {
+                            s.pointer("/waiting/reason")
+                                .or_else(|| s.pointer("/terminated/reason"))
+                        })
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string());
+                    MetricsPodStatus {
+                        name: p
+                            .pointer("/metadata/name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        phase: status
+                            .and_then(|s| s.get("phase"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown")
+                            .to_string(),
+                        ready,
+                        restarts,
+                        reason,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Turns the raw flags into the one sentence the UI shows (or nothing).
+fn diagnose_metrics(
+    installed: bool,
+    ready: bool,
+    kubelet_insecure_tls: bool,
+    top_works: bool,
+    pods: &[MetricsPodStatus],
+) -> Option<String> {
+    if !installed {
+        return None;
+    }
+    if let Some(p) = pods
+        .iter()
+        .find(|p| p.reason.is_some() || p.phase == "Failed")
+    {
+        let why = p.reason.clone().unwrap_or_else(|| p.phase.clone());
+        return Some(format!(
+            "metrics-server pod {} is stuck in {why} (restarts: {})",
+            p.name, p.restarts
+        ));
+    }
+    if !ready {
+        return Some(
+            "metrics-server deployment is installed but has no ready replica yet — the pod is still starting."
+                .to_string(),
+        );
+    }
+    if !kubelet_insecure_tls {
+        return Some(
+            "metrics-server is running without --kubelet-insecure-tls; kind's self-signed kubelet certs make every scrape fail. Restart the install to patch it."
+                .to_string(),
+        );
+    }
+    if !top_works {
+        return Some(
+            "metrics-server is running — usage data usually shows up within a minute."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Reads the real metrics-server state of a cluster (deployment, pods, and
+/// whether `kubectl top` actually answers).
+async fn read_metrics_status(
+    state: &AppState,
+    cluster: &str,
+) -> Result<MetricsServerStatus, String> {
+    let deployment = match kubectl_json(
+        state,
+        cluster,
+        &[
+            "get",
+            "deployment",
+            "metrics-server",
+            "-n",
+            "kube-system",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) if e.contains("NotFound") || e.to_lowercase().contains("not found") => {
+            return Ok(MetricsServerStatus {
+                installed: false,
+                desired_replicas: 0,
+                available_replicas: 0,
+                ready: false,
+                kubelet_insecure_tls: false,
+                pods: Vec::new(),
+                top_works: false,
+                message: None,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
+    let pods = kubectl_json(
+        state,
+        cluster,
+        &[
+            "get",
+            "pods",
+            "-n",
+            "kube-system",
+            "-l",
+            "k8s-app=metrics-server",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    .map(|v| parse_metrics_pods(&v))
+    .unwrap_or_default();
+
+    let desired_replicas = deployment_desired_replicas(&deployment);
+    let available_replicas = deployment_available_replicas(&deployment);
+    let ready = available_replicas > 0 && available_replicas >= desired_replicas;
+    let kubelet_insecure_tls = deployment_has_arg(&deployment, "--kubelet-insecure-tls");
+    let top_works = kubectl_raw(state, cluster, &["top", "nodes"]).await.is_ok();
+    let message = diagnose_metrics(
+        true,
+        ready,
+        kubelet_insecure_tls,
+        top_works,
+        &pods,
+    );
+
+    Ok(MetricsServerStatus {
+        installed: true,
+        desired_replicas,
+        available_replicas,
+        ready,
+        kubelet_insecure_tls,
+        pods,
+        top_works,
+        message,
+    })
+}
+
+/// Real metrics-server state — lets the UI show "installed but starting",
+/// "installed but broken", or "working" instead of only "no usage numbers".
+#[tauri::command]
+pub async fn metrics_server_status(
+    state: State<'_, AppState>,
+    cluster: String,
+) -> Result<MetricsServerStatus, String> {
+    read_metrics_status(&state, &cluster).await
+}
+
+/// Installs metrics-server the way kind needs it: upstream manifest, the
+/// `--kubelet-insecure-tls` flag kind's self-signed kubelets require, a wait
+/// for the rollout, then a bounded wait until `kubectl top` actually answers.
+/// Idempotent — running it again on an existing install repairs/updates it.
 #[tauri::command]
 pub async fn install_metrics_server(
     state: State<'_, AppState>,
     cluster: String,
-) -> Result<(), String> {
+) -> Result<MetricsServerStatus, String> {
     kubectl_raw(
         &state,
         &cluster,
+        &["apply", "-f", METRICS_SERVER_MANIFEST],
+    )
+    .await?;
+
+    // Only patch when the flag is missing: a second `add` would append a
+    // duplicate argument on every re-install.
+    let deployment = kubectl_json(
+        &state,
+        &cluster,
         &[
-            "apply",
-            "-f",
-            "https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml",
+            "get",
+            "deployment",
+            "metrics-server",
+            "-n",
+            "kube-system",
+            "-o",
+            "json",
         ],
     )
     .await?;
-    Ok(())
+    if !deployment_has_arg(&deployment, "--kubelet-insecure-tls") {
+        kubectl_raw(
+            &state,
+            &cluster,
+            &[
+                "patch",
+                "deployment",
+                "metrics-server",
+                "-n",
+                "kube-system",
+                "--type=json",
+                "-p",
+                r#"[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]"#,
+            ],
+        )
+        .await?;
+    }
+
+    // Bounded wait for the rollout; a timeout is not fatal — the status read
+    // below reports whatever actually happened (ImagePullBackOff, slow pull…).
+    let _ = kubectl_raw(
+        &state,
+        &cluster,
+        &[
+            "rollout",
+            "status",
+            "deployment/metrics-server",
+            "-n",
+            "kube-system",
+            "--timeout=150s",
+        ],
+    )
+    .await;
+
+    // metrics-server needs one scrape cycle before `kubectl top` answers.
+    for _ in 0..12 {
+        if kubectl_raw(&state, &cluster, &["top", "nodes"]).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
+    read_metrics_status(&state, &cluster).await
+}
+
+/// Shells probed, in order, when opening a pod terminal. Absolute paths only —
+/// some images have no `PATH` entries but do have `/bin/sh`.
+const POD_SHELL_CANDIDATES: &[&str] = &["/bin/sh", "/bin/bash", "/bin/ash", "/busybox/sh"];
+
+/// Detects which shell (if any) exists inside a pod container, by running each
+/// candidate with `-c true`. Returns the first working path, or `None` for
+/// images with no shell at all (distroless), which is what produced
+/// `exec: "sh": executable file not found in $PATH`.
+#[tauri::command]
+pub async fn detect_pod_shell(
+    state: State<'_, AppState>,
+    cluster: String,
+    namespace: String,
+    name: String,
+    container: Option<String>,
+) -> Result<Option<String>, String> {
+    k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    if let Some(c) = container.as_deref().filter(|s| !s.is_empty()) {
+        k8s_name_check(c)?;
+    }
+
+    for shell in POD_SHELL_CANDIDATES {
+        let mut args: Vec<&str> = vec!["exec", "-n", &namespace, &name];
+        if let Some(c) = container.as_deref().filter(|s| !s.is_empty()) {
+            args.extend(["-c", c]);
+        }
+        args.extend(["--", shell, "-c", "true"]);
+        if kubectl_raw(&state, &cluster, &args).await.is_ok() {
+            return Ok(Some((*shell).to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod metrics_status_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn deployment(args: &[&str], available: i64) -> serde_json::Value {
+        json!({
+            "spec": { "replicas": 1, "template": { "spec": { "containers": [
+                { "args": args }
+            ] } } },
+            "status": { "availableReplicas": available }
+        })
+    }
+
+    #[test]
+    fn deployment_args_detected_without_duplicates() {
+        let d = deployment(&["--kubelet-insecure-tls"], 1);
+        assert!(deployment_has_arg(&d, "--kubelet-insecure-tls"));
+        let d = deployment(&["--metric-resolution=15s"], 1);
+        assert!(!deployment_has_arg(&d, "--kubelet-insecure-tls"));
+        // Missing args array must not panic.
+        assert!(!deployment_has_arg(&json!({}), "--kubelet-insecure-tls"));
+    }
+
+    #[test]
+    fn replicas_are_read_from_status_and_spec() {
+        assert_eq!(deployment_available_replicas(&deployment(&[], 1)), 1);
+        assert_eq!(deployment_available_replicas(&deployment(&[], 0)), 0);
+        assert_eq!(deployment_desired_replicas(&deployment(&[], 1)), 1);
+        assert_eq!(deployment_desired_replicas(&json!({})), 1);
+    }
+
+    #[test]
+    fn pod_status_captures_ready_state_restarts_and_reason() {
+        let pods = json!({ "items": [
+            { "metadata": { "name": "ms-1" },
+              "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                  { "ready": false, "restartCount": 4,
+                    "state": { "waiting": { "reason": "CrashLoopBackOff" } } }
+                ]
+              } }
+        ]});
+        let parsed = parse_metrics_pods(&pods);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "ms-1");
+        assert!(!parsed[0].ready);
+        assert_eq!(parsed[0].restarts, 4);
+        assert_eq!(parsed[0].reason.as_deref(), Some("CrashLoopBackOff"));
+        assert!(parse_metrics_pods(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn diagnosis_prefers_the_most_actionable_problem() {
+        // Not installed → nothing to say (the UI offers Install).
+        assert_eq!(diagnose_metrics(false, false, false, false, &[]), None);
+        // A stuck pod explains itself first.
+        let stuck = vec![MetricsPodStatus {
+            name: "ms".into(),
+            phase: "Pending".into(),
+            ready: false,
+            restarts: 0,
+            reason: Some("ImagePullBackOff".into()),
+        }];
+        let msg = diagnose_metrics(true, false, false, false, &stuck).unwrap();
+        assert!(msg.contains("ImagePullBackOff"));
+        // Installed, not ready, no pod reason → still starting.
+        assert!(diagnose_metrics(true, false, false, false, &[])
+            .unwrap()
+            .contains("still starting"));
+        // Ready but missing the kind flag → the real misconfiguration.
+        assert!(diagnose_metrics(true, true, false, false, &[])
+            .unwrap()
+            .contains("kubelet-insecure-tls"));
+        // Ready + flag + no data yet → warming up, not an error.
+        assert!(diagnose_metrics(true, true, true, false, &[])
+            .unwrap()
+            .contains("within a minute"));
+        // Fully healthy → no banner.
+        assert_eq!(diagnose_metrics(true, true, true, true, &[]), None);
+    }
 }
 
 

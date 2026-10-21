@@ -42,6 +42,7 @@ import type {
   K8sEventInfo,
   K8sWorkloadInfo,
   K8sMetrics,
+  MetricsServerStatus,
   K8sClusterSummary,
   K8sServiceInfo,
   K8sConfigInfo,
@@ -249,7 +250,21 @@ export const api = {
   getClusterMetrics: (cluster: string) =>
     invoke<K8sMetrics>("get_cluster_metrics", { cluster }),
   installMetricsServer: (cluster: string) =>
-    invoke<void>("install_metrics_server", { cluster }),
+    invoke<MetricsServerStatus>("install_metrics_server", { cluster }),
+  metricsServerStatus: (cluster: string) =>
+    invoke<MetricsServerStatus>("metrics_server_status", { cluster }),
+  detectPodShell: (
+    cluster: string,
+    namespace: string,
+    name: string,
+    container?: string | null
+  ) =>
+    invoke<string | null>("detect_pod_shell", {
+      cluster,
+      namespace,
+      name,
+      container: container ?? null,
+    }),
 
   // Container groups (bulk start/stop, optional auto-start with the engine)
   listContainerGroups: () => invoke<ContainerGroup[]>("list_container_groups"),
