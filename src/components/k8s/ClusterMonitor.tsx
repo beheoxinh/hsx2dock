@@ -579,6 +579,12 @@ export const ClusterMonitor: React.FC<{
     clusterStats?.mem_used_mb != null
       ? clusterStats.mem_used_mb * 1024 * 1024
       : null;
+  // Same denominator as the CPU tile's "% of host": the machine's RAM, not
+  // the node cgroups. Falls back to the summed node capacity when unknown.
+  const hostMemTotalBytes =
+    clusterStats?.host_mem_total_mb != null && clusterStats.host_mem_total_mb > 0
+      ? clusterStats.host_mem_total_mb * 1024 * 1024
+      : null;
 
   return (
     <section className="rounded-2xl border border-zinc-800/80 bg-zinc-900/40 overflow-hidden">
@@ -683,19 +689,48 @@ export const ClusterMonitor: React.FC<{
                 <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
                   Pod phases
                 </span>
-                {noMetrics && (
-                  <button
-                    onClick={installMetricsServer}
-                    disabled={installingMs}
-                    className="flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-2.5 py-1 text-[11px] font-medium text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-60"
-                  >
-                    {installingMs ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <Download className="h-3 w-3" />
-                    )}
-                    Install metrics-server
-                  </button>
+                {noMetrics && msStatus && (
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <span
+                      className={`flex items-center gap-1.5 text-[11px] ${
+                        msStatus.installed ? "text-amber-300" : "text-zinc-500"
+                      }`}
+                    >
+                      {msStatus.installed ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <AlertTriangle className="h-3 w-3" />
+                      )}
+                      {msStatus.installed
+                        ? `metrics-server installed — ${
+                            msStatus.top_works
+                              ? "warming up"
+                              : msStatus.ready
+                                ? "waiting for usage data"
+                                : "not ready yet"
+                          }`
+                        : "metrics-server not installed"}
+                    </span>
+                    <button
+                      onClick={installMetricsServer}
+                      disabled={installingMs}
+                      title={msStatus.message ?? undefined}
+                      className="flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-2.5 py-1 text-[11px] font-medium text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-60"
+                    >
+                      {installingMs ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : msStatus.installed ? (
+                        <RotateCw className="h-3 w-3" />
+                      ) : (
+                        <Download className="h-3 w-3" />
+                      )}
+                      {installingMs
+                        ? "Repairing…"
+                        : msStatus.installed
+                          ? "Repair & restart"
+                          : "Install metrics-server"}
+                    </button>
+                  </div>
                 )}
               </div>
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -730,6 +765,7 @@ export const ClusterMonitor: React.FC<{
                     pct: cpuPct,
                     fmt: fmtCpu,
                     icon: Activity,
+                    capSuffix: "",
                     fallbackText:
                       hostCpuPct != null ? `${hostCpuPct.toFixed(1)}% of host` : null,
                     fallbackPct: hostCpuPct,
@@ -737,19 +773,29 @@ export const ClusterMonitor: React.FC<{
                   {
                     label: "Cluster memory",
                     used: totalMemUsed,
-                    cap: totalMemCap,
-                    pct: memPct,
+                    // Report memory against the host's RAM, matching the CPU
+                    // tile; node capacity is only a fallback.
+                    cap: hostMemTotalBytes ?? totalMemCap,
+                    pct:
+                      hostMemTotalBytes != null
+                        ? (totalMemUsed / hostMemTotalBytes) * 100
+                        : memPct,
                     fmt: formatBytes,
                     icon: Server,
+                    capSuffix: hostMemTotalBytes != null ? " of host" : "",
                     fallbackText:
                       fallbackMemBytes != null
-                        ? `${formatBytes(fallbackMemBytes)}${
-                            totalMemCap > 0 ? ` / ${formatBytes(totalMemCap)}` : ""
+                        ? `${formatBytes(fallbackMemBytes)} / ${
+                            hostMemTotalBytes != null
+                              ? `${formatBytes(hostMemTotalBytes)} of host`
+                              : totalMemCap > 0
+                                ? formatBytes(totalMemCap)
+                                : "?"
                           }`
                         : null,
                     fallbackPct:
-                      fallbackMemBytes != null && totalMemCap > 0
-                        ? (fallbackMemBytes / totalMemCap) * 100
+                      fallbackMemBytes != null && (hostMemTotalBytes ?? totalMemCap) > 0
+                        ? (fallbackMemBytes / (hostMemTotalBytes ?? totalMemCap)) * 100
                         : null,
                   },
                 ] as const
@@ -761,6 +807,7 @@ export const ClusterMonitor: React.FC<{
                   pct,
                   fmt,
                   icon: Icon,
+                  capSuffix,
                   fallbackText,
                   fallbackPct,
                 }) => {
@@ -780,7 +827,7 @@ export const ClusterMonitor: React.FC<{
                     </span>
                     <span className="font-mono text-zinc-300">
                       {live
-                        ? `${fmt(used)} / ${fmt(cap)}`
+                        ? `${fmt(used)} / ${fmt(cap)}${capSuffix}`
                         : fallbackText ?? "n/a"}
                     </span>
                   </div>

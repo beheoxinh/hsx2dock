@@ -484,6 +484,8 @@ export interface KindCluster {
   cpu_quota_m: number | null;
   /** Applied per-node memory cap summed across nodes (MiB), if capped. */
   mem_limit_mb: number | null;
+  /** Total host memory in MiB; denominator for the Overview "of host" tile. */
+  host_mem_total_mb: number | null;
 }
 
 /** Install state of the app-managed (isolated) kind binary. */
@@ -602,6 +604,12 @@ export interface MetricsServerStatus {
   kubelet_insecure_tls: boolean;
   pods: MetricsPodStatus[];
   top_works: boolean;
+  /** `namespace/name` of the workload backing the metrics API, if found. */
+  workload: string | null;
+  /** `v1beta1.metrics.k8s.io` is registered — proves the install exists. */
+  apiservice_found: boolean;
+  /** Available condition of that APIService; null when not registered. */
+  apiservice_available: boolean | null;
   message: string | null;
 }
 

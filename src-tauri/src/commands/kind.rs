@@ -47,6 +47,11 @@ pub struct KindCluster {
     pub cpu_percent: Option<f64>,
     #[serde(default)]
     pub mem_used_mb: Option<f64>,
+    /// Total memory of the host in MiB. The Overview tile uses it as the
+    /// denominator so "Cluster memory" answers the same question as
+    /// "Cluster CPU" (`x% of host`), independent of the node cgroup caps.
+    #[serde(default)]
+    pub host_mem_total_mb: Option<f64>,
     /// Node resource caps applied to this cluster (None = uncapped).
     #[serde(default)]
     pub cpu_quota_m: Option<u64>,
@@ -141,6 +146,7 @@ pub async fn list_kind_clusters(
             api_ready: None,
             cpu_percent: None,
             mem_used_mb: None,
+            host_mem_total_mb: None,
             cpu_quota_m: None,
             mem_limit_mb: None,
         });
@@ -174,6 +180,11 @@ async fn enrich_cluster_card(
     client: &crate::docker::client::DockerClient,
     cluster: &mut KindCluster,
 ) {
+    // The Overview tile reports memory as a share of the host, mirroring the
+    // CPU tile's `% of host`; read it even when the cluster is stopped so the
+    // number is available as soon as it starts.
+    cluster.host_mem_total_mb = host_memory_total_mb();
+
     let Ok(ids) = cluster_node_ids(client, &cluster.name).await else {
         return;
     };
@@ -290,6 +301,19 @@ async fn enrich_cluster_card(
         // API not answering (still booting or unhealthy) — Detail must stay shut.
         cluster.api_ready = Some(false);
     }
+}
+
+/// Total physical memory of the host in MiB, from `/proc/meminfo`.
+///
+/// `None` off Linux (or on an unreadable `/proc`), which the UI renders as
+/// "n/a" rather than inventing a denominator.
+fn host_memory_total_mb() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: f64 = text.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })?;
+    (kib > 0.0).then(|| kib / 1024.0)
 }
 
 /// Parses Docker's RFC3339 timestamps ("2026-10-20T01:02:03.123456789Z").
@@ -1688,6 +1712,15 @@ pub struct MetricsServerStatus {
     pub kubelet_insecure_tls: bool,
     pub pods: Vec<MetricsPodStatus>,
     pub top_works: bool,
+    /// `namespace/name` of the workload backing the metrics API, when found.
+    /// The manifest allows a rename, so this is reported rather than assumed.
+    pub workload: Option<String>,
+    /// True when `v1beta1.metrics.k8s.io` is registered in the cluster. This
+    /// alone proves metrics-server is deployed even if its workload uses an
+    /// unexpected name/namespace, which a deployment-only probe missed.
+    pub apiservice_found: bool,
+    /// `Available` condition of that APIService (`None` when not registered).
+    pub apiservice_available: Option<bool>,
     /// Human-readable diagnosis when something needs attention.
     pub message: Option<String>,
 }
@@ -1775,12 +1808,17 @@ fn parse_metrics_pods(json: &serde_json::Value) -> Vec<MetricsPodStatus> {
 }
 
 /// Turns the raw flags into the one sentence the UI shows (or nothing).
+///
+/// `kubelet_insecure_tls` is `None` when no Deployment was found (an
+/// APIService-only install), so the app never claims a flag is missing on a
+/// workload it could not inspect.
 fn diagnose_metrics(
     installed: bool,
     ready: bool,
-    kubelet_insecure_tls: bool,
+    kubelet_insecure_tls: Option<bool>,
     top_works: bool,
     pods: &[MetricsPodStatus],
+    apiservice_available: Option<bool>,
 ) -> Option<String> {
     if !installed {
         return None;
@@ -1796,12 +1834,30 @@ fn diagnose_metrics(
         ));
     }
     if !ready {
+        if apiservice_available == Some(false) {
+            return Some(
+                "metrics-server is deployed but the v1beta1.metrics.k8s.io API service reports unavailable — check the pod below."
+                    .to_string(),
+            );
+        }
+        if let Some(p) = pods.iter().find(|p| !p.ready) {
+            return Some(format!(
+                "metrics-server pod {} is {} — waiting for it to become ready.",
+                p.name, p.phase
+            ));
+        }
+        if pods.is_empty() {
+            return Some(
+                "metrics-server is deployed but has no pod — the workload may be scaled to zero or blocked by scheduling."
+                    .to_string(),
+            );
+        }
         return Some(
             "metrics-server deployment is installed but has no ready replica yet — the pod is still starting."
                 .to_string(),
         );
     }
-    if !kubelet_insecure_tls {
+    if kubelet_insecure_tls == Some(false) {
         return Some(
             "metrics-server is running without --kubelet-insecure-tls; kind's self-signed kubelet certs make every scrape fail. Restart the install to patch it."
                 .to_string(),
@@ -1816,13 +1872,166 @@ fn diagnose_metrics(
     None
 }
 
-/// Reads the real metrics-server state of a cluster (deployment, pods, and
-/// whether `kubectl top` actually answers).
+/// `Available` condition of an APIService object (`None` when missing).
+fn apiservice_available_condition(json: &serde_json::Value) -> Option<bool> {
+    json.pointer("/status/conditions")
+        .and_then(|c| c.as_array())
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|c| c.get("type").and_then(|v| v.as_str()) == Some("Available"))
+        })
+        .and_then(|c| c.get("status").and_then(|v| v.as_str()))
+        .map(|s| s.eq_ignore_ascii_case("true"))
+}
+
+/// Turns a Deployment `spec.selector` (with `matchLabels`) or a Service
+/// `spec.selector` (a flat map) into a `kubectl -l` argument.
+fn selector_arg(selector: &serde_json::Value) -> Option<String> {
+    let map = selector.get("matchLabels").unwrap_or(selector).as_object()?;
+    let mut parts: Vec<String> = map
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+        .collect();
+    parts.sort();
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
+/// Finds a Deployment whose selector equals `selector` in a `get deployments`
+/// list. Used when the install uses a name other than `metrics-server`.
+fn find_deployment_by_selector(
+    list: &serde_json::Value,
+    selector: &str,
+) -> Option<serde_json::Value> {
+    list.get("items")?.as_array()?.iter().find_map(|d| {
+        let own = d.pointer("/spec/selector").and_then(selector_arg);
+        (own.as_deref() == Some(selector)).then(|| d.clone())
+    })
+}
+
+/// Selector of the Service behind the metrics APIService, when it exists.
+async fn metrics_service_selector(
+    state: &AppState,
+    cluster: &str,
+    namespace: &str,
+    service: Option<&str>,
+) -> Option<serde_json::Value> {
+    let service = service?;
+    let svc = kubectl_json(
+        state,
+        cluster,
+        &["get", "service", service, "-n", namespace, "-o", "json"],
+    )
+    .await
+    .ok()?;
+    svc.pointer("/spec/selector").cloned()
+}
+
+/// Metrics-server pods, trying progressively looser matches so a renamed or
+/// re-labelled install is still visible:
+/// 1. the workload's own selector;
+/// 2. the conventional `k8s-app=metrics-server` label;
+/// 3. any pod whose name mentions metrics-server.
+async fn metrics_pods(
+    state: &AppState,
+    cluster: &str,
+    namespace: &str,
+    selector: Option<&str>,
+) -> Vec<MetricsPodStatus> {
+    if let Some(selector) = selector {
+        if let Ok(v) = kubectl_json(
+            state,
+            cluster,
+            &["get", "pods", "-n", namespace, "-l", selector, "-o", "json"],
+        )
+        .await
+        {
+            let pods = parse_metrics_pods(&v);
+            if !pods.is_empty() {
+                return pods;
+            }
+        }
+    }
+    if let Ok(v) = kubectl_json(
+        state,
+        cluster,
+        &[
+            "get",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            "k8s-app=metrics-server",
+            "-o",
+            "json",
+        ],
+    )
+    .await
+    {
+        let pods = parse_metrics_pods(&v);
+        if !pods.is_empty() {
+            return pods;
+        }
+    }
+    let Ok(v) = kubectl_json(
+        state,
+        cluster,
+        &["get", "pods", "-n", namespace, "-o", "json"],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let mut pods = parse_metrics_pods(&v);
+    pods.retain(|p| p.name.contains("metrics-server"));
+    pods
+}
+
+/// Reads the real metrics-server state of a cluster.
+///
+/// Detection is belt-and-braces: a Deployment-only probe reports "not
+/// installed" for perfectly valid installs (renamed workload, chart installed
+/// under another release name) and for a workload that is deployed but not
+/// ready — exactly the case where the UI used to offer to install it again.
+///
+/// 1. the aggregated APIService (`v1beta1.metrics.k8s.io`) — authoritative
+///    registration of the metrics API;
+/// 2. the Deployment behind it (classic `kube-system/metrics-server`, else the
+///    one matching the APIService's Service selector);
+/// 3. its pods, so "starting" and "crash-looping" can be told apart;
+/// 4. `kubectl get --raw` — whether usage actually answers yet.
 async fn read_metrics_status(
     state: &AppState,
     cluster: &str,
 ) -> Result<MetricsServerStatus, String> {
-    let deployment = match kubectl_json(
+    let apiservice = kubectl_json(
+        state,
+        cluster,
+        &["get", "apiservice", "v1beta1.metrics.k8s.io", "-o", "json"],
+    )
+    .await
+    .ok();
+    let apiservice_found = apiservice.is_some();
+    let apiservice_available = apiservice
+        .as_ref()
+        .and_then(apiservice_available_condition);
+
+    // Namespace/name the APIService points at; Helm installs can move it.
+    let service_ns = apiservice
+        .as_ref()
+        .and_then(|v| v.pointer("/spec/service/namespace"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("kube-system")
+        .to_string();
+    let service_name = apiservice
+        .as_ref()
+        .and_then(|v| v.pointer("/spec/service/name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // 1. Classic manifest name first — cheapest, covers the normal case.
+    let mut workload_ns = "kube-system".to_string();
+    let classic = kubectl_json(
         state,
         cluster,
         &[
@@ -1836,45 +2045,87 @@ async fn read_metrics_status(
         ],
     )
     .await
-    {
-        Ok(v) => v,
-        Err(e) if e.contains("NotFound") || e.to_lowercase().contains("not found") => {
-            return Ok(MetricsServerStatus {
-                installed: false,
-                desired_replicas: 0,
-                available_replicas: 0,
-                ready: false,
-                kubelet_insecure_tls: false,
-                pods: Vec::new(),
-                top_works: false,
-                message: None,
-            });
+    .ok();
+    let mut deployment = classic;
+    let mut workload = deployment
+        .as_ref()
+        .map(|_| "kube-system/metrics-server".to_string());
+
+    // 2. Otherwise match the Deployment whose selector backs the Service the
+    //    APIService exposes. Labels are more reliable than names.
+    if deployment.is_none() && apiservice_found {
+        // An APIService-only install lives wherever its Service does.
+        workload_ns = service_ns.clone();
+        if let Some(selector) =
+            metrics_service_selector(state, cluster, &service_ns, service_name.as_deref()).await
+        {
+            if let Some(want) = selector_arg(&selector) {
+                if let Ok(list) = kubectl_json(
+                    state,
+                    cluster,
+                    &["get", "deployments", "-n", service_ns.as_str(), "-o", "json"],
+                )
+                .await
+                {
+                    if let Some(found) = find_deployment_by_selector(&list, &want) {
+                        workload = found
+                            .pointer("/metadata/name")
+                            .and_then(|v| v.as_str())
+                            .map(|name| format!("{service_ns}/{name}"));
+                        deployment = Some(found);
+                    }
+                }
+            }
         }
-        Err(e) => return Err(e),
+    }
+
+    if !apiservice_found && deployment.is_none() {
+        return Ok(MetricsServerStatus {
+            installed: false,
+            desired_replicas: 0,
+            available_replicas: 0,
+            ready: false,
+            kubelet_insecure_tls: false,
+            pods: Vec::new(),
+            top_works: false,
+            workload: None,
+            apiservice_found: false,
+            apiservice_available: None,
+            message: None,
+        });
+    }
+
+    // Pods: prefer the workload's own selector, then the conventional label,
+    // then a name scan so a custom-labelled install is still visible.
+    let selector = deployment
+        .as_ref()
+        .and_then(|d| d.pointer("/spec/selector"))
+        .and_then(selector_arg);
+    let pods = metrics_pods(state, cluster, &workload_ns, selector.as_deref()).await;
+
+    let desired_replicas = deployment
+        .as_ref()
+        .map(deployment_desired_replicas)
+        .unwrap_or(0);
+    let available_replicas = deployment
+        .as_ref()
+        .map(deployment_available_replicas)
+        .unwrap_or(0);
+    let deployment_ready = desired_replicas > 0 && available_replicas >= desired_replicas;
+    // The APIService is what actually serves usage; trust it when it answers,
+    // otherwise require the workload to be available.
+    let ready = match apiservice_available {
+        Some(true) => true,
+        // The APIService is what serves usage: if it reports unavailable, the
+        // deployment's replica count is not enough to call this ready.
+        Some(false) => false,
+        None => deployment_ready,
     };
-
-    let pods = kubectl_json(
-        state,
-        cluster,
-        &[
-            "get",
-            "pods",
-            "-n",
-            "kube-system",
-            "-l",
-            "k8s-app=metrics-server",
-            "-o",
-            "json",
-        ],
-    )
-    .await
-    .map(|v| parse_metrics_pods(&v))
-    .unwrap_or_default();
-
-    let desired_replicas = deployment_desired_replicas(&deployment);
-    let available_replicas = deployment_available_replicas(&deployment);
-    let ready = available_replicas > 0 && available_replicas >= desired_replicas;
-    let kubelet_insecure_tls = deployment_has_arg(&deployment, "--kubelet-insecure-tls");
+    // `None` when no Deployment was found: the flag cannot be judged for an
+    // APIService-only install, and claiming it is missing would be wrong.
+    let kubelet_insecure_tls = deployment
+        .as_ref()
+        .map(|d| deployment_has_arg(d, "--kubelet-insecure-tls"));
     // Measured through the same endpoint the monitoring UI reads, so "top
     // works" and "usage shows up" can never disagree.
     let top_works = kubectl_json(
@@ -1890,6 +2141,7 @@ async fn read_metrics_status(
         kubelet_insecure_tls,
         top_works,
         &pods,
+        apiservice_available,
     );
 
     Ok(MetricsServerStatus {
@@ -1897,9 +2149,12 @@ async fn read_metrics_status(
         desired_replicas,
         available_replicas,
         ready,
-        kubelet_insecure_tls,
+        kubelet_insecure_tls: kubelet_insecure_tls.unwrap_or(false),
         pods,
         top_works,
+        workload,
+        apiservice_found,
+        apiservice_available,
         message,
     })
 }
@@ -2089,7 +2344,10 @@ mod metrics_status_tests {
     #[test]
     fn diagnosis_prefers_the_most_actionable_problem() {
         // Not installed → nothing to say (the UI offers Install).
-        assert_eq!(diagnose_metrics(false, false, false, false, &[]), None);
+        assert_eq!(
+            diagnose_metrics(false, false, Some(false), false, &[], None),
+            None
+        );
         // A stuck pod explains itself first.
         let stuck = vec![MetricsPodStatus {
             name: "ms".into(),
@@ -2098,22 +2356,94 @@ mod metrics_status_tests {
             restarts: 0,
             reason: Some("ImagePullBackOff".into()),
         }];
-        let msg = diagnose_metrics(true, false, false, false, &stuck).unwrap();
+        let msg = diagnose_metrics(true, false, Some(false), false, &stuck, None).unwrap();
         assert!(msg.contains("ImagePullBackOff"));
-        // Installed, not ready, no pod reason → still starting.
-        assert!(diagnose_metrics(true, false, false, false, &[])
+        // Installed, not ready, no pod → never says "install it again".
+        let msg = diagnose_metrics(true, false, Some(false), false, &[], None).unwrap();
+        assert!(msg.contains("no pod"), "unexpected: {msg}");
+        assert!(!msg.to_lowercase().contains("not installed"));
+        // Installed deployment with a pending pod → names the pod, not an install.
+        let pending = vec![MetricsPodStatus {
+            name: "metrics-server-abc".into(),
+            phase: "Pending".into(),
+            ready: false,
+            restarts: 0,
+            reason: None,
+        }];
+        let msg = diagnose_metrics(true, false, Some(false), false, &pending, None).unwrap();
+        assert!(msg.contains("metrics-server-abc"), "unexpected: {msg}");
+        // APIService unavailable is the specific reason when known.
+        assert!(diagnose_metrics(true, false, Some(false), false, &[], Some(false))
             .unwrap()
-            .contains("still starting"));
+            .contains("API service"));
         // Ready but missing the kind flag → the real misconfiguration.
-        assert!(diagnose_metrics(true, true, false, false, &[])
+        assert!(diagnose_metrics(true, true, Some(false), false, &[], None)
             .unwrap()
             .contains("kubelet-insecure-tls"));
         // Ready + flag + no data yet → warming up, not an error.
-        assert!(diagnose_metrics(true, true, true, false, &[])
+        assert!(diagnose_metrics(true, true, Some(true), false, &[], None)
+            .unwrap()
+            .contains("within a minute"));
+        // APIService-only install: the flag cannot be judged, so do not claim
+        // it is missing just because no Deployment was found.
+        assert!(diagnose_metrics(true, true, None, false, &[], Some(true))
             .unwrap()
             .contains("within a minute"));
         // Fully healthy → no banner.
-        assert_eq!(diagnose_metrics(true, true, true, true, &[]), None);
+        assert_eq!(
+            diagnose_metrics(true, true, Some(true), true, &[], Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn apiservice_condition_is_read_from_status() {
+        let available = json!({
+            "status": { "conditions": [
+                { "type": "Available", "status": "True" },
+                { "type": "NamesAccepted", "status": "True" }
+            ]}
+        });
+        assert_eq!(apiservice_available_condition(&available), Some(true));
+        let broken = json!({
+            "status": { "conditions": [{ "type": "Available", "status": "False" }] }
+        });
+        assert_eq!(apiservice_available_condition(&broken), Some(false));
+        assert_eq!(apiservice_available_condition(&json!({})), None);
+    }
+
+    #[test]
+    fn selectors_work_for_deployments_and_services() {
+        let deployment_sel = json!({ "matchLabels": { "k8s-app": "metrics-server" } });
+        assert_eq!(
+            selector_arg(&deployment_sel).as_deref(),
+            Some("k8s-app=metrics-server")
+        );
+        // Service selectors are flat maps.
+        assert_eq!(
+            selector_arg(&json!({ "k8s-app": "metrics-server" })).as_deref(),
+            Some("k8s-app=metrics-server")
+        );
+        assert_eq!(
+            selector_arg(&json!({ "a": "2", "b": "1" })).as_deref(),
+            Some("a=2,b=1")
+        );
+        assert_eq!(selector_arg(&json!({ "matchLabels": {} })), None);
+    }
+
+    #[test]
+    fn renamed_workload_is_found_by_its_selector() {
+        let list = json!({ "items": [
+            { "metadata": { "name": "other" }, "spec": { "selector": { "matchLabels": { "app": "x" } } } },
+            { "metadata": { "name": "metrics-helm" }, "spec": { "selector": { "matchLabels": { "app.kubernetes.io/name": "metrics-server" } } } }
+        ]});
+        let found = find_deployment_by_selector(&list, "app.kubernetes.io/name=metrics-server")
+            .expect("renamed deployment must be found");
+        assert_eq!(
+            found.pointer("/metadata/name").and_then(|v| v.as_str()),
+            Some("metrics-helm")
+        );
+        assert!(find_deployment_by_selector(&list, "app=missing").is_none());
     }
 }
 
