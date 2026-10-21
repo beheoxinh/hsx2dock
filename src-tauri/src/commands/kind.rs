@@ -37,6 +37,10 @@ pub struct KindCluster {
     pub pod_count: Option<u32>,
     #[serde(default)]
     pub running_pod_count: Option<u32>,
+    /// Whether the API server answers `/readyz` right now. `None` when the
+    /// cluster is stopped. Detail/monitoring is gated on this.
+    #[serde(default)]
+    pub api_ready: Option<bool>,
     /// Summed one-shot docker stats across node containers: CPU as % of the
     /// host, memory in MiB actually used by the cluster right now.
     #[serde(default)]
@@ -134,6 +138,7 @@ pub async fn list_kind_clusters(
             last_started_at: None,
             pod_count: None,
             running_pod_count: None,
+            api_ready: None,
             cpu_percent: None,
             mem_used_mb: None,
             cpu_quota_m: None,
@@ -264,6 +269,26 @@ async fn enrich_cluster_card(
         let (total, running) = count_pods(&out);
         cluster.pod_count = Some(total);
         cluster.running_pod_count = Some(running);
+        // The pods query answering means discovery + core API are serving;
+        // /readyz is the authoritative check for the whole control plane.
+        cluster.api_ready = Some(
+            client
+                .exec_capture(
+                    &cp,
+                    vec![
+                        "kubectl".into(),
+                        "--kubeconfig=/etc/kubernetes/admin.conf".into(),
+                        "get".into(),
+                        "--raw".into(),
+                        "/readyz".into(),
+                    ],
+                )
+                .await
+                .is_ok(),
+        );
+    } else {
+        // API not answering (still booting or unhealthy) — Detail must stay shut.
+        cluster.api_ready = Some(false);
     }
 }
 
@@ -2341,7 +2366,7 @@ pub async fn get_resource_events(
     k8s_name_check(&name)?;
     k8s_name_check(&namespace)?;
     let selector = format!("involvedObject.name={name}");
-    let v = kubectl_json(
+    let v = match kubectl_json(
         &state,
         &cluster,
         &[
@@ -2352,9 +2377,35 @@ pub async fn get_resource_events(
             "--field-selector",
             &selector,
             "--sort-by=.lastTimestamp",
+            "-o",
+            "json",
         ],
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        // Some apiservers reject a field selector on events with
+        // "the server could not find the requested resource" (notably while
+        // the cluster is still settling). Listing the namespace and filtering
+        // here gives the same answer without the server-side selector.
+        Err(_) => {
+            let mut all = kubectl_json(
+                &state,
+                &cluster,
+                &["get", "events", "-n", &namespace, "-o", "json"],
+            )
+            .await?;
+            if let Some(items) = all.get_mut("items").and_then(|i| i.as_array_mut()) {
+                items.retain(|e| {
+                    e.get("involvedObject")
+                        .and_then(|o| o.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some(name.as_str())
+                });
+            }
+            all
+        }
+    };
     Ok(parse_events(&v))
 }
 

@@ -474,6 +474,8 @@ export interface KindCluster {
   pod_count: number | null;
   /** Pods in `Running` phase. */
   running_pod_count: number | null;
+  /** Whether the API server answers /readyz (null while the cluster is stopped). */
+  api_ready: boolean | null;
   /** Cluster CPU usage summed across nodes, as % of the host. */
   cpu_percent: number | null;
   /** Cluster memory usage summed across nodes, in MiB. */

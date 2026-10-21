@@ -652,6 +652,14 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                           status={c.running ? "Running" : "Stopped"}
                           pulse={c.running}
                         />
+                        {c.running && c.api_ready === false && (
+                          <span
+                            title="The API server is still starting — monitoring opens as soon as /readyz passes"
+                            className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30"
+                          >
+                            API starting…
+                          </span>
+                        )}
                         {c.has_kubeconfig && (
                           <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/60 font-mono">
                             kubeconfig
@@ -817,11 +825,15 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                     variant="outline"
                     size="sm"
                     onClick={() => setDetailFor(c.name)}
-                    disabled={!!busyOp || !c.running}
+                    disabled={
+                      !!busyOp || !c.running || c.api_ready === false
+                    }
                     title={
-                      c.running
-                        ? "Open the full monitoring screen for this cluster"
-                        : "Start the cluster to open monitoring"
+                      !c.running
+                        ? "Start the cluster to open monitoring"
+                        : c.api_ready === false
+                          ? "Waiting for the API server to become ready"
+                          : "Open the full monitoring screen for this cluster"
                     }
                     className="gap-1.5"
                   >
@@ -947,7 +959,19 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
             />
             <span className="text-white font-medium">{detailCluster.name}</span>
           </div>
-          <ClusterMonitor key={detailFor} cluster={detailFor} />
+          {detailCluster.api_ready === false ? (
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-300">
+              The API server for <span className="font-mono">{detailCluster.name}</span> is
+              not ready yet. Monitoring opens automatically as soon as <code>/readyz</code>{" "}
+              passes — this refresh every ~10s.
+            </div>
+          ) : (
+            <ClusterMonitor
+              key={detailFor}
+              cluster={detailFor}
+              clusterStats={detailCluster}
+            />
+          )}
         </div>
       )}
 

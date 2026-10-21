@@ -37,6 +37,7 @@ import type {
   K8sPvcInfo,
   K8sServiceInfo,
   K8sWorkloadInfo,
+  KindCluster,
   MetricsServerStatus,
 } from "../../types";
 
@@ -124,7 +125,15 @@ function StatTile({
  * usage (via metrics-server when present), workloads, and events. Data is
  * polled from kubectl inside the control-plane node — no host kubectl needed.
  */
-export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
+export const ClusterMonitor: React.FC<{
+  cluster: string;
+  /**
+   * Per-cluster numbers already shown on the cluster card (docker stats of the
+   * node containers). Used as the usage fallback so Detail never goes blank
+   * just because metrics-server has not answered yet.
+   */
+  clusterStats?: KindCluster | null;
+}> = ({ cluster, clusterStats }) => {
   const toast = useToast();
   const [tab, setTab] = useState<MonitorTab>("overview");
   const [summary, setSummary] = useState<K8sClusterSummary | null>(null);
@@ -207,41 +216,40 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     let alive = true;
 
     const fast = async () => {
-      try {
-        const [s, p, m] = await Promise.all([
-          api.getClusterSummary(cluster),
-          api.getClusterPods(cluster),
-          api.getClusterMetrics(cluster),
-        ]);
-        if (!alive) return;
-        setSummary(s);
-        setPods(p);
-        setMetrics(m);
-        setMonitorError(null);
-      } catch (e) {
-        if (alive) setMonitorError(String(e));
-      }
+      // Each query settles on its own: without metrics-server only the
+      // metrics call fails, and it must not blank the pods/summary panes.
+      const [s, p, m] = await Promise.allSettled([
+        api.getClusterSummary(cluster),
+        api.getClusterPods(cluster),
+        api.getClusterMetrics(cluster),
+      ]);
+      if (!alive) return;
+      if (s.status === "fulfilled") setSummary(s.value);
+      if (p.status === "fulfilled") setPods(p.value);
+      if (m.status === "fulfilled") setMetrics(m.value);
+      const failed = [s, p, m].find((r) => r.status === "rejected");
+      setMonitorError(
+        failed && failed.status === "rejected" ? String(failed.reason) : null
+      );
     };
     const slow = async () => {
-      try {
-        const [n, ev, w, sv, cf, pv] = await Promise.all([
-          api.getClusterNodes(cluster),
-          api.getClusterEvents(cluster),
-          api.getClusterWorkloads(cluster),
-          api.getClusterServices(cluster),
-          api.getClusterConfigResources(cluster),
-          api.getClusterPvcs(cluster),
-        ]);
-        if (!alive) return;
-        setNodes(n);
-        setEvents(ev);
-        setWorkloads(w);
-        setServices(sv);
-        setConfigs(cf);
-        setPvcs(pv);
-      } catch {
-        /* fast poll surfaces connectivity errors */
-      }
+      // Independent again: a failing sub-query (e.g. PVC listing on an old
+      // apiserver) must not wipe the tabs that answered fine.
+      const [n, ev, w, sv, cf, pv] = await Promise.allSettled([
+        api.getClusterNodes(cluster),
+        api.getClusterEvents(cluster),
+        api.getClusterWorkloads(cluster),
+        api.getClusterServices(cluster),
+        api.getClusterConfigResources(cluster),
+        api.getClusterPvcs(cluster),
+      ]);
+      if (!alive) return;
+      if (n.status === "fulfilled") setNodes(n.value);
+      if (ev.status === "fulfilled") setEvents(ev.value);
+      if (w.status === "fulfilled") setWorkloads(w.value);
+      if (sv.status === "fulfilled") setServices(sv.value);
+      if (cf.status === "fulfilled") setConfigs(cf.value);
+      if (pv.status === "fulfilled") setPvcs(pv.value);
     };
     const ms = () => {
       api
@@ -563,6 +571,15 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
     !metrics?.pods.length &&
     (!!metrics?.error || (msStatus?.installed === true && !msStatus.top_works));
 
+  // Fallback numbers from the cluster card (docker stats over the node
+  // containers). The Metrics API needs metrics-server; docker stats always
+  // works, so Detail shows live usage even before the API catches up.
+  const hostCpuPct = clusterStats?.cpu_percent ?? null;
+  const fallbackMemBytes =
+    clusterStats?.mem_used_mb != null
+      ? clusterStats.mem_used_mb * 1024 * 1024
+      : null;
+
   return (
     <section className="rounded-2xl border border-zinc-800/80 bg-zinc-900/40 overflow-hidden">
       {/* Header: title + live chip + refresh info */}
@@ -713,6 +730,9 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                     pct: cpuPct,
                     fmt: fmtCpu,
                     icon: Activity,
+                    fallbackText:
+                      hostCpuPct != null ? `${hostCpuPct.toFixed(1)}% of host` : null,
+                    fallbackPct: hostCpuPct,
                   },
                   {
                     label: "Cluster memory",
@@ -721,9 +741,34 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                     pct: memPct,
                     fmt: formatBytes,
                     icon: Server,
+                    fallbackText:
+                      fallbackMemBytes != null
+                        ? `${formatBytes(fallbackMemBytes)}${
+                            totalMemCap > 0 ? ` / ${formatBytes(totalMemCap)}` : ""
+                          }`
+                        : null,
+                    fallbackPct:
+                      fallbackMemBytes != null && totalMemCap > 0
+                        ? (fallbackMemBytes / totalMemCap) * 100
+                        : null,
                   },
                 ] as const
-              ).map(({ label, used, cap, pct, fmt, icon: Icon }) => (
+              ).map(
+                ({
+                  label,
+                  used,
+                  cap,
+                  pct,
+                  fmt,
+                  icon: Icon,
+                  fallbackText,
+                  fallbackPct,
+                }) => {
+                  // Metrics API numbers win; docker-stats numbers fill in
+                  // while metrics-server is warming up or absent.
+                  const live = (metrics?.nodes.length ?? 0) > 0 && cap > 0;
+                  const showPct = live ? pct : fallbackPct;
+                  return (
                 <div
                   key={label}
                   className="rounded-xl border border-zinc-800/80 bg-zinc-900/60 px-4 py-3"
@@ -734,11 +779,22 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                       {label}
                     </span>
                     <span className="font-mono text-zinc-300">
-                      {noMetrics || cap === 0 ? "n/a" : `${fmt(used)} / ${fmt(cap)}`}
+                      {live
+                        ? `${fmt(used)} / ${fmt(cap)}`
+                        : fallbackText ?? "n/a"}
                     </span>
                   </div>
                   <div className="mt-2">
-                    {noMetrics || cap === 0 ? (
+                    {live || fallbackText != null ? (
+                      <>
+                        {showPct != null && <UsageBar pct={showPct} />}
+                        {showPct != null && (
+                          <div className="mt-1 text-right font-mono text-[11px] text-zinc-400">
+                            {showPct.toFixed(1)}%
+                          </div>
+                        )}
+                      </>
+                    ) : (
                       <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-500">
                         <span>
                           {msStatus?.installed
@@ -771,17 +827,12 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
                           </Button>
                         )}
                       </div>
-                    ) : (
-                      <>
-                        <UsageBar pct={pct} />
-                        <div className="mt-1 text-right font-mono text-[11px] text-zinc-400">
-                          {pct.toFixed(1)}%
-                        </div>
-                      </>
                     )}
                   </div>
                 </div>
-              ))}
+                  );
+                }
+              )}
             </div>
 
             {/* Recent warnings */}
