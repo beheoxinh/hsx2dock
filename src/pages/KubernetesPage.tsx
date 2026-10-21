@@ -23,6 +23,7 @@ import {
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
+import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
 import { formatBytes, formatRelativeTime } from "../lib/utils";
@@ -147,10 +148,14 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     (KindClusterPrefs & { name: string; isNew?: boolean }) | null
   >(null);
   const [prefsSaving, setPrefsSaving] = useState(false);
+  // Master switch: start auto-start clusters together with the engine.
+  const [engineAutoStart, setEngineAutoStart] = useState(false);
+  const [autoStartBusy, setAutoStartBusy] = useState(false);
   const loadPrefs = async () => {
     try {
       const cfg = await api.getAppConfig();
       setPrefsByName(cfg.kind_cluster_prefs ?? {});
+      setEngineAutoStart(cfg.kind_auto_start ?? false);
     } catch (e) {
       console.error(e);
     }
@@ -177,6 +182,47 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   };
   const prefsFor = (name: string): KindClusterPrefs =>
     prefsByName[name] ?? { autoStart: false, nodeCpuM: 0, nodeMemoryMb: 0 };
+
+  /** Master auto-start switch: engine up → start the marked clusters. */
+  const toggleEngineAutoStart = async (next: boolean) => {
+    try {
+      setAutoStartBusy(true);
+      const cfg = await api.getAppConfig();
+      await api.saveAppConfig({ ...cfg, kind_auto_start: next });
+      setEngineAutoStart(next);
+      const marked = Object.values(prefsByName).filter((p) => p.autoStart).length;
+      toast.success(
+        next ? "Auto-start enabled" : "Auto-start disabled",
+        next
+          ? `${marked} cluster${marked === 1 ? "" : "s"} marked auto-start will start with the engine.`
+          : "Clusters will wait for an explicit Start."
+      );
+    } catch (e) {
+      toast.error("Could not update auto-start", String(e));
+    } finally {
+      setAutoStartBusy(false);
+    }
+  };
+
+  /** Per-cluster switch on each card (honoured when the master is on). */
+  const toggleClusterAutoStart = async (c: KindCluster) => {
+    const current = prefsFor(c.name);
+    const next = { ...current, autoStart: !current.autoStart };
+    try {
+      await api.setClusterPrefs(c.name, next);
+      setPrefsByName((p) => ({ ...p, [c.name]: next }));
+      toast.success(
+        next.autoStart ? "Auto-start on" : "Auto-start off",
+        next.autoStart
+          ? engineAutoStart
+            ? `${c.name} will start with the engine.`
+            : `${c.name} is marked — turn on the master Auto-start switch too.`
+          : `${c.name} will wait for an explicit Start.`
+      );
+    } catch (e) {
+      toast.error("Could not update auto-start", String(e));
+    }
+  };
 
   const loadAll = async () => {
     try {
@@ -451,6 +497,14 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
         </div>
 
         <div className="flex items-center gap-3">
+          <Switch
+            checked={engineAutoStart}
+            onChange={toggleEngineAutoStart}
+            disabled={autoStartBusy}
+            label="Auto-start"
+            title="Start clusters marked auto-start when the Docker engine comes up (staggered by the delay in Settings)"
+          />
+
           {status?.installed && (
             <span
               title={status.path ?? undefined}
@@ -665,14 +719,6 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                             kubeconfig
                           </span>
                         )}
-                        {prefsFor(c.name).autoStart && (
-                          <span
-                            title="Starts with the engine (staggered)"
-                            className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30"
-                          >
-                            auto-start
-                          </span>
-                        )}
                         {(prefsFor(c.name).nodeCpuM > 0 ||
                           prefsFor(c.name).nodeMemoryMb > 0) && (
                           <span
@@ -694,6 +740,14 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                       </div>
                     </div>
                   </div>
+                  <Switch
+                    checked={prefsFor(c.name).autoStart}
+                    onChange={() => toggleClusterAutoStart(c)}
+                    disabled={!!busyOp}
+                    label="Auto-start"
+                    title="Start this cluster when the Docker engine comes up (the master Auto-start switch above must also be on)"
+                    className="mt-0.5 shrink-0"
+                  />
                 </div>
 
                 <p className="mt-2 text-xs text-zinc-500">
@@ -1008,7 +1062,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
               </div>
               <div className="px-5 py-4 space-y-4">
                 <label className="flex items-center justify-between gap-3 text-sm text-zinc-200">
-                  <span>Auto-start with engine</span>
+                  <span>
+                    Auto-start with engine
+                    <span className="block text-[11px] text-zinc-500">
+                      Honoured when the master Auto-start switch on the page is on.
+                    </span>
+                  </span>
                   <input
                     type="checkbox"
                     checked={prefsEdit.autoStart}

@@ -112,9 +112,10 @@ export const KubernetesCard: React.FC = () => {
           <span>Auto-start clusters when the engine comes up</span>
         </label>
         <p className="text-xs text-zinc-500 leading-relaxed">
-          Only clusters with per-cluster auto-start enabled (Kubernetes page → ⚙) are
-          started, one after another with the delay below — so the host CPU/RAM is never
-          slammed by every cluster booting at once.
+          Only clusters with their card's Auto-start switch on are started, one after
+          another with the delay below — so the host CPU/RAM is never slammed by every
+          cluster booting at once. The master switch lives here and on the Kubernetes
+          page.
         </p>
         {autoStart && (
           <div className="max-w-[220px]">
