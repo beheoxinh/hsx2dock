@@ -15,6 +15,12 @@ use state::AppState;
 
 fn start_background_monitoring(app_handle: AppHandle) {
     let handle = app_handle.clone();
+    // Containers Docker restores during an engine start have a StartedAt at or
+    // after this moment; anything older was deliberate and is left alone.
+    let app_started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     crate::runtime::spawn(async move {
         let mut last_state = None;
         loop {
@@ -22,6 +28,10 @@ fn start_background_monitoring(app_handle: AppHandle) {
             if let Some(state) = handle.try_state::<AppState>() {
                 let status = state.daemon_state();
                 if last_state.as_ref() != Some(&status) {
+                    // The first tick after launch proves nothing about what the
+                    // engine did while the app was closed; only a real
+                    // stopped→running transition may drop restored clusters.
+                    let had_previous_state = last_state.is_some();
                     last_state = Some(status.clone());
                     // The bridge can only attach once the daemon's socket
                     // exists, so enabling it while the engine was stopped left
@@ -51,19 +61,27 @@ fn start_background_monitoring(app_handle: AppHandle) {
                                 crate::commands::groups::auto_start_groups(&st).await;
                             }
                         });
-                        // Kind clusters flagged auto-start come up after the
-                        // engine, staggered and capped (see auto_start_kind_clusters).
+                        // Kind clusters: pin node restart policies (kind's
+                        // on-failure:1 lets Docker resurrect clusters behind
+                        // the app's back), drop clusters restored against the
+                        // auto-start switches, then start the flagged ones
+                        // staggered and capped.
                         {
                             let app = handle.clone();
+                            let restored_since = if had_previous_state { 0 } else { app_started };
                             tauri::async_runtime::spawn(async move {
                                 let Some(st2) = app.try_state::<AppState>() else {
                                     return;
                                 };
                                 if let Err(e) =
-                                    crate::commands::kind::auto_start_kind_clusters(app.clone(), &st2)
-                                        .await
+                                    crate::commands::kind::reconcile_kind_auto_start(
+                                        app.clone(),
+                                        &st2,
+                                        restored_since,
+                                    )
+                                    .await
                                 {
-                                    tracing::warn!("kind auto-start failed: {e}");
+                                    tracing::warn!("kind auto-start reconcile failed: {e}");
                                 }
                             });
                         }

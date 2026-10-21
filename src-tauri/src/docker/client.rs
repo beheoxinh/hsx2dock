@@ -205,6 +205,31 @@ impl DockerClient {
         Ok(())
     }
 
+    /// Rewrites a container's restart policy. kind nodes are created with
+    /// `on-failure:1`, which lets Docker bring a cluster back on its own when
+    /// the engine starts; the app pins them to `"no"` so only its own
+    /// auto-start logic decides what runs.
+    pub async fn update_restart_policy(&self, id: &str, policy: &str) -> anyhow::Result<()> {
+        use bollard::models::{
+            ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum as B,
+        };
+        let name = match policy {
+            "always" => B::ALWAYS,
+            "unless-stopped" => B::UNLESS_STOPPED,
+            "on-failure" => B::ON_FAILURE,
+            _ => B::NO,
+        };
+        let body = ContainerUpdateBody {
+            restart_policy: Some(RestartPolicy {
+                name: Some(name),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        };
+        self.docker.update_container(id, body).await?;
+        Ok(())
+    }
+
     pub async fn list_containers(&self, all: bool) -> anyhow::Result<Vec<ContainerItem>> {
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(all)
@@ -904,6 +929,24 @@ impl DockerClient {
             )
             .await?;
         Ok(container_details_from_inspect(&info))
+    }
+
+    /// Unix seconds when the container was (last) started, if it ever was.
+    /// Used to tell containers Docker restored on engine start apart from the
+    /// ones that were already running when the app launched.
+    pub async fn container_started_at(&self, id: &str) -> Option<i64> {
+        let info = self
+            .docker
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .ok()?;
+        let started = info.state.and_then(|s| s.started_at)?;
+        chrono::DateTime::parse_from_rfc3339(&started)
+            .ok()
+            .map(|d| d.timestamp())
     }
 
     /// Create (and optionally start) a container from a [`RunConfig`].

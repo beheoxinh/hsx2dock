@@ -151,6 +151,9 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   // Master switch: start auto-start clusters together with the engine.
   const [engineAutoStart, setEngineAutoStart] = useState(false);
   const [autoStartBusy, setAutoStartBusy] = useState(false);
+  // Toggles stay inert until the persisted prefs are read, so the first click
+  // can never write back a stale `false` over an enabled cluster.
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const loadPrefs = async () => {
     try {
       const cfg = await api.getAppConfig();
@@ -158,6 +161,8 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
       setEngineAutoStart(cfg.kind_auto_start ?? false);
     } catch (e) {
       console.error(e);
+    } finally {
+      setPrefsLoaded(true);
     }
   };
   const savePrefs = async () => {
@@ -500,7 +505,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
           <Switch
             checked={engineAutoStart}
             onChange={toggleEngineAutoStart}
-            disabled={autoStartBusy}
+            disabled={autoStartBusy || !prefsLoaded}
             label="Auto-start"
             title="Start clusters marked auto-start when the Docker engine comes up (staggered by the delay in Settings)"
           />
@@ -743,7 +748,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                   <Switch
                     checked={prefsFor(c.name).autoStart}
                     onChange={() => toggleClusterAutoStart(c)}
-                    disabled={!!busyOp}
+                    disabled={!!busyOp || !prefsLoaded}
                     label="Auto-start"
                     title="Start this cluster when the Docker engine comes up (the master Auto-start switch above must also be on)"
                     className="mt-0.5 shrink-0"

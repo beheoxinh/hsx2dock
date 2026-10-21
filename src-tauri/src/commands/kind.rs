@@ -563,6 +563,9 @@ pub async fn create_kind_cluster(
         // Creation "succeeds" as soon as kind exits 0; the cluster is usable
         // because the create command waits for nodes by default.
         crate::tray::notify_kind_event(&app, true, &name);
+        // kind ships nodes with on-failure:1 — pin them so a later engine
+        // start cannot resurrect a cluster the user stopped.
+        let _ = enforce_kind_restart_policy(&state).await;
     }
     result
 }
@@ -2200,23 +2203,29 @@ async fn cluster_node_ids(
     Ok(list.into_iter().filter_map(|c| c.id).collect())
 }
 
+/// Clusters eligible for auto-start, sorted. Both switches must agree: the
+/// master `kind_auto_start` and the cluster's own `auto_start`.
+fn auto_start_names(cfg: &crate::config::AppConfig) -> Vec<String> {
+    if !cfg.kind_auto_start {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = cfg
+        .kind_cluster_prefs
+        .iter()
+        .filter(|(_, p)| p.auto_start)
+        .map(|(k, _)| k.clone())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Auto-starts every cluster flagged `auto_start` when the engine comes up.
 /// Starts are sequential with a configurable pause so N clusters don't hit
 /// the host at once; caps are applied before each start.
 pub async fn auto_start_kind_clusters(app: AppHandle, state: &AppState) -> Result<u32, String> {
     let (names, delay) = {
         let cfg = state.config.read().await;
-        if !cfg.kind_auto_start {
-            return Ok(0);
-        }
-        let mut names: Vec<String> = cfg
-            .kind_cluster_prefs
-            .iter()
-            .filter(|(_, p)| p.auto_start)
-            .map(|(k, _)| k.clone())
-            .collect();
-        names.sort();
-        (names, cfg.kind_auto_start_delay)
+        (auto_start_names(&cfg), cfg.kind_auto_start_delay)
     };
     if names.is_empty() {
         return Ok(0);
@@ -2250,6 +2259,95 @@ pub async fn auto_start_kind_clusters(app: AppHandle, state: &AppState) -> Resul
         );
     }
     Ok(started)
+}
+
+/// Pins every kind node container to `restart=no`. kind creates nodes with
+/// `on-failure:1`, so Docker otherwise restarts a cluster on its own whenever
+/// the engine comes up — bypassing the auto-start switches entirely.
+pub async fn enforce_kind_restart_policy(state: &AppState) -> Result<usize, String> {
+    let client = local_client(state).await?;
+    let containers = client
+        .list_containers(true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut pinned = 0;
+    for c in containers.iter().filter(|c| c.kind_cluster.is_some()) {
+        let policy = client
+            .inspect_container(&c.id)
+            .await
+            .map(|d| d.restart_policy)
+            .unwrap_or_default();
+        if policy != "no" && client.update_restart_policy(&c.id, "no").await.is_ok() {
+            pinned += 1;
+        }
+    }
+    Ok(pinned)
+}
+
+/// A running node is stopped only when its cluster is not eligible and the
+/// container came up as part of this engine launch (restored), not before it.
+fn should_stop_restored(eligible: bool, started_at: i64, restored_since: i64) -> bool {
+    !eligible && started_at >= restored_since
+}
+
+/// Brings the cluster set in line with the auto-start configuration whenever
+/// the engine comes up:
+///  * node restart policies are pinned to `no` (for the next boot),
+///  * clusters that started at/after `restored_since` while not marked
+///    auto-start are stopped again (that covers containers Docker restored on
+///    engine start; pass `0` on a known stopped→running transition, and the
+///    process start time on the first observation after launch so clusters
+///    that were already running are left alone),
+///  * marked clusters are started staggered, as before.
+pub async fn reconcile_kind_auto_start(
+    app: AppHandle,
+    state: &AppState,
+    restored_since: i64,
+) -> Result<u32, String> {
+    let _ = enforce_kind_restart_policy(state).await;
+    // Docker restores containers in parallel right after the socket appears;
+    // give that pass a moment so nothing is started again after we look.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    {
+        let allowed: std::collections::HashSet<String> = {
+            let cfg = state.config.read().await;
+            auto_start_names(&cfg).into_iter().collect()
+        };
+        if let Ok(client) = local_client(state).await {
+            if let Ok(containers) = client.list_containers(true).await {
+                for c in containers.iter().filter(|c| c.state == "running") {
+                    let Some(cluster) = c.kind_cluster.as_ref() else {
+                        continue;
+                    };
+                    if allowed.contains(cluster) {
+                        continue;
+                    }
+                    // Only touch containers this engine launch brought up;
+                    // ones that predate the launch were deliberate.
+                    let started = client.container_started_at(&c.id).await.unwrap_or(0);
+                    if !should_stop_restored(
+                        allowed.contains(cluster),
+                        started,
+                        restored_since,
+                    ) {
+                        continue;
+                    }
+                    let _ = client.stop_container(&c.id).await;
+                    let _ = app.emit(
+                        "kind-progress",
+                        serde_json::json!({
+                            "action": "auto-start",
+                            "name": cluster,
+                            "line": format!("Stopped {cluster}: auto-start is off"),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    auto_start_kind_clusters(app, state).await
 }
 
 // ==================== Pod & resource management ====================
@@ -3154,3 +3252,56 @@ mod monitor_tests {
         }
         eprintln!("hammer: {fails} failures / 50 execs");
     }
+
+#[cfg(test)]
+mod auto_start_tests {
+    use super::*;
+    use crate::config::{AppConfig, KindClusterPrefs};
+
+    fn prefs(auto: bool) -> KindClusterPrefs {
+        KindClusterPrefs {
+            auto_start: auto,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn master_switch_gates_every_cluster() {
+        let mut cfg = AppConfig::default();
+        cfg.kind_cluster_prefs.insert("a".into(), prefs(true));
+        cfg.kind_cluster_prefs.insert("b".into(), prefs(false));
+
+        cfg.kind_auto_start = false;
+        assert!(auto_start_names(&cfg).is_empty());
+
+        cfg.kind_auto_start = true;
+        assert_eq!(auto_start_names(&cfg), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn names_are_sorted_and_unmarked_clusters_skipped() {
+        let mut cfg = AppConfig::default();
+        cfg.kind_auto_start = true;
+        cfg.kind_cluster_prefs.insert("zeta".into(), prefs(true));
+        cfg.kind_cluster_prefs.insert("alpha".into(), prefs(true));
+        cfg.kind_cluster_prefs.insert("mid".into(), prefs(false));
+
+        assert_eq!(
+            auto_start_names(&cfg),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn restored_ineligible_cluster_is_stopped_but_preexisting_is_kept() {
+        // A real stopped→running transition uses threshold 0: every ineligible
+        // running cluster goes, regardless of when it started.
+        assert!(should_stop_restored(false, 10, 0));
+        // First tick after launch only stops containers started at/after it,
+        // so a cluster that was already running is left alone.
+        assert!(should_stop_restored(false, 100, 100));
+        assert!(!should_stop_restored(false, 99, 100));
+        // Marked clusters are never stopped by the reconciler.
+        assert!(!should_stop_restored(true, 100, 0));
+    }
+}
