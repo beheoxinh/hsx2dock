@@ -556,8 +556,12 @@ export const ClusterMonitor: React.FC<{ cluster: string }> = ({ cluster }) => {
 
   const cpuPct = totalCpuCap > 0 ? (totalCpuUsed / totalCpuCap) * 100 : 0;
   const memPct = totalMemCap > 0 ? (totalMemUsed / totalMemCap) * 100 : 0;
+  // Usage is missing only when neither source produced data — one failing
+  // query must not blank the other's numbers.
   const noMetrics =
-    !!metrics?.error || (msStatus?.installed && !msStatus.top_works);
+    !metrics?.nodes.length &&
+    !metrics?.pods.length &&
+    (!!metrics?.error || (msStatus?.installed === true && !msStatus.top_works));
 
   return (
     <section className="rounded-2xl border border-zinc-800/80 bg-zinc-900/40 overflow-hidden">

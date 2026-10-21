@@ -859,14 +859,26 @@ async fn kubectl_raw(
         .map_err(|e| format!("kubectl {args:?}: {e}"))
 }
 
-/// Same as [`kubectl_raw`] but parses stdout as JSON.
+/// Same as [`kubectl_raw`] but parses stdout as JSON. kubectl warnings can land
+/// in the merged exec stream ahead of the payload, so a first failed parse
+/// retries from the first `{`/`[`.
 async fn kubectl_json(
     state: &AppState,
     cluster: &str,
     args: &[&str],
 ) -> Result<serde_json::Value, String> {
     let out = kubectl_raw(state, cluster, args).await?;
-    serde_json::from_str(out.trim()).map_err(|e| format!("bad kubectl JSON from {args:?}: {e}"))
+    extract_json(&out).ok_or_else(|| format!("bad kubectl JSON from {args:?}"))
+}
+
+/// Parses `out` as JSON, tolerating leading warning lines.
+fn extract_json(out: &str) -> Option<serde_json::Value> {
+    let trimmed = out.trim();
+    if let Ok(v) = serde_json::from_str(trimmed) {
+        return Some(v);
+    }
+    let start = trimmed.find(['{', '['])?;
+    serde_json::from_str(&trimmed[start..]).ok()
 }
 
 fn rfc3339_to_epoch(ts: &str) -> Option<i64> {
@@ -1477,11 +1489,23 @@ pub async fn get_cluster_metrics(
     state: State<'_, AppState>,
     cluster: String,
 ) -> Result<K8sMetrics, String> {
-    // Both `kubectl top` queries are best-effort: kind ships no metrics-server
-    // by default, so a failure is data (reported via `error`), not an error.
-    let nodes_res = kubectl_json(&state, &cluster, &["top", "nodes", "-o", "json"]).await;
-    let pods_res =
-        kubectl_json(&state, &cluster, &["top", "pods", "--all-namespaces", "-o", "json"]).await;
+    // Both metric queries are best-effort: without metrics-server the API
+    // isn't registered, so a failure is data (reported via `error`), not an
+    // error. NOTE: `kubectl top` only prints a table — it has no `-o json`
+    // flag at all — so asking it for JSON fails even with a healthy
+    // metrics-server. The Metrics API returns the same data as real JSON.
+    let nodes_res = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+    )
+    .await;
+    let pods_res = kubectl_json(
+        &state,
+        &cluster,
+        &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"],
+    )
+    .await;
     let error = match (&nodes_res, &pods_res) {
         (Err(a), Err(b)) => Some(format!("{a}; {b}")),
         (Err(a), Ok(_)) => Some(a.clone()),
@@ -1489,8 +1513,14 @@ pub async fn get_cluster_metrics(
         _ => None,
     };
     Ok(K8sMetrics {
-        nodes: nodes_res.as_ref().map(|v| parse_node_metrics(v)).unwrap_or_default(),
-        pods: pods_res.as_ref().map(|v| parse_pod_metrics(v)).unwrap_or_default(),
+        nodes: nodes_res
+            .as_ref()
+            .map(parse_node_metrics)
+            .unwrap_or_default(),
+        pods: pods_res
+            .as_ref()
+            .map(parse_pod_metrics)
+            .unwrap_or_default(),
         error,
     })
 }
@@ -1817,7 +1847,15 @@ async fn read_metrics_status(
     let available_replicas = deployment_available_replicas(&deployment);
     let ready = available_replicas > 0 && available_replicas >= desired_replicas;
     let kubelet_insecure_tls = deployment_has_arg(&deployment, "--kubelet-insecure-tls");
-    let top_works = kubectl_raw(state, cluster, &["top", "nodes"]).await.is_ok();
+    // Measured through the same endpoint the monitoring UI reads, so "top
+    // works" and "usage shows up" can never disagree.
+    let top_works = kubectl_json(
+        state,
+        cluster,
+        &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+    )
+    .await
+    .is_ok();
     let message = diagnose_metrics(
         true,
         ready,
@@ -1914,9 +1952,16 @@ pub async fn install_metrics_server(
     )
     .await;
 
-    // metrics-server needs one scrape cycle before `kubectl top` answers.
+    // metrics-server needs one scrape cycle before the Metrics API answers.
     for _ in 0..12 {
-        if kubectl_raw(&state, &cluster, &["top", "nodes"]).await.is_ok() {
+        if kubectl_json(
+            &state,
+            &cluster,
+            &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+        )
+        .await
+        .is_ok()
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2724,6 +2769,20 @@ pub async fn get_cluster_pvcs(
 mod monitor_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extract_json_tolerates_leading_warnings() {
+        // Clean payloads parse directly.
+        assert_eq!(extract_json(r#"{"items":[]}"#), Some(json!({"items": []})));
+        // kubectl warnings merged into the exec stream must not break parsing.
+        let noisy = "Warning: v1 PodMetrics is deprecated\n{\"items\":[{\"metadata\":{\"name\":\"p\"}}]}";
+        assert_eq!(
+            extract_json(noisy),
+            Some(json!({"items":[{"metadata":{"name":"p"}}]}))
+        );
+        assert_eq!(extract_json("no json here"), None);
+        assert_eq!(extract_json(""), None);
+    }
 
     #[test]
     fn readyz_verdict_accepts_all_formats() {
