@@ -59,7 +59,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
         <div>
           <h1 className="font-semibold text-sm tracking-tight text-white flex items-center gap-1.5">
-            Docker Manager
+            Hsx2Dock
           </h1>
           <p className="text-[11px] text-zinc-400 font-medium">Desktop Suite</p>
         </div>

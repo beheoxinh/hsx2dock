@@ -749,11 +749,11 @@ fn inside_rounded_rect(x: f64, y: f64, min: f64, max: f64, r: f64) -> bool {
 pub fn format_tooltip(label: &str, stats: Option<(usize, usize, usize, usize)>) -> String {
     match stats {
         Some((total, running, images, kinds)) => format!(
-            "Docker Manager — Engine {label} · {total} containers ({running} running) · \
+            "Hsx2Dock — Engine {label} · {total} containers ({running} running) · \
              {images} images · {kinds} kind {}",
             if kinds == 1 { "cluster" } else { "clusters" }
         ),
-        None => format!("Docker Manager — Engine {label}"),
+        None => format!("Hsx2Dock — Engine {label}"),
     }
 }
 
@@ -780,11 +780,11 @@ mod tests {
     fn tooltip_carries_stats_and_pluralizes() {
         assert_eq!(
             format_tooltip("Running", None),
-            "Docker Manager — Engine Running"
+            "Hsx2Dock — Engine Running"
         );
         assert_eq!(
             format_tooltip("Running", Some((12, 7, 3, 1))),
-            "Docker Manager — Engine Running · 12 containers (7 running) · 3 images · 1 kind cluster"
+            "Hsx2Dock — Engine Running · 12 containers (7 running) · 3 images · 1 kind cluster"
         );
         let two = format_tooltip("Running", Some((1, 1, 0, 2)));
         assert!(two.ends_with("2 kind clusters"), "got: {two}");

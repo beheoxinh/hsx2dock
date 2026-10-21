@@ -153,7 +153,7 @@ verify_dev_env() {
 
 main() {
     echo "=========================================================="
-    echo "   Docker Manager — Chuẩn bị môi trường phát triển       "
+    echo "      Hsx2Dock — Chuẩn bị môi trường phát triển       "
     echo "=========================================================="
     install_system_deps
     install_rust

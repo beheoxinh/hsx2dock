@@ -1,10 +1,11 @@
-# Docker Manager
+# Hsx2Dock
 
-Native GTK4 + libadwaita GUI for managing Docker resources — a simpler, faster
-alternative to Docker Desktop. Built in Rust on top of the Docker Engine API
-via [bollard](https://crates.io/crates/bollard).
+Modern cross-platform Docker GUI — a Tauri v2 desktop app with a
+React/TypeScript frontend and a Rust backend built on the Docker Engine API via
+[bollard](https://crates.io/crates/bollard). It ships its own isolated rootless
+Docker engine and manages kind (Kubernetes-in-Docker) clusters.
 
-![GTK4 native](https://img.shields.io/badge/GTK-4-blue) ![Rust](https://img.shields.io/badge/Rust-2021-orange)
+![Tauri 2](https://img.shields.io/badge/Tauri-2-blue) ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![React](https://img.shields.io/badge/React-19-61dafb)
 
 ## Features
 
@@ -13,9 +14,9 @@ via [bollard](https://crates.io/crates/bollard).
   image counts. One-click Start / Stop of the Docker daemon.
 - **Containers** — list running + stopped, search/filter, start, stop,
   restart, rename, delete (force), edit resource limits (memory / CPUs /
-  cpuset / pids), open an interactive shell (`docker exec -it`, bash with sh
-  fallback) in your terminal or a **Debug** shell that starts a stopped
-  container first, and view tailed logs with Follow.
+  cpuset / pids), open an embedded terminal (`docker exec -it`, shell
+  auto-detected, debug container fallback for distroless images) or a **Debug**
+  shell that starts a stopped container first, and view tailed logs with Follow.
 - **Monitoring** — per-container CPU % and memory usage/limit bars, refreshed
   every 3 seconds for running containers via the Docker stats API.
 - **Images** — list tags/size/age, search, pull new images with live progress
@@ -30,29 +31,27 @@ via [bollard](https://crates.io/crates/bollard).
   data directory (never your `PATH`), cluster create (custom node image/count)
   / delete with live log streaming, per-cluster kubeconfig path (copied for
   `KUBECONFIG=… kubectl`, always outside `~/.kube`), and one-click
-  *Load to cluster* from the Images page (`kind load docker-image`).
+  *Load to cluster* from the Images page (`kind load docker-image`). Per
+  cluster: CPU/RAM charts, pods, workloads, services, config/secrets, PVCs,
+  events, pod terminal/YAML/logs, and metrics-server install.
+- **Auto-start** — a master switch plus a per-cluster switch decide which
+  clusters start with the engine; starts are staggered and node containers are
+  pinned to `restart=no` so Docker never resurrects a cluster on its own.
 - **Networks** — list name/driver/subnet/gateway, create (name + driver),
   delete, prune unused.
 - **Compose** — pick a compose file, Up/Down (Down confirmed), service list,
   per-service logs.
 - **Registries** — tag/push/history, build with live progress, Docker Hub
   search, login/logout via the `docker` CLI (no secrets stored in-app).
-- **System tray & notifications** — live tray icon colored by engine state
-  (blue running / gray stopped / amber transitioning) with a dynamic tooltip,
-  rich menu (engine status, container/image/cluster counts, Start/Stop engine,
-  Open Dashboard), a `Notifications ▸` submenu with recent history and
-  per-category toggles, and desktop notifications for build/pull/push
-  completion, engine transitions and kind cluster events — every category
-  configurable from Settings → Notifications.
-- **Polish** — `Ctrl+R` refresh / `Ctrl+,` preferences shortcuts, header
-  working spinner, long-error dialog, copy-ID buttons on every row,
-  confirm-before-every-prune/delete.
+- **System tray & notifications** — live tray icon colored by engine state,
+  dynamic tooltip, rich menu (engine status, container/image/cluster counts,
+  Start/Stop engine, Open Dashboard), a `Notifications ▸` submenu with recent
+  history, and per-category desktop notifications (build/pull/push, engine
+  transitions, kind events), configurable from Settings → Notifications.
 - **Bundled engine** — the app downloads its own Docker Engine (official
   static rootless binaries) into `~/.local/share/docker-manager` on first run
   and runs `dockerd` rootless as a child process on a private socket. Fully
   isolated: the system's Docker install is neither required nor touched.
-  No engine yet? Download it from the Engine page (needs network once), then
-  every action just works.
 - **Docker CLI bridge** — optional switch on the Engine page makes the system
   `docker` command talk to this bundled engine: creates
   `$XDG_RUNTIME_DIR/docker.sock` and a `docker-manager-engine` context, with an
@@ -61,23 +60,25 @@ via [bollard](https://crates.io/crates/bollard).
 
 ## Requirements (Nobara / GNOME)
 
-- GTK 4.12+, libadwaita 1.4+
+- WebKitGTK 4.1 (the Tauri 2 webview runtime)
 - No system Docker needed — the app bundles its own rootless engine
-- A terminal emulator for `docker exec`: `ptyxis` (preferred) or
-  `gnome-terminal`
+- Network access the first time the engine (and the kind binary) is installed
 
 ## Build & run
 
 ```sh
-cargo build
-./target/debug/docker-manager
+pnpm install
+pnpm tauri dev
 
-# release
-cargo build --release
-./target/release/docker-manager
+# release + system install (binary `hsx2dock`, .desktop entry and icon)
+./install.sh
 ```
 
-CLI flags: `--help`, `-V` / `--version`.
+`./install.sh` builds the release binary and installs:
+
+- `~/.local/bin/hsx2dock`
+- `~/.local/share/applications/com.github.hsx2dock.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/com.github.hsx2dock.svg`
 
 ## Configuration
 
@@ -90,6 +91,12 @@ compose_file = ""
 
 - `auto_start_daemon` — start the bundled engine when the app opens.
 - `compose_file` — default compose file used by the Compose page.
+- `data_root` — where containers/images/volumes live (survives engine updates).
+- `kind_auto_start` / `kind_cluster_prefs` — cluster auto-start switches.
+
+The internal directory names (`docker-manager`) are kept for backwards
+compatibility with existing installs; the public identity of the app is
+**Hsx2Dock** / `com.github.hsx2dock`.
 
 ## Engine layout
 
@@ -118,81 +125,42 @@ $XDG_RUNTIME_DIR/docker-manager/
 
 ## Desktop integration
 
-```sh
-# install the .desktop entry and icon
-sudo install -Dm644 data/com.github.docker_manager.desktop \
-  /usr/share/applications/com.github.docker_manager.desktop
-sudo install -Dm644 data/icons/com.github.docker_manager.svg \
-  /usr/share/icons/hicolor/scalable/apps/com.github.docker_manager.svg
-gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
-```
+`./install.sh` does all of this for you. Manually:
 
-`desktop-file-validate data/com.github.docker_manager.desktop` passes clean.
+```sh
+install -Dm755 src-tauri/target/release/hsx2dock ~/.local/bin/hsx2dock
+install -Dm644 data/com.github.hsx2dock.desktop \
+  ~/.local/share/applications/com.github.hsx2dock.desktop
+install -Dm644 data/icons/com.github.hsx2dock.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/com.github.hsx2dock.svg
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
 
 ## Architecture
 
 ```
-src/
-  main.rs               adw::Application entry, CSS, CLI flags
-  runtime.rs            shared Tokio runtime (GTK ↔ async bridge)
-  config.rs             TOML config load/save
-  terminal_launcher.rs  ptyxis/gnome-terminal `docker exec -it`
-  docker/
-    client.rs           bollard wrapper (27 methods, all resources)
-    daemon.rs           private-socket detection helpers
-    engine.rs           bundled engine: paths, download/verify/extract,
-                        child-process lifecycle (start/stop), docker_command
-    models.rs           ContainerItem/ImageItem/VolumeItem/NetworkItem/stats
-  ui/
-    app_state.rs        AppEvent bus, with_client, refresh/toggle daemon
-    common.rs           format helpers + main_loop_channel marshalling
-    window.rs           ViewStack shell, event drain, poll loops, spinner,
-                      shortcuts, error dialog
-    dialogs/           run/exec/logs/inspect/pull/push/build/tag/login/hub/preferences
+src-tauri/src/            Rust backend (Tauri commands + engine supervision)
+  main.rs                 binary entry (`hsx2dock_lib::run()`)
+  lib.rs                  Tauri builder, command registration, background monitor
+  state.rs                AppState (engine, client, config, exec sessions)
+  runtime.rs              shared Tokio runtime / engine-op marshalling
+  config.rs               TOML config load/save
+  tray.rs                 tray icon, menu, notifications
+  commands/               engine, containers, images, volumes, networks,
+                          compose, kind/k8s, exec, registries, groups…
+  docker/                 bollard client wrapper, bundled-engine management,
+                          CLI bridge, kind paths
+src/                      React frontend
+  pages/                  Dashboard, Containers, Images, Volumes, Networks,
+                          Compose, Kubernetes, Settings
+  components/             UI primitives, k8s monitor, terminal, settings cards
+  lib/api.ts              typed `invoke` wrappers for every Tauri command
+  types/index.ts          shared payload types
 ```
-
-Full map: [docs/architecture.md](docs/architecture.md) ·
-Usage: [docs/user-guide.md](docs/user-guide.md) ·
-Config: [docs/configuration.md](docs/configuration.md) ·
-Dev: [docs/development.md](docs/development.md)
-
-```
-ui/
-  app_state.rs        AppEvent bus, with_client, refresh/toggle daemon
-  common.rs           format helpers + main_loop_channel marshalling
-  window.rs           ViewStack shell, event drain, poll loops, spinner,
-                      shortcuts, error dialog
-  dialogs/           run/exec/logs/inspect/pull/push/build/tag/login/hub/preferences
-  system_view.rs      engine dashboard
-  containers_view.rs  containers + stats bars
-  container_details_dialog.rs   logs dialog
-  images_view.rs      images list
-  pull_image_dialog.rs          pull with progress
-  volumes_view.rs
-  networks_view.rs
-  compose_view.rs
-  preferences.rs
-  build_image_dialog.rs
-  run_container_dialog.rs
-```
-```
-
-Threading rule: GTK widgets are `!Send`. All Docker I/O runs on the shared
-Tokio runtime; results return through `main_loop_channel` (async_channel +
-`glib::MainContext::spawn_local`) so widgets are only touched on the GTK main
-loop.
 
 ## Tests
 
 ```sh
-cargo test            # 31 unit tests
-cargo check --all-targets
+cd src-tauri && cargo test --lib    # unit tests (156)
+pnpm build                          # tsc + vite production build
 ```
-
-Unit tests cover socket-detection (`docker::daemon`), the engine pipeline
-(paths, checksum rejection, tarball extraction, symlink swap, `docker_command`
-env) (`docker::engine`), config round-trips, byte/relative-time formatting
-(`ui::common`), and the terminal launcher.
-
-The full bundled-engine path (download → verify → extract → rootless start →
-`docker run`) was verified manually against a real 29.9.0 static release.

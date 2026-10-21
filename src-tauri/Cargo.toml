@@ -1,5 +1,5 @@
 [package]
-name = "docker-manager"
+name = "hsx2dock"
 version = "0.3.0"
 edition = "2021"
 authors = ["Hsx2Coder"]
@@ -7,7 +7,7 @@ description = "Modern cross-platform Docker GUI Manager powered by Tauri v2 and 
 license = "MIT"
 
 [lib]
-name = "docker_manager_lib"
+name = "hsx2dock_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -30,12 +30,12 @@ error() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-APP_ID="com.github.docker-manager"
+APP_ID="com.github.hsx2dock"
 SOURCE_ICON="/mnt/SubSystem/Downloads/google-container-optimized-os.svg"
 LOCAL_ICON="$ROOT_DIR/data/icons/${APP_ID}.svg"
 
 echo "=========================================================="
-echo "   Docker Manager — Build & Cài đặt hệ thống (Tauri v2)   "
+echo "      Hsx2Dock — Build & Cài đặt hệ thống (Tauri v2)       "
 echo "=========================================================="
 
 # 1. Đảm bảo icon có sẵn
@@ -48,7 +48,7 @@ fi
 info "Đang chạy script build.sh..."
 "$ROOT_DIR/build.sh"
 
-BIN_SRC="$ROOT_DIR/src-tauri/target/release/docker-manager"
+BIN_SRC="$ROOT_DIR/src-tauri/target/release/hsx2dock"
 if [ ! -f "$BIN_SRC" ]; then
     error "Không tìm thấy file binary sau khi build: $BIN_SRC"
     exit 1
@@ -70,8 +70,8 @@ mkdir -p "$USER_APPS_DIR"
 mkdir -p "$USER_ICONS_DIR"
 
 # 4. Cài đặt binary
-info "Đang cài đặt binary 'docker-manager' vào $USER_BIN_DIR/..."
-install -m 755 "$BIN_SRC" "$USER_BIN_DIR/docker-manager"
+info "Đang cài đặt binary 'hsx2dock' vào $USER_BIN_DIR/..."
+install -m 755 "$BIN_SRC" "$USER_BIN_DIR/hsx2dock"
 success "Đã cài đặt binary thành công."
 
 # 5. Cài đặt icon SVG
@@ -83,22 +83,22 @@ fi
 
 # 6. Cài đặt file .desktop (Dọn dẹp các desktop entry cũ không đồng bộ)
 info "Đang dọn dẹp các desktop entry cũ..."
-rm -f "$USER_APPS_DIR/com.github.docker_manager.desktop"
+rm -f "$USER_APPS_DIR/com.github.docker_manager.desktop" "$USER_APPS_DIR/com.github.docker-manager.desktop"
 
 info "Đang tạo và cài đặt file .desktop vào $USER_APPS_DIR/..."
 cat << EOF > "$USER_APPS_DIR/${APP_ID}.desktop"
 [Desktop Entry]
 Type=Application
 Version=1.5
-Name=Docker Manager
+Name=Hsx2Dock
 GenericName=Docker Desktop Suite
 Comment=Modern Cross-platform Desktop Suite to manage Docker containers, images, volumes and networks
-Exec=docker-manager
+Exec=hsx2dock
 Icon=${APP_ID}
 Terminal=false
 Categories=Development;
-Keywords=docker;containers;images;volumes;networks;
-StartupWMClass=docker-manager
+Keywords=docker;containers;images;volumes;networks;hsx2dock;
+StartupWMClass=hsx2dock
 EOF
 
 chmod 644 "$USER_APPS_DIR/${APP_ID}.desktop"
@@ -120,8 +120,8 @@ fi
 
 echo "=========================================================="
 success "CÀI ĐẶT THÀNH CÔNG!"
-echo "Ứng dụng Docker Manager (Tauri) đã sẵn sàng trên hệ thống."
+echo "Ứng dụng Hsx2Dock (Tauri) đã sẵn sàng trên hệ thống."
 echo "Bạn có thể mở ứng dụng bằng cách:"
-echo " 1. Tìm 'Docker Manager' trong App Launcher (phím Super)"
-echo " 2. Hoặc chạy lệnh trong terminal: docker-manager"
+echo " 1. Tìm 'Hsx2Dock' trong App Launcher (phím Super)"
+echo " 2. Hoặc chạy lệnh trong terminal: hsx2dock"
 echo "=========================================================="

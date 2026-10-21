@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# build.sh — Build hoàn thiện ứng dụng Docker Manager (Tauri v2 + React 19 + Rust)
+# build.sh — Build hoàn thiện ứng dụng Hsx2Dock (Tauri v2 + React 19 + Rust)
 # ==============================================================================
 
 set -euo pipefail
@@ -43,7 +43,7 @@ fi
 info "Tiến hành build ứng dụng với Tauri CLI (Release mode, nhúng offline assets)..."
 pnpm tauri build --no-bundle
 
-BIN_PATH="$ROOT_DIR/src-tauri/target/release/docker-manager"
+BIN_PATH="$ROOT_DIR/src-tauri/target/release/hsx2dock"
 if [ -f "$BIN_PATH" ]; then
     success "Build hoàn tất thành công!"
     info "Binary path: $BIN_PATH"

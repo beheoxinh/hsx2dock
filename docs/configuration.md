@@ -1,6 +1,6 @@
 # Configuration
 
-Docker Manager reads a TOML file (override with `--config <path>`):
+Hsx2Dock reads a TOML file (override with `--config <path>`):
 
 ```toml
 # ~/.config/docker-manager/config.toml
@@ -32,5 +32,5 @@ the entry widget afterwards.
 ## CLI flags
 
 ```sh
-docker-manager --socket /var/run/docker.sock --config ~/.config/docker-manager/config.toml
+hsx2dock --socket /var/run/docker.sock --config ~/.config/docker-manager/config.toml
 ```

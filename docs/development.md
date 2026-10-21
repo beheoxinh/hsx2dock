@@ -14,7 +14,7 @@ sudo dnf install gtk4-devel libadwaita-devel pkg-config desktop-file-utils
 
 ```sh
 cargo build
-./target/debug/docker-manager
+./target/debug/hsx2dock
 
 # release
 cargo build --release
@@ -44,10 +44,10 @@ desktop-file-validate data/*.desktop
 ## Desktop integration
 
 ```sh
-sudo install -Dm644 data/com.github.docker_manager.desktop \
-  /usr/share/applications/com.github.docker_manager.desktop
-sudo install -Dm644 data/icons/com.github.docker_manager.svg \
-  /usr/share/icons/hicolor/scalable/apps/com.github.docker_manager.svg
+sudo install -Dm644 data/com.github.hsx2dock.desktop \
+  /usr/share/applications/com.github.hsx2dock.desktop
+sudo install -Dm644 data/icons/com.github.hsx2dock.svg \
+  /usr/share/icons/hicolor/scalable/apps/com.github.hsx2dock.svg
 ```
 
 ## Release checklist

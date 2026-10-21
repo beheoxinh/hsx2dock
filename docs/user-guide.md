@@ -1,6 +1,6 @@
 # User Guide
 
-How to use Docker Manager day to day.
+How to use Hsx2Dock day to day.
 
 ## First run
 
