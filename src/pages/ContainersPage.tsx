@@ -288,8 +288,11 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         </div>
       </div>
 
-      {/* Groups: bulk start/stop + engine auto-start */}
-      <ContainerGroupsBar
+      {/* Groups. The ungrouped containers are rendered as children so they sit
+          *inside* the Isolated bucket rather than floating below it. This whole
+          block scrolls as one region now that the list lives inside it. */}
+      <div className="flex-1 overflow-y-auto pb-8">
+        <ContainerGroupsBar
         containers={containers}
         groups={groups}
         onSaveGroups={saveGroups}
@@ -298,12 +301,12 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         onOpenDetails={onOpenDetails}
         onContainerAction={handleAction}
         busyMap={actionLoading}
-      />
-
-      {/* Containers List / Cards */}
-      <div className="flex-1 overflow-y-auto space-y-3 pb-8">
-        <AnimatePresence>
-          {entries.map((entry) => {
+      >
+        {/* Ungrouped containers, with compose projects kept as their own header
+            rows. This is the body of the Isolated bucket. */}
+        <div className="space-y-3">
+          <AnimatePresence>
+            {entries.map((entry) => {
             if (entry.kind === "project") {
               const projectBusy = !!actionLoading[`project:${entry.project}`];
               return (
@@ -407,6 +410,8 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
             </p>
           </div>
         )}
+        </div>
+        </ContainerGroupsBar>
       </div>
     </div>
   );
