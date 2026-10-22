@@ -1,23 +1,26 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  FolderTree,
-  FolderOpen,
-  Play,
-  Square,
-  Pencil,
-  Trash2,
-  Plus,
-  Check,
-  X,
   ChevronDown,
+  FolderOpen,
+  FolderTree,
+  Pencil,
+  Plus,
+  Trash2,
   Activity,
   Cpu,
   HardDrive,
-  GripVertical,
+  Play,
+  Square,
 } from "lucide-react";
 import { Button } from "./ui/Button";
 import { useToast } from "./ui/Toast";
 import { useModal } from "./ui/ModalContext";
+import { ContainerCard, type ContainerAction } from "./ContainerCard";
+import {
+  useDraggable,
+  useDropHandler,
+  useDropTarget,
+} from "./ContainerDragLayer";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
 import {
@@ -28,34 +31,106 @@ import {
 import type { ContainerGroup, ContainerItem, ContainerStats } from "../types";
 
 interface ContainerGroupsBarProps {
-  /** Current container list — drives member resolution and the Isolated group. */
+  /** Current container list — drives member resolution and the Isolated bucket. */
   containers: ContainerItem[];
-  /** Saved groups, owned by the page so the container list can filter by them. */
+  /** Saved groups, owned by the page so the flat list can filter by them. */
   groups: ContainerGroup[];
   /** Persists the whole group set (the page keeps the returned state). */
   onSaveGroups: (next: ContainerGroup[]) => Promise<void>;
-  /** Live per-container stats from the page's stats tick — powers the RAM/CPU pills. */
+  /** Live per-container stats from the page's stats tick. */
   statsMap?: Record<string, ContainerStats>;
   /** Called after a bulk start/stop so the page re-fetches row states. */
   onChanged?: () => void;
+  /** Opens the details drawer for a member card. */
+  onOpenDetails: (
+    id: string,
+    tab?: "logs" | "inspect" | "stats" | "terminal",
+    debug?: boolean
+  ) => void;
+  /** Runs a lifecycle action on a member card. */
+  onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
+  /** Containers with an action in flight, so their buttons disable. */
+  busyMap?: Record<string, boolean>;
 }
 
 const newId = () =>
   `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
-/** The drop payload shared with the container rows on the page. */
-export const CONTAINER_DRAG_TYPE = "text/dm-container-id";
+/** A card inside a group: identical to a list card, but compact and draggable. */
+const MemberCard: React.FC<{
+  c: ContainerItem;
+  stats?: ContainerStats;
+  busy: boolean;
+  onAction: (action: ContainerAction) => void;
+  onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
+}> = ({ c, stats, busy, onAction, onOpenDetails }) => {
+  const drag = useDraggable({ id: c.id, label: c.name.replace(/^\//, "") });
+  return (
+    <ContainerCard
+      container={c}
+      stats={stats}
+      busy={busy}
+      dragHandle={drag}
+      compact
+      onAction={onAction}
+      onOpenDetails={onOpenDetails}
+    />
+  );
+};
 
-/** Synthetic id for the "Isolated" folder (ungrouped containers). */
-const ISOLATED_ID = "__isolated__";
+/** The dashed area a card can be dropped into. */
+const DropZone: React.FC<{ isOver: boolean; children: React.ReactNode }> = ({
+  isOver,
+  children,
+}) => (
+  <div
+    className={`flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed px-3 py-6 text-center transition-colors ${
+      isOver
+        ? "border-emerald-500/70 bg-emerald-500/5"
+        : "border-zinc-700/70 bg-zinc-950/30"
+    }`}
+  >
+    <FolderTree className="w-5 h-5 text-zinc-600" />
+    {children}
+  </div>
+);
+
+/** Inline-editable group name plus its member count. */
+const GroupName: React.FC<{
+  name: string;
+  countLabel: string;
+  editing: string | null;
+  onChange: (name: string) => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}> = ({ name, countLabel, editing, onChange, onCommit, onCancel }) =>
+  editing !== null ? (
+    <input
+      autoFocus
+      value={editing}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onCommit();
+        if (e.key === "Escape") onCancel();
+      }}
+      onBlur={onCommit}
+      aria-label="Group name"
+      className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-800/80 px-1.5 py-0.5 text-sm text-white focus:border-indigo-500 focus:outline-none"
+    />
+  ) : (
+    <>
+      <span className="truncate text-sm font-semibold text-white">{name}</span>
+      <span className="shrink-0 text-[11px] text-zinc-500">{countLabel}</span>
+    </>
+  );
 
 /**
- * Docker Desktop-style container groups as collapsible folder cards.
+ * Container groups as full-width folder cards.
  *
  * A container belongs to exactly one group — like a file in one folder — so a
- * drop *moves* it there, out of whatever group held it before. Containers in no
- * group are listed under the pinned "Isolated" group, which is where a drop
- * target is also used to take a container back out of every group.
+ * drop *moves* it out of whatever group held it before. Containers in no group
+ * are shown under "Isolated", which is not a saved group: it is the heading for
+ * everything unclaimed, and dropping onto it removes a container from its group.
  *
  * Groups persist in the app config (not on the engine).
  */
@@ -65,15 +140,19 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   onSaveGroups,
   statsMap,
   onChanged,
+  onOpenDetails,
+  onContainerAction,
+  busyMap,
 }) => {
   const toast = useToast();
   const modal = useModal();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [sizes, setSizes] = useState<Record<string, number>>({});
   // Inline rename: which card is being edited and the text being typed.
-  const [editing, setEditing] = useState<{ id: string; name: string } | null>(null);
+  const [editing, setEditing] = useState<{ id: string; name: string } | null>(
+    null
+  );
   const [saving, setSaving] = useState(false);
 
   const loadSizes = useCallback(async () => {
@@ -97,7 +176,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const toggleAutoStart = async (g: ContainerGroup) => {
     try {
       await saveAll(
-        groups.map((x) => (x.id === g.id ? { ...x, auto_start: !x.auto_start } : x))
+        groups.map((x) =>
+          x.id === g.id ? { ...x, auto_start: !x.auto_start } : x
+        )
       );
     } catch (e) {
       toast.error("Could not update auto-start", String(e));
@@ -150,7 +231,6 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     setSaving(true);
     try {
       await saveAll([...groups, next]);
-      setExpanded((e) => ({ ...e, [next.id]: true }));
       setEditing({ id: next.id, name });
     } catch (e) {
       toast.error("Could not create group", String(e));
@@ -167,78 +247,28 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     setEditing(null);
     if (!current || !name || name === current.name) return;
     try {
-      await saveAll(groups.map((x) => (x.id === current.id ? { ...x, name } : x)));
+      await saveAll(
+        groups.map((x) => (x.id === current.id ? { ...x, name } : x))
+      );
     } catch (e) {
       toast.error("Could not rename group", String(e));
     }
   };
 
-  /**
-   * Drops a container into `groupId`, or takes it out of every group when
-   * `groupId` is null. A container lives in one group only, so this is a move
-   * rather than an append.
-   */
-  const moveInto = async (groupId: string | null, e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOverId(null);
-    const token = e.dataTransfer.getData(CONTAINER_DRAG_TYPE);
-    if (!token) return;
-    const target = containers.find(
-      (x) => x.id === token || x.short_id === token || x.name === token
-    );
-    if (!target) return;
-    const map = canonicalContainerIds(containers);
-    const from = groupOf(groups, map, target.id);
-    if ((from?.id ?? null) === groupId) {
-      setExpanded((e2) => (groupId ? { ...e2, [groupId]: true } : e2));
-      return;
-    }
-    try {
-      await saveAll(moveMember(groups, map, target.id, groupId));
-      const label = target.name.replace(/^\//, "");
-      const dest = groupId
-        ? groups.find((g) => g.id === groupId)?.name ?? "group"
-        : "Isolated";
-      toast.success("Container moved", `${label} → ${dest}`);
-    } catch (err) {
-      toast.error("Could not move container", String(err));
-    }
-  };
-
-  const removeMember = async (memberId: string) => {
-    try {
-      const map = canonicalContainerIds(containers);
-      const target = resolveMember(memberId);
-      await saveAll(moveMember(groups, map, target?.id ?? memberId, null));
-    } catch (e) {
-      toast.error("Could not update group", String(e));
-    }
-  };
-
-  const resolveMember = (id: string) =>
-    containers.find((x) => x.id === id || x.short_id === id || x.name === id);
-
-  /** Aggregated live stats across the group's running members. */
-  const aggregate = (g: ContainerGroup) => {
-    let mem = 0;
-    let cpu = 0;
-    let disk = 0;
-    for (const id of g.container_ids) {
-      const cid = resolveMember(id)?.id ?? id;
-      const s = statsMap?.[cid];
-      if (s) {
-        mem += s.mem_usage ?? 0;
-        cpu += s.cpu_percent ?? 0;
-      }
-      disk += sizes[cid] ?? 0;
-    }
-    return { mem, cpu, disk };
-  };
+  const resolveMember = useCallback(
+    (id: string) =>
+      containers.find(
+        (x) => x.id === id || x.short_id === id || x.name === id
+      ),
+    [containers]
+  );
 
   // kind node containers belong to the Kubernetes tab; they must never be
-  // offered as group members or counted in the picker.
-  const visibleContainers = containers.filter((c) => !c.kind_cluster);
+  // offered as group members or counted here.
+  const visibleContainers = useMemo(
+    () => containers.filter((c) => !c.kind_cluster),
+    [containers]
+  );
   const canonicalMap = useMemo(
     () => canonicalContainerIds(visibleContainers),
     [visibleContainers]
@@ -257,29 +287,76 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     return out;
   };
 
-  // Everything not claimed by a user group is "Isolated" — the default folder.
-  const isolated = visibleContainers.filter((c) => !groupOf(groups, canonicalMap, c.id));
+  // Everything not claimed by a user group is "Isolated" — the default bucket.
+  const isolated = visibleContainers.filter(
+    (c) => !groupOf(groups, canonicalMap, c.id)
+  );
 
-  const groupDragProps = (id: string | null) => ({
-    onDragOver: (e: React.DragEvent) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      if (dragOverId !== (id ?? ISOLATED_ID)) setDragOverId(id ?? ISOLATED_ID);
-    },
-    onDragLeave: (e: React.DragEvent) => {
-      if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-        setDragOverId((d) => (d === (id ?? ISOLATED_ID) ? null : d));
+  /**
+   * Moves a container into `groupId`, or out of every group when `groupId` is
+   * null. A container lives in one group only, so this is a move, not an
+   * append.
+   */
+  const moveInto = useCallback(
+    async (groupId: string | null, payload: { id: string; label: string }) => {
+      const target = containers.find(
+        (x) =>
+          x.id === payload.id ||
+          x.short_id === payload.id ||
+          x.name === payload.id
+      );
+      if (!target) return;
+      const map = canonicalContainerIds(containers);
+      const from = groupOf(groups, map, target.id);
+      if ((from?.id ?? null) === groupId) {
+        if (groupId) setExpanded((e) => ({ ...e, [groupId]: true }));
+        return;
+      }
+      try {
+        await saveAll(moveMember(groups, map, target.id, groupId));
+        // Show the result of the drop: a collapsed group would otherwise
+        // swallow the card with no visible feedback.
+        if (groupId) setExpanded((e) => ({ ...e, [groupId]: true }));
+        const label = target.name.replace(/^\//, "");
+        const dest = groupId
+          ? groups.find((g) => g.id === groupId)?.name ?? "group"
+          : "Isolated";
+        toast.success("Container moved", `${label} → ${dest}`);
+      } catch (err) {
+        toast.error("Could not move container", String(err));
       }
     },
-    onDrop: (e: React.DragEvent) => void moveInto(id, e),
-  });
+    [containers, groups, onSaveGroups, toast]
+  );
+
+  // The drag layer reports where the drop landed; this component owns the move.
+  useDropHandler(moveInto);
+
+  /** Aggregated live stats across the group's members. */
+  const aggregate = (g: ContainerGroup) => {
+    let mem = 0;
+    let cpu = 0;
+    let disk = 0;
+    for (const id of g.container_ids) {
+      const cid = resolveMember(id)?.id ?? id;
+      const s = statsMap?.[cid];
+      if (s) {
+        mem += s.mem_usage ?? 0;
+        cpu += s.cpu_percent ?? 0;
+      }
+      disk += sizes[cid] ?? 0;
+    }
+    return { mem, cpu, disk };
+  };
 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2 text-zinc-400">
           <FolderTree className="w-4 h-4 shrink-0" />
-          <span className="shrink-0 text-xs font-semibold uppercase tracking-wider">Groups</span>
+          <span className="shrink-0 text-xs font-semibold uppercase tracking-wider">
+            Groups
+          </span>
           <span className="truncate text-[11px] text-zinc-600">
             drag a card into a group to move it · one group per container
           </span>
@@ -297,251 +374,318 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-        {groups.map((g) => {
-          const isBusy = !!busy[g.id];
-          const isOpen = !!expanded[g.id];
-          const members = membersOf(g);
-          const running = members.filter((c) => c.state === "running").length;
-          const agg = aggregate(g);
-          const isDropTarget = dragOverId === g.id;
-          const isRenaming = editing?.id === g.id;
-          return (
-            <div
-              key={g.id}
-              className={`rounded-2xl border bg-zinc-900/60 backdrop-blur-xl shadow-xl transition-all duration-200 ${
-                isDropTarget
-                  ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
-                  : "border-zinc-800/80 hover:border-zinc-700/60"
+      {/* Full-width stack: a group card holds its member cards, so it spans the
+          list instead of sitting in a narrow grid cell. */}
+      <div className="space-y-3">
+        {groups.map((g) => (
+          <GroupCard
+            key={g.id}
+            group={g}
+            members={membersOf(g)}
+            aggregate={aggregate(g)}
+            busy={!!busy[g.id]}
+            isOpen={!!expanded[g.id]}
+            editing={editing?.id === g.id ? editing.name : null}
+            statsMap={statsMap}
+            busyMap={busyMap}
+            onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
+            onRenameStart={() => setEditing({ id: g.id, name: g.name })}
+            onRenameChange={(name) => setEditing({ id: g.id, name })}
+            onRenameCommit={() => void commitRename()}
+            onRenameCancel={() => setEditing(null)}
+            onAutoStart={() => void toggleAutoStart(g)}
+            onBulk={(action) => void runBulk(g, action)}
+            onDelete={() => void removeGroup(g)}
+            onOpenDetails={onOpenDetails}
+            onContainerAction={onContainerAction}
+          />
+        ))}
+
+        <IsolatedCard isolated={isolated} />
+      </div>
+    </div>
+  );
+};
+
+interface GroupCardProps {
+  group: ContainerGroup;
+  members: ContainerItem[];
+  aggregate: { mem: number; cpu: number; disk: number };
+  busy: boolean;
+  isOpen: boolean;
+  editing: string | null;
+  statsMap?: Record<string, ContainerStats>;
+  busyMap?: Record<string, boolean>;
+  onToggle: () => void;
+  onRenameStart: () => void;
+  onRenameChange: (name: string) => void;
+  onRenameCommit: () => void;
+  onRenameCancel: () => void;
+  onAutoStart: () => void;
+  onBulk: (action: "start" | "stop") => void;
+  onDelete: () => void;
+  onOpenDetails: (
+    id: string,
+    tab?: "logs" | "inspect" | "stats" | "terminal",
+    debug?: boolean
+  ) => void;
+  onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
+}
+
+const GroupCard: React.FC<GroupCardProps> = ({
+  group: g,
+  members,
+  aggregate,
+  busy,
+  isOpen,
+  editing,
+  statsMap,
+  busyMap,
+  onToggle,
+  onRenameStart,
+  onRenameChange,
+  onRenameCommit,
+  onRenameCancel,
+  onAutoStart,
+  onBulk,
+  onDelete,
+  onOpenDetails,
+  onContainerAction,
+}) => {
+  const drop = useDropTarget(g.id);
+  const hasMembers = members.length > 0;
+  const running = members.filter((c) => c.state === "running").length;
+
+  return (
+    <div
+      ref={drop.ref}
+      data-group-card={g.id}
+      className={`rounded-2xl border bg-zinc-900/60 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
+        drop.isOver
+          ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
+          : "border-zinc-800/80"
+      }`}
+      title={g.auto_start ? "Auto-starts with the engine" : "Manual start only"}
+    >
+      <div className="flex items-center gap-2 px-4 pt-3 pb-2">
+        {hasMembers ? (
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-expanded={isOpen}
+            aria-label={isOpen ? `Collapse ${g.name}` : `Expand ${g.name}`}
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-lg text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+          >
+            <ChevronDown
+              className={`w-4 h-4 shrink-0 text-zinc-500 transition-transform duration-200 ${
+                isOpen ? "rotate-0" : "-rotate-90"
               }`}
-              title={g.auto_start ? "Auto-starts with the engine" : "Manual start only"}
-              {...groupDragProps(g.id)}
+            />
+            <FolderOpen className="w-4 h-4 shrink-0 text-indigo-400" />
+            <GroupName
+              name={g.name}
+              countLabel={`${running}/${members.length} running`}
+              editing={editing}
+              onChange={onRenameChange}
+              onCommit={onRenameCommit}
+              onCancel={onRenameCancel}
+            />
+          </button>
+        ) : (
+          /* Empty group: no chevron, no actions — just the name and the drop
+             zone below, which is the only thing it can do yet. */
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <FolderTree className="w-4 h-4 shrink-0 text-indigo-400/70" />
+            <GroupName
+              name={g.name}
+              countLabel="empty"
+              editing={editing}
+              onChange={onRenameChange}
+              onCommit={onRenameCommit}
+              onCancel={onRenameCancel}
+            />
+          </div>
+        )}
+
+        {hasMembers && (
+          <div className="flex shrink-0 items-center gap-0.5">
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Start group"
+              aria-label={`Start group ${g.name}`}
+              disabled={busy}
+              onClick={() => onBulk("start")}
+              className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
             >
-              {/* Card header: name + running + expand + actions */}
-              <div className="flex items-center gap-2 px-4 pt-3 pb-2">
-                <button
-                  type="button"
-                  onClick={() => setExpanded((e) => ({ ...e, [g.id]: !isOpen }))}
-                  aria-expanded={isOpen}
-                  aria-label={isOpen ? "Collapse group" : "Expand group"}
-                  className="flex items-center gap-2 min-w-0 flex-1 text-left rounded-lg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
-                >
-                  <ChevronDown
-                    className={`w-4 h-4 shrink-0 text-zinc-500 transition-transform duration-200 ${isOpen ? "rotate-0" : "-rotate-90"}`}
-                  />
-                  {isOpen ? (
-                    <FolderOpen className="w-4 h-4 shrink-0 text-indigo-400" />
-                  ) : (
-                    <FolderTree className="w-4 h-4 shrink-0 text-indigo-400" />
-                  )}
-                  {isRenaming ? (
-                    <input
-                      autoFocus
-                      value={editing.name}
-                      onChange={(e) => setEditing({ id: g.id, name: e.target.value })}
-                      onClick={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void commitRename();
-                        if (e.key === "Escape") setEditing(null);
-                      }}
-                      onBlur={() => void commitRename()}
-                      aria-label="Group name"
-                      className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-800/80 px-1.5 py-0.5 text-sm text-white focus:outline-none focus:border-indigo-500"
-                    />
-                  ) : (
-                    <span className="truncate text-sm font-semibold text-white">{g.name}</span>
-                  )}
-                  <span className="shrink-0 text-[11px] text-zinc-500">
-                    {running}/{members.length} running
-                  </span>
-                </button>
-                <div className="flex items-center gap-0.5 shrink-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title="Start group"
-                    aria-label="Start group"
-                    disabled={isBusy || members.length === 0}
-                    onClick={() => runBulk(g, "start")}
-                    className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
-                  >
-                    <Play className="w-3.5 h-3.5 fill-current" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title="Stop group"
-                    aria-label="Stop group"
-                    disabled={isBusy || members.length === 0}
-                    onClick={() => runBulk(g, "stop")}
-                    className="text-rose-400 hover:text-rose-300 hover:bg-rose-500/10"
-                  >
-                    <Square className="w-3.5 h-3.5 fill-current" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title={
-                      g.auto_start
-                        ? "Auto-start: on — starts with the engine"
-                        : "Auto-start: off"
-                    }
-                    aria-label="Toggle auto-start"
-                    disabled={members.length === 0}
-                    onClick={() => toggleAutoStart(g)}
-                    className={
-                      g.auto_start
-                        ? "text-amber-400 hover:text-amber-300"
-                        : "text-zinc-500 hover:text-zinc-300"
-                    }
-                  >
-                    <Check
-                      className={`w-3.5 h-3.5 ${g.auto_start ? "opacity-100" : "opacity-30"}`}
-                    />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title="Rename group"
-                    aria-label="Rename group"
-                    onClick={() => setEditing({ id: g.id, name: g.name })}
-                    className="text-zinc-400 hover:text-white"
-                  >
-                    <Pencil className="w-3.5 h-3.5" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title="Delete group"
-                    aria-label="Delete group"
-                    onClick={() => removeGroup(g)}
-                    className="text-zinc-400 hover:text-rose-400"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </Button>
-                </div>
-              </div>
+              <Play className="w-3.5 h-3.5 fill-current" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Stop group"
+              aria-label={`Stop group ${g.name}`}
+              disabled={busy}
+              onClick={() => onBulk("stop")}
+              className="text-rose-400 hover:text-rose-300 hover:bg-rose-500/10"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={g.auto_start ? "Auto-start on" : "Auto-start off"}
+              aria-label={`Toggle auto-start for ${g.name}`}
+              aria-pressed={g.auto_start}
+              onClick={onAutoStart}
+              className={
+                g.auto_start
+                  ? "text-indigo-400 hover:text-indigo-300"
+                  : "text-zinc-500 hover:text-zinc-300"
+              }
+            >
+              <Activity className="w-3.5 h-3.5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Rename group"
+              aria-label={`Rename group ${g.name}`}
+              onClick={onRenameStart}
+              className="text-zinc-400 hover:text-white"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Delete group"
+              aria-label={`Delete group ${g.name}`}
+              onClick={onDelete}
+              className="text-zinc-400 hover:text-rose-400"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        )}
+      </div>
 
-              {/* Aggregated resource pills */}
-              {members.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5 px-4 pb-2">
-                  <span className="inline-flex items-center gap-1 rounded-lg bg-zinc-800/60 border border-zinc-700/50 px-2 py-0.5 text-[11px] font-mono text-emerald-300">
-                    <Activity className="w-3 h-3 text-emerald-400" />
-                    {formatBytes(agg.mem)}
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded-lg bg-zinc-800/60 border border-zinc-700/50 px-2 py-0.5 text-[11px] font-mono text-blue-300">
-                    <Cpu className="w-3 h-3 text-blue-400" />
-                    {agg.cpu.toFixed(1)}%
-                  </span>
-                  <span className="inline-flex items-center gap-1 rounded-lg bg-zinc-800/60 border border-zinc-700/50 px-2 py-0.5 text-[11px] font-mono text-amber-300">
-                    <HardDrive className="w-3 h-3 text-amber-400" />
-                    {formatBytes(agg.disk)}
-                  </span>
-                </div>
-              )}
+      {hasMembers && (
+        <div className="flex flex-wrap items-center gap-1.5 px-4 pb-2">
+          <span className="inline-flex items-center gap-1 rounded-lg border border-zinc-700/50 bg-zinc-800/60 px-2 py-0.5 font-mono text-[11px] text-emerald-300">
+            <Activity className="w-3 h-3 text-emerald-400" />
+            {formatBytes(aggregate.mem)}
+          </span>
+          <span className="inline-flex items-center gap-1 rounded-lg border border-zinc-700/50 bg-zinc-800/60 px-2 py-0.5 font-mono text-[11px] text-blue-300">
+            <Cpu className="w-3 h-3 text-blue-400" />
+            {aggregate.cpu.toFixed(1)}%
+          </span>
+          <span className="inline-flex items-center gap-1 rounded-lg border border-zinc-700/50 bg-zinc-800/60 px-2 py-0.5 font-mono text-[11px] text-amber-300">
+            <HardDrive className="w-3 h-3 text-amber-400" />
+            {formatBytes(aggregate.disk)}
+          </span>
+        </div>
+      )}
 
-              {/* Expanded body: members, or a dashed drop zone while empty */}
-              {isOpen && (
-                <div className="mx-4 mb-3">
-                  {members.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-zinc-700/70 bg-zinc-950/30 px-3 py-6 text-center">
-                      <FolderTree className="w-5 h-5 text-zinc-600" />
-                      <p className="text-xs text-zinc-500">
-                        Drop container cards here to add them
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="rounded-xl border border-zinc-800/80 divide-y divide-zinc-800/60 max-h-48 overflow-y-auto">
-                      {members.map((c) => {
-                        const s = statsMap?.[c.id];
-                        return (
-                          <div
-                            key={c.id}
-                            draggable
-                            onDragStart={(e) => {
-                              e.dataTransfer.setData(CONTAINER_DRAG_TYPE, c.id);
-                              e.dataTransfer.effectAllowed = "move";
-                            }}
-                            title="Drag into another group, or onto Isolated to remove"
-                            className="flex cursor-grab items-center gap-2 px-3 py-1.5 text-xs active:cursor-grabbing"
-                          >
-                            <GripVertical className="w-3 h-3 shrink-0 text-zinc-700" />
-                            <span
-                              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                c.state === "running" ? "bg-emerald-400" : "bg-zinc-600"
-                              }`}
-                            />
-                            <span className="text-zinc-200 truncate">
-                              {c.name.replace(/^\//, "")}
-                            </span>
-                            {s && c.state === "running" && (
-                              <span className="shrink-0 font-mono text-[10px] text-zinc-500">
-                                {s.cpu_percent.toFixed(1)}% · {formatBytes(s.mem_usage)}
-                              </span>
-                            )}
-                            <button
-                              type="button"
-                              title="Move to Isolated"
-                              aria-label="Move to Isolated"
-                              onClick={() => removeMember(c.id)}
-                              className="ml-auto shrink-0 text-zinc-600 hover:text-rose-400"
-                            >
-                              <X className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
+      <div className="px-4 pb-3">
+        {hasMembers ? (
+          isOpen ? (
+            <div className="space-y-2">
+              {members.map((c) => (
+                <MemberCard
+                  key={c.id}
+                  c={c}
+                  stats={statsMap?.[c.id]}
+                  busy={!!busyMap?.[c.id]}
+                  onAction={(action) => onContainerAction(c, action)}
+                  onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                />
+              ))}
             </div>
-          );
-        })}
-
-        {/* Isolated — the pinned default folder holding every ungrouped card */}
-        <div
-          className={`rounded-2xl border bg-zinc-900/40 backdrop-blur-xl shadow-xl transition-all duration-200 ${
-            dragOverId === ISOLATED_ID
-              ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
-              : "border-dashed border-zinc-800/80 hover:border-zinc-700/60"
-          }`}
-          title="Containers that are not in any group"
-          {...groupDragProps(null)}
-        >
-          <div className="flex items-center gap-2 px-4 pt-3 pb-2">
+          ) : (
+            /* Collapsed: a one-line summary, not the drop hint — the group
+               already has members, so it is not waiting for a first drop. */
             <button
               type="button"
-              onClick={() => setExpanded((e) => ({ ...e, [ISOLATED_ID]: !e[ISOLATED_ID] }))}
-              aria-expanded={!!expanded[ISOLATED_ID]}
-              aria-label={expanded[ISOLATED_ID] ? "Collapse Isolated" : "Expand Isolated"}
-              className="flex items-center gap-2 min-w-0 flex-1 text-left rounded-lg focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
+              onClick={onToggle}
+              className="flex w-full items-center justify-between gap-2 rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2 text-left transition-colors hover:border-zinc-700/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-indigo-500"
             >
-              <ChevronDown
-                className={`w-4 h-4 shrink-0 text-zinc-500 transition-transform duration-200 ${expanded[ISOLATED_ID] ? "rotate-0" : "-rotate-90"}`}
-              />
-              <FolderTree className="w-4 h-4 shrink-0 text-zinc-400" />
-              <span className="truncate text-sm font-semibold text-zinc-300">Isolated</span>
-              <span className="shrink-0 text-[11px] text-zinc-500">
-                {isolated.filter((c) => c.state === "running").length}/{isolated.length} running
+              <span className="truncate text-xs text-zinc-400">
+                {members
+                  .slice(0, 3)
+                  .map((c) => c.name.replace(/^\//, ""))
+                  .join(", ")}
+                {members.length > 3 ? ` +${members.length - 3} more` : ""}
+              </span>
+              <span className="shrink-0 text-[11px] text-zinc-600">
+                {drop.isOver ? "Release to move here" : "Expand"}
               </span>
             </button>
-          </div>
-          <div className="px-4 pb-3">
-            <div className="rounded-xl border border-dashed border-zinc-700/70 bg-zinc-950/30 px-3 py-3 text-center">
-              <p className="text-xs text-zinc-500">
-                Drop a card here to take it out of its group
-              </p>
-              {expanded[ISOLATED_ID] && (
-                <p className="mt-1 text-[11px] text-zinc-600">
-                  {isolated.length === 0
-                    ? "Every container is grouped"
-                    : `${isolated.length} ungrouped card${isolated.length === 1 ? "" : "s"} listed below`}
-                </p>
-              )}
-            </div>
-          </div>
-        </div>
+          )
+        ) : (
+          <DropZone isOver={drop.isOver}>
+            <p className="text-xs text-zinc-500">
+              Drop container cards here to add them
+            </p>
+          </DropZone>
+        )}
+      </div>
+    </div>
+  );
+};
+
+interface IsolatedCardProps {
+  isolated: ContainerItem[];
+}
+
+/**
+ * The bucket for containers with no group.
+ *
+ * This is symbolic, not a saved group: it is the heading that represents the
+ * ungrouped containers, whose cards are the flat list below the group cards.
+ * It deliberately does not render those cards itself — that would duplicate
+ * every ungrouped container on the page. Dropping here takes a container out
+ * of whichever group held it.
+ */
+const IsolatedCard: React.FC<IsolatedCardProps> = ({ isolated }) => {
+  const drop = useDropTarget(null);
+  const hasMembers = isolated.length > 0;
+  const running = isolated.filter((c) => c.state === "running").length;
+
+  return (
+    <div
+      ref={drop.ref}
+      data-group-card="__isolated__"
+      className={`rounded-2xl border bg-zinc-900/40 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
+        drop.isOver
+          ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
+          : "border-zinc-800/80"
+      }`}
+      title="Containers that are not in any group"
+    >
+      <div className="flex items-center gap-2 px-4 pt-3 pb-2">
+        <FolderTree className="w-4 h-4 shrink-0 text-zinc-400" />
+        <span className="truncate text-sm font-semibold text-zinc-300">
+          Isolated
+        </span>
+        <span className="shrink-0 text-[11px] text-zinc-500">
+          {hasMembers
+            ? `${running}/${isolated.length} running`
+            : "every container is grouped"}
+        </span>
+      </div>
+
+      <div className="px-4 pb-3">
+        <DropZone isOver={drop.isOver}>
+          <p className="text-xs text-zinc-500">
+            {hasMembers
+              ? `${isolated.length} container${isolated.length === 1 ? "" : "s"} listed below`
+              : "Containers created outside a group appear here"}
+          </p>
+          <p className="text-[11px] text-zinc-600">
+            Drop a card here to take it out of its group
+          </p>
+        </DropZone>
       </div>
     </div>
   );

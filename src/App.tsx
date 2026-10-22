@@ -5,6 +5,7 @@ import { Header } from "./components/layout/Header";
 import { RemoteEndpointBanner } from "./components/layout/RemoteEndpointBanner";
 import { ToastProvider, useToast } from "./components/ui/Toast";
 import { ModalProvider } from "./components/ui/ModalContext";
+import { ContainerDragProvider } from "./components/ContainerDragLayer";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ContainersPage } from "./pages/ContainersPage";
 import { ContainerDetailsDrawer } from "./pages/ContainerDetailsDrawer";
@@ -265,7 +266,9 @@ export const App: React.FC = () => {
   return (
     <ToastProvider>
       <ModalProvider>
-        <MainLayout />
+        <ContainerDragProvider>
+          <MainLayout />
+        </ContainerDragProvider>
       </ModalProvider>
     </ToastProvider>
   );
