@@ -6,6 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { dropIndexAt } from "../lib/containerGroups";
 
 /**
  * Pointer-driven drag layer for container cards.
@@ -31,6 +32,26 @@ export interface DragPayload {
   id: string;
   /** Rendered in the ghost so the user sees what they grabbed. */
   label: string;
+  /**
+   * The group this card is currently in, when it is rendered inside one. The
+   * layer only computes a reorder preview for that group — anywhere else the
+   * gesture is a move, not a reorder. Whether a move is *allowed* is the group
+   * bar's call (a compose member may only be reordered inside its project).
+   */
+  ownGroupId?: string;
+  /** True for a compose-managed container, which may not be moved at all. */
+  composeOwned?: boolean;
+}
+
+/** Live reorder preview inside a group while a card is dragged over it. */
+export interface ReorderPreview {
+  groupId: string;
+  /** Stable key of the card the placeholder sits before. */
+  beforeKey: string | null;
+  /** Placement index, so a card in its original slot draws nothing. */
+  index: number;
+  /** True when the placement would leave the order unchanged. */
+  unchanged: boolean;
 }
 
 interface DropTarget {
@@ -39,7 +60,11 @@ interface DropTarget {
   element: HTMLElement;
 }
 
-type DropHandler = (groupId: string | null, payload: DragPayload) => void;
+type DropHandler = (
+  groupId: string | null,
+  payload: DragPayload,
+  preview?: ReorderPreview | null
+) => void;
 
 interface DragContextValue {
   /** Non-null while a drag is in progress. */
@@ -48,8 +73,19 @@ interface DragContextValue {
   overGroupId: string | null;
   /** True when the pointer is over the isolated bucket specifically. */
   overIsolated: boolean;
+  /** Where the dragged card would land, while it hovers over a group it owns. */
+  reorder: ReorderPreview | null;
   startDrag: (payload: DragPayload, event: React.PointerEvent) => void;
   registerTarget: (target: DropTarget) => () => void;
+  /**
+   * Registers the card stack of a group so the layer can work out the reorder
+   * index from the pointer position. Keyed by group id.
+   */
+  registerMemberList: (
+    groupId: string,
+    getElements: () => HTMLElement[],
+    getOrderedIds: () => string[]
+  ) => () => void;
 }
 
 const DragContext = createContext<DragContextValue | null>(null);
@@ -70,15 +106,24 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
   const [payload, setPayload] = useState<DragPayload | null>(null);
   const [overGroupId, setOverGroupId] = useState<string | null>(null);
   const [overIsolated, setOverIsolated] = useState(false);
+  const [reorder, setReorder] = useState<ReorderPreview | null>(null);
 
   // Refs, not state: these are read on every pointermove and must not re-create
   // the window listeners or re-render the tree per frame.
   const targets = useRef<DropTarget[]>([]);
-  const pending = useRef<{ payload: DragPayload; x: number; y: number } | null>(
+  const memberLists = useRef<
+    Map<
+      string,
+      { getElements: () => HTMLElement[]; getOrderedIds: () => string[] }
+    >
+  >(new Map());  const pending = useRef<{ payload: DragPayload; x: number; y: number } | null>(
     null
   );
   const active = useRef<DragPayload | null>(null);
   const dropHandler = useRef<DropHandler | null>(null);
+  // Last preview computed, mirrored into a ref so pointerup can read it without
+  // depending on a state update having flushed.
+  const reorderRef = useRef<ReorderPreview | null>(null);
   // Set while a drag is live so the click that follows the drop is discarded
   // instead of opening the container drawer underneath the group card. It is a
   // timestamp rather than a flag: if no click follows the drag (browsers do not
@@ -99,6 +144,25 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, []);
 
+  const registerMemberList = useCallback(
+    (
+      groupId: string,
+      getElements: () => HTMLElement[],
+      getOrderedIds: () => string[]
+    ) => {
+      const entry = { getElements, getOrderedIds };
+      memberLists.current.set(groupId, entry);
+      return () => {
+        // Only drop the entry if this registration is still the live one: a
+        // re-render installs the new one before the old cleanup runs.
+        if (memberLists.current.get(groupId) === entry) {
+          memberLists.current.delete(groupId);
+        }
+      };
+    },
+    []
+  );
+
   /** Innermost registered target under a viewport point. */
   const targetAt = (x: number, y: number): DropTarget | null => {
     const el = document.elementFromPoint(x, y);
@@ -108,6 +172,31 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
       if (t.element.contains(el)) return t;
     }
     return null;
+  };
+
+  /**
+   * Where the dragged card would land inside `groupId`, or null when that
+   * group has no registered stack (empty group — the drop is an append).
+   */
+  const previewAt = (groupId: string, y: number): ReorderPreview | null => {
+    const list = memberLists.current.get(groupId);
+    if (!list) return null;
+    const elements = list.getElements();
+    const ordered = list.getOrderedIds();
+    if (elements.length === 0) return null;
+    const dragging = active.current;
+    const index = dropIndexAt(elements, y, dragging?.id ?? null);
+    const without = ordered.filter((id) => id !== dragging?.id);
+    // `index` counts the cards above the pointer *excluding* the dragged one,
+    // so the placement is a no-op exactly when it equals the dragged card's
+    // original position — dropping a card onto itself must not dirty the order.
+    const originalIndex = ordered.indexOf(dragging?.id ?? "");
+    return {
+      groupId,
+      beforeKey: without[index] ?? null,
+      index,
+      unchanged: originalIndex === -1 || index === originalIndex,
+    };
   };
 
   const startDrag = useCallback(
@@ -132,9 +221,11 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     const finish = () => {
       pending.current = null;
       active.current = null;
+      reorderRef.current = null;
       setPayload(null);
       setOverGroupId(null);
       setOverIsolated(false);
+      setReorder(null);
     };
 
     const onMove = (e: PointerEvent) => {
@@ -156,6 +247,15 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
       const t = targetAt(e.clientX, e.clientY);
       setOverGroupId(t ? t.groupId : null);
       setOverIsolated(!!t && t.groupId === null);
+      // Only the group that already holds the card gets a reorder preview;
+      // anywhere else the layer is showing a move, not a reorder.
+      const owning = active.current?.ownGroupId;
+      const next =
+        t && t.groupId && t.groupId === owning
+          ? previewAt(t.groupId, e.clientY)
+          : null;
+      reorderRef.current = next;
+      setReorder(next);
     };
 
     const onUp = (e: PointerEvent) => {
@@ -165,12 +265,16 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
         return;
       }
       const t = targetAt(e.clientX, e.clientY);
+      const preview = reorderRef.current;
       finish();
       if (!t) return; // released over nothing — cancel, no click follows
+      // The group bar decides whether a drop is allowed — a compose member, for
+      // instance, may only be reordered inside its project — and reports the
+      // refusal, so the layer always forwards the drop.
       // Arm the window at drop time so the click that immediately follows the
       // drop is swallowed rather than opening the card underneath.
       suppressClickUntil.current = performance.now() + CLICK_SUPPRESS_MS;
-      dropHandler.current?.(t.groupId, dragging);
+      dropHandler.current?.(t.groupId, dragging, preview);
     };
 
     // A cancelled pointer (OS gesture, window blur) must clear the ghost too,
@@ -212,7 +316,15 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
 
   return (
     <DragContext.Provider
-      value={{ payload, overGroupId, overIsolated, startDrag, registerTarget }}
+      value={{
+        payload,
+        overGroupId,
+        overIsolated,
+        reorder,
+        startDrag,
+        registerTarget,
+        registerMemberList,
+      }}
     >
       <DropHandlerContext.Provider value={setDropHandler}>
         {children}
@@ -239,7 +351,9 @@ export const useDropHandler = (fn: DropHandler) => {
   stable.current = fn;
   useEffect(() => {
     if (!set) return;
-    set((groupId, payload) => stable.current(groupId, payload));
+    set((groupId, payload, preview) =>
+      stable.current(groupId, payload, preview)
+    );
     return () => set(null);
   }, [set]);
 };
@@ -251,6 +365,27 @@ export const useDraggable = (payload: DragPayload) => {
   return {
     onPointerDown: (e: React.PointerEvent) => ctx.startDrag(payload, e),
   };
+};
+
+/**
+ * Registers a group's card stack for reorder hit-testing and reports where the
+ * dragged card would land. Returns `null` until the pointer is over the stack.
+ */
+export const useReorderTarget = (
+  groupId: string,
+  getElements: () => HTMLElement[],
+  getOrderedIds: () => string[]
+) => {
+  const ctx = useContext(DragContext);
+  if (!ctx) throw new Error("useReorderTarget requires <ContainerDragProvider>");
+  const register = ctx.registerMemberList;
+  useEffect(() => register(groupId, getElements, getOrderedIds), [
+    register,
+    groupId,
+    getElements,
+    getOrderedIds,
+  ]);
+  return ctx.reorder?.groupId === groupId ? ctx.reorder : null;
 };
 
 /** Registers an element as a drop target and reports hover state. */
@@ -276,5 +411,5 @@ export const useDropTarget = <T extends HTMLElement = HTMLDivElement>(
     ctx.payload !== null &&
     (groupId === null ? ctx.overIsolated : ctx.overGroupId === groupId);
 
-  return { ref, isOver, isDragging: ctx.payload !== null };
+  return { ref, isOver, isDragging: ctx.payload !== null, payload: ctx.payload };
 };

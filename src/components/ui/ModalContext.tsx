@@ -3,7 +3,23 @@ import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle, Info, HelpCircle, CheckCircle2, X } from "lucide-react";
 import { Button } from "./Button";
 
-export type ModalType = "info" | "warning" | "danger" | "success" | "confirm" | "prompt";
+export type ModalType =
+  | "info"
+  | "warning"
+  | "danger"
+  | "success"
+  | "confirm"
+  | "prompt"
+  | "choice";
+
+/** One button in a multi-choice dialog. `value` is what the promise resolves to. */
+export interface ModalChoice {
+  value: string;
+  label: string;
+  variant?: "primary" | "danger" | "secondary" | "ghost";
+  /** Shown under the label in smaller type. */
+  hint?: string;
+}
 
 export interface ModalOptions {
   title?: string;
@@ -13,12 +29,25 @@ export interface ModalOptions {
   cancelText?: string;
   placeholder?: string;
   defaultValue?: string;
+  /** Present only for `choice` dialogs; replaces the confirm/cancel pair. */
+  choices?: ModalChoice[];
 }
 
 interface ModalContextType {
   showAlert: (message: string, title?: string, type?: ModalType) => Promise<void>;
   showConfirm: (message: string, title?: string, type?: ModalType) => Promise<boolean>;
   showPrompt: (message: string, defaultValue?: string, title?: string) => Promise<string | null>;
+  /**
+   * A dialog with N labelled outcomes, for decisions a yes/no cannot express
+   * (delete the folder *and* its contents, or only the folder). Resolves to the
+   * chosen `value`, or null when dismissed.
+   */
+  showChoice: (
+    message: string,
+    choices: ModalChoice[],
+    title?: string,
+    type?: ModalType
+  ) => Promise<string | null>;
 }
 
 const ModalContext = createContext<ModalContextType | undefined>(undefined);
@@ -63,6 +92,17 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
     });
   };
 
+  const showChoice = (
+    message: string,
+    choices: ModalChoice[],
+    title: string = "Choose an action",
+    type: ModalType = "warning"
+  ): Promise<string | null> => {
+    return new Promise((resolve) => {
+      setModalState({ isOpen: true, options: { message, title, type, choices }, resolve });
+    });
+  };
+
   const handleClose = (value: any) => {
     if (modalState) {
       modalState.resolve(value);
@@ -83,6 +123,8 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
         return <CheckCircle2 className="w-6 h-6 text-emerald-500 shrink-0" />;
       case "prompt":
         return <HelpCircle className="w-6 h-6 text-indigo-500 shrink-0" />;
+      case "choice":
+        return <HelpCircle className="w-6 h-6 text-amber-500 shrink-0" />;
       case "info":
       case "confirm":
       default:
@@ -91,7 +133,7 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   };
 
   return (
-    <ModalContext.Provider value={{ showAlert, showConfirm, showPrompt }}>
+    <ModalContext.Provider value={{ showAlert, showConfirm, showPrompt, showChoice }}>
       {children}
       <AnimatePresence>
         {modalState?.isOpen && (
@@ -159,23 +201,52 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
 
               {/* Footer Actions */}
               <div className="flex items-center justify-end gap-3 px-6 py-4 bg-zinc-950/40 border-t border-zinc-800/80">
-                {(currentOptions?.cancelText || currentOptions?.type === "confirm" || currentOptions?.type === "prompt") && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() => handleClose(currentOptions?.type === "prompt" ? null : false)}
-                  >
-                    {currentOptions?.cancelText || "Cancel"}
-                  </Button>
+                {currentOptions?.choices ? (
+                  <>
+                    <Button type="button" variant="ghost" onClick={() => handleClose(null)}>
+                      Cancel
+                    </Button>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      {currentOptions.choices.map((choice) => (
+                        <Button
+                          key={choice.value}
+                          type="button"
+                          variant={choice.variant ?? "secondary"}
+                          onClick={() => handleClose(choice.value)}
+                          title={choice.hint}
+                          className="h-auto flex-col items-start gap-0 py-1.5 text-left"
+                        >
+                          <span>{choice.label}</span>
+                          {choice.hint && (
+                            <span className="text-[11px] font-normal opacity-70">
+                              {choice.hint}
+                            </span>
+                          )}
+                        </Button>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {(currentOptions?.cancelText || currentOptions?.type === "confirm" || currentOptions?.type === "prompt") && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={() => handleClose(currentOptions?.type === "prompt" ? null : false)}
+                      >
+                        {currentOptions?.cancelText || "Cancel"}
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      variant={currentOptions?.type === "danger" ? "danger" : "primary"}
+                      onClick={() => handleClose(currentOptions?.type === "prompt" ? promptInput : true)}
+                      autoFocus
+                    >
+                      {currentOptions?.confirmText || "OK"}
+                    </Button>
+                  </>
                 )}
-                <Button
-                  type="button"
-                  variant={currentOptions?.type === "danger" ? "danger" : "primary"}
-                  onClick={() => handleClose(currentOptions?.type === "prompt" ? promptInput : true)}
-                  autoFocus
-                >
-                  {currentOptions?.confirmText || "OK"}
-                </Button>
               </div>
             </motion.div>
           </div>

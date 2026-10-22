@@ -1,13 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Play,
-  Square,
-  RotateCw,
   Search,
   Plus,
   Layers,
-  FileCode2,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { EngineGate } from "../components/ui/EngineGate";
@@ -50,6 +46,7 @@ const DraggableContainerCard: React.FC<{
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
+    composeOwned: !!container.compose_project,
   });
   return (
     <ContainerCard
@@ -184,9 +181,10 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         c.id.toLowerCase().includes(search.toLowerCase()))
   );
 
-  // Containers placed in a user group live inside that group's card above, so
-  // the flat list only shows what is still ungrouped ("Isolated") — moving a
-  // card into a group removes it from here, like a file leaving a folder.
+  // Containers placed in a user group live inside that group's card above, and
+  // compose containers live inside their project's card, so the flat list only
+  // shows what is still ungrouped ("Isolated") — moving a card into a group
+  // removes it from here, like a file leaving a folder.
   // Membership is resolved against the full list so a search cannot make a
   // grouped container look ungrouped.
   const groupsMap = useMemo(
@@ -194,60 +192,9 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     [containers]
   );
   const filteredContainers = searchMatches.filter(
-    (c) => !groupOf(groups, groupsMap, c.id)
+    (c) => !c.compose_project && !groupOf(groups, groupsMap, c.id)
   );
   const allGrouped = searchMatches.length > 0 && filteredContainers.length === 0;
-
-  // Group compose-managed containers under a project header (Docker Desktop
-  // style); loose containers keep their original order after their project.
-  type Entry =
-    | { kind: "project"; project: string; count: number; running: number }
-    | { kind: "container"; c: ContainerItem };
-  const membersByProject = new Map<string, ContainerItem[]>();
-  for (const c of filteredContainers) {
-    if (!c.compose_project) continue;
-    const arr = membersByProject.get(c.compose_project);
-    if (arr) arr.push(c);
-    else membersByProject.set(c.compose_project, [c]);
-  }
-  const entries: Entry[] = [];
-  const emitted = new Set<string>();
-  for (const c of filteredContainers) {
-    const project = c.compose_project;
-    if (!project) {
-      entries.push({ kind: "container", c });
-      continue;
-    }
-    if (emitted.has(project)) continue;
-    emitted.add(project);
-    const members = membersByProject.get(project) ?? [];
-    entries.push({
-      kind: "project",
-      project,
-      count: members.length,
-      running: members.filter((m) => m.state === "running").length,
-    });
-    for (const m of members) entries.push({ kind: "container", c: m });
-  }
-
-  const handleProjectAction = async (
-    project: string,
-    action: "start" | "stop" | "restart"
-  ) => {
-    try {
-      setActionLoading((prev) => ({ ...prev, [`project:${project}`]: true }));
-      const out = await api.composeProjectAction(project, action);
-      toast.success(
-        `Project ${action}d`,
-        out.trim() ? `${project}: ${out.trim()}` : project
-      );
-      await loadContainers();
-    } catch (e) {
-      toast.error(`Compose ${action} failed`, String(e));
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [`project:${project}`]: false }));
-    }
-  };
 
   // Engine off → designed feature panel instead of fetch errors.
   if (daemonState !== "Running") {
@@ -302,114 +249,49 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         onContainerAction={handleAction}
         busyMap={actionLoading}
       >
-        {/* Ungrouped containers, with compose projects kept as their own header
-            rows. This is the body of the Isolated bucket. */}
+        {/* Ungrouped containers — the body of the Isolated bucket. */}
         <div className="space-y-3">
           <AnimatePresence>
-            {entries.map((entry) => {
-            if (entry.kind === "project") {
-              const projectBusy = !!actionLoading[`project:${entry.project}`];
+            {filteredContainers.map((c) => {
+              const stats = statsMap[c.id];
+              const isBusy = !!actionLoading[c.id];
+
               return (
-                <div
-                  key={`project:${entry.project}`}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3"
+                <motion.div
+                  key={c.id}
+                  layout
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                  transition={{ duration: 0.2 }}
                 >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-8 h-8 shrink-0 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
-                      <FileCode2 className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-white truncate">
-                          {entry.project}
-                        </span>
-                        <span className="text-[10px] uppercase tracking-wider text-blue-400/80">
-                          compose
-                        </span>
-                      </div>
-                      <p className="text-xs text-zinc-400">
-                        {entry.running}/{entry.count} running
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1.5 text-xs text-emerald-400 hover:text-emerald-300"
-                      onClick={() => handleProjectAction(entry.project, "start")}
-                      disabled={projectBusy}
-                      title="Start all project containers"
-                    >
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      Start
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1.5 text-xs text-rose-400 hover:text-rose-300"
-                      onClick={() => handleProjectAction(entry.project, "stop")}
-                      disabled={projectBusy}
-                      title="Stop all project containers"
-                    >
-                      <Square className="w-3.5 h-3.5 fill-current" />
-                      Stop
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1.5 text-xs text-amber-400 hover:text-amber-300"
-                      onClick={() => handleProjectAction(entry.project, "restart")}
-                      disabled={projectBusy}
-                      title="Restart all project containers"
-                    >
-                      <RotateCw className="w-3.5 h-3.5" />
-                      Restart
-                    </Button>
-                  </div>
-                </div>
+                  <DraggableContainerCard
+                    container={c}
+                    stats={stats}
+                    busy={isBusy}
+                    onAction={(action) => handleAction(c, action)}
+                    onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                  />
+                </motion.div>
               );
-            }
-            const c = entry.c;
-            const stats = statsMap[c.id];
-            const isBusy = !!actionLoading[c.id];
+            })}
+          </AnimatePresence>
 
-            return (
-              <motion.div
-                key={c.id}
-                layout
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.98 }}
-                transition={{ duration: 0.2 }}
-              >
-                <DraggableContainerCard
-                  container={c}
-                  stats={stats}
-                  busy={isBusy}
-                  onAction={(action) => handleAction(c, action)}
-                  onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                />
-              </motion.div>
-            );
-          })}
-        </AnimatePresence>
-
-        {!loading && filteredContainers.length === 0 && (
-          <div className="py-16 text-center text-zinc-400">
-            <Layers className="w-10 h-10 mx-auto text-zinc-500 mb-3" />
-            <p className="font-medium text-white">
-              {allGrouped ? "All matching containers are in groups" : "No containers matched"}
-            </p>
-            <p className="text-xs text-zinc-400 mt-1">
-              {allGrouped
-                ? "Open a group card above to reach them"
-                : search
-                  ? "Try searching with a different keyword"
-                  : "Get started by launching a new container image"}
-            </p>
-          </div>
-        )}
+          {!loading && filteredContainers.length === 0 && (
+            <div className="py-16 text-center text-zinc-400">
+              <Layers className="w-10 h-10 mx-auto text-zinc-500 mb-3" />
+              <p className="font-medium text-white">
+                {allGrouped ? "All matching containers are in groups" : "No containers matched"}
+              </p>
+              <p className="text-xs text-zinc-400 mt-1">
+                {allGrouped
+                  ? "Open a group card above to reach them"
+                  : search
+                    ? "Try searching with a different keyword"
+                    : "Get started by launching a new container image"}
+              </p>
+            </div>
+          )}
         </div>
         </ContainerGroupsBar>
       </div>

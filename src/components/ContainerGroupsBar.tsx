@@ -7,12 +7,15 @@ import {
   Plus,
   Trash2,
   Activity,
+  Boxes,
   Cpu,
   HardDrive,
   Play,
+  RotateCw,
   Square,
 } from "lucide-react";
 import { Button } from "./ui/Button";
+import { Switch } from "./ui/Switch";
 import { useToast } from "./ui/Toast";
 import { useModal } from "./ui/ModalContext";
 import { ContainerCard, type ContainerAction } from "./ContainerCard";
@@ -20,6 +23,7 @@ import {
   useDraggable,
   useDropHandler,
   useDropTarget,
+  useReorderTarget,
 } from "./ContainerDragLayer";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
@@ -27,6 +31,7 @@ import {
   canonicalContainerIds,
   groupOf,
   moveMember,
+  reorderMember,
 } from "../lib/containerGroups";
 import type { ContainerGroup, ContainerItem, ContainerStats } from "../types";
 
@@ -62,15 +67,59 @@ interface ContainerGroupsBarProps {
 const newId = () =>
   `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
+/**
+ * Stable id of the synthetic group that mirrors a compose project's containers.
+ *
+ * Compose owns its containers: the project starts and stops them, and its files
+ * describe them, so they are shown as a group that cannot be renamed, deleted,
+ * or dragged out of — only reordered inside, which is purely a display choice.
+ */
+const composeId = (project: string) => `compose:${project}`;
+
+/** The synthetic group wrapping one compose project's containers. */
+const composeGroup = (project: string, memberIds: string[]): ContainerGroup => ({
+  id: composeId(project),
+  name: project,
+  container_ids: memberIds,
+  auto_start: false,
+});
+
+/**
+ * The on-disk form of a compose project's remembered order.
+ *
+ * Its name is the synthetic id, not the project name: config validation
+ * requires unique names, and a user group may legitimately be called "web"
+ * while a compose project is too. The name is never rendered.
+ */
+const persistedComposeGroup = (
+  project: string,
+  memberIds: string[]
+): ContainerGroup => ({
+  id: composeId(project),
+  name: composeId(project),
+  container_ids: memberIds,
+  auto_start: false,
+});
+
+/** True for a saved entry that only carries a compose project's card order. */
+const isComposeOrderEntry = (g: ContainerGroup) => g.id.startsWith("compose:");
+
 /** A card inside a group: identical to a list card, but compact and draggable. */
 const MemberCard: React.FC<{
   c: ContainerItem;
   stats?: ContainerStats;
   busy: boolean;
+  /** Groups this card is rendered in — enables the in-place reorder preview. */
+  ownGroupId: string;
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
-}> = ({ c, stats, busy, onAction, onOpenDetails }) => {
-  const drag = useDraggable({ id: c.id, label: c.name.replace(/^\//, "") });
+}> = ({ c, stats, busy, ownGroupId, onAction, onOpenDetails }) => {
+  const drag = useDraggable({
+    id: c.id,
+    label: c.name.replace(/^\//, ""),
+    ownGroupId,
+    composeOwned: !!c.compose_project,
+  });
   return (
     <ContainerCard
       container={c}
@@ -181,7 +230,40 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   }, [loadSizes]);
 
   const saveAll = async (next: ContainerGroup[]) => {
-    await onSaveGroups(next);
+    // Invariant: a compose container belongs to its project card. Older saved
+    // groups may still list one, and config validation rejects a container
+    // claimed twice — so user groups are scrubbed here rather than failing the
+    // save with a message the user cannot act on.
+    const composeOwned = new Set(
+      containers.filter((c) => c.compose_project).map((c) => c.id)
+    );
+    // Stored tokens can be short ids or names, so they are resolved before the
+    // comparison; an unresolvable token is left alone (it is a stale entry the
+    // member resolver already ignores).
+    const tokenMap = canonicalContainerIds(containers);
+    // A project that no longer exists leaves an order entry behind; drop it so
+    // the config does not accumulate one per `compose up` ever run.
+    const liveProjects = new Set(
+      containers.map((c) => c.compose_project).filter(Boolean)
+    );
+    const cleaned = next
+      .filter(
+        (g) =>
+          !isComposeOrderEntry(g) ||
+          liveProjects.has(g.id.slice("compose:".length))
+      )
+      .map((g) =>
+        isComposeOrderEntry(g)
+          ? g
+          : {
+              ...g,
+              container_ids: g.container_ids.filter((token) => {
+                const id = tokenMap.get(token);
+                return id ? !composeOwned.has(id) : true;
+              }),
+            }
+      );
+    await onSaveGroups(cleaned);
   };
 
   const toggleAutoStart = async (g: ContainerGroup) => {
@@ -212,15 +294,85 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     }
   };
 
+  /**
+   * Starts/stops a compose project.
+   *
+   * A project group is derived, not saved, so the group command cannot address
+   * it. It goes through the compose CLI instead, which is the only thing that
+   * knows a project's services — stopping the containers directly would leave
+   * compose's own state out of sync.
+   */
+  const runComposeBulk = async (
+    g: ContainerGroup,
+    action: "start" | "stop" | "restart"
+  ) => {
+    const project = g.id.slice("compose:".length);
+    setBusy((b) => ({ ...b, [g.id]: true }));
+    try {
+      const out = await api.composeProjectAction(project, action);
+      const past =
+        action === "stop" ? "stopped" : action === "start" ? "started" : "restarted";
+      toast.success(
+        `Project ${past}`,
+        out.trim() ? `${project}: ${out.trim()}` : project
+      );
+      onChanged?.();
+    } catch (e) {
+      toast.error(`Could not ${action} project`, String(e));
+    } finally {
+      setBusy((b) => ({ ...b, [g.id]: false }));
+    }
+  };
+
   const removeGroup = async (g: ContainerGroup) => {
-    const ok = await modal.showConfirm(
-      `Delete group "${g.name}"?`,
-      "The containers themselves are not touched.",
+    const members = membersOf(g);
+    const choice = await modal.showChoice(
+      members.length === 0
+        ? `Delete group "${g.name}"?`
+        : `Delete group "${g.name}" and its ${members.length} container${members.length === 1 ? "" : "s"}?`,
+      members.length === 0
+        ? [
+            { value: "keep", label: "Delete group", variant: "danger" },
+          ]
+        : [
+            {
+              value: "keep",
+              label: "Group only",
+              hint: `Release ${members.length} container${members.length === 1 ? "" : "s"} to Isolated`,
+              variant: "secondary",
+            },
+            {
+              value: "delete",
+              label: "Group + containers",
+              hint: "Delete them from the engine",
+              variant: "danger",
+            },
+          ],
+      "Delete group",
       "danger"
     );
-    if (!ok) return;
+    if (!choice) return;
     try {
+      if (choice === "delete") {
+        const results = await Promise.allSettled(
+          members.map((c) => api.removeContainer(c.id, true))
+        );
+        const failed = results.filter((r) => r.status === "rejected").length;
+        if (failed > 0) {
+          toast.error(
+            "Some containers survived",
+            `${failed} of ${members.length} could not be deleted.`
+          );
+        } else {
+          toast.success(
+            "Containers deleted",
+            `${members.length} removed from the engine.`
+          );
+        }
+        onChanged?.();
+      }
       await saveAll(groups.filter((x) => x.id !== g.id));
+      toast.success("Group deleted", g.name);
     } catch (e) {
       toast.error("Could not delete group", String(e));
     }
@@ -231,7 +383,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     const base = "New group";
     let name = base;
     let n = 2;
-    const taken = new Set(groups.map((g) => g.name.trim().toLowerCase()));
+    const taken = new Set(userGroups.map((g) => g.name.trim().toLowerCase()));
     while (taken.has(name.toLowerCase())) name = `${base} ${n++}`;
     const next: ContainerGroup = {
       id: newId(),
@@ -292,16 +444,56 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     for (const token of g.container_ids) {
       const c = resolveMember(token);
       if (!c || seen.has(c.id)) continue;
+      // A compose container belongs to its project card, even if an older
+      // saved group still lists it — otherwise it would render twice.
+      if (!isComposeOrderEntry(g) && c.compose_project) continue;
       seen.add(c.id);
       out.push(c);
     }
     return out;
   };
 
-  // Everything not claimed by a user group is "Isolated" — the default bucket.
+  /**
+   * Compose projects shown as locked groups.
+   *
+   * A project is not a saved group: it is derived from the containers' labels,
+   * so it appears and disappears with `docker compose up/down`. Its member order
+   * is remembered in a saved group of the same synthetic id when the user
+   * reorders it, which is why the saved groups are consulted for ordering.
+   */
+  const composeGroups = useMemo(() => {
+    const byProject = new Map<string, ContainerItem[]>();
+    for (const c of visibleContainers) {
+      if (!c.compose_project) continue;
+      const arr = byProject.get(c.compose_project);
+      if (arr) arr.push(c);
+      else byProject.set(c.compose_project, [c]);
+    }
+    const out: ContainerGroup[] = [];
+    for (const [project, members] of byProject) {
+      const saved = groups.find((g) => g.id === composeId(project));
+      const order = new Map<string, number>();
+      saved?.container_ids.forEach((token, i) => order.set(token, i));
+      const sorted = [...members].sort(
+        (a, b) =>
+          (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+          (order.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+      );
+      out.push(composeGroup(project, sorted.map((c) => c.id)));
+    }
+    // Projects sort by name so the list does not reshuffle between polls.
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }, [visibleContainers, groups]);
+
+  // Everything not claimed by a user group or a compose project is "Isolated".
+  // Compose containers are excluded explicitly: their project group is derived,
+  // not saved, so `groupOf` cannot see it.
   const isolated = visibleContainers.filter(
-    (c) => !groupOf(groups, canonicalMap, c.id)
+    (c) => !c.compose_project && !groupOf(groups, canonicalMap, c.id)
   );
+
+  /** Groups the user owns — compose order entries are not rendered as cards. */
+  const userGroups = groups.filter((g) => !isComposeOrderEntry(g));
 
   /**
    * Moves a container into `groupId`, or out of every group when `groupId` is
@@ -309,7 +501,11 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
    * append.
    */
   const moveInto = useCallback(
-    async (groupId: string | null, payload: { id: string; label: string }) => {
+    async (
+      groupId: string | null,
+      payload: { id: string; label: string; lockedToGroupId?: string },
+      preview?: { beforeKey: string | null; index: number; unchanged: boolean } | null
+    ) => {
       const target = containers.find(
         (x) =>
           x.id === payload.id ||
@@ -318,8 +514,77 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       );
       if (!target) return;
       const map = canonicalContainerIds(containers);
+
+      // A compose member is owned by its project. Reordering inside it is a
+      // display preference we remember; moving it out would leave the project
+      // half-managed, so it is refused rather than silently ignored.
+      if (target.compose_project) {
+        const ownId = composeId(target.compose_project);
+        if (groupId !== ownId) {
+          toast.error(
+            "Managed by compose",
+            `${target.name.replace(/^\//, "")} belongs to project "${target.compose_project}" and cannot leave it.`
+          );
+          return;
+        }
+        if (!preview || preview.unchanged) return;
+        const current = composeGroups.find((g) => g.id === ownId);
+        const ordered = current?.container_ids ?? [];
+        const without = ordered.filter((id) => id !== target.id);
+        const at = Math.max(0, Math.min(preview.index, without.length));
+        const nextIds = [
+          ...without.slice(0, at),
+          target.id,
+          ...without.slice(at),
+        ];
+        try {
+          // The synthetic compose group is persisted alongside real ones; it is
+          // not shown as an editable card, it only carries the member order.
+          const others = groups.filter((g) => g.id !== ownId);
+          await saveAll([
+            ...others,
+            persistedComposeGroup(target.compose_project, nextIds),
+          ]);
+        } catch (err) {
+          toast.error("Could not reorder project", String(err));
+        }
+        return;
+      }
+
+      // A compose project group is not a destination for loose containers.
+      if (groupId && groupId.startsWith("compose:")) {
+        toast.error(
+          "Project group is read-only",
+          "Compose containers are managed by their project."
+        );
+        return;
+      }
+
       const from = groupOf(groups, map, target.id);
       if ((from?.id ?? null) === groupId) {
+        // Same group: this is a reorder, not a move.
+        if (groupId && preview && !preview.unchanged) {
+          const current = groups.find((g) => g.id === groupId);
+          if (current) {
+            const ordered = current.container_ids
+              .map((token) => map.get(token))
+              .filter((id): id is string => !!id);
+            const without = ordered.filter((id) => id !== target.id);
+            const at = Math.max(0, Math.min(preview.index, without.length));
+            const nextIds = [
+              ...without.slice(0, at),
+              target.id,
+              ...without.slice(at),
+            ];
+            try {
+              await saveAll(
+                reorderMember(groups, map, target.id, groupId, nextIds)
+              );
+            } catch (err) {
+              toast.error("Could not reorder group", String(err));
+            }
+          }
+        }
         if (groupId) setExpanded((e) => ({ ...e, [groupId]: true }));
         return;
       }
@@ -337,7 +602,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         toast.error("Could not move container", String(err));
       }
     },
-    [containers, groups, onSaveGroups, toast]
+    [containers, groups, composeGroups, onSaveGroups, toast]
   );
 
   // The drag layer reports where the drop landed; this component owns the move.
@@ -373,9 +638,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           </span>
         </div>
         <Button
-          variant="ghost"
+          variant="outline"
           size="sm"
-          className="shrink-0 gap-1.5 text-xs"
+          className="shrink-0 gap-1.5 border-emerald-500/60 bg-emerald-500/10 text-xs text-emerald-300 hover:border-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-200"
           onClick={createGroup}
           disabled={saving}
           title="Create an empty group"
@@ -386,9 +651,36 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       </div>
 
       {/* Full-width stack: a group card holds its member cards, so it spans the
-          list instead of sitting in a narrow grid cell. */}
+          list instead of sitting in a narrow grid cell. Compose projects come
+          first — they are the containers the user is least likely to touch. */}
       <div className="space-y-3">
-        {groups.map((g) => (
+        {composeGroups.map((g) => (
+          <GroupCard
+            key={g.id}
+            group={g}
+            members={membersOf(g)}
+            aggregate={aggregate(g)}
+            busy={!!busy[g.id]}
+            isOpen={!!expanded[g.id]}
+            editing={null}
+            statsMap={statsMap}
+            busyMap={busyMap}
+            compose
+            onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
+            onRenameStart={() => undefined}
+            onRenameChange={() => undefined}
+            onRenameCommit={() => undefined}
+            onRenameCancel={() => undefined}
+            onAutoStart={() => undefined}
+            onBulk={(action) => void runComposeBulk(g, action)}
+            onRestart={() => void runComposeBulk(g, "restart")}
+            onDelete={() => undefined}
+            onOpenDetails={onOpenDetails}
+            onContainerAction={onContainerAction}
+          />
+        ))}
+
+        {userGroups.map((g) => (
           <GroupCard
             key={g.id}
             group={g}
@@ -406,6 +698,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onRenameCancel={() => setEditing(null)}
             onAutoStart={() => void toggleAutoStart(g)}
             onBulk={(action) => void runBulk(g, action)}
+            onRestart={() => undefined}
             onDelete={() => void removeGroup(g)}
             onOpenDetails={onOpenDetails}
             onContainerAction={onContainerAction}
@@ -429,6 +722,11 @@ interface GroupCardProps {
   editing: string | null;
   statsMap?: Record<string, ContainerStats>;
   busyMap?: Record<string, boolean>;
+  /**
+   * A compose project group: its membership is owned by the project, so it
+   * cannot be renamed, deleted, auto-started, or have cards dragged out.
+   */
+  compose?: boolean;
   onToggle: () => void;
   onRenameStart: () => void;
   onRenameChange: (name: string) => void;
@@ -436,6 +734,8 @@ interface GroupCardProps {
   onRenameCancel: () => void;
   onAutoStart: () => void;
   onBulk: (action: "start" | "stop") => void;
+  /** Only used by compose project cards, which have a restart verb. */
+  onRestart: () => void;
   onDelete: () => void;
   onOpenDetails: (
     id: string,
@@ -454,6 +754,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
   editing,
   statsMap,
   busyMap,
+  compose = false,
   onToggle,
   onRenameStart,
   onRenameChange,
@@ -461,6 +762,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
   onRenameCancel,
   onAutoStart,
   onBulk,
+  onRestart,
   onDelete,
   onOpenDetails,
   onContainerAction,
@@ -469,16 +771,50 @@ const GroupCard: React.FC<GroupCardProps> = ({
   const hasMembers = members.length > 0;
   const running = members.filter((c) => c.state === "running").length;
 
+  // Compose containers may only be reordered inside their own project, so a
+  // drop from one onto any other card is refused — do not paint the accepting
+  // highlight for a drop that will be rejected.
+  const acceptsDrop = !drop.payload
+    ? false
+    : compose
+      ? drop.payload.composeOwned === true && drop.payload.ownGroupId === g.id
+      : drop.payload.composeOwned !== true;
+  const isOver = drop.isOver && acceptsDrop;
+
+  // Members are read for reorder hit-testing, which the drag layer calls on
+  // every pointermove — keep the accessors stable so they do not re-register.
+  const stackRef = React.useRef<HTMLDivElement | null>(null);
+  const orderedIds = React.useMemo(() => members.map((c) => c.id), [members]);
+  const getElements = React.useCallback(
+    () =>
+      stackRef.current
+        ? Array.from(
+            stackRef.current.querySelectorAll<HTMLElement>("[data-container-card]")
+          )
+        : [],
+    []
+  );
+  const getOrderedIds = React.useCallback(() => orderedIds, [orderedIds]);
+  const reorder = useReorderTarget(g.id, getElements, getOrderedIds);
+
   return (
     <div
       ref={drop.ref}
       data-group-card={g.id}
       className={`rounded-2xl border bg-zinc-900/60 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
-        drop.isOver
+        isOver
           ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
-          : "border-zinc-800/80"
+          : compose
+            ? "border-sky-500/25"
+            : "border-zinc-800/80"
       }`}
-      title={g.auto_start ? "Auto-starts with the engine" : "Manual start only"}
+      title={
+        compose
+          ? `Compose project — managed by docker compose`
+          : g.auto_start
+            ? "Auto-starts with the engine"
+            : "Manual start only"
+      }
     >
       <div className="flex items-center gap-2 px-4 pt-3 pb-2">
         {hasMembers ? (
@@ -520,10 +856,35 @@ const GroupCard: React.FC<GroupCardProps> = ({
           </div>
         )}
 
+        {/* Compose projects are derived from container labels, not saved
+            groups: the badge marks why their card has no rename/delete. */}
+        {compose && (
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
+            <Boxes className="w-3 h-3" />
+            compose
+          </span>
+        )}
+
         {/* Rename, auto-start and delete apply to every group, empty or not —
             an empty group still has a name and a startup policy to configure.
             Start/stop are hidden until there is something to act on. */}
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-1">
+          {/* Auto-start is a policy, not an action, so it leads the row as a
+              labelled switch — an icon button here read as "run once".
+              Compose projects start with their project, not the engine. */}
+          {!compose && (
+            <Switch
+              checked={g.auto_start}
+              onChange={onAutoStart}
+              label="Auto-start"
+              title={
+                g.auto_start
+                  ? "Auto-start on — starts with the engine"
+                  : "Auto-start off — manual start only"
+              }
+              className="mr-1.5"
+            />
+          )}
           {hasMembers && (
             <>
               <Button
@@ -548,47 +909,47 @@ const GroupCard: React.FC<GroupCardProps> = ({
               >
                 <Square className="w-3.5 h-3.5 fill-current" />
               </Button>
+              {/* Compose projects have a restart verb of their own; plain
+                  groups get it per container from the card's own action. */}
+              {compose && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Restart project"
+                  aria-label={`Restart project ${g.name}`}
+                  disabled={busy}
+                  onClick={() => onRestart()}
+                  className="text-blue-400 hover:text-blue-300 hover:bg-blue-500/10"
+                >
+                  <RotateCw className="w-3.5 h-3.5" />
+                </Button>
+              )}
             </>
           )}
-          <Button
-            variant="ghost"
-            size="icon"
-            title={
-              g.auto_start
-                ? "Auto-start on — starts with the engine"
-                : "Auto-start off — manual start only"
-            }
-            aria-label={`Toggle auto-start for ${g.name}`}
-            aria-pressed={g.auto_start}
-            onClick={onAutoStart}
-            className={
-              g.auto_start
-                ? "text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10"
-                : "text-zinc-500 hover:text-zinc-300"
-            }
-          >
-            <Activity className="w-3.5 h-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Rename group"
-            aria-label={`Rename group ${g.name}`}
-            onClick={onRenameStart}
-            className="text-zinc-400 hover:text-white"
-          >
-            <Pencil className="w-3.5 h-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Delete group"
-            aria-label={`Delete group ${g.name}`}
-            onClick={onDelete}
-            className="text-zinc-400 hover:text-rose-400"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </Button>
+          {!compose && (
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                title="Rename group"
+                aria-label={`Rename group ${g.name}`}
+                onClick={onRenameStart}
+                className="text-zinc-400 hover:text-white"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                title="Delete group"
+                aria-label={`Delete group ${g.name}`}
+                onClick={onDelete}
+                className="text-zinc-400 hover:text-rose-400"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
@@ -612,17 +973,28 @@ const GroupCard: React.FC<GroupCardProps> = ({
       <div className="px-4 pb-3">
         {hasMembers ? (
           isOpen ? (
-            <div className="space-y-2">
+            <div ref={stackRef} className="space-y-2">
               {members.map((c) => (
-                <MemberCard
-                  key={c.id}
-                  c={c}
-                  stats={statsMap?.[c.id]}
-                  busy={!!busyMap?.[c.id]}
-                  onAction={(action) => onContainerAction(c, action)}
-                  onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                />
+                <React.Fragment key={c.id}>
+                  {/* Where the dragged card would land. Rendered from live
+                      pointer position, so the user sees the order change
+                      before releasing. */}
+                  {reorder && !reorder.unchanged && reorder.beforeKey === c.id && (
+                    <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
+                  )}
+                  <MemberCard
+                    c={c}
+                    stats={statsMap?.[c.id]}
+                    busy={!!busyMap?.[c.id]}
+                    ownGroupId={g.id}
+                    onAction={(action) => onContainerAction(c, action)}
+                    onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                  />
+                </React.Fragment>
               ))}
+              {reorder && !reorder.unchanged && reorder.beforeKey === null && (
+                <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
+              )}
             </div>
           ) : (
             /* Collapsed: a one-line summary, not the drop hint — the group
@@ -640,12 +1012,12 @@ const GroupCard: React.FC<GroupCardProps> = ({
                 {members.length > 3 ? ` +${members.length - 3} more` : ""}
               </span>
               <span className="shrink-0 text-[11px] text-zinc-600">
-                {drop.isOver ? "Release to move here" : "Expand"}
+                {isOver ? "Release to move here" : "Expand"}
               </span>
             </button>
           )
         ) : (
-          <DropZone isOver={drop.isOver}>
+          <DropZone isOver={isOver}>
             <p className="text-xs text-zinc-500">
               Drop container cards here to add them
             </p>
@@ -688,7 +1060,7 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
       ref={drop.ref}
       data-group-card="__isolated__"
       className={`rounded-2xl border bg-zinc-900/40 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
-        drop.isOver
+        drop.isOver && drop.payload?.composeOwned !== true
           ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
           : "border-zinc-800/80"
       }`}
