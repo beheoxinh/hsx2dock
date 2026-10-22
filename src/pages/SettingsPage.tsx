@@ -30,6 +30,16 @@ const humanError = (e: unknown): string => {
   return s;
 };
 
+// The Settings page remounts on navigation, and update checks are advisory:
+// one attempt per half hour is plenty. A failure backs off further and stays
+// silent — only an explicit click may surface an error.
+const AUTO_CHECK_TTL_MS = 30 * 60_000;
+const AUTO_FAIL_TTL_MS = 10 * 60_000;
+let composeCheckedAt = 0;
+let composeCheckOk = true;
+let engineCheckedAt = 0;
+let engineCheckOk = true;
+
 export const SettingsPage: React.FC = () => {
   const toast = useToast();
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -72,9 +82,15 @@ export const SettingsPage: React.FC = () => {
   const [updateProgress, setUpdateProgress] = useState<EngineInstallProgress | null>(null);
 
   const checkForEngineUpdate = async (announce?: boolean) => {
+    if (!announce) {
+      const ttl = engineCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
+      if (Date.now() - engineCheckedAt < ttl) return;
+    }
     setChecking(true);
     try {
       const info = await api.checkEngineUpdate();
+      engineCheckedAt = Date.now();
+      engineCheckOk = true;
       setRelease(info);
       if (announce && !info.update_available) {
         toast.success(
@@ -83,7 +99,10 @@ export const SettingsPage: React.FC = () => {
         );
       }
     } catch (e) {
-      toast.error("Update check failed", humanError(e));
+      engineCheckedAt = Date.now();
+      engineCheckOk = false;
+      // Background checks fail quietly: there is simply no update to show.
+      if (announce) toast.error("Update check failed", humanError(e));
     } finally {
       setChecking(false);
     }
@@ -96,6 +115,9 @@ export const SettingsPage: React.FC = () => {
     try {
       const version = await api.installEngineUpdate(release.latest_version);
       toast.success("Engine updated", `Docker Engine ${version} is now active.`);
+      // Force a fresh probe: the cached "update available" answer belongs to
+      // the build we just replaced, and re-using it would leave a stale CTA.
+      engineCheckedAt = 0;
       await checkForEngineUpdate();
     } catch (e) {
       toast.error("Engine update failed", String(e));
@@ -140,9 +162,15 @@ export const SettingsPage: React.FC = () => {
   };
 
   const checkCompose = async (announce?: boolean) => {
+    if (!announce) {
+      const ttl = composeCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
+      if (Date.now() - composeCheckedAt < ttl) return;
+    }
     setCheckingCompose(true);
     try {
       const info = await api.checkComposeUpdate();
+      composeCheckedAt = Date.now();
+      composeCheckOk = true;
       setCompose(info);
       if (announce) {
         if (info.update_available) {
@@ -152,7 +180,11 @@ export const SettingsPage: React.FC = () => {
         }
       }
     } catch (e) {
-      toast.error("Compose check failed", humanError(e));
+      composeCheckedAt = Date.now();
+      composeCheckOk = false;
+      // A failed background check means "no update known", not an error state:
+      // stay quiet and keep whatever was shown before.
+      if (announce) toast.error("Compose check failed", humanError(e));
     } finally {
       setCheckingCompose(false);
     }
@@ -165,6 +197,9 @@ export const SettingsPage: React.FC = () => {
       const version = compose.latest_version;
       await api.installComposeUpdate(version);
       toast.success("Docker Compose updated", `Now using ${version}`);
+      // Force a fresh probe: the cached "update available" answer belongs to
+      // the binary we just replaced, and re-using it would leave a stale CTA.
+      composeCheckedAt = 0;
       await checkCompose();
       await checkDockerCli();
     } catch (e) {
@@ -467,16 +502,17 @@ export const SettingsPage: React.FC = () => {
               >
                 {checkingCompose ? "Checking…" : "Check Compose"}
               </button>
-              <button
-                type="button"
-                onClick={applyComposeUpdate}
-                disabled={
-                  updatingCompose || checkingCompose || !compose?.update_available
-                }
-                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
-              >
-                {updatingCompose ? "Updating…" : "Update Compose"}
-              </button>
+              {/* Only offer the update when one actually exists. */}
+              {compose?.update_available && (
+                <button
+                  type="button"
+                  onClick={applyComposeUpdate}
+                  disabled={updatingCompose || checkingCompose}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
+                >
+                  {updatingCompose ? "Updating…" : "Update Compose"}
+                </button>
+              )}
             </div>
           </div>
         </Card>

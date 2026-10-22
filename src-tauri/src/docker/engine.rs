@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -2118,11 +2118,44 @@ pub async fn fetch_latest_compose_version() -> Result<String> {
     Ok(version.to_string())
 }
 
+/// GitHub's unauthenticated API allows ~60 requests/hour per IP. The Settings
+/// page can be opened repeatedly, so the "latest compose" answer is cached:
+/// successes for six hours, failures for two minutes (a flaky link must not
+/// turn into a rate-limit loop, but an explicit retry still goes out).
+const COMPOSE_OK_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const COMPOSE_FAIL_TTL: Duration = Duration::from_secs(2 * 60);
+
+static COMPOSE_LATEST: OnceLock<
+    tokio::sync::Mutex<Option<(Instant, std::result::Result<String, String>)>>,
+> = OnceLock::new();
+
+/// Cached, single-flight wrapper around [`fetch_latest_compose_version`]:
+/// concurrent page mounts serialize on the mutex, so a burst costs one request.
+async fn fetch_latest_compose_version_cached() -> Result<String> {
+    let cache = COMPOSE_LATEST.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut guard = cache.lock().await;
+    if let Some((at, cached)) = guard.as_ref() {
+        let ttl = if cached.is_ok() {
+            COMPOSE_OK_TTL
+        } else {
+            COMPOSE_FAIL_TTL
+        };
+        if at.elapsed() < ttl {
+            return cached.clone().map_err(|e| anyhow::anyhow!(e));
+        }
+    }
+    let fresh = fetch_latest_compose_version()
+        .await
+        .map_err(|e| format!("{e:#}"));
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh.map_err(|e| anyhow::anyhow!(e))
+}
+
 pub async fn check_compose_update(paths: &EnginePaths) -> Result<ComposeUpdateInfo> {
     let plugin = ensure_compose_layout(paths)?
         .unwrap_or_else(|| compose_plugin_dir(paths).join("docker-compose"));
     let installed = compose_plugin_version(&plugin);
-    let latest = fetch_latest_compose_version().await?;
+    let latest = fetch_latest_compose_version_cached().await?;
     let update = update_available(&latest, installed.as_deref());
     Ok(ComposeUpdateInfo {
         installed_version: installed,
