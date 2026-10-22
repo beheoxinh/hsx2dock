@@ -95,8 +95,13 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
     }
   };
 
-  const filteredNetworks = networks.filter((n) =>
-    n.name.toLowerCase().includes(search.toLowerCase())
+  // Kind networks and protected cluster topologies are managed via the Kubernetes tab.
+  // Hide them from the user's networks list.
+  const filteredNetworks = networks.filter(
+    (n) =>
+      !n.protected &&
+      n.name !== "kind" &&
+      n.name.toLowerCase().includes(search.toLowerCase())
   );
 
   // Engine off → designed feature panel instead of fetch errors.

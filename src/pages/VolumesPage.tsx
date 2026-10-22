@@ -92,8 +92,10 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
     }
   };
 
-  const filteredVolumes = volumes.filter((v) =>
-    v.name.toLowerCase().includes(search.toLowerCase())
+  // Kind-managed volumes belong to cluster nodes and are managed through Kubernetes.
+  // Hide them from the user's volume list so core cluster state is kept out of sight.
+  const filteredVolumes = volumes.filter(
+    (v) => !v.protected && v.name.toLowerCase().includes(search.toLowerCase())
   );
 
   // Engine off → designed feature panel instead of fetch errors.

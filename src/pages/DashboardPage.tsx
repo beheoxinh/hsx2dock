@@ -230,7 +230,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     {
       icon: HardDrive,
       label: "Volumes",
-      value: String(volumes.length),
+      value: String(volumes.filter((v) => !v.protected).length),
       sub: "persistent volumes",
       color: "text-amber-400",
       glow: "from-amber-500/15 to-amber-600/5 border-amber-500/25",
@@ -239,7 +239,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     {
       icon: Network,
       label: "Networks",
-      value: String(networks.length),
+      value: String(networks.filter((n) => !n.protected && n.name !== "kind").length),
       sub: "bridge + custom",
       color: "text-indigo-400",
       glow: "from-indigo-500/15 to-indigo-600/5 border-indigo-500/25",

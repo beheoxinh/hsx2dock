@@ -544,23 +544,53 @@ impl DockerClient {
     pub async fn list_volumes(&self) -> anyhow::Result<Vec<VolumeItem>> {
         let opts = bollard::query_parameters::ListVolumesOptionsBuilder::default().build();
         let res = self.docker.list_volumes(Some(opts)).await?;
+
+        // Kind node containers mount /var as an anonymous Docker volume without
+        // io.x-k8s.kind* labels. Inspect containers to discover all volumes attached
+        // to kind node containers so they can be marked protected as well.
+        let mut kind_volume_names = std::collections::HashSet::new();
+        let container_opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+            .all(true)
+            .build();
+        if let Ok(containers) = self.docker.list_containers(Some(container_opts)).await {
+            for c in containers {
+                let is_kind = c
+                    .labels
+                    .as_ref()
+                    .map(|l| l.contains_key(crate::docker::kind::CLUSTER_LABEL))
+                    .unwrap_or(false);
+                if is_kind {
+                    if let Some(mounts) = c.mounts {
+                        for m in mounts {
+                            if let Some(name) = m.name {
+                                if !name.is_empty() {
+                                    kind_volume_names.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(res
             .volumes
             .unwrap_or_default()
             .into_iter()
-            .map(|v| VolumeItem {
-                protected: v
-                    .labels
-                    .keys()
-                    .any(|k| k.starts_with("io.x-k8s.kind")),
-                name: v.name,
-                driver: v.driver,
-                mountpoint: v.mountpoint,
-                created: v.created_at.map(|c| c.to_string()),
-                // Filled in by the `list_volumes` command after walking the
-                // mountpoint on disk; the raw API list leaves them unknown.
-                size: None,
-                restricted_dirs: 0,
+            .map(|v| {
+                let is_kind_labelled = v.labels.keys().any(|k| k.starts_with("io.x-k8s.kind"));
+                let is_kind_mounted = kind_volume_names.contains(&v.name);
+                VolumeItem {
+                    protected: is_kind_labelled || is_kind_mounted,
+                    name: v.name,
+                    driver: v.driver,
+                    mountpoint: v.mountpoint,
+                    created: v.created_at.map(|c| c.to_string()),
+                    // Filled in by the `list_volumes` command after walking the
+                    // mountpoint on disk; the raw API list leaves them unknown.
+                    size: None,
+                    restricted_dirs: 0,
+                }
             })
             .collect())
     }
