@@ -30,7 +30,13 @@ pub async fn remove_image(
         .await
         .map_err(|e| e.to_string())?;
     let configured = state.config.read().await.kind_default_image.clone();
-    if crate::docker::kind::is_kind_image(&tags, Some(configured.as_str())) {
+    // Tags cover official and configured node images; container-derived IDs
+    // cover retagged or digest-only ones.
+    let kind_ids = client.kind_node_image_ids().await.unwrap_or_default();
+    let normalised_id = id.trim_start_matches("sha256:");
+    if crate::docker::kind::is_kind_image(&tags, Some(configured.as_str()))
+        || kind_ids.contains(normalised_id)
+    {
         return Err(
             "This image is a kind node image. Removing it would break every cluster \
              that uses it, so the app keeps it protected."

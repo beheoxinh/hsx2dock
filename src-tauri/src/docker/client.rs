@@ -465,18 +465,57 @@ impl DockerClient {
             .collect())
     }
 
+    /// Summaries of kind node containers — every one carries
+    /// `io.x-k8s.kind.cluster`, whatever image it was created from.
+    async fn kind_node_containers(&self) -> anyhow::Result<Vec<bollard::models::ContainerSummary>> {
+        let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+            .all(true)
+            .build();
+        Ok(self
+            .docker
+            .list_containers(Some(opts))
+            .await?
+            .into_iter()
+            .filter(|c| {
+                c.labels
+                    .as_ref()
+                    .map(|l| l.contains_key(crate::docker::kind::CLUSTER_LABEL))
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    /// Image IDs (without the `sha256:` prefix) that kind node containers were
+    /// created from. A node image may be retagged or referenced only by digest,
+    /// so the tag list alone cannot identify it — the nodes themselves are the
+    /// proof that the image is load-bearing.
+    pub async fn kind_node_image_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(self
+            .kind_node_containers()
+            .await?
+            .into_iter()
+            .filter_map(|c| c.image_id)
+            .map(|id| id.trim_start_matches("sha256:").to_string())
+            .collect())
+    }
+
     /// Images the user may see and delete: kind node images are hidden because
     /// removing one breaks every cluster that uses it.
     pub async fn list_images_visible(
         &self,
         configured_kind_image: Option<&str>,
     ) -> anyhow::Result<Vec<ImageItem>> {
+        // Container-derived IDs catch retagged / digest-only node images that
+        // the tag check cannot see. A failure here only degrades to the tag
+        // check rather than taking the whole image list down.
+        let kind_images = self.kind_node_image_ids().await.unwrap_or_default();
         Ok(self
             .list_images()
             .await?
             .into_iter()
             .filter(|i| {
                 !crate::docker::kind::is_kind_image(&i.tags, configured_kind_image)
+                    && !kind_images.contains(i.id.trim_start_matches("sha256:"))
             })
             .collect())
     }
@@ -546,28 +585,14 @@ impl DockerClient {
         let res = self.docker.list_volumes(Some(opts)).await?;
 
         // Kind node containers mount /var as an anonymous Docker volume without
-        // io.x-k8s.kind* labels. Inspect containers to discover all volumes attached
-        // to kind node containers so they can be marked protected as well.
+        // io.x-k8s.kind* labels. Inspect the nodes to discover every volume they
+        // attach so those can be marked protected as well.
         let mut kind_volume_names = std::collections::HashSet::new();
-        let container_opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
-            .all(true)
-            .build();
-        if let Ok(containers) = self.docker.list_containers(Some(container_opts)).await {
+        if let Ok(containers) = self.kind_node_containers().await {
             for c in containers {
-                let is_kind = c
-                    .labels
-                    .as_ref()
-                    .map(|l| l.contains_key(crate::docker::kind::CLUSTER_LABEL))
-                    .unwrap_or(false);
-                if is_kind {
-                    if let Some(mounts) = c.mounts {
-                        for m in mounts {
-                            if let Some(name) = m.name {
-                                if !name.is_empty() {
-                                    kind_volume_names.insert(name);
-                                }
-                            }
-                        }
+                for m in c.mounts.into_iter().flatten() {
+                    if let Some(name) = m.name.filter(|n| !n.is_empty()) {
+                        kind_volume_names.insert(name);
                     }
                 }
             }
