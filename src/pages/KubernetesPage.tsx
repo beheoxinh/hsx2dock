@@ -40,6 +40,8 @@ interface KubernetesPageProps {
   refreshKey?: number;
   /** Engine state — the page renders an EngineGate panel unless Running. */
   daemonState?: DaemonState;
+  /** Cluster a tray row asked to open; null opens the cluster list. */
+  openCluster?: string | null;
 }
 
 /** Formats a seconds duration as a compact uptime string. */
@@ -105,6 +107,7 @@ const Sparkline: React.FC<{
 export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   refreshKey,
   daemonState = "Running",
+  openCluster,
 }) => {
   const modal = useModal();
   const toast = useToast();
@@ -141,6 +144,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   // Full monitoring screen for the selected cluster (null = cluster list).
   const [detailFor, setDetailFor] = useState<string | null>(null);
   const detailCluster = clusters.find((c) => c.name === detailFor) ?? null;
+
+  // A tray cluster row sets `openCluster`; open that monitor. Keeping the name
+  // in app state also covers the page mounting after the event fired.
+  useEffect(() => {
+    if (openCluster) setDetailFor(openCluster);
+  }, [openCluster]);
 
   // Per-cluster prefs (auto-start, per-node caps) mirrored from the config.
   const [prefsByName, setPrefsByName] = useState<Record<string, KindClusterPrefs>>({});

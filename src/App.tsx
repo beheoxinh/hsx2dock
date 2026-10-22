@@ -29,6 +29,8 @@ const MainLayout: React.FC = () => {
   const [drawerEdit, setDrawerEdit] = useState(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  // Cluster requested by a tray row click; consumed by KubernetesPage.
+  const [trayCluster, setTrayCluster] = useState<string | null>(null);
   const toast = useToast();
 
   const fetchEngineStatus = async () => {
@@ -91,9 +93,9 @@ const MainLayout: React.FC = () => {
       })
       .then((u) => (unlistenEndpoint = u));
 
-    // Tray quick actions ("Containers", "Images", "Manage Kubernetes").
-    // Validate the payload: the backend and the shell must stay in sync even
-    // if an old build sends a tab this build no longer has.
+    // Tray quick actions. A payload of `kubernetes:<name>` (a cluster row) also
+    // asks the Kubernetes page to open that monitor; plain payloads are just
+    // navigation. Validate the tab: an old build must never blank the shell.
     let unlistenTray: (() => void) | undefined;
     const NAV_TABS: NavTab[] = [
       "dashboard",
@@ -106,8 +108,11 @@ const MainLayout: React.FC = () => {
       "settings",
     ];
     events
-      .onTrayNavigate((tab) => {
-        if (NAV_TABS.includes(tab as NavTab)) setActiveTab(tab as NavTab);
+      .onTrayNavigate((payload) => {
+        const [rawTab, cluster] = payload.split(":", 2);
+        if (!NAV_TABS.includes(rawTab as NavTab)) return;
+        setTrayCluster(cluster ?? null);
+        setActiveTab(rawTab as NavTab);
       })
       .then((u) => (unlistenTray = u));
 
@@ -158,7 +163,15 @@ const MainLayout: React.FC = () => {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-950 font-sans">
       {/* Sidebar Navigation */}
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={(tab) => {
+          // Manual navigation always lands on the page's normal entry point,
+          // not the cluster a previous tray click opened.
+          setTrayCluster(null);
+          setActiveTab(tab);
+        }}
+      />
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
@@ -202,7 +215,13 @@ const MainLayout: React.FC = () => {
               {activeTab === "images" && <ImagesPage refreshKey={refreshKey} daemonState={daemonState} />}
               {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} daemonState={daemonState} />}
               {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} daemonState={daemonState} />}
-              {activeTab === "kubernetes" && <KubernetesPage refreshKey={refreshKey} daemonState={daemonState} />}
+              {activeTab === "kubernetes" && (
+                <KubernetesPage
+                  refreshKey={refreshKey}
+                  daemonState={daemonState}
+                  openCluster={trayCluster}
+                />
+              )}
               {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>
