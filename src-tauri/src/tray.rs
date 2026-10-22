@@ -29,8 +29,13 @@ const MAX_CLUSTER_ROWS: usize = 5;
 
 // Menu ids — matched in the tray's `on_menu_event` handler.
 const ID_TOGGLE: &str = "engine-toggle";
-const ID_OPEN: &str = "open-dashboard";
+const ID_RESTART: &str = "engine-restart";
+const ID_NAV_DASHBOARD: &str = "nav-dashboard";
+const ID_NAV_CONTAINERS: &str = "nav-containers";
+const ID_NAV_IMAGES: &str = "nav-images";
+const ID_NAV_VOLUMES: &str = "nav-volumes";
 const ID_NAV_CLUSTERS: &str = "nav-kubernetes";
+const ID_NAV_SETTINGS: &str = "nav-settings";
 const ID_QUIT: &str = "quit";
 const CLUSTER_ROW_PREFIX: &str = "cluster-row-";
 
@@ -59,13 +64,15 @@ enum Signal {
 #[derive(Clone)]
 struct TrayParts {
     tray: Option<TrayIcon<Wry>>,
-    engine_header: MenuItem<Wry>,
-    /// One compact line: containers · running · images.
+    /// App name + version, mirroring Docker Desktop's title row.
+    title_row: MenuItem<Wry>,
+    /// Engine state plus live Docker counts.
     stats_row: MenuItem<Wry>,
     /// Exactly one row per cluster currently known (capped), so the menu has
     /// no blank placeholders; it is rebuilt when the cluster set changes.
     cluster_rows: Vec<MenuItem<Wry>>,
     toggle: MenuItem<Wry>,
+    restart: MenuItem<Wry>,
     /// Names of the clusters this menu was laid out for.
     cluster_sig: String,
     tx: tokio::sync::mpsc::UnboundedSender<Signal>,
@@ -109,10 +116,11 @@ struct MonitorCtx {
 /// The freshly built menu plus the handles `refresh` mutates in place.
 struct MenuParts {
     menu: Menu<Wry>,
-    engine_header: MenuItem<Wry>,
+    title_row: MenuItem<Wry>,
     stats_row: MenuItem<Wry>,
     cluster_rows: Vec<MenuItem<Wry>>,
     toggle: MenuItem<Wry>,
+    restart: MenuItem<Wry>,
     /// Cluster names this layout was built for; a change triggers a rebuild.
     cluster_sig: String,
 }
@@ -125,11 +133,19 @@ fn cluster_signature(clusters: &[ClusterStat]) -> String {
         .join("\u{1f}")
 }
 
-fn format_stats_row(s: &TrayStats) -> String {
-    format!(
-        "{} containers · {} running · {} images",
-        s.containers, s.running, s.images
-    )
+/// Status line under the title — the same shape Docker Desktop uses: engine
+/// state first, live Docker counts only while the daemon is up.
+fn format_status_row(daemon: &DaemonState, stats: Option<&TrayStats>) -> String {
+    match stats {
+        Some(s) => format!(
+            "Engine {} · {} containers · {} running · {} images",
+            state_label(daemon),
+            s.containers,
+            s.running,
+            s.images
+        ),
+        None => format!("Engine {}", state_label(daemon)),
+    }
 }
 
 fn format_cluster_row(c: &ClusterStat) -> String {
@@ -151,19 +167,17 @@ fn build_menu(
     daemon: &DaemonState,
     stats: Option<&TrayStats>,
 ) -> tauri::Result<MenuParts> {
-    let engine_header = MenuItem::with_id(
+    let title_row = MenuItem::with_id(
         app,
-        "engine-status",
-        format!("Engine: {}", state_label(daemon)),
+        "app-title",
+        format!("Hsx2Dock {}", env!("CARGO_PKG_VERSION")),
         false,
         None::<&str>,
     )?;
     let stats_row = MenuItem::with_id(
         app,
-        "tray-stats",
-        stats
-            .map(format_stats_row)
-            .unwrap_or_else(|| "Containers — · Images —".to_string()),
+        "tray-status",
+        format_status_row(daemon, stats),
         false,
         None::<&str>,
     )?;
@@ -184,6 +198,10 @@ fn build_menu(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let transitioning = matches!(
+        daemon,
+        DaemonState::Starting | DaemonState::Stopping | DaemonState::Installing
+    );
     let toggle = MenuItem::with_id(
         app,
         ID_TOGGLE,
@@ -192,21 +210,40 @@ fn build_menu(
         } else {
             "Start Engine"
         },
-        true,
+        !transitioning,
         None::<&str>,
     )?;
-    let open = MenuItem::with_id(app, ID_OPEN, "Open Hsx2Dock", true, None::<&str>)?;
+    let restart = MenuItem::with_id(
+        app,
+        ID_RESTART,
+        "Restart Engine",
+        *daemon == DaemonState::Running,
+        None::<&str>,
+    )?;
+    let nav_dashboard = MenuItem::with_id(app, ID_NAV_DASHBOARD, "Dashboard", true, None::<&str>)?;
+    let nav_containers =
+        MenuItem::with_id(app, ID_NAV_CONTAINERS, "Containers", true, None::<&str>)?;
+    let nav_images = MenuItem::with_id(app, ID_NAV_IMAGES, "Images", true, None::<&str>)?;
+    let nav_volumes = MenuItem::with_id(app, ID_NAV_VOLUMES, "Volumes", true, None::<&str>)?;
     let nav_clusters =
-        MenuItem::with_id(app, ID_NAV_CLUSTERS, "Manage Kubernetes", true, None::<&str>)?;
+        MenuItem::with_id(app, ID_NAV_CLUSTERS, "Kubernetes", true, None::<&str>)?;
+    let nav_settings = MenuItem::with_id(app, ID_NAV_SETTINGS, "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
     let menu = Menu::new(app)?;
-    menu.append(&engine_header)?;
+    menu.append(&title_row)?;
     menu.append(&stats_row)?;
     // The cluster block (and its separator) exists only when there is a
     // cluster to show — otherwise the menu stays short.
     if !cluster_rows.is_empty() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
+        menu.append(&MenuItem::with_id(
+            app,
+            "clusters-title",
+            "Clusters",
+            false,
+            None::<&str>,
+        )?)?;
         for row in &cluster_rows {
             menu.append(row)?;
         }
@@ -221,18 +258,25 @@ fn build_menu(
         }
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&toggle)?;
-    menu.append(&open)?;
+    menu.append(&nav_dashboard)?;
+    menu.append(&nav_containers)?;
+    menu.append(&nav_images)?;
+    menu.append(&nav_volumes)?;
     menu.append(&nav_clusters)?;
+    menu.append(&nav_settings)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&restart)?;
+    menu.append(&toggle)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&quit)?;
 
     Ok(MenuParts {
         menu,
-        engine_header,
+        title_row,
         stats_row,
         cluster_rows,
         toggle,
+        restart,
         cluster_sig: cluster_signature(clusters),
     })
 }
@@ -267,10 +311,11 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayState {
         parts: Mutex::new(TrayParts {
             tray: Some(tray),
-            engine_header: built.engine_header,
+            title_row: built.title_row,
             stats_row: built.stats_row,
             cluster_rows: built.cluster_rows,
             toggle: built.toggle,
+            restart: built.restart,
             cluster_sig: built.cluster_sig,
             tx: tx.clone(),
         }),
@@ -473,18 +518,29 @@ async fn handle_signal(app: &AppHandle, ctx: &mut MonitorCtx, signal: Signal) {
 async fn handle_menu(app: &AppHandle, id: &str) {
     match id {
         ID_TOGGLE => toggle_engine_from_tray(app).await,
-        ID_OPEN => {
+        ID_RESTART => restart_engine_from_tray(app).await,
+        // Page shortcuts mirror the sidebar one-for-one (no duplicate actions).
+        ID_NAV_DASHBOARD
+        | ID_NAV_CONTAINERS
+        | ID_NAV_IMAGES
+        | ID_NAV_VOLUMES
+        | ID_NAV_CLUSTERS
+        | ID_NAV_SETTINGS => {
             show_main_window(app);
-            let _ = app.emit("tray-navigate", "dashboard");
+            let target = match id {
+                ID_NAV_DASHBOARD => "dashboard",
+                ID_NAV_CONTAINERS => "containers",
+                ID_NAV_IMAGES => "images",
+                ID_NAV_VOLUMES => "volumes",
+                ID_NAV_CLUSTERS => "kubernetes",
+                _ => "settings",
+            };
+            let _ = app.emit("tray-navigate", target);
         }
         ID_QUIT => app.exit(0),
-        // Clicking a cluster row opens that cluster; "Manage Kubernetes" opens
-        // the list. Navigation state lives in the React shell, so the tray only
-        // reveals the window and emits the intent.
-        ID_NAV_CLUSTERS => {
-            show_main_window(app);
-            let _ = app.emit("tray-navigate", "kubernetes");
-        }
+        // Clicking a cluster row opens that cluster. Navigation state lives in
+        // the React shell, so the tray only reveals the window and emits the
+        // intent.
         id if id.starts_with(CLUSTER_ROW_PREFIX) => {
             show_main_window(app);
             let cluster = &id[CLUSTER_ROW_PREFIX.len()..];
@@ -538,6 +594,41 @@ async fn toggle_engine_from_tray(app: &AppHandle) {
         }
         // Mid-transition clicks are ignored; the running op owns the state.
         _ => {}
+    }
+}
+
+/// Tray Restart: a stop followed by a start through the same gated path.
+/// Refuses to run against a remote endpoint, exactly like the toggle.
+async fn restart_engine_from_tray(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    if let Err(e) = state.engine_control_guard().await {
+        record_notice(app, "Engine controls unavailable", &e);
+        return;
+    }
+    if state.daemon_state() != DaemonState::Running {
+        return;
+    }
+    let engine = state.engine.clone();
+    match crate::runtime::engine_op(move || engine.stop()).await {
+        Ok(Ok(())) => {
+            *state.client.write().await = None;
+        }
+        Ok(Err(e)) => {
+            record_notice(app, "Engine restart failed", &e.to_string());
+            return;
+        }
+        Err(e) => {
+            record_notice(app, "Engine restart failed", &e);
+            return;
+        }
+    }
+    let engine = state.engine.clone();
+    match crate::runtime::engine_op(move || engine.start()).await {
+        Ok(Ok(())) => {
+            let _ = state.get_client().await;
+        }
+        Ok(Err(e)) => record_notice(app, "Engine restart failed", &e.to_string()),
+        Err(e) => record_notice(app, "Engine restart failed", &e),
     }
 }
 
@@ -636,10 +727,11 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
                     if let Some(tray) = &guard.tray {
                         let _ = tray.set_menu(Some(built.menu));
                     }
-                    guard.engine_header = built.engine_header;
+                    guard.title_row = built.title_row;
                     guard.stats_row = built.stats_row;
                     guard.cluster_rows = built.cluster_rows;
                     guard.toggle = built.toggle;
+                    guard.restart = built.restart;
                     guard.cluster_sig = built.cluster_sig;
                     let refreshed = guard.clone();
                     drop(guard);
@@ -654,24 +746,28 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
 }
 
 /// Writes the live values into the current menu handles. Row count and names
-/// are owned by `build_menu`; this only updates text.
+/// are owned by `build_menu`; this only updates text and enabled state.
 fn update_rows(
     parts: &TrayParts,
     daemon: &DaemonState,
-    label: &str,
+    _label: &str,
     stats: Option<&TrayStats>,
 ) {
-    let _ = parts.engine_header.set_text(format!("Engine: {label}"));
-    let _ = parts.stats_row.set_text(
-        stats
-            .map(format_stats_row)
-            .unwrap_or_else(|| "Containers — · Images —".to_string()),
+    let _ = parts.stats_row.set_text(format_status_row(daemon, stats));
+    let running = *daemon == DaemonState::Running;
+    let transitioning = matches!(
+        daemon,
+        DaemonState::Starting | DaemonState::Stopping | DaemonState::Installing
     );
-    let _ = parts.toggle.set_text(if *daemon == DaemonState::Running {
+    let _ = parts.toggle.set_text(if running {
         "Stop Engine"
     } else {
         "Start Engine"
     });
+    let _ = parts.toggle.set_enabled(!transitioning);
+    // Restart only makes sense against a live engine, and must not race a
+    // start/stop that is already in flight.
+    let _ = parts.restart.set_enabled(running);
     let clusters = stats.map(|s| s.clusters.as_slice()).unwrap_or(&[]);
     for (row, c) in parts.cluster_rows.iter().zip(clusters) {
         let _ = row.set_text(format_cluster_row(c));
@@ -865,6 +961,29 @@ mod tests {
         let alpha = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3];
         assert_eq!(alpha(0, 0), 0, "corner must be fully transparent");
         assert_eq!(alpha(w / 2, w / 2), 255, "center must be fully opaque");
+    }
+
+    #[test]
+    fn status_row_shows_counts_only_with_live_stats() {
+        let stats = TrayStats {
+            containers: 4,
+            running: 2,
+            images: 9,
+            kinds: 0,
+            clusters: vec![],
+        };
+        assert_eq!(
+            format_status_row(&DaemonState::Running, Some(&stats)),
+            "Engine Running · 4 containers · 2 running · 9 images"
+        );
+        assert_eq!(
+            format_status_row(&DaemonState::Stopped, None),
+            "Engine Stopped"
+        );
+        assert_eq!(
+            format_status_row(&DaemonState::Starting, None),
+            "Engine Starting…"
+        );
     }
 
     #[test]
