@@ -92,6 +92,9 @@ export const api = {
     invoke<RegistryTestResult>("test_registry_auth", { input }),
   saveRegistryAuth: (input: RegistryInput) =>
     invoke<void>("save_registry_auth", { input }),
+  /** Marks one login as the default push target; `""` clears the choice. */
+  setDefaultRegistry: (id: string) =>
+    invoke<void>("set_default_registry", { id }),
   removeRegistryAuth: (id: string) => invoke<void>("remove_registry_auth", { id }),
   pushImage: (image: string) => invoke<void>("push_image", { image }),
   checkDataRootPath: (path: string) =>

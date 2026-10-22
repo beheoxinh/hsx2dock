@@ -194,6 +194,8 @@ export interface AppConfig {
   kind_auto_start_delay?: number;
   /** Per-cluster prefs keyed by cluster name (camelCase values). */
   kind_cluster_prefs?: Record<string, KindClusterPrefs>;
+  /** Id of the login new pushes default to; empty = first saved login. */
+  default_registry?: string;
 }
 
 /** Per-feature desktop-notification toggles (tray menu + Settings card). */
@@ -468,6 +470,8 @@ export interface RegistryStatus {
   insecure: boolean;
   /** Whether a secret is stored — never the secret itself. */
   has_password: boolean;
+  /** True for the login new pushes default to. */
+  is_default: boolean;
 }
 
 export interface RegistryInput {

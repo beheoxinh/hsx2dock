@@ -290,6 +290,7 @@ pub fn run() {
             registries::list_registries,
             registries::test_registry_auth,
             registries::save_registry_auth,
+            registries::set_default_registry,
             registries::remove_registry_auth,
             // Networks
             networks::list_networks,

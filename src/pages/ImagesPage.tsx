@@ -162,7 +162,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     // Strip any docker.io/library prefix from the local name.
     const shortRepo = repo.replace(/^docker\.io\/(library\/)?/, "");
 
-    const reg = regs[0];
+    const reg = regs.find((r) => r.is_default) ?? regs[0];
     if (!reg) return `docker.io/library/${shortRepo}:${tag}`;
     if (reg.host === "docker.io") return `docker.io/${shortRepo}:${tag}`;
     return `${reg.host}/${reg.username}/${shortRepo}:${tag}`;

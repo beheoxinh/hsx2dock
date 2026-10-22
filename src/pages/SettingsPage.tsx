@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
@@ -46,8 +46,44 @@ let engineCheckOk = true;
 let cliCheckedAt = 0;
 let cliCheckOk = true;
 
+/** The four configuration domains, in the order the rail presents them. */
+type SettingsTab = "casual" | "engine" | "tools" | "registry";
+
+const SETTINGS_TABS: {
+  id: SettingsTab;
+  label: string;
+  hint: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  {
+    id: "casual",
+    label: "Casual",
+    hint: "Look & feel, alerts, terminal",
+    icon: Monitor,
+  },
+  {
+    id: "engine",
+    label: "Engine",
+    hint: "Docker engine, storage, Kind",
+    icon: Cpu,
+  },
+  {
+    id: "tools",
+    label: "Tools",
+    hint: "Docker CLI & Compose",
+    icon: Wrench,
+  },
+  {
+    id: "registry",
+    label: "Registry",
+    hint: "Logins & default push target",
+    icon: Boxes,
+  },
+];
+
 export const SettingsPage: React.FC = () => {
   const toast = useToast();
+  const [tab, setTab] = useState<SettingsTab>("casual");
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [cliStatus, setCliStatus] = useState<CliBridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
@@ -349,635 +385,724 @@ export const SettingsPage: React.FC = () => {
   if (!config) return null;
 
   return (
-    <div className="p-8 space-y-6 max-w-4xl mx-auto h-full overflow-y-auto">
-      <div>
-        <h2 className="text-2xl font-bold tracking-tight text-white">Application Settings</h2>
-        <p className="text-sm text-zinc-400 mt-1">
-          Tune bundled engine parameters, CLI socket bridges, and default paths
-        </p>
-      </div>
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Page header + horizontal tab rail. Stays put while the active panel
+          scrolls underneath it. */}
+      <div className="shrink-0 px-8 pt-8">
+        <div className="max-w-4xl mx-auto">
+          <h2 className="text-2xl font-bold tracking-tight text-white">Application Settings</h2>
+          <p className="text-sm text-zinc-400 mt-1">
+            Tune bundled engine parameters, CLI socket bridges, and default paths
+          </p>
 
-      <RegistriesCard />
-
-      <NotificationsCard />
-
-      <KubernetesCard />
-
-      <form onSubmit={handleSave} className="space-y-6">
-
-
-        {/* Docker CLI */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <div className="p-2 rounded-lg bg-zinc-800/80 border border-zinc-700/50">
-              <Terminal className="w-5 h-5 text-emerald-400" />
-            </div>
-            <div className="flex-1">
-              <h3 className="font-semibold text-white">Docker CLI</h3>
-              <p className="text-xs text-zinc-400 mt-0.5">
-                Prefer a docker CLI you already have, or use the one bundled with the app.
-              </p>
-            </div>
-          </div>
-
-          {cliResolution ? (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span
-                  className={`text-xs font-medium px-2 py-0.5 rounded border ${
-                    cliResolution.source === "system"
-                      ? "bg-sky-500/10 text-sky-300 border-sky-500/30"
-                      : "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+          <div
+            role="tablist"
+            aria-label="Settings sections"
+            className="mt-5 flex items-stretch gap-1 overflow-x-auto border-b border-zinc-800"
+          >
+            {SETTINGS_TABS.map(({ id, label, hint, icon: Icon }) => {
+              const active = tab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  aria-controls={`settings-panel-${id}`}
+                  onClick={() => setTab(id)}
+                  className={`group relative -mb-px flex items-center gap-2.5 rounded-t-lg border-b-2 px-4 py-3 text-left transition-colors ${
+                    active
+                      ? "border-emerald-500 text-white"
+                      : "border-transparent text-zinc-400 hover:bg-zinc-900/40 hover:text-zinc-200"
                   }`}
                 >
-                  Using {cliResolution.source === "system" ? "system docker" : "bundled docker"}{" "}
-                  {cliResolution.version}
+                  <Icon
+                    className={`h-4 w-4 shrink-0 ${
+                      active ? "text-emerald-400" : "text-zinc-500 group-hover:text-zinc-300"
+                    }`}
+                  />
+                  <span className="min-w-0">
+                    <span className="block whitespace-nowrap text-sm font-medium">{label}</span>
+                    <span className="block whitespace-nowrap text-[11px] text-zinc-500">
+                      {hint}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <form onSubmit={handleSave} className="flex min-h-0 flex-1 flex-col">
+        <div className="min-h-0 flex-1 overflow-y-auto px-8 py-6">
+          <div className="max-w-4xl mx-auto space-y-6">
+        {/* Casual — appearance first, then alerts, then the terminal. */}
+        <div
+          id="settings-panel-casual"
+          role="tabpanel"
+          aria-label="Casual"
+          hidden={tab !== "casual"}
+          className="space-y-6"
+        >
+          {/* Theme Settings */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <Palette className="w-5 h-5 text-indigo-400" />
+              <div>
+                <h3 className="font-semibold text-white">Appearance & Theme</h3>
+                <p className="text-xs text-zinc-400">Switch color theme for application interface</p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between py-2">
+              <div>
+                <span className="font-medium text-sm text-zinc-200 block">Theme Mode</span>
+                <span className="text-xs text-zinc-400 block mt-0.5">
+                  Choose between Dark, Light or System default
                 </span>
-                <span className="text-xs text-zinc-400">{cliResolution.reason}</span>
               </div>
+              <select
+                value={config.theme || "dark"}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setConfig({ ...config, theme: val });
+                  if (val === "dark") {
+                    document.documentElement.classList.add("dark");
+                    document.documentElement.classList.remove("light");
+                    localStorage.setItem("theme", "dark");
+                  } else if (val === "light") {
+                    document.documentElement.classList.remove("dark");
+                    document.documentElement.classList.add("light");
+                    localStorage.setItem("theme", "light");
+                  } else {
+                    localStorage.removeItem("theme");
+                    if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
+                      document.documentElement.classList.add("dark");
+                    } else {
+                      document.documentElement.classList.remove("dark");
+                    }
+                  }
+                }}
+                className="h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer [&>option]:bg-zinc-900 [&>option]:text-white"
+              >
+                <option value="dark">Dark Theme</option>
+                <option value="light">Light Theme</option>
+                <option value="system">System Default</option>
+              </select>
+            </div>
+          </Card>
 
-              <div className="grid gap-2 text-xs">
-                <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <span className="text-zinc-400">System</span>
-                  <span className="font-mono text-zinc-300 truncate">
-                    {cliResolution.system_path
-                      ? `${cliResolution.system_path} · ${cliResolution.system_version}`
-                      : "not installed"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <span className="text-zinc-400">Bundled</span>
-                  <span className="font-mono text-zinc-300 truncate">
-                    {cliResolution.bundled_version
-                      ? `${cliResolution.bundled_path} · ${cliResolution.bundled_version}`
-                      : "no engine installed"}
-                  </span>
-                </div>
+          <NotificationsCard />
+
+          {/* Interactive Terminal */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <Terminal className="w-5 h-5 text-emerald-400" />
+              <div>
+                <h3 className="font-semibold text-white">Interactive Terminal</h3>
+                <p className="text-xs text-zinc-400">
+                  Shell and font used by the container terminal and the Debug action
+                </p>
               </div>
+            </div>
 
-              {/* The system docker cannot be replaced without root, so this
-                  updates the bundled copy only. */}
-              <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                <div className="min-w-0">
-                  <p className="text-xs font-medium text-zinc-200">
-                    Bundled docker CLI
-                  </p>
-                  <p className="text-[11px] text-zinc-500 mt-0.5">
-                    {cliUpdate
-                      ? cliUpdate.installed_version
-                        ? cliUpdate.update_available
-                          ? `Update ${cliUpdate.installed_version} → ${cliUpdate.latest_version}`
-                          : `Up to date · ${cliUpdate.installed_version}`
-                        : "No bundled CLI — install Docker Engine first"
-                      : "Not checked yet"}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    disabled={checkingCli || updatingCli}
-                    onClick={() => checkCliForUpdate(true)}
-                  >
-                    <RefreshCw
-                      className={`w-4 h-4 ${checkingCli ? "animate-spin" : ""}`}
-                    />
-                    <span>Check</span>
-                  </Button>
-                  {cliUpdate?.update_available && cliUpdate.installed_version && (
-                    <Button
-                      type="button"
-                      variant="primary"
-                      size="sm"
-                      disabled={updatingCli}
-                      onClick={applyCliUpdate}
-                    >
-                      <DownloadCloud className="w-4 h-4" />
-                      <span>{updatingCli ? "Updating…" : "Update CLI"}</span>
-                    </Button>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-zinc-200 block">
+                Default Shell
+              </label>
+              <span className="text-xs text-zinc-400 block -mt-1">
+                Opened when you attach a terminal or debug a stopped container. The
+                shell must exist inside the container — <code className="text-zinc-300">sh</code>{" "}
+                is the safe default for minimal images.
+              </span>
+              <input
+                list="terminal-shell-presets"
+                value={config.terminal_shell || "sh"}
+                onChange={(e) => setConfig({ ...config, terminal_shell: e.target.value })}
+                placeholder="sh"
+                className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+              />
+              <datalist id="terminal-shell-presets">
+                <option value="sh" />
+                <option value="bash" />
+                <option value="ash" />
+                <option value="zsh" />
+                <option value="fish" />
+              </datalist>
+            </div>
+
+            <div className="flex items-center justify-between py-1">
+              <div>
+                <span className="font-medium text-sm text-zinc-200 block">
+                  Terminal Font Size
+                </span>
+                <span className="text-xs text-zinc-400 block mt-0.5">
+                  Font size in pixels for terminal panes (8–32)
+                </span>
+              </div>
+              <input
+                type="number"
+                min={8}
+                max={32}
+                value={config.terminal_font_size ?? 12}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  setConfig({
+                    ...config,
+                    terminal_font_size: Number.isFinite(n)
+                      ? Math.min(Math.max(n, 8), 32)
+                      : 12,
+                  });
+                }}
+                className="w-24 h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono text-center"
+              />
+            </div>
+          </Card>
+        </div>
+
+        {/* Engine — the daemon itself, its storage, and the Kind clusters it hosts. */}
+        <div
+          id="settings-panel-engine"
+          role="tabpanel"
+          aria-label="Engine"
+          hidden={tab !== "engine"}
+          className="space-y-6"
+        >
+          {/* Engine Update */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <Power className="w-5 h-5 text-amber-400" />
+              <div>
+                <h3 className="font-semibold text-white">Docker Engine</h3>
+                <p className="text-xs text-zinc-400">
+                  Which engine this app drives — the bundled one or a remote daemon —
+                  plus auto-start and updates for the bundled engine.
+                </p>
+              </div>
+            </div>
+
+            {/* Endpoints (bundled + remote) — the "which engine" half of this card. */}
+            <EndpointsCard />
+
+            {/* Lifecycle: the one engine setting that is not an update. */}
+            <div className="flex items-center justify-between py-2">
+              <div>
+                <span className="font-medium text-sm text-zinc-200 block">
+                  Auto-start on App Launch
+                </span>
+                <span className="text-xs text-zinc-400 block mt-0.5">
+                  Boot the rootless dockerd when this app opens
+                </span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={config.auto_start_daemon}
+                  onChange={(e) =>
+                    setConfig({ ...config, auto_start_daemon: e.target.checked })
+                  }
+                  className="sr-only peer"
+                />
+                <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+
+            {/* Resource limits */}
+            <div className="pt-3 mt-1 border-t border-zinc-800/60">
+              <span className="font-medium text-sm text-zinc-200 block">
+                Engine Resource Limits
+              </span>
+              <span className="text-xs text-zinc-400 block mt-0.5">
+                Caps host RAM/CPU dockerd and all its containers may use, so a
+                heavy build or runaway container cannot starve the OS. 0 / empty =
+                unlimited.
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                <label className="space-y-1">
+                  <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                    Memory cap (MiB)
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={128}
+                    value={config.engine_memory_limit_mb ?? 0}
+                    onChange={(e) =>
+                      setConfig({
+                        ...config,
+                        engine_memory_limit_mb: Math.max(
+                          0,
+                          Math.floor(Number(e.target.value) || 0)
+                        ),
+                      })
+                    }
+                    placeholder="0 = unlimited"
+                    aria-label="Engine memory cap in MiB"
+                    className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                    CPU cap (cores)
+                  </span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={config.engine_cpu_cores ?? ""}
+                    onChange={(e) =>
+                      setConfig({ ...config, engine_cpu_cores: e.target.value })
+                    }
+                    placeholder="e.g. 2.5 — empty = unlimited"
+                    aria-label="Engine CPU cap in cores"
+                    className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm">
+                  {updating ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
+                      <span className="text-zinc-200">
+                        {engineRun?.label ?? "Starting…"}
+                      </span>
+                    </>
+                  ) : release?.update_available ? (
+                    <>
+                      <DownloadCloud className="w-4 h-4 text-sky-400" />
+                      <span className="text-zinc-200">
+                        Docker Engine{" "}
+                        <span className="font-mono text-sky-300">{release.latest_version}</span> is available
+                      </span>
+                    </>
+                  ) : release ? (
+                    <>
+                      <PackageCheck className="w-4 h-4 text-emerald-400" />
+                      <span className="text-zinc-200">
+                        {release.installed_version
+                          ? `Up to date · ${release.installed_version}`
+                          : `No engine installed · latest is ${release.latest_version}`}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-zinc-400">
+                      {checking ? "Checking for updates…" : "Update status unknown"}
+                    </span>
                   )}
                 </div>
+                {release && !updating && (
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Installed: {release.installed_version ?? "none"} · Latest: {release.latest_version}
+                    {release.update_available && release.latest_version !== release.pinned_version && (
+                      <> · checksums for this version come from Docker over TLS (not pinned)</>
+                    )}
+                  </p>
+                )}
               </div>
 
-              {cliRun && (
-                <UpdateProgressPanel run={cliRun} onDismiss={resetCliRun} />
-              )}
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={checking || updating}
+                  onClick={() => checkForEngineUpdate(true)}
+                >
+                  <RefreshCw className={`w-4 h-4 ${checking ? "animate-spin" : ""}`} />
+                  <span>Check</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary"
+                  disabled={updating || checking || !release?.update_available}
+                  onClick={applyEngineUpdate}
+                >
+                  <DownloadCloud className="w-4 h-4" />
+                  <span>{release?.installed_version ? "Update Engine" : "Install Engine"}</span>
+                </Button>
+              </div>
             </div>
-          ) : (
-            <p className="text-xs text-zinc-500">Checking which docker CLI is available…</p>
-          )}
 
-          <div className="space-y-2">
-            <label className="text-xs font-medium text-zinc-300">Preference</label>
-            <select
-              value={config?.cli_mode ?? "auto"}
-              onChange={(e) => setConfig((c) => (c ? { ...c, cli_mode: e.target.value } : c))}
-              className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-sm text-white focus:border-blue-500 focus:outline-none"
-            >
-              <option value="auto">Automatic — use whichever is newer</option>
-              <option value="system">Always use the system docker</option>
-              <option value="bundled">Always use the bundled docker</option>
-            </select>
-          </div>
+            {engineRun && (
+              <UpdateProgressPanel run={engineRun} onDismiss={resetEngineRun} />
+            )}
+          </Card>
 
-          {/* Terminal access: how a shell reaches this engine. The socket
-              bridge is the right answer when a docker already exists; the
-              shim only when there is none to bridge. */}
-          <div className="space-y-3 pt-1">
-            <p className="text-xs font-medium text-zinc-400 uppercase tracking-wide">
-              Terminal access
-            </p>
+          {/* Engine Storage Location (Data Root) */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <HardDrive className="w-5 h-5 text-emerald-400" />
+              <div>
+                <h3 className="font-semibold text-white">Engine Storage Location (Data Root)</h3>
+                <p className="text-xs text-zinc-400">
+                  Custom directory path for images, containers, and volumes (`dockerd --data-root`)
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                Current Data Root Path
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  readOnly
+                  disabled
+                  value={config.data_root || "Default: ~/.local/share/hsx2dock/data"}
+                  className="flex-1 h-10 px-3.5 rounded-xl bg-zinc-950/80 border border-zinc-800 text-sm text-zinc-300 font-mono cursor-not-allowed select-text opacity-90"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setNewPathInput(config.data_root || "");
+                    setStep("input");
+                    setPathInspection(null);
+                    setShouldMoveData(false);
+                    setShouldClearOld(false);
+                    setMigrationError("");
+                    setIsModalOpen(true);
+                  }}
+                  className="gap-2 h-10 px-4 shrink-0 font-medium"
+                >
+                  <FolderEdit className="w-4 h-4 text-emerald-400" />
+                  <span>Change Path</span>
+                </Button>
+              </div>
+              <p className="text-xs text-zinc-500 mt-2">
+                * Note: Modifying the path uses an interactive wizard to safely check folder contents, offer data migration, and switch paths seamlessly.
+              </p>
+            </div>
+          </Card>
+
+          <KubernetesCard />
+        </div>
+
+        {/* Tools — the two command-line surfaces this app owns. */}
+        <div
+          id="settings-panel-tools"
+          role="tabpanel"
+          aria-label="Tools"
+          hidden={tab !== "tools"}
+          className="space-y-6"
+        >
+          {/* Docker CLI */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <div className="p-2 rounded-lg bg-zinc-800/80 border border-zinc-700/50">
+                <Terminal className="w-5 h-5 text-emerald-400" />
+              </div>
+              <div className="flex-1">
+                <h3 className="font-semibold text-white">Docker CLI</h3>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Prefer a docker CLI you already have, or use the one bundled with the app.
+                </p>
+              </div>
+            </div>
+
+            {cliResolution ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span
+                    className={`text-xs font-medium px-2 py-0.5 rounded border ${
+                      cliResolution.source === "system"
+                        ? "bg-sky-500/10 text-sky-300 border-sky-500/30"
+                        : "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+                    }`}
+                  >
+                    Using {cliResolution.source === "system" ? "system docker" : "bundled docker"}{" "}
+                    {cliResolution.version}
+                  </span>
+                  <span className="text-xs text-zinc-400">{cliResolution.reason}</span>
+                </div>
+
+                <div className="grid gap-2 text-xs">
+                  <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
+                    <span className="text-zinc-400">System</span>
+                    <span className="font-mono text-zinc-300 truncate">
+                      {cliResolution.system_path
+                        ? `${cliResolution.system_path} · ${cliResolution.system_version}`
+                        : "not installed"}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 p-2.5 rounded-lg bg-zinc-950 border border-zinc-800">
+                    <span className="text-zinc-400">Bundled</span>
+                    <span className="font-mono text-zinc-300 truncate">
+                      {cliResolution.bundled_version
+                        ? `${cliResolution.bundled_path} · ${cliResolution.bundled_version}`
+                        : "no engine installed"}
+                    </span>
+                  </div>
+                </div>
+
+                {/* The system docker cannot be replaced without root, so this
+                    updates the bundled copy only. */}
+                <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-zinc-200">
+                      Bundled docker CLI
+                    </p>
+                    <p className="text-[11px] text-zinc-500 mt-0.5">
+                      {cliUpdate
+                        ? cliUpdate.installed_version
+                          ? cliUpdate.update_available
+                            ? `Update ${cliUpdate.installed_version} → ${cliUpdate.latest_version}`
+                            : `Up to date · ${cliUpdate.installed_version}`
+                          : "No bundled CLI — install Docker Engine first"
+                        : "Not checked yet"}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={checkingCli || updatingCli}
+                      onClick={() => checkCliForUpdate(true)}
+                    >
+                      <RefreshCw
+                        className={`w-4 h-4 ${checkingCli ? "animate-spin" : ""}`}
+                      />
+                      <span>Check</span>
+                    </Button>
+                    {cliUpdate?.update_available && cliUpdate.installed_version && (
+                      <Button
+                        type="button"
+                        variant="primary"
+                        size="sm"
+                        disabled={updatingCli}
+                        onClick={applyCliUpdate}
+                      >
+                        <DownloadCloud className="w-4 h-4" />
+                        <span>{updatingCli ? "Updating…" : "Update CLI"}</span>
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {cliRun && (
+                  <UpdateProgressPanel run={cliRun} onDismiss={resetCliRun} />
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-zinc-500">Checking which docker CLI is available…</p>
+            )}
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-zinc-300">Preference</label>
+              <select
+                value={config?.cli_mode ?? "auto"}
+                onChange={(e) => setConfig((c) => (c ? { ...c, cli_mode: e.target.value } : c))}
+                className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-sm text-white focus:border-blue-500 focus:outline-none"
+              >
+                <option value="auto">Automatic — use whichever is newer</option>
+                <option value="system">Always use the system docker</option>
+                <option value="bundled">Always use the bundled docker</option>
+              </select>
+            </div>
+
+            {/* Terminal access: how a shell reaches this engine. The socket
+                bridge is the right answer when a docker already exists; the
+                shim only when there is none to bridge. */}
+            <div className="space-y-3 pt-1">
+              <p className="text-xs font-medium text-zinc-400 uppercase tracking-wide">
+                Terminal access
+              </p>
+
+              <div className="flex items-start justify-between gap-4 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                <div className="flex-1">
+                  <p className="text-sm text-zinc-200">Socket bridge</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    Symlinks <span className="font-mono">$XDG_RUNTIME_DIR/docker.sock</span> and
+                    registers a docker context, so your existing{" "}
+                    <span className="font-mono">docker</span> reaches this app's engine.
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                  <input
+                    type="checkbox"
+                    className="sr-only peer"
+                    checked={config.cli_bridge_enabled}
+                    onChange={(e) => handleToggleCliBridge(e.target.checked)}
+                  />
+                  <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-between px-3 py-2 text-xs">
+                <span className="text-zinc-400">Bridge status</span>
+                <span
+                  className={`font-mono font-medium ${
+                    !config.cli_bridge_enabled
+                      ? "text-zinc-500"
+                      : cliStatus?.link_state
+                        ? "text-emerald-400"
+                        : "text-amber-400"
+                  }`}
+                >
+                  {/* Three distinct states: the toggle is off (nothing to
+                      report), the link is live, or the toggle is on but the
+                      symlink/context is missing — which IS a problem. */}
+                  {!config.cli_bridge_enabled
+                    ? "Off"
+                    : cliStatus?.link_state
+                      ? "Connected & Active"
+                      : "Enabled, but not connected"}
+                </span>
+              </div>
+            </div>
 
             <div className="flex items-start justify-between gap-4 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
               <div className="flex-1">
-                <p className="text-sm text-zinc-200">Socket bridge</p>
+                <p className="text-sm text-zinc-200">Expose docker in your terminal</p>
                 <p className="text-xs text-zinc-500 mt-0.5">
-                  Symlinks <span className="font-mono">$XDG_RUNTIME_DIR/docker.sock</span> and
-                  registers a docker context, so your existing{" "}
-                  <span className="font-mono">docker</span> reaches this app's engine.
+                  Installs <span className="font-mono">{shimStatus?.path ?? "~/.local/bin/docker"}</span>{" "}
+                  so the <span className="font-mono">docker</span> command reaches this app's engine —
+                  useful when no docker is installed system-wide.
                 </p>
-              </div>
-              <label className="relative inline-flex items-center cursor-pointer shrink-0">
-                <input
-                  type="checkbox"
-                  className="sr-only peer"
-                  checked={config.cli_bridge_enabled}
-                  onChange={(e) => handleToggleCliBridge(e.target.checked)}
-                />
-                <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
-              </label>
-            </div>
-
-            <div className="flex items-center justify-between px-3 py-2 text-xs">
-              <span className="text-zinc-400">Bridge status</span>
-              <span
-                className={`font-mono font-medium ${
-                  !config.cli_bridge_enabled
-                    ? "text-zinc-500"
-                    : cliStatus?.link_state
-                      ? "text-emerald-400"
-                      : "text-amber-400"
-                }`}
-              >
-                {/* Three distinct states: the toggle is off (nothing to
-                    report), the link is live, or the toggle is on but the
-                    symlink/context is missing — which IS a problem. */}
-                {!config.cli_bridge_enabled
-                  ? "Off"
-                  : cliStatus?.link_state
-                    ? "Connected & Active"
-                    : "Enabled, but not connected"}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-start justify-between gap-4 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-            <div className="flex-1">
-              <p className="text-sm text-zinc-200">Expose docker in your terminal</p>
-              <p className="text-xs text-zinc-500 mt-0.5">
-                Installs <span className="font-mono">{shimStatus?.path ?? "~/.local/bin/docker"}</span>{" "}
-                so the <span className="font-mono">docker</span> command reaches this app's engine —
-                useful when no docker is installed system-wide.
-              </p>
-              {shimStatus?.installed && shimStatus.effect === "shadowed" && (
-                <p className="text-xs text-amber-400 mt-1">
-                  Inactive — <span className="font-mono">{shimStatus.shadows}</span> comes
-                  first on your PATH, so the shell still uses that docker.
-                </p>
-              )}
-              {shimStatus?.installed && shimStatus.stale && (
-                <p className="text-xs text-amber-400/90">
-                  This shim still points at{" "}
-                  <span className="font-mono">{shimStatus.target}</span>, not the CLI
-                  selected above. Re-install it to pick up the new choice.
-                </p>
-              )}
-              {shimStatus?.installed && shimStatus.effect === "not_on_path" && (
-                <p className="text-xs text-amber-400 mt-1">
-                  Inactive — <span className="font-mono">~/.local/bin</span> is not on your
-                  PATH, so a shell will not find this shim.
-                </p>
-              )}
-              {!shimStatus?.installed && shimStatus?.shadows && (
-                <p className="text-xs text-amber-400 mt-1">
-                  You already have <span className="font-mono">{shimStatus.shadows}</span>.
-                  Installing the shim would hide it from your terminal — prefer the socket
-                  bridge above instead.
-                </p>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={handleToggleShim}
-              disabled={shimBusy}
-              className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
-                shimStatus?.installed
-                  ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20"
-                  : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"
-              } disabled:opacity-50`}
-            >
-              {shimBusy ? "Working…" : shimStatus?.installed ? "Remove" : "Install"}
-            </button>
-          </div>
-
-          <div className="flex items-center justify-between gap-3 pt-1">
-            <div className="text-xs text-zinc-400">
-              {compose ? (
-                <>
-                  Docker Compose: <span className="font-mono text-zinc-300">
-                    {compose.installed_version ?? "not installed"}
-                  </span>
-                  {compose.update_available && (
-                    <>
-                      {" "}· <span className="text-amber-300">{compose.latest_version} available</span>
-                    </>
-                  )}
-                </>
-              ) : (
-                "Docker Compose: not checked"
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => checkCompose(true)}
-                disabled={checkingCompose || updatingCompose}
-                className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-xs font-medium text-zinc-200 transition-colors"
-              >
-                {checkingCompose ? "Checking…" : "Check Compose"}
-              </button>
-              {/* Only offer the update when one actually exists. */}
-              {compose?.update_available && (
-                <button
-                  type="button"
-                  onClick={applyComposeUpdate}
-                  disabled={updatingCompose || checkingCompose}
-                  className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
-                >
-                  {updatingCompose ? "Updating…" : "Update Compose"}
-                </button>
-              )}
-            </div>
-          </div>
-          {composeRun && (
-            <UpdateProgressPanel run={composeRun} onDismiss={resetComposeRun} />
-          )}
-        </Card>
-
-        {/* Engine Update */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <Power className="w-5 h-5 text-amber-400" />
-            <div>
-              <h3 className="font-semibold text-white">Docker Engine</h3>
-              <p className="text-xs text-zinc-400">
-                Which engine this app drives — the bundled one or a remote daemon —
-                plus auto-start and updates for the bundled engine.
-              </p>
-            </div>
-          </div>
-
-          {/* Endpoints (bundled + remote) — the "which engine" half of this card. */}
-          <EndpointsCard />
-
-          {/* Lifecycle: the one engine setting that is not an update. */}
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <span className="font-medium text-sm text-zinc-200 block">
-                Auto-start on App Launch
-              </span>
-              <span className="text-xs text-zinc-400 block mt-0.5">
-                Boot the rootless dockerd when this app opens
-              </span>
-            </div>
-            <label className="relative inline-flex items-center cursor-pointer">
-              <input
-                type="checkbox"
-                checked={config.auto_start_daemon}
-                onChange={(e) =>
-                  setConfig({ ...config, auto_start_daemon: e.target.checked })
-                }
-                className="sr-only peer"
-              />
-              <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-            </label>
-          </div>
-
-          {/* Resource limits */}
-          <div className="pt-3 mt-1 border-t border-zinc-800/60">
-            <span className="font-medium text-sm text-zinc-200 block">
-              Engine Resource Limits
-            </span>
-            <span className="text-xs text-zinc-400 block mt-0.5">
-              Caps host RAM/CPU dockerd and all its containers may use, so a
-              heavy build or runaway container cannot starve the OS. 0 / empty =
-              unlimited.
-            </span>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
-              <label className="space-y-1">
-                <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
-                  Memory cap (MiB)
-                </span>
-                <input
-                  type="number"
-                  min={0}
-                  step={128}
-                  value={config.engine_memory_limit_mb ?? 0}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      engine_memory_limit_mb: Math.max(
-                        0,
-                        Math.floor(Number(e.target.value) || 0)
-                      ),
-                    })
-                  }
-                  placeholder="0 = unlimited"
-                  aria-label="Engine memory cap in MiB"
-                  className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
-                />
-              </label>
-              <label className="space-y-1">
-                <span className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider">
-                  CPU cap (cores)
-                </span>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  value={config.engine_cpu_cores ?? ""}
-                  onChange={(e) =>
-                    setConfig({ ...config, engine_cpu_cores: e.target.value })
-                  }
-                  placeholder="e.g. 2.5 — empty = unlimited"
-                  aria-label="Engine CPU cap in cores"
-                  className="h-9 w-full rounded-lg bg-zinc-900 border border-zinc-800 px-3 text-sm text-white focus:outline-none focus:border-blue-500 transition-colors"
-                />
-              </label>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between gap-4">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 text-sm">
-                {updating ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
-                    <span className="text-zinc-200">
-                      {engineRun?.label ?? "Starting…"}
-                    </span>
-                  </>
-                ) : release?.update_available ? (
-                  <>
-                    <DownloadCloud className="w-4 h-4 text-sky-400" />
-                    <span className="text-zinc-200">
-                      Docker Engine{" "}
-                      <span className="font-mono text-sky-300">{release.latest_version}</span> is available
-                    </span>
-                  </>
-                ) : release ? (
-                  <>
-                    <PackageCheck className="w-4 h-4 text-emerald-400" />
-                    <span className="text-zinc-200">
-                      {release.installed_version
-                        ? `Up to date · ${release.installed_version}`
-                        : `No engine installed · latest is ${release.latest_version}`}
-                    </span>
-                  </>
-                ) : (
-                  <span className="text-zinc-400">
-                    {checking ? "Checking for updates…" : "Update status unknown"}
-                  </span>
+                {shimStatus?.installed && shimStatus.effect === "shadowed" && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    Inactive — <span className="font-mono">{shimStatus.shadows}</span> comes
+                    first on your PATH, so the shell still uses that docker.
+                  </p>
+                )}
+                {shimStatus?.installed && shimStatus.stale && (
+                  <p className="text-xs text-amber-400/90">
+                    This shim still points at{" "}
+                    <span className="font-mono">{shimStatus.target}</span>, not the CLI
+                    selected above. Re-install it to pick up the new choice.
+                  </p>
+                )}
+                {shimStatus?.installed && shimStatus.effect === "not_on_path" && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    Inactive — <span className="font-mono">~/.local/bin</span> is not on your
+                    PATH, so a shell will not find this shim.
+                  </p>
+                )}
+                {!shimStatus?.installed && shimStatus?.shadows && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    You already have <span className="font-mono">{shimStatus.shadows}</span>.
+                    Installing the shim would hide it from your terminal — prefer the socket
+                    bridge above instead.
+                  </p>
                 )}
               </div>
-              {release && !updating && (
-                <p className="text-[11px] text-zinc-500 mt-1">
-                  Installed: {release.installed_version ?? "none"} · Latest: {release.latest_version}
-                  {release.update_available && release.latest_version !== release.pinned_version && (
-                    <> · checksums for this version come from Docker over TLS (not pinned)</>
-                  )}
-                </p>
-              )}
+              <button
+                type="button"
+                onClick={handleToggleShim}
+                disabled={shimBusy}
+                className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ${
+                  shimStatus?.installed
+                    ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20"
+                    : "bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700"
+                } disabled:opacity-50`}
+              >
+                {shimBusy ? "Working…" : shimStatus?.installed ? "Remove" : "Install"}
+              </button>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
-              <Button
-                type="button"
-                variant="ghost"
-                disabled={checking || updating}
-                onClick={() => checkForEngineUpdate(true)}
-              >
-                <RefreshCw className={`w-4 h-4 ${checking ? "animate-spin" : ""}`} />
-                <span>Check</span>
-              </Button>
-              <Button
-                type="button"
-                variant="primary"
-                disabled={updating || checking || !release?.update_available}
-                onClick={applyEngineUpdate}
-              >
-                <DownloadCloud className="w-4 h-4" />
-                <span>{release?.installed_version ? "Update Engine" : "Install Engine"}</span>
-              </Button>
+            <div className="flex items-center justify-between gap-3 pt-1">
+              <div className="text-xs text-zinc-400">
+                {compose ? (
+                  <>
+                    Docker Compose: <span className="font-mono text-zinc-300">
+                      {compose.installed_version ?? "not installed"}
+                    </span>
+                    {compose.update_available && (
+                      <>
+                        {" "}· <span className="text-amber-300">{compose.latest_version} available</span>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  "Docker Compose: not checked"
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => checkCompose(true)}
+                  disabled={checkingCompose || updatingCompose}
+                  className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-xs font-medium text-zinc-200 transition-colors"
+                >
+                  {checkingCompose ? "Checking…" : "Check Compose"}
+                </button>
+                {/* Only offer the update when one actually exists. */}
+                {compose?.update_available && (
+                  <button
+                    type="button"
+                    onClick={applyComposeUpdate}
+                    disabled={updatingCompose || checkingCompose}
+                    className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
+                  >
+                    {updatingCompose ? "Updating…" : "Update Compose"}
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+            {composeRun && (
+              <UpdateProgressPanel run={composeRun} onDismiss={resetComposeRun} />
+            )}
+          </Card>
 
-          {engineRun && (
-            <UpdateProgressPanel run={engineRun} onDismiss={resetEngineRun} />
-          )}
-        </Card>
+          {/* Compose File Path */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <FileCode2 className="w-5 h-5 text-purple-400" />
+              <div>
+                <h3 className="font-semibold text-white">Compose Workspace</h3>
+                <p className="text-xs text-zinc-400">Default project file location</p>
+              </div>
+            </div>
 
-        {/* Engine Storage Location (Data Root) */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <HardDrive className="w-5 h-5 text-emerald-400" />
             <div>
-              <h3 className="font-semibold text-white">Engine Storage Location (Data Root)</h3>
-              <p className="text-xs text-zinc-400">
-                Custom directory path for images, containers, and volumes (`dockerd --data-root`)
-              </p>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
-              Current Data Root Path
-            </label>
-            <div className="flex items-center gap-3">
+              <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                Default Compose YAML Path
+              </label>
               <input
                 type="text"
-                readOnly
-                disabled
-                value={config.data_root || "Default: ~/.local/share/hsx2dock/data"}
-                className="flex-1 h-10 px-3.5 rounded-xl bg-zinc-950/80 border border-zinc-800 text-sm text-zinc-300 font-mono cursor-not-allowed select-text opacity-90"
+                placeholder="e.g. ~/projects/my-app/docker-compose.yml"
+                value={config.compose_file}
+                onChange={(e) => setConfig({ ...config, compose_file: e.target.value })}
+                className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
               />
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  setNewPathInput(config.data_root || "");
-                  setStep("input");
-                  setPathInspection(null);
-                  setShouldMoveData(false);
-                  setShouldClearOld(false);
-                  setMigrationError("");
-                  setIsModalOpen(true);
-                }}
-                className="gap-2 h-10 px-4 shrink-0 font-medium"
-              >
-                <FolderEdit className="w-4 h-4 text-emerald-400" />
-                <span>Change Path</span>
+            </div>
+          </Card>
+        </div>
+
+        {/* Registry — logins, live status, and the default push target. */}
+        <div
+          id="settings-panel-registry"
+          role="tabpanel"
+          aria-label="Registry"
+          hidden={tab !== "registry"}
+          className="space-y-6"
+        >
+          <RegistriesCard />
+        </div>
+          </div>
+        </div>
+
+        {/* Sticky action bar — pinned below the scroll region, so Save stays
+            reachable no matter how tall the active tab grows. */}
+        <div className="shrink-0 border-t border-zinc-800 bg-zinc-950/90 px-8 py-3 backdrop-blur-xl">
+          <div className="max-w-4xl mx-auto flex items-center justify-between gap-4">
+            <p className="text-xs text-zinc-500">
+              {saved
+                ? "All changes saved."
+                : "Engine, terminal and workspace preferences apply on save."}
+            </p>
+            <div className="flex items-center gap-3 shrink-0">
+              <Button type="submit" variant="primary" isLoading={saving} className="gap-2">
+                {saved ? <Check className="w-4 h-4 text-emerald-400" /> : <Save className="w-4 h-4" />}
+                <span>{saved ? "Saved Changes" : "Save Settings"}</span>
               </Button>
             </div>
-            <p className="text-xs text-zinc-500 mt-2">
-              * Note: Modifying the path uses an interactive wizard to safely check folder contents, offer data migration, and switch paths seamlessly.
-            </p>
           </div>
-        </Card>
-
-        {/* Theme Settings */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <Palette className="w-5 h-5 text-indigo-400" />
-            <div>
-              <h3 className="font-semibold text-white">Appearance & Theme</h3>
-              <p className="text-xs text-zinc-400">Switch color theme for application interface</p>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between py-2">
-            <div>
-              <span className="font-medium text-sm text-zinc-200 block">Theme Mode</span>
-              <span className="text-xs text-zinc-400 block mt-0.5">
-                Choose between Dark, Light or System default
-              </span>
-            </div>
-            <select
-              value={config.theme || "dark"}
-              onChange={(e) => {
-                const val = e.target.value;
-                setConfig({ ...config, theme: val });
-                if (val === "dark") {
-                  document.documentElement.classList.add("dark");
-                  document.documentElement.classList.remove("light");
-                  localStorage.setItem("theme", "dark");
-                } else if (val === "light") {
-                  document.documentElement.classList.remove("dark");
-                  document.documentElement.classList.add("light");
-                  localStorage.setItem("theme", "light");
-                } else {
-                  localStorage.removeItem("theme");
-                  if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
-                    document.documentElement.classList.add("dark");
-                  } else {
-                    document.documentElement.classList.remove("dark");
-                  }
-                }
-              }}
-              className="h-10 px-3 rounded-xl bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500 cursor-pointer [&>option]:bg-zinc-900 [&>option]:text-white"
-            >
-              <option value="dark">Dark Theme</option>
-              <option value="light">Light Theme</option>
-              <option value="system">System Default</option>
-            </select>
-          </div>
-        </Card>
-
-        {/* Compose File Path */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <FileCode2 className="w-5 h-5 text-purple-400" />
-            <div>
-              <h3 className="font-semibold text-white">Compose Workspace</h3>
-              <p className="text-xs text-zinc-400">Default project file location</p>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
-              Default Compose YAML Path
-            </label>
-            <input
-              type="text"
-              placeholder="e.g. ~/projects/my-app/docker-compose.yml"
-              value={config.compose_file}
-              onChange={(e) => setConfig({ ...config, compose_file: e.target.value })}
-              className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
-            />
-          </div>
-        </Card>
-
-        {/* Interactive Terminal */}
-        <Card className="space-y-4">
-          <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
-            <Terminal className="w-5 h-5 text-emerald-400" />
-            <div>
-              <h3 className="font-semibold text-white">Interactive Terminal</h3>
-              <p className="text-xs text-zinc-400">
-                Shell and font used by the container terminal and the Debug action
-              </p>
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-sm font-medium text-zinc-200 block">
-              Default Shell
-            </label>
-            <span className="text-xs text-zinc-400 block -mt-1">
-              Opened when you attach a terminal or debug a stopped container. The
-              shell must exist inside the container — <code className="text-zinc-300">sh</code>{" "}
-              is the safe default for minimal images.
-            </span>
-            <input
-              list="terminal-shell-presets"
-              value={config.terminal_shell || "sh"}
-              onChange={(e) => setConfig({ ...config, terminal_shell: e.target.value })}
-              placeholder="sh"
-              className="w-full h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
-            />
-            <datalist id="terminal-shell-presets">
-              <option value="sh" />
-              <option value="bash" />
-              <option value="ash" />
-              <option value="zsh" />
-              <option value="fish" />
-            </datalist>
-          </div>
-
-          <div className="flex items-center justify-between py-1">
-            <div>
-              <span className="font-medium text-sm text-zinc-200 block">
-                Terminal Font Size
-              </span>
-              <span className="text-xs text-zinc-400 block mt-0.5">
-                Font size in pixels for terminal panes (8–32)
-              </span>
-            </div>
-            <input
-              type="number"
-              min={8}
-              max={32}
-              value={config.terminal_font_size ?? 12}
-              onChange={(e) => {
-                const n = parseInt(e.target.value, 10);
-                setConfig({
-                  ...config,
-                  terminal_font_size: Number.isFinite(n)
-                    ? Math.min(Math.max(n, 8), 32)
-                    : 12,
-                });
-              }}
-              className="w-24 h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono text-center"
-            />
-          </div>
-        </Card>
-
-        {/* Save button */}
-        <div className="flex justify-end gap-3 pt-4">
-          <Button type="submit" variant="primary" isLoading={saving} className="gap-2">
-            {saved ? <Check className="w-4 h-4 text-emerald-400" /> : <Save className="w-4 h-4" />}
-            <span>{saved ? "Saved Changes" : "Save Settings"}</span>
-          </Button>
         </div>
       </form>
 

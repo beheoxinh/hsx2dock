@@ -70,6 +70,10 @@ pub struct AppConfig {
     /// Saved registry logins (Docker Hub, ghcr.io, GitLab, Harbor, custom).
     #[serde(default)]
     pub registries: Vec<RegistryConfig>,
+    /// Id of the login new pushes/pulls default to. Empty = the first saved
+    /// login, preserving the pre-selection behaviour.
+    #[serde(default)]
+    pub default_registry: String,
     /// Desktop-notification opt-outs, driven by the tray's Notifications submenu.
     #[serde(default)]
     pub notifications: NotificationPrefs,
@@ -275,6 +279,7 @@ impl Default for AppConfig {
             terminal_shell: default_shell(),
             terminal_font_size: default_terminal_font_size(),
             registries: Vec::new(),
+            default_registry: String::new(),
             notifications: NotificationPrefs::default(),
             kind_default_nodes: default_kind_nodes(),
             kind_default_image: String::new(),
@@ -442,6 +447,7 @@ mod tests {
             terminal_shell: default_shell(),
             terminal_font_size: default_terminal_font_size(),
             registries: Vec::new(),
+            default_registry: String::new(),
             notifications: NotificationPrefs::default(),
             kind_default_nodes: default_kind_nodes(),
             kind_default_image: String::new(),

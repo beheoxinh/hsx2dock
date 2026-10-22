@@ -25,6 +25,8 @@ pub struct RegistryStatus {
     pub insecure: bool,
     /// Whether a secret is stored — never the secret itself.
     pub has_password: bool,
+    /// True for the login new pushes default to.
+    pub is_default: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -65,7 +67,7 @@ pub fn encode_auth(username: &str, password: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
 }
 
-fn to_status(cfg: &RegistryConfig) -> RegistryStatus {
+fn to_status(cfg: &RegistryConfig, default_id: &str) -> RegistryStatus {
     RegistryStatus {
         id: cfg.id.clone(),
         name: cfg.name.clone(),
@@ -73,13 +75,43 @@ fn to_status(cfg: &RegistryConfig) -> RegistryStatus {
         username: cfg.username.clone(),
         insecure: cfg.insecure,
         has_password: !cfg.auth.is_empty(),
+        is_default: !default_id.is_empty() && cfg.id == default_id,
     }
+}
+
+/// Resolves the login new operations should use: the explicit default when it
+/// still exists, else the first saved login. Returns `None` with no logins.
+pub fn default_registry<'a>(cfg: &'a crate::config::AppConfig) -> Option<&'a RegistryConfig> {
+    if !cfg.default_registry.is_empty() {
+        if let Some(found) = cfg.registries.iter().find(|r| r.id == cfg.default_registry) {
+            return Some(found);
+        }
+    }
+    cfg.registries.first()
 }
 
 #[tauri::command]
 pub async fn list_registries(state: State<'_, AppState>) -> Result<Vec<RegistryStatus>, String> {
     let cfg = state.config.read().await;
-    Ok(cfg.registries.iter().map(to_status).collect())
+    let default_id = default_registry(&cfg).map(|r| r.id.as_str()).unwrap_or("");
+    Ok(cfg
+        .registries
+        .iter()
+        .map(|r| to_status(r, default_id))
+        .collect())
+}
+
+/// Marks one saved login as the default for new pushes. An empty id clears
+/// the selection, which falls back to the first saved login.
+#[tauri::command]
+pub async fn set_default_registry(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut cfg = state.config.write().await;
+    if !id.is_empty() && !cfg.registries.iter().any(|r| r.id == id) {
+        return Err("No registry login with that id".into());
+    }
+    cfg.default_registry = id;
+    drop(cfg);
+    state.save_config().await
 }
 
 /// Probes `GET /v2/` with the given credentials. Every registry that speaks
@@ -283,6 +315,11 @@ pub async fn remove_registry_auth(state: State<'_, AppState>, id: String) -> Res
     if cfg.registries.len() == before {
         return Err("No registry login with that id".into());
     }
+    // The removed login may have been the default; clear it so the resolver
+    // falls back to the first remaining login instead of a dangling id.
+    if cfg.default_registry == id {
+        cfg.default_registry.clear();
+    }
     drop(cfg);
     state.save_config().await
 }
@@ -290,6 +327,7 @@ pub async fn remove_registry_auth(state: State<'_, AppState>, id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
 
     #[test]
     fn normalize_host_strips_scheme_case_and_slash() {
@@ -367,5 +405,34 @@ mod tests {
             Some(""),
             "broken stored auth must not panic and must yield an empty password"
         );
+    }
+
+    #[test]
+    fn default_registry_falls_back_to_the_first_login() {
+        let reg = |id: &str| RegistryConfig {
+            id: id.into(),
+            name: id.into(),
+            host: format!("{id}.example.com"),
+            username: "user".into(),
+            auth: encode_auth("user", "pw"),
+            insecure: false,
+        };
+        let mut cfg = AppConfig {
+            registries: vec![reg("first"), reg("second")],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(default_registry(&cfg).map(|r| r.id.as_str()), Some("first"));
+
+        cfg.default_registry = "second".into();
+        assert_eq!(default_registry(&cfg).map(|r| r.id.as_str()), Some("second"));
+
+        // A login removed outside the command leaves a dangling id; the
+        // resolver must not hand back nothing while logins still exist.
+        cfg.default_registry = "gone".into();
+        assert_eq!(default_registry(&cfg).map(|r| r.id.as_str()), Some("first"));
+
+        cfg.registries.clear();
+        assert!(default_registry(&cfg).is_none());
     }
 }

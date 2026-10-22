@@ -7,6 +7,7 @@ import {
   Plug,
   Plus,
   ShieldAlert,
+  Star,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -18,11 +19,13 @@ import { api } from "../../lib/api";
 import type { RegistryInput, RegistryStatus, RegistryTestResult } from "../../types";
 
 /** One-click presets for the registries people actually use. */
-const PRESETS: { label: string; host: string }[] = [
+const PRESETS: { label: string; host: string; hint?: string }[] = [
   { label: "Docker Hub", host: "docker.io" },
   { label: "GitHub ghcr", host: "ghcr.io" },
-  { label: "GitLab", host: "registry.gitlab.com" },
+  { label: "GitLab.com", host: "registry.gitlab.com" },
+  { label: "GitLab self-hosted", host: "registry.example.com", hint: "your GitLab's registry host" },
   { label: "Quay", host: "quay.io" },
+  { label: "Harbor", host: "harbor.example.com", hint: "your Harbor host[:port]" },
 ];
 
 interface DraftState {
@@ -58,6 +61,8 @@ export const RegistriesCard: React.FC = () => {
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [testing, setTesting] = useState(false);
   const [tested, setTested] = useState<RegistryTestResult | null>(null);
+  /** Id of the login whose default toggle is in flight, so its star can spin. */
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = async () => {
     try {
@@ -176,6 +181,20 @@ export const RegistriesCard: React.FC = () => {
     }
   };
 
+  const handleMakeDefault = async (reg: RegistryStatus) => {
+    if (reg.is_default) return;
+    setBusyId(reg.id);
+    try {
+      await api.setDefaultRegistry(reg.id);
+      toast.success("Default registry set", `New pushes go to ${reg.host}`);
+      await load();
+    } catch (e) {
+      toast.error("Could not set the default registry", String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <Card className="space-y-4">
       <div className="flex items-center justify-between gap-3">
@@ -187,7 +206,7 @@ export const RegistriesCard: React.FC = () => {
           <p className="text-xs text-zinc-500 mt-1">
             Sign in to Docker Hub, GitHub, GitLab, Harbor, or any custom registry.
             Saved logins are used automatically when pulling or pushing images
-            from that host.
+            from that host. Star a login to make it the default push target.
           </p>
         </div>
         <Button variant="secondary" size="sm" onClick={() => openNew()} className="shrink-0 whitespace-nowrap">
@@ -201,9 +220,10 @@ export const RegistriesCard: React.FC = () => {
         <span className="text-[11px] text-zinc-600">Quick add:</span>
         {PRESETS.map((p) => (
           <button
-            key={p.host}
+            key={p.label}
             type="button"
             onClick={() => openNew(p.host, p.label)}
+            title={p.hint}
             className="rounded-md border border-zinc-800 bg-zinc-900/50 px-2 py-0.5 text-[11px] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 transition-colors"
           >
             {p.label}
@@ -234,6 +254,12 @@ export const RegistriesCard: React.FC = () => {
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="truncate text-sm text-zinc-100">{reg.name}</span>
+                    {reg.is_default && (
+                      <span className="flex shrink-0 items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/5 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-emerald-400">
+                        <Star className="h-3 w-3" />
+                        default
+                      </span>
+                    )}
                     {reg.insecure && (
                       <span className="flex shrink-0 items-center gap-1 rounded border border-amber-500/30 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-400">
                         <ShieldAlert className="h-3 w-3" />
@@ -248,6 +274,24 @@ export const RegistriesCard: React.FC = () => {
               </div>
 
               <div className="flex shrink-0 items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => handleMakeDefault(reg)}
+                  disabled={reg.is_default || busyId === reg.id}
+                  title={
+                    reg.is_default
+                      ? "New pushes already default to this registry"
+                      : "Make this the default push target"
+                  }
+                  className={
+                    reg.is_default
+                      ? "text-emerald-400"
+                      : "text-zinc-500 hover:text-emerald-400"
+                  }
+                >
+                  <Star className={`w-3.5 h-3.5 ${reg.is_default ? "fill-current" : ""}`} />
+                </Button>
                 {reg.has_password ? (
                   <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                 ) : (
