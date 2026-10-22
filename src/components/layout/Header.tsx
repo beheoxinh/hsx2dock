@@ -3,13 +3,16 @@ import { Power, RefreshCw, Sun, Moon } from "lucide-react";
 import { useState, useEffect } from "react";
 import { Button } from "../ui/Button";
 import { StatusBadge } from "../ui/StatusBadge";
-import type { DaemonState } from "../../types";
+import { api } from "../../lib/api";
+import type { DaemonState, KindCluster } from "../../types";
 
 interface HeaderProps {
   daemonState: DaemonState;
   onToggleEngine: () => void;
   isToggling?: boolean;
   onRefresh?: () => void;
+  /** Opens the Kubernetes page from the cluster status badge. */
+  onOpenClusters?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -17,14 +20,55 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleEngine,
   isToggling = false,
   onRefresh,
+  onOpenClusters,
 }) => {
   const isRunning = daemonState === "Running";
   const stateStr = typeof daemonState === "string" ? daemonState : "Error";
   const [isDark, setIsDark] = useState(true);
+  const [clusters, setClusters] = useState<KindCluster[]>([]);
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains("dark"));
   }, []);
+
+  // Cluster status next to the daemon badge. Clusters can only change while
+  // the engine is up, so the poll is idle otherwise.
+  useEffect(() => {
+    if (!isRunning) {
+      setClusters([]);
+      return;
+    }
+    let disposed = false;
+    const load = () => {
+      api
+        .listKindClusters()
+        .then((list) => {
+          if (!disposed) setClusters(list);
+        })
+        .catch(() => {
+          /* engine went away mid-poll — keep the last snapshot */
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [isRunning]);
+
+  const runningClusters = clusters.filter((c) => c.running).length;
+  const clusterLabel =
+    clusters.length === 0
+      ? isRunning
+        ? "None"
+        : "—"
+      : runningClusters === clusters.length
+        ? `${runningClusters} Running`
+        : `${runningClusters}/${clusters.length} Running`;
+  const clustersTitle = clusters.length
+    ? clusters.map((c) => `${c.name}: ${c.running ? "running" : "stopped"}`).join("\n")
+    : "No kind clusters";
 
   const toggleTheme = () => {
     const nextDark = !isDark;
@@ -42,14 +86,28 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="h-16 px-6 bg-zinc-950/60 backdrop-blur-xl border-b border-zinc-800/80 flex items-center justify-between select-none z-10">
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-5">
         <div className="flex items-center gap-2.5">
           <span className="text-xs font-medium text-zinc-400">Docker Daemon:</span>
           <StatusBadge status={stateStr} pulse={isRunning} />
         </div>
+
+        <div className="flex items-center gap-2.5">
+          <span className="text-xs font-medium text-zinc-400">K8s Clusters:</span>
+          <button
+            type="button"
+            onClick={onOpenClusters}
+            disabled={!onOpenClusters}
+            title={clustersTitle}
+            aria-label={`Kubernetes clusters: ${clusterLabel}`}
+            className="rounded-full transition-opacity hover:opacity-80 disabled:cursor-default disabled:hover:opacity-100"
+          >
+            <StatusBadge status={clusterLabel} pulse={runningClusters > 0} />
+          </button>
+        </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex shrink-0 items-center gap-3">
         <Button
           variant="ghost"
           size="icon"

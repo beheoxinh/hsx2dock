@@ -26,7 +26,7 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
-import { formatRelativeTime } from "../lib/utils";
+import { formatDuration, formatRelativeTime } from "../lib/utils";
 import type {
   KindCluster,
   KindClusterPrefs,
@@ -43,19 +43,6 @@ interface KubernetesPageProps {
   /** Cluster a tray row asked to open; null opens the cluster list. */
   openCluster?: string | null;
 }
-
-/** Formats a seconds duration as a compact uptime string. */
-const fmtUptime = (secs: number | null | undefined): string => {
-  if (secs == null || secs < 0) return "—";
-  const s = Math.floor(secs);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
-};
 
 /** A single-series inline sparkline (change over time) drawn as a thin line. */
 const Sparkline: React.FC<{
@@ -767,7 +754,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                   {c.running ? "Uptime" : c.last_started_at ? "Last run" : "Age"}{" "}
                   <span className="font-mono text-zinc-300">
                     {c.running
-                      ? fmtUptime(c.uptime_seconds)
+                      ? formatDuration(c.uptime_seconds)
                       : c.last_started_at
                         ? formatRelativeTime(c.last_started_at)
                         : c.created

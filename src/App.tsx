@@ -180,6 +180,10 @@ const MainLayout: React.FC = () => {
           daemonState={daemonState}
           onToggleEngine={handleToggleEngine}
           isToggling={isTogglingEngine}
+          onOpenClusters={() => {
+            setTrayCluster(null);
+            setActiveTab("kubernetes");
+          }}
           onRefresh={() => {
             setRefreshKey((k) => k + 1);
             toast.info("Data refreshed", "Updated dashboard state.");

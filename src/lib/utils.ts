@@ -27,6 +27,19 @@ export function formatRelativeTime(timestamp: number): string {
   return `${Math.floor(diff / 604800)}w ago`;
 }
 
+/** Compact duration for uptimes, e.g. `2d 3h`, `4h 12m`, `7m`, `42s`. */
+export function formatDuration(secs: number | null | undefined): string {
+  if (secs == null || secs < 0) return "—";
+  const s = Math.floor(secs);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
 export function truncateId(id: string, len = 12): string {
   if (!id) return "";
   return id.length > len ? id.substring(0, len) : id;

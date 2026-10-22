@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
+  Boxes,
   HardDrive,
   Layers,
   Network,
@@ -14,14 +15,15 @@ import { api, events } from "../lib/api";
 import { useSeries } from "../hooks/useSeries";
 import { AreaChart } from "../components/charts/AreaChart";
 import { DonutChart } from "../components/charts/DonutChart";
-import { BarList } from "../components/charts/BarList";
-import { formatBytes } from "../lib/utils";
+import { cn, formatBytes, formatDuration } from "../lib/utils";
 import type {
   ContainerItem,
   ContainerStats,
   DaemonState,
   DfReport,
   EngineInfo,
+  ImageItem,
+  KindCluster,
   NetworkItem,
   VolumeItem,
 } from "../types";
@@ -29,7 +31,15 @@ import type {
 interface DashboardPageProps {
   daemonState: DaemonState;
   onNavigate: (
-    tab: "dashboard" | "containers" | "images" | "volumes" | "networks" | "compose" | "settings"
+    tab:
+      | "dashboard"
+      | "containers"
+      | "images"
+      | "volumes"
+      | "networks"
+      | "kubernetes"
+      | "compose"
+      | "settings"
   ) => void;
 }
 
@@ -58,10 +68,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null);
   const [diskUsage, setDiskUsage] = useState<DfReport | null>(null);
   const [containers, setContainers] = useState<ContainerItem[]>([]);
+  const [images, setImages] = useState<ImageItem[]>([]);
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
+  const [clusters, setClusters] = useState<KindCluster[]>([]);
   const [stats, setStats] = useState<Record<string, ContainerStats>>({});
   const [pruning, setPruning] = useState(false);
+
+  // Kind node ids, so their CPU/memory never inflates the user's charts.
+  const kindIdsRef = useRef<Set<string>>(new Set());
 
   const { samples, push, reset } = useSeries<StatSample>(MAX_SAMPLES);
 
@@ -71,18 +86,54 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const runningCount = appContainers.filter((c) => c.state === "running").length;
   const isRunning = daemonState === "Running";
 
+  // Keep the Kind container id set current so their stats never reach the
+  // user-facing charts (the engine reports every running container).
+  useEffect(() => {
+    kindIdsRef.current = new Set(
+      containers.filter((c) => c.kind_cluster).map((c) => c.id)
+    );
+  }, [containers]);
+
+  // Cluster status for the dashboard card. Clusters change slowly, so a gentle
+  // poll is enough while the engine is up.
+  useEffect(() => {
+    if (!isRunning) {
+      setClusters([]);
+      return;
+    }
+    let disposed = false;
+    const load = () => {
+      api
+        .listKindClusters()
+        .then((list) => {
+          if (!disposed) setClusters(list);
+        })
+        .catch(() => {
+          /* engine went away mid-poll — keep the last known snapshot */
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [isRunning]);
+
   const loadData = async () => {
     try {
-      const [infoR, dfR, cR, vR, nR] = await Promise.allSettled([
+      const [infoR, dfR, cR, iR, vR, nR] = await Promise.allSettled([
         api.getEngineInfo(),
         api.getDiskUsage(),
         api.listContainers(true),
+        api.listImages(),
         api.listVolumes(),
         api.listNetworks(),
       ]);
       if (infoR.status === "fulfilled") setEngineInfo(infoR.value);
       if (dfR.status === "fulfilled") setDiskUsage(dfR.value);
       if (cR.status === "fulfilled") setContainers(cR.value);
+      if (iR.status === "fulfilled") setImages(iR.value);
       if (vR.status === "fulfilled") setVolumes(vR.value);
       if (nR.status === "fulfilled") setNetworks(nR.value);
     } catch (e) {
@@ -118,7 +169,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       let txRate = 0;
       const nextNet: Record<string, { rx: number; tx: number }> = {};
 
+      let counted = 0;
       for (const id of ids) {
+        // Kind nodes belong to the Kubernetes tab; they must not move the
+        // dashboard's CPU/memory/network charts.
+        if (kindIdsRef.current.has(id)) continue;
+        counted += 1;
         const s = tick[id];
         const rx = s.net_rx ?? 0;
         const tx = s.net_tx ?? 0;
@@ -135,7 +191,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
       setStats(tick);
       push({
-        cpu: ids.length ? cpuSum / ids.length : 0,
+        cpu: counted ? cpuSum / counted : 0,
         mem: memSum,
         rxRate,
         txRate,
@@ -186,19 +242,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const rxSeries = samples.map((s) => s.rxRate);
   const txSeries = samples.map((s) => s.txRate);
 
-  const topConsumers = Object.entries(stats)
-    .map(([id, s]) => {
-      const c = containers.find((x) => x.id === id || x.short_id === id.slice(0, 12));
-      return {
-        key: id,
-        label: c?.name || id.slice(0, 12),
-        sublabel: c?.image || "",
-        value: s.cpu_percent ?? 0,
-        mem: s.mem_usage ?? 0,
-      };
-    })
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 6);
+  const runningClusters = clusters.filter((c) => c.running).length;
 
   const kpiItems: {
     icon: typeof Server;
@@ -212,7 +256,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     {
       icon: Server,
       label: "Containers",
-      value: String(containers.length),
+      value: String(appContainers.length),
       sub: `${runningCount} running`,
       color: "text-blue-400",
       glow: "from-blue-500/15 to-blue-600/5 border-blue-500/25",
@@ -221,7 +265,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     {
       icon: Layers,
       label: "Images",
-      value: engineInfo ? String(engineInfo.images) : "—",
+      value: isRunning ? String(images.length) : "—",
       sub: "local images",
       color: "text-purple-400",
       glow: "from-purple-500/15 to-purple-600/5 border-purple-500/25",
@@ -410,31 +454,61 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
         <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
           <div className="flex shrink-0 items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-white">Top Consumers</h3>
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-white">Kind Clusters</h3>
+              <p className="truncate text-[11px] text-zinc-500">
+                {clusters.length === 0
+                  ? isRunning
+                    ? "No clusters yet"
+                    : "Engine not running"
+                  : `${runningClusters} of ${clusters.length} running`}
+              </p>
+            </div>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => onNavigate("containers")}
-              className="text-[11px] text-zinc-400 hover:text-zinc-100"
+              onClick={() => onNavigate("kubernetes")}
+              className="shrink-0 text-[11px] text-zinc-400 hover:text-zinc-100"
             >
               View all
             </Button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <BarList
-              items={topConsumers.map((c) => ({
-                key: c.key,
-                label: c.label,
-                sublabel: c.sublabel
-                  ? `${c.sublabel} · ${formatBytes(c.mem)}`
-                  : formatBytes(c.mem),
-                value: c.value,
-                display: `${c.value.toFixed(1)}%`,
-                color: "#22d3ee",
-              }))}
-              max={Math.max(0, ...topConsumers.map((c) => c.value))}
-              emptyHint={runningCount ? "Sampling…" : "No running containers"}
-            />
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
+            {clusters.length === 0 && (
+              <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+                <Boxes className="h-7 w-7 text-zinc-600" />
+                <p className="text-[11px] text-zinc-500">
+                  {isRunning
+                    ? "Create a cluster on the Kubernetes page"
+                    : "Start the engine to manage clusters"}
+                </p>
+              </div>
+            )}
+            {clusters.slice(0, 8).map((c) => (
+              <button
+                key={c.name}
+                type="button"
+                onClick={() => onNavigate("kubernetes")}
+                className="flex w-full items-center gap-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
+              >
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 shrink-0 rounded-full",
+                    c.running ? "bg-emerald-400" : "bg-zinc-500"
+                  )}
+                />
+                <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-200">
+                  {c.name}
+                </span>
+                <span className="shrink-0 text-[10px] tabular-nums text-zinc-400">
+                  {c.running
+                    ? `${c.running_nodes}/${c.node_count} nodes${
+                        c.uptime_seconds != null ? ` · ${formatDuration(c.uptime_seconds)}` : ""
+                      }`
+                    : "stopped"}
+                </span>
+              </button>
+            ))}
           </div>
         </Card>
       </div>
