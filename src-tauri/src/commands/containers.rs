@@ -51,6 +51,23 @@ pub async fn remove_container(
     force: bool,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
+    // kind node containers *are* the cluster: deleting one silently destroys
+    // user data. Cluster lifecycle is owned by the Kubernetes page.
+    let details = client
+        .inspect_container(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if details
+        .labels
+        .iter()
+        .any(|label| label.key == crate::docker::kind::CLUSTER_LABEL)
+    {
+        return Err(
+            "This container is a kind cluster node. Use the Kubernetes page to \
+             start, stop or delete the cluster."
+                .to_string(),
+        );
+    }
     client
         .remove_container(&id, force)
         .await

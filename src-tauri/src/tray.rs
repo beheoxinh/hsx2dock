@@ -782,7 +782,12 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
     let containers = client.list_containers(true).await.ok()?;
     let total = containers.len();
     let running = containers.iter().filter(|c| c.running).count();
-    let images = client.list_images().await.ok()?.len();
+    let configured = state.config.read().await.kind_default_image.clone();
+    let images = client
+        .list_images_visible(Some(configured.as_str()))
+        .await
+        .ok()?
+        .len();
     // Group kind node containers into a compact per-cluster line. The container
     // list already carries the cluster label, so the tray never shells out to
     // kubectl just to redraw its menu.

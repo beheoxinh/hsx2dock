@@ -9,7 +9,13 @@ use crate::state::AppState;
 #[tauri::command]
 pub async fn list_images(state: State<'_, AppState>) -> Result<Vec<ImageItem>, String> {
     let client = state.get_client().await?;
-    client.list_images().await.map_err(|e| e.to_string())
+    // kind's node images are core to this app: keep them out of the Images
+    // page so they cannot be selected for removal.
+    let configured = state.config.read().await.kind_default_image.clone();
+    client
+        .list_images_visible(Some(configured.as_str()))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -19,6 +25,18 @@ pub async fn remove_image(
     force: bool,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
+    let tags = client
+        .image_repo_tags(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let configured = state.config.read().await.kind_default_image.clone();
+    if crate::docker::kind::is_kind_image(&tags, Some(configured.as_str())) {
+        return Err(
+            "This image is a kind node image. Removing it would break every cluster \
+             that uses it, so the app keeps it protected."
+                .to_string(),
+        );
+    }
     client.remove_image(&id, force).await.map_err(|e| e.to_string())
 }
 

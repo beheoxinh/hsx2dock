@@ -15,6 +15,17 @@ pub struct DockerClient {
     docker: Docker,
 }
 
+/// A stopped container is a prune candidate unless it is a kind node — those
+/// carry the cluster and must survive every cleanup pass.
+fn pruneable_container(state: &str, kind_cluster: Option<&str>) -> bool {
+    kind_cluster.is_none() && matches!(state, "exited" | "dead" | "created")
+}
+
+/// kind's network and Docker's built-ins are never prune candidates.
+fn pruneable_network(name: &str, protected: bool) -> bool {
+    !protected && !matches!(name, "bridge" | "host" | "none")
+}
+
 impl DockerClient {
     pub fn connect(socket: Option<&Path>) -> anyhow::Result<Self> {
         let docker = match socket {
@@ -321,6 +332,32 @@ impl DockerClient {
         Ok(())
     }
 
+    /// Remove stopped containers, never kind cluster nodes.
+    ///
+    /// The Docker prune API has no reliable negative label filter, and a
+    /// stopped kind node is exactly what a "stopped containers" prune would
+    /// eat — deleting it destroys the cluster. Selection happens here instead.
+    pub async fn prune_containers(&self) -> anyhow::Result<u64> {
+        let mut removed = 0u64;
+        for container in self.list_containers(true).await? {
+            if !pruneable_container(&container.state, container.kind_cluster.as_deref()) {
+                continue;
+            }
+            let opts = bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                .v(true)
+                .build();
+            if self
+                .docker
+                .remove_container(&container.id, Some(opts))
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub async fn container_stats(&self, id: &str) -> anyhow::Result<ContainerStats> {
         let opts = bollard::query_parameters::StatsOptionsBuilder::default()
             .stream(false)
@@ -406,6 +443,9 @@ impl DockerClient {
         Ok(out)
     }
 
+    /// Every image, including kind's node images. Callers that render lists
+    /// for the user should use [`Self::list_images_visible`] so core images
+    /// stay out of reach.
     pub async fn list_images(&self) -> anyhow::Result<Vec<ImageItem>> {
         let opts = bollard::query_parameters::ListImagesOptionsBuilder::default().build();
         let list = self.docker.list_images(Some(opts)).await?;
@@ -425,6 +465,29 @@ impl DockerClient {
             .collect())
     }
 
+    /// Images the user may see and delete: kind node images are hidden because
+    /// removing one breaks every cluster that uses it.
+    pub async fn list_images_visible(
+        &self,
+        configured_kind_image: Option<&str>,
+    ) -> anyhow::Result<Vec<ImageItem>> {
+        Ok(self
+            .list_images()
+            .await?
+            .into_iter()
+            .filter(|i| {
+                !crate::docker::kind::is_kind_image(&i.tags, configured_kind_image)
+            })
+            .collect())
+    }
+
+    /// Tags (repo:tag) currently attached to an image, used to decide whether
+    /// removing it would take a kind node image with it.
+    pub async fn image_repo_tags(&self, id: &str) -> anyhow::Result<Vec<String>> {
+        let info = self.docker.inspect_image(id).await?;
+        Ok(info.repo_tags.unwrap_or_default())
+    }
+
     pub async fn remove_image(&self, id: &str, force: bool) -> anyhow::Result<()> {
         let opts = bollard::query_parameters::RemoveImageOptionsBuilder::default()
             .force(force)
@@ -434,7 +497,15 @@ impl DockerClient {
     }
 
     pub async fn prune_images(&self) -> anyhow::Result<(u64, u64)> {
-        let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default().build();
+        // Dangling-only for two reasons: it matches the UI copy ("unused
+        // images") and it can never touch a tagged kind node image.
+        let filters = std::collections::HashMap::from([(
+            "dangling".to_string(),
+            vec!["true".to_string()],
+        )]);
+        let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
+            .filters(&filters)
+            .build();
         let res = self.docker.prune_images(Some(opts)).await?;
         Ok((
             res.images_deleted.map(|v| v.len() as u64).unwrap_or(0),
@@ -478,6 +549,10 @@ impl DockerClient {
             .unwrap_or_default()
             .into_iter()
             .map(|v| VolumeItem {
+                protected: v
+                    .labels
+                    .keys()
+                    .any(|k| k.starts_with("io.x-k8s.kind")),
                 name: v.name,
                 driver: v.driver,
                 mountpoint: v.mountpoint,
@@ -529,9 +604,19 @@ impl DockerClient {
     }
 
     pub async fn prune_volumes(&self) -> anyhow::Result<u64> {
-        let opts = bollard::query_parameters::PruneVolumesOptionsBuilder::default().build();
-        let res = self.docker.prune_volumes(Some(opts)).await?;
-        Ok(res.volumes_deleted.map(|v| v.len() as u64).unwrap_or(0))
+        // Hand-rolled rather than the API call so protected (kind-managed)
+        // volumes can never be selected. In-use volumes fail to remove and are
+        // skipped, which matches Docker's "unused volumes" semantics.
+        let mut removed = 0u64;
+        for volume in self.list_volumes().await? {
+            if volume.protected {
+                continue;
+            }
+            if self.remove_volume(&volume.name, false).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     pub async fn list_networks(&self) -> anyhow::Result<Vec<NetworkItem>> {
@@ -541,6 +626,12 @@ impl DockerClient {
             .into_iter()
             .map(|n| {
                 let id = n.id.unwrap_or_default();
+                let name = n.name.unwrap_or_default();
+                let protected = name == crate::docker::kind::NETWORK_NAME
+                    || n.labels
+                        .as_ref()
+                        .map(|labels| labels.keys().any(|k| k.starts_with("io.x-k8s.kind")))
+                        .unwrap_or(false);
                 let mut subnet = String::new();
                 let mut gateway = String::new();
                 if let Some(ipam) = n.ipam {
@@ -552,11 +643,12 @@ impl DockerClient {
                     }
                 }
                 NetworkItem {
-                    name: n.name.unwrap_or_default(),
+                    name,
                     driver: n.driver.unwrap_or_default(),
                     id,
                     subnet,
                     gateway,
+                    protected,
                 }
             })
             .collect())
@@ -622,9 +714,18 @@ impl DockerClient {
     }
 
     pub async fn prune_networks(&self) -> anyhow::Result<u64> {
-        let opts = bollard::query_parameters::PruneNetworksOptionsBuilder::default().build();
-        let res = self.docker.prune_networks(Some(opts)).await?;
-        Ok(res.networks_deleted.map(|v| v.len() as u64).unwrap_or(0))
+        // Skip kind's network and Docker's built-ins; attempt the rest and
+        // ignore "network is in use" failures.
+        let mut removed = 0u64;
+        for network in self.list_networks().await? {
+            if !pruneable_network(&network.name, network.protected) {
+                continue;
+            }
+            if self.docker.remove_network(&network.id).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     pub async fn tag_image(&self, id: &str, repo: &str, tag: &str) -> anyhow::Result<()> {
@@ -883,18 +984,10 @@ impl DockerClient {
 
     pub async fn system_prune(&self) -> anyhow::Result<u64> {
         let (mut reclaimed, _) = self.prune_images().await.unwrap_or((0, 0));
-        reclaimed += self
-            .docker
-            .prune_containers(None::<bollard::query_parameters::PruneContainersOptions>)
-            .await
-            .map(|r| r.space_reclaimed.unwrap_or(0).max(0) as u64)
-            .unwrap_or(0);
-        reclaimed += self
-            .docker
-            .prune_networks(None::<bollard::query_parameters::PruneNetworksOptions>)
-            .await
-            .map(|_| 0u64)
-            .unwrap_or(0);
+        // Container/network/volume pruning is hand-rolled so kind's node
+        // containers, its network and any protected volumes survive.
+        let _ = self.prune_containers().await.unwrap_or(0);
+        let _ = self.prune_networks().await.unwrap_or(0);
         reclaimed += self.prune_volumes().await.unwrap_or(0);
         let _ = reclaimed;
         // Recompute via df for an accurate total.
@@ -1515,6 +1608,21 @@ fn normalize_ssh_uri(uri: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use crate::docker::models::{EnvVar, PortMapping};
+
+    #[test]
+    fn kind_resources_are_never_prune_candidates() {
+        // Stopped containers are candidates, except kind nodes.
+        assert!(pruneable_container("exited", None));
+        assert!(pruneable_container("created", None));
+        assert!(!pruneable_container("exited", Some("dev")));
+        assert!(!pruneable_container("running", None));
+        // Networks: kind and the built-ins stay.
+        assert!(!pruneable_network("kind", true));
+        assert!(!pruneable_network("bridge", false));
+        assert!(!pruneable_network("host", false));
+        assert!(!pruneable_network("none", false));
+        assert!(pruneable_network("my-app_net", false));
+    }
 
     #[test]
     fn run_config_validation() {

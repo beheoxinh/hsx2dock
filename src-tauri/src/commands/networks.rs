@@ -37,6 +37,17 @@ pub async fn create_network(
 #[tauri::command]
 pub async fn remove_network(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let client = state.get_client().await?;
+    let networks = client.list_networks().await.map_err(|e| e.to_string())?;
+    if networks
+        .iter()
+        .any(|n| n.protected && (n.id == id || n.name == id))
+    {
+        return Err(
+            "The 'kind' network carries every cluster node. Remove the cluster \
+             from the Kubernetes page instead."
+                .to_string(),
+        );
+    }
     client.remove_network(&id).await.map_err(|e| e.to_string())
 }
 

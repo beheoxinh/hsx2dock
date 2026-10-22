@@ -165,6 +165,11 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
                     <span className="font-semibold text-white tracking-tight text-sm">
                       {vol.name}
                     </span>
+                    {vol.protected && (
+                      <span className="ml-2 align-middle text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30">
+                        kind
+                      </span>
+                    )}
                     <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 mt-1 font-mono">
                       <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300">
                         {vol.driver}
@@ -194,8 +199,17 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
                   variant="ghost"
                   size="icon"
                   onClick={() => handleRemove(vol.name)}
-                  title="Remove Volume"
-                  className="text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
+                  disabled={vol.protected}
+                  title={
+                    vol.protected
+                      ? "Managed by kind — remove the cluster in Kubernetes"
+                      : "Remove Volume"
+                  }
+                  className={
+                    vol.protected
+                      ? "text-zinc-600 cursor-not-allowed"
+                      : "text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
+                  }
                 >
                   <Trash2 className="w-4 h-4" />
                 </Button>

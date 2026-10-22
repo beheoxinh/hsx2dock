@@ -29,6 +29,34 @@ pub const KIND_UPDATE_STEPS: &[&str] = &[
     "Verify version",
 ];
 
+/// Docker label kind stamps on every node container.
+pub const CLUSTER_LABEL: &str = "io.x-k8s.kind.cluster";
+
+/// The Docker network kind creates for its node containers.
+pub const NETWORK_NAME: &str = "kind";
+
+/// True when a tag names kind's node image (`kindest/node:…`), optionally
+/// prefixed with an explicit registry (`docker.io/kindest/node:…`).
+pub fn is_kind_image_tag(tag: &str) -> bool {
+    let tag = tag.trim().trim_start_matches("docker.io/");
+    tag.starts_with("kindest/") || tag.contains("/kindest/")
+}
+
+/// True when any tag belongs to kind. `configured` is the user's
+/// `kind_default_image`: if they run clusters from a custom node image, that
+/// image is just as load-bearing as the official one.
+pub fn is_kind_image(tags: &[String], configured: Option<&str>) -> bool {
+    if tags.iter().any(|tag| is_kind_image_tag(tag)) {
+        return true;
+    }
+    let Some(configured) = configured.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let configured = configured.trim_start_matches("docker.io/");
+    tags.iter()
+        .any(|tag| tag.trim().trim_start_matches("docker.io/") == configured)
+}
+
 /// sha256 of each published binary for the pinned tag, verified before the
 /// binary is ever executed. Sourced from the GitHub release asset digests
 /// (`digest: sha256:…` in the v0.33.0 release API response).
@@ -368,6 +396,24 @@ pub async fn check_kind_update(paths: &KindPaths) -> Result<KindUpdateInfo> {
 mod tests {
     use super::*;
     use crate::docker::engine::sha256_file;
+
+    #[test]
+    fn kind_image_detection_covers_registry_prefixes_and_custom_defaults() {
+        assert!(is_kind_image_tag("kindest/node:v1.33.0"));
+        assert!(is_kind_image_tag("docker.io/kindest/node:v1.33.0"));
+        assert!(!is_kind_image_tag("nginx:latest"));
+        assert!(!is_kind_image_tag("kindest-fake/node:v1"));
+
+        // Official node image seen through any tag.
+        assert!(is_kind_image(&["kindest/node:v1.33.0".into()], None));
+        // A custom node image configured in settings is equally load-bearing.
+        assert!(is_kind_image(&["myreg/node:v1".into()], Some("myreg/node:v1")));
+        // Same repository, different tag: not the configured image.
+        assert!(!is_kind_image(&["myreg/node:v2".into()], Some("myreg/node:v1")));
+        // Blank configured value must not match anything.
+        assert!(!is_kind_image(&["nginx:latest".into()], Some("  ")));
+        assert!(!is_kind_image(&[], None));
+    }
 
     fn temp_paths(tag: &str) -> KindPaths {
         let base = std::env::temp_dir().join(format!("dm-kind-{tag}-{}", std::process::id()));

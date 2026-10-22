@@ -175,6 +175,11 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
                         <span className="px-2 py-0.5 rounded-full text-[11px] bg-zinc-800 text-zinc-400 font-mono">
                           {net.driver}
                         </span>
+                        {net.protected && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-sky-500/10 text-sky-300 border border-sky-500/30">
+                            kind
+                          </span>
+                        )}
                         {isDefault && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] bg-zinc-800/80 text-zinc-500">
                             system
@@ -199,7 +204,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
                     </div>
                   </div>
 
-                  {!isDefault && (
+                  {!isDefault && !net.protected && (
                     <Button
                       variant="ghost"
                       size="icon"

@@ -59,6 +59,10 @@ pub struct VolumeItem {
     /// Number of subtrees that could not be read (permissions). When > 0,
     /// `size` is a lower bound.
     pub restricted_dirs: u32,
+    /// Owned by kind (or labelled as such): the app refuses to delete or
+    /// prune it, because cluster state lives on top of it.
+    #[serde(default)]
+    pub protected: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -68,6 +72,9 @@ pub struct NetworkItem {
     pub driver: String,
     pub subnet: String,
     pub gateway: String,
+    /// True for kind's network: removing it strands every cluster node.
+    #[serde(default)]
+    pub protected: bool,
 }
 
 /// One `--build-arg KEY=VALUE` pair collected by the build form.

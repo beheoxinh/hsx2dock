@@ -107,6 +107,8 @@ export interface VolumeItem {
   size?: number;
   /** Number of subtrees skipped due to restricted permissions. */
   restricted_dirs?: number;
+  /** Managed by kind: deleting or pruning it is refused by the backend. */
+  protected?: boolean;
 }
 
 export interface NetworkItem {
@@ -115,6 +117,8 @@ export interface NetworkItem {
   driver: string;
   subnet: string;
   gateway: string;
+  /** kind's network: protected from removal and pruning. */
+  protected?: boolean;
 }
 
 export interface ComposeService {

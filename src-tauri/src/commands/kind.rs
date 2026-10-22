@@ -10,11 +10,10 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::docker::kind::{kind_status as read_kind_status, KindInstallStatus, KindPaths};
+use crate::docker::kind::{
+    kind_status as read_kind_status, KindInstallStatus, KindPaths, CLUSTER_LABEL,
+};
 use crate::state::AppState;
-
-/// Docker label kind puts on every node container; its value is the cluster name.
-const CLUSTER_LABEL: &str = "io.x-k8s.kind.cluster";
 
 #[derive(Clone, serde::Serialize)]
 pub struct KindCluster {

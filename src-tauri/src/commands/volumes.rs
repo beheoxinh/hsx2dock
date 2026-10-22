@@ -60,6 +60,17 @@ pub async fn remove_volume(
     force: bool,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
+    let volumes = client.list_volumes().await.map_err(|e| e.to_string())?;
+    if volumes
+        .iter()
+        .any(|v| v.protected && v.name == name)
+    {
+        return Err(
+            "This volume is managed by kind. Remove the cluster from the \
+             Kubernetes page instead."
+                .to_string(),
+        );
+    }
     client
         .remove_volume(&name, force)
         .await
