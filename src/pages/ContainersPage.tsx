@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Play,
@@ -25,10 +25,11 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { EngineGate } from "../components/ui/EngineGate";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
-import { ContainerGroupsBar } from "../components/ContainerGroupsBar";
+import { ContainerGroupsBar, CONTAINER_DRAG_TYPE } from "../components/ContainerGroupsBar";
+import { canonicalContainerIds, groupOf } from "../lib/containerGroups";
 import { api, events } from "../lib/api";
 import { formatBytes, truncateId } from "../lib/utils";
-import type { ContainerItem, ContainerStats, DaemonState } from "../types";
+import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
 
 interface ContainersPageProps {
   onOpenDetails: (
@@ -54,6 +55,14 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const toast = useToast();
   const modal = useModal();
+  // Groups live here so the flat list can hide containers already placed in
+  // one; the group bar edits and persists the same array.
+  const [groups, setGroups] = useState<ContainerGroup[]>([]);
+
+  const saveGroups = async (next: ContainerGroup[]) => {
+    await api.saveContainerGroups(next);
+    setGroups(next);
+  };
 
   const loadContainers = async () => {
     try {
@@ -69,6 +78,10 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 
   useEffect(() => {
     loadContainers();
+    api
+      .listContainerGroups()
+      .then(setGroups)
+      .catch((e) => console.error(e));
 
     let unlistenStats: (() => void) | undefined;
     let unlistenContainers: (() => void) | undefined;
@@ -143,13 +156,27 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 
   // Kind node containers are managed entirely on the Kubernetes tab, so they
   // are hidden from this generic container list.
-  const filteredContainers = containers.filter(
+  const searchMatches = containers.filter(
     (c) =>
       !c.kind_cluster &&
       (c.name.toLowerCase().includes(search.toLowerCase()) ||
         c.image.toLowerCase().includes(search.toLowerCase()) ||
         c.id.toLowerCase().includes(search.toLowerCase()))
   );
+
+  // Containers placed in a user group live inside that group's card above, so
+  // the flat list only shows what is still ungrouped ("Isolated") — moving a
+  // card into a group removes it from here, like a file leaving a folder.
+  // Membership is resolved against the full list so a search cannot make a
+  // grouped container look ungrouped.
+  const groupsMap = useMemo(
+    () => canonicalContainerIds(containers.filter((c) => !c.kind_cluster)),
+    [containers]
+  );
+  const filteredContainers = searchMatches.filter(
+    (c) => !groupOf(groups, groupsMap, c.id)
+  );
+  const allGrouped = searchMatches.length > 0 && filteredContainers.length === 0;
 
   // Group compose-managed containers under a project header (Docker Desktop
   // style); loose containers keep their original order after their project.
@@ -242,7 +269,13 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
       </div>
 
       {/* Groups: bulk start/stop + engine auto-start */}
-      <ContainerGroupsBar containers={containers} statsMap={statsMap} onChanged={loadContainers} />
+      <ContainerGroupsBar
+        containers={containers}
+        groups={groups}
+        onSaveGroups={saveGroups}
+        statsMap={statsMap}
+        onChanged={loadContainers}
+      />
 
       {/* Containers List / Cards */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
@@ -329,8 +362,8 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                   className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 p-4 hover:border-zinc-700/80 transition-all cursor-grab active:cursor-grabbing"
                   draggable
                   onDragStart={(e) => {
-                    e.dataTransfer.setData("text/dm-container-id", c.id);
-                    e.dataTransfer.effectAllowed = "copy";
+                    e.dataTransfer.setData(CONTAINER_DRAG_TYPE, c.id);
+                    e.dataTransfer.effectAllowed = "move";
                   }}
                 >
                   {/* Left: Container Basic Info */}
@@ -522,9 +555,15 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         {!loading && filteredContainers.length === 0 && (
           <div className="py-16 text-center text-zinc-400">
             <Layers className="w-10 h-10 mx-auto text-zinc-500 mb-3" />
-            <p className="font-medium text-white">No containers matched</p>
+            <p className="font-medium text-white">
+              {allGrouped ? "All matching containers are in groups" : "No containers matched"}
+            </p>
             <p className="text-xs text-zinc-400 mt-1">
-              {search ? "Try searching with a different keyword" : "Get started by launching a new container image"}
+              {allGrouped
+                ? "Open a group card above to reach them"
+                : search
+                  ? "Try searching with a different keyword"
+                  : "Get started by launching a new container image"}
             </p>
           </div>
         )}

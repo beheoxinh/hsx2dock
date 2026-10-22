@@ -52,6 +52,9 @@ pub async fn stop_container_group(
 fn validate_groups(groups: &[ContainerGroup]) -> Result<(), String> {
     let mut names = HashSet::new();
     let mut ids = HashSet::new();
+    // A container lives in exactly one group (like a file in one folder), so a
+    // member claimed twice is rejected rather than silently duplicated.
+    let mut members: HashSet<&str> = HashSet::new();
     for g in groups {
         let name = g.name.trim();
         if name.is_empty() {
@@ -66,6 +69,17 @@ fn validate_groups(groups: &[ContainerGroup]) -> Result<(), String> {
         }
         if !ids.insert(id.to_string()) {
             return Err(format!("Duplicate group id '{id}'"));
+        }
+        for member in &g.container_ids {
+            let member = member.trim();
+            if member.is_empty() {
+                return Err(format!("Group '{name}' has an empty member id"));
+            }
+            if !members.insert(member) {
+                return Err(format!(
+                    "Container '{member}' is listed in more than one group"
+                ));
+            }
         }
     }
     Ok(())
@@ -151,5 +165,54 @@ pub async fn auto_start_groups(state: &AppState) {
             Ok(summary) => tracing::info!("auto-start group {id}: {summary}"),
             Err(e) => tracing::warn!("auto-start group {id} failed: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(id: &str, name: &str, members: &[&str]) -> ContainerGroup {
+        ContainerGroup {
+            id: id.to_string(),
+            name: name.to_string(),
+            container_ids: members.iter().map(|m| m.to_string()).collect(),
+            auto_start: false,
+        }
+    }
+
+    #[test]
+    fn empty_group_is_valid() {
+        // Creating an empty group is the normal flow: members arrive by drag.
+        assert!(validate_groups(&[group("g1", "Empty", &[])]).is_ok());
+    }
+
+    #[test]
+    fn group_names_must_be_unique_and_present() {
+        assert!(validate_groups(&[group("g1", "", &[])]).is_err());
+        assert!(validate_groups(&[group("g1", "A", &[]), group("g2", " a ", &[])]).is_err());
+        assert!(validate_groups(&[group("g1", "A", &[]), group("g1", "B", &[])]).is_err());
+    }
+
+    #[test]
+    fn a_container_cannot_belong_to_two_groups() {
+        let err = validate_groups(&[
+            group("g1", "A", &["abc"]),
+            group("g2", "B", &["abc"]),
+        ])
+        .unwrap_err();
+        assert!(err.contains("more than one group"), "{err}");
+        // The same container listed twice inside one group is fine to reject
+        // too — it is still one membership claimed twice.
+        assert!(validate_groups(&[group("g1", "A", &["abc", "abc"])]).is_err());
+    }
+
+    #[test]
+    fn distinct_members_across_groups_are_accepted() {
+        assert!(validate_groups(&[
+            group("g1", "A", &["one"]),
+            group("g2", "B", &["two", "three"]),
+        ])
+        .is_ok());
     }
 }
