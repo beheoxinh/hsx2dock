@@ -212,8 +212,6 @@ export const api = {
   // Cluster monitoring (kubectl queries inside the control-plane node)
   getClusterSummary: (cluster: string) =>
     invoke<K8sClusterSummary>("get_cluster_summary", { cluster }),
-  getClusterPrefs: (cluster: string) =>
-    invoke<KindClusterPrefs>("get_cluster_prefs", { cluster }),
   setClusterPrefs: (cluster: string, prefs: KindClusterPrefs) =>
     invoke<void>("set_cluster_prefs", { cluster, prefs }),
   getPodLogs: (cluster: string, namespace: string, name: string, tail?: number) =>
@@ -296,22 +294,12 @@ export const api = {
   // Compose project lifecycle addressed by project name (no compose file)
   composeProjectAction: (project: string, action: "start" | "stop" | "restart") =>
     invoke<string>("compose_project_action", { project, action }),
-
-  // Engine cgroup caps — returns the engine's report ("" = nothing to apply)
-  applyEngineLimits: () => invoke<string>("apply_engine_limits"),
 };
 
 // Event Listeners helper
 export const events = {
   onEngineStateChanged: (cb: (state: DaemonState) => void): Promise<UnlistenFn> =>
     listen<DaemonState>("engine-state-changed", (event) => cb(event.payload)),
-
-  onEngineInstallProgress: (
-    cb: (progress: EngineInstallProgress) => void
-  ): Promise<UnlistenFn> =>
-    listen<EngineInstallProgress>("engine-install-progress", (event) =>
-      cb(event.payload)
-    ),
 
   /** Unified progress for every bundled binary (engine, CLI, compose, kind). */
   onInstallProgress: (

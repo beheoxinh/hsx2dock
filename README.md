@@ -33,7 +33,10 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   `KUBECONFIG=… kubectl`, always outside `~/.kube`), and one-click
   *Load to cluster* from the Images page (`kind load docker-image`). Per
   cluster: CPU/RAM charts, pods, workloads, services, config/secrets, PVCs,
-  events, pod terminal/YAML/logs, and metrics-server install.
+  events, pod terminal/YAML/logs, and metrics-server install. Cluster
+  infrastructure (node images and containers, the `kind` network and node
+  volumes) is hidden from the generic resource lists and excluded from every
+  delete and prune path — it is only managed from the Kubernetes page.
 - **Auto-start** — a master switch plus a per-cluster switch decide which
   clusters start with the engine; starts are staggered and node containers are
   pinned to `restart=no` so Docker never resurrects a cluster on its own.
@@ -52,6 +55,11 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   static rootless binaries) into `~/.local/share/hsx2dock` on first run
   and runs `dockerd` rootless as a child process on a private socket. Fully
   isolated: the system's Docker install is neither required nor touched.
+- **Binary updates** — Settings → Updates checks Docker Engine, Docker CLI,
+  Docker Compose and kind against their upstream releases and updates each one
+  step by step (stop → download → verify checksum → replace → verify →
+  restart) with live progress bars and logs. A release only becomes current
+  after it verifies, so an interrupted update always leaves a working binary.
 - **Docker CLI bridge** — optional switch on the Engine page makes the system
   `docker` command talk to this bundled engine: creates
   `$XDG_RUNTIME_DIR/docker.sock` and a `hsx2dock-engine` context, with an

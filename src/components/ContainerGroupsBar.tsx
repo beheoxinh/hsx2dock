@@ -241,6 +241,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     return { mem, cpu, disk };
   };
 
+  // kind node containers belong to the Kubernetes tab; they must never be
+  // offered as group members or counted in the picker.
+  const visibleContainers = containers.filter((c) => !c.kind_cluster);
+
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
@@ -499,10 +503,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           </div>
 
           <div className="max-h-48 overflow-y-auto rounded-lg border border-zinc-800/80 divide-y divide-zinc-800/60">
-            {containers.length === 0 && (
+            {visibleContainers.length === 0 && (
               <p className="px-3 py-2 text-xs text-zinc-500">No containers yet.</p>
             )}
-            {containers.map((c) => {
+            {visibleContainers.map((c) => {
               const checked = draft.containerIds.includes(c.id);
               return (
                 <label

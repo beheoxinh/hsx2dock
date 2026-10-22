@@ -67,13 +67,18 @@ where
     let job: Job = Box::new(move || {
         let _ = tx.send_blocking(f());
     });
-    engine_thread()
+    let sent = engine_thread()
         .lock()
         // Recover from a poisoned mutex instead of panicking: a panic on
         // this thread must not kill the caller's next engine operation.
         .unwrap_or_else(|e| e.into_inner())
-        .send(job)
-        .expect("engine thread is gone");
+        .send(job);
+    if let Err(unsent) = sent {
+        // The engine thread is gone. Dropping the job drops its channel
+        // sender, so `rx.recv()` fails and the caller gets a readable error
+        // (see `engine_op`) instead of aborting the whole app.
+        drop(unsent.0);
+    }
     rx
 }
 
