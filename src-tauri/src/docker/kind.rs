@@ -13,12 +13,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::docker::engine::{download, verify};
+use crate::docker::engine::{
+    download, normalize_version, step_plan, update_available, verify, InstallProgress,
+};
 
 /// Pinned kind release. Bump together with the per-platform checksums below.
 pub const KIND_VERSION: &str = "0.33.0";
-const KIND_TAG: &str = "v0.33.0";
 const KIND_BASE: &str = "https://github.com/kubernetes-sigs/kind/releases/download";
+
+/// Steps every kind install/update follows; the UI renders this checklist.
+pub const KIND_UPDATE_STEPS: &[&str] = &[
+    "Download kind",
+    "Verify checksum",
+    "Replace binary",
+    "Verify version",
+];
 
 /// sha256 of each published binary for the pinned tag, verified before the
 /// binary is ever executed. Sourced from the GitHub release asset digests
@@ -63,8 +72,8 @@ fn asset_name(os: &str, arch: &str) -> Option<String> {
 /// Where the kind binary and its isolated kubeconfig live. Everything stays
 /// under the app's data dir — nothing is written to `~/.kube` or `PATH`.
 pub struct KindPaths {
-    /// Directory holding the pinned binary: `<data>/versions/kind/<ver>/`.
-    install_dir: PathBuf,
+    /// Root of every kind release: `<data>/versions/kind/`.
+    root: PathBuf,
     /// App-managed kubeconfig so clusters never touch `~/.kube/config`.
     pub kubeconfig: PathBuf,
 }
@@ -80,71 +89,159 @@ impl KindPaths {
 
     /// Builds paths under the shared app data root (same base the engine uses).
     pub fn new(app_data_root: &Path) -> Self {
-        let install_dir = app_data_root
-            .join("versions")
-            .join("kind")
-            .join(KIND_VERSION);
-        let kubeconfig = app_data_root.join("kind-kubeconfig");
         Self {
-            install_dir,
-            kubeconfig,
+            root: app_data_root.join("versions").join("kind"),
+            kubeconfig: app_data_root.join("kind-kubeconfig"),
         }
     }
 
-    /// Absolute path to the kind binary for this platform.
+    /// Version selected by the `current` pointer. Trees installed before kind
+    /// updates existed have no pointer and fall back to the pinned release.
+    pub fn active_version(&self) -> String {
+        std::fs::read_to_string(self.root.join("current"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| KIND_VERSION.to_string())
+    }
+
+    /// Directory holding one release: `<data>/versions/kind/<version>/`.
+    pub fn version_dir(&self, version: &str) -> PathBuf {
+        self.root.join(version)
+    }
+
+    /// Directory of the release currently in use.
+    pub fn install_dir(&self) -> PathBuf {
+        self.version_dir(&self.active_version())
+    }
+
+    /// Absolute path to the active kind binary for this platform.
     pub fn binary(&self) -> PathBuf {
-        let os = std::env::consts::OS;
-        let mut p = self.install_dir.join("kind");
-        if os == "windows" {
-            p.set_extension("exe");
-        }
-        p
+        binary_in(&self.install_dir())
     }
 
-    /// True when the pinned binary is present on disk.
+    /// Absolute path to a specific release's binary.
+    pub fn binary_at(&self, version: &str) -> PathBuf {
+        binary_in(&self.version_dir(version))
+    }
+
+    /// True when the active binary is present on disk.
     pub fn is_installed(&self) -> bool {
         self.binary().is_file()
     }
 
-    pub fn install_dir(&self) -> &Path {
-        &self.install_dir
+    /// Point the `current` marker at `version`. A separate file (rather than a
+    /// directory symlink) keeps the layout readable and works on every
+    /// filesystem the app data dir may live on.
+    pub fn set_active(&self, version: &str) -> Result<()> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let tmp = self.root.join(".current.tmp");
+        std::fs::write(&tmp, format!("{version}\n"))?;
+        std::fs::rename(&tmp, self.root.join("current"))?;
+        Ok(())
     }
 }
 
-/// Download + verify + install the pinned kind binary. Returns the final path.
-/// `on_progress` receives (done_bytes, total_bytes_or_None).
-pub async fn install_kind<F>(paths: &KindPaths, mut on_progress: F) -> Result<PathBuf>
+fn binary_in(dir: &Path) -> PathBuf {
+    let mut p = dir.join("kind");
+    if std::env::consts::OS == "windows" {
+        p.set_extension("exe");
+    }
+    p
+}
+
+/// Download + verify + install the pinned kind binary.
+pub async fn install_kind<F>(paths: &KindPaths, on_progress: F) -> Result<PathBuf>
 where
-    F: FnMut(u64, Option<u64>) + Send,
+    F: FnMut(InstallProgress) + Send,
 {
+    install_kind_version(paths, KIND_VERSION, on_progress).await
+}
+
+/// Download + verify + install a specific kind release, then point `current`
+/// at it. The previous release stays on disk, so a failed update never leaves
+/// the app without a usable kind.
+pub async fn install_kind_version<F>(
+    paths: &KindPaths,
+    version: &str,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(InstallProgress) + Send,
+{
+    let version = normalize_version(version).to_string();
+    if version.is_empty() {
+        bail!("no kind version given");
+    }
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let Some(asset) = asset_name(os, arch) else {
         bail!("kind is not published for {os}-{arch}");
     };
-    let Some(sha) = expected_sha256(os, arch) else {
-        bail!("no pinned checksum for kind on {os}-{arch}");
+
+    let plan = step_plan(KIND_UPDATE_STEPS);
+    let version_dir = paths.version_dir(&version);
+    std::fs::create_dir_all(&version_dir)
+        .with_context(|| format!("create {}", version_dir.display()))?;
+    let staging = version_dir.join(format!(".{asset}.partial"));
+    let _ = std::fs::remove_file(&staging);
+    let url = format!("{KIND_BASE}/v{version}/{asset}");
+
+    on_progress(InstallProgress::stage(
+        "kind", &version, &plan, 0, Some(0.05),
+    ));
+    let mut last = 0u64;
+    download(&url, &staging, |done, total| {
+        if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
+            return;
+        }
+        last = done;
+        on_progress(InstallProgress::tick(
+            "kind",
+            &version,
+            &plan,
+            0,
+            Some(0.05 + 0.5 * crate::docker::engine::fraction_of(done, total)),
+            match total {
+                Some(t) if t > 0 => format!(
+                    "{} / {}",
+                    crate::docker::engine::human_size(done),
+                    crate::docker::engine::human_size(t)
+                ),
+                _ => crate::docker::engine::human_size(done),
+            },
+        ));
+    })
+    .await
+    .with_context(|| format!("download kind v{version}"))?;
+
+    on_progress(InstallProgress::stage(
+        "kind", &version, &plan, 1, Some(0.6),
+    ));
+    // The pinned release carries a maintainer-checked digest; every other tag
+    // publishes `<asset>.sha256sum` next to the binary.
+    let expected = match expected_sha256(os, arch) {
+        Some(sha) if version == KIND_VERSION => sha.to_string(),
+        _ => fetch_kind_checksum(&version, &asset).await?,
     };
-
-    let url = format!("{KIND_BASE}/{KIND_TAG}/{asset}");
-    let staging = paths
-        .install_dir
-        .join(format!(".{asset}.partial"));
-    std::fs::create_dir_all(paths.install_dir())
-        .with_context(|| format!("create {}", paths.install_dir().display()))?;
-
-    download(&url, &staging, |done, total| on_progress(done, total))
-        .await
-        .with_context(|| format!("download kind {KIND_TAG}"))?;
-
-    // Verify before the binary is ever placed where it could be executed.
-    if let Err(e) = verify(&staging, sha) {
+    if let Err(e) = verify(&staging, &expected) {
         let _ = std::fs::remove_file(&staging);
         return Err(e).context("kind checksum verification failed");
     }
+    on_progress(InstallProgress::note(
+        "kind",
+        &version,
+        &plan,
+        1,
+        Some(0.65),
+        format!("sha256 {expected}"),
+    ));
 
-    let dest = paths.binary();
-    // Replace any previous install atomically-ish: remove then rename.
+    on_progress(InstallProgress::stage(
+        "kind", &version, &plan, 2, Some(0.75),
+    ));
+    let dest = paths.binary_at(&version);
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&staging, &dest)
         .with_context(|| format!("move kind into {}", dest.display()))?;
@@ -156,14 +253,63 @@ where
             .context("chmod kind binary")?;
     }
 
-    // Record the installed version so `kind_status` can report it without
-    // spawning the binary.
-    let _ = std::fs::write(
-        paths.install_dir().join("VERSION"),
-        format!("{KIND_VERSION}\n"),
-    );
+    on_progress(InstallProgress::stage(
+        "kind", &version, &plan, 3, Some(0.9),
+    ));
+    // A binary that cannot report its own version never becomes current.
+    let reported = probe_kind_version(&dest)
+        .ok_or_else(|| anyhow::anyhow!("staged kind {version} failed `kind version`"))?;
+    if reported != version {
+        bail!("staged kind reported {reported}, but {version} was expected");
+    }
 
+    let _ = std::fs::write(version_dir.join("VERSION"), format!("{version}\n"));
+    paths.set_active(&version)?;
+
+    on_progress(InstallProgress::finished("kind", &version, &plan));
     Ok(dest)
+}
+
+/// Read `<asset>.sha256sum` from the release and return the digest token.
+async fn fetch_kind_checksum(version: &str, asset: &str) -> Result<String> {
+    let url = format!("{KIND_BASE}/v{version}/{asset}.sha256sum");
+    let text = crate::docker::engine::http_get(&url)
+        .await?
+        .text()
+        .await
+        .context("read kind checksum file")?;
+    parse_sha256sum(&text)
+        .ok_or_else(|| anyhow::anyhow!("no usable checksum in {url}"))
+}
+
+/// A `sha256sum` file is `<64 hex chars>  <file name>`; keep only the digest.
+fn parse_sha256sum(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .next()
+        .filter(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|hash| hash.to_string())
+}
+
+/// `kind version` prints `kind v0.33.0 go1.24.6 linux/amd64` — note it has no
+/// `version` keyword, so the docker parser cannot be reused.
+fn probe_kind_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = text.split_whitespace().nth(1)?;
+    let version = normalize_version(token);
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 /// Reported install state for the UI.
@@ -199,6 +345,25 @@ pub fn kind_status(paths: &KindPaths) -> KindInstallStatus {
     }
 }
 
+/// What the GitHub release channel reports versus the installed binary.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KindUpdateInfo {
+    pub installed_version: Option<String>,
+    pub latest_version: String,
+    pub update_available: bool,
+}
+
+pub async fn check_kind_update(paths: &KindPaths) -> Result<KindUpdateInfo> {
+    let installed_version = paths.is_installed().then(|| paths.active_version());
+    let latest_version =
+        crate::docker::engine::fetch_github_latest_cached("kubernetes-sigs/kind").await?;
+    Ok(KindUpdateInfo {
+        update_available: update_available(&latest_version, installed_version.as_deref()),
+        installed_version,
+        latest_version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +395,25 @@ mod tests {
         assert_eq!(st.latest, KIND_VERSION);
         assert!(st.version.is_none());
         assert!(st.supported, "linux/mac/windows are all supported");
+    }
+
+    #[test]
+    fn sha256sum_parser_takes_the_digest_token() {
+        let hash = "a".repeat(64);
+        let text = format!("{hash}  kind-linux-amd64\n");
+        assert_eq!(parse_sha256sum(&text).as_deref(), Some(hash.as_str()));
+        assert!(parse_sha256sum("not-a-hash  kind-linux-amd64").is_none());
+        assert!(parse_sha256sum("").is_none());
+    }
+
+    #[test]
+    fn active_version_pointer_wins_over_the_pinned_default() {
+        let p = temp_paths("active");
+        assert_eq!(p.active_version(), KIND_VERSION);
+        std::fs::create_dir_all(p.version_dir("0.99.0")).unwrap();
+        p.set_active("0.99.0").unwrap();
+        assert_eq!(p.active_version(), "0.99.0");
+        assert_eq!(p.install_dir(), p.version_dir("0.99.0"));
     }
 
     #[test]

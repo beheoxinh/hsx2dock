@@ -6,6 +6,7 @@
 //! over a private unix socket. `dockerd` runs rootless inside `rootlesskit`
 //! and is a *child of this app* — it dies with the app.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -506,6 +507,33 @@ pub async fn download<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<(
 where
     F: FnMut(u64, Option<u64>),
 {
+    // Release CDNs occasionally cut a connection short; a short file would
+    // then fail its checksum and look like a bad release. Retry the transfer
+    // (from scratch) a couple of times before giving up.
+    const ATTEMPTS: u64 = 3;
+    let mut last_error = None;
+    for attempt in 1..=ATTEMPTS {
+        match download_once(url, dest, &mut on_progress).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(dest);
+                last_error = Some(e);
+                if attempt < ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(400 * attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed")))
+        .with_context(|| format!("download {url} after {ATTEMPTS} attempts"))
+}
+
+/// One transfer attempt. Fails when fewer bytes arrive than the server
+/// advertised (a truncated body must never reach checksum verification).
+async fn download_once<F>(url: &str, dest: &Path, on_progress: &mut F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
     // `http_get` already turned any non-2xx into an error.
     let resp = http_get(url)
         .await
@@ -520,6 +548,11 @@ where
         on_progress(done, total);
     }
     file.flush()?;
+    if let Some(expected) = total {
+        if done != expected {
+            bail!("incomplete download: got {done} of {expected} bytes");
+        }
+    }
     Ok(())
 }
 
@@ -575,6 +608,35 @@ fn extract_binaries(tgz_path: &Path, bin_dir: &Path) -> Result<()> {
         set_executable(&dest)?;
     }
     Ok(())
+}
+
+/// Extract a single named member of a docker tarball to `dest`.
+///
+/// The engine tarball also carries `dockerd`, `containerd`, `runc` and friends;
+/// a CLI-only update must not overwrite any of them.
+fn extract_member(tgz_path: &Path, member: &str, dest: &Path) -> Result<()> {
+    let file = File::open(tgz_path).with_context(|| format!("open {}", tgz_path.display()))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !matches!(entry.header().entry_type(), tar::EntryType::Regular) {
+            continue;
+        }
+        if entry.path()?.file_name().and_then(|n| n.to_str()) != Some(member) {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        std::io::copy(&mut entry, &mut out)?;
+        out.flush()?;
+        drop(out);
+        set_executable(dest)?;
+        return Ok(());
+    }
+    bail!("{member} not found in {}", tgz_path.display())
 }
 
 #[cfg(unix)]
@@ -1167,12 +1229,200 @@ pub fn docker_command_resolved(paths: &EnginePaths) -> Command {
 // Install / update
 // ---------------------------------------------------------------------------
 
-/// Progress for the download phase of an install, as a human-readable label
-/// plus a 0.0–1.0 fraction when the total size is known.
+/// Ordered checklist for a bundled-engine update. Stop/start are driven by the
+/// command (they need the supervisor), the middle steps by the installer; both
+/// emit indices into this same list so the UI can show every step up front.
+pub const ENGINE_UPDATE_STEPS: &[&str] = &[
+    "Stop Docker Engine",
+    "Download Docker Engine",
+    "Verify checksums",
+    "Replace binaries",
+    "Verify new engine",
+    "Start Docker Engine",
+];
+
+/// Checklist for updating the bundled `docker` CLI on its own.
+pub const CLI_UPDATE_STEPS: &[&str] = &[
+    "Download Docker CLI",
+    "Verify checksum",
+    "Replace CLI",
+    "Verify version",
+];
+
+/// Checklist for updating the docker-compose plugin.
+pub const COMPOSE_UPDATE_STEPS: &[&str] = &[
+    "Download Docker Compose",
+    "Verify checksum",
+    "Verify binary",
+    "Install plugin",
+];
+
+/// Turn a static checklist into the owned form carried by every event.
+pub fn step_plan(steps: &[&str]) -> Vec<String> {
+    steps.iter().map(|s| s.to_string()).collect()
+}
+
+/// Progress for one binary update run.
+///
+/// `plan` is the complete ordered checklist, repeated on every event so a
+/// listener that attaches late still renders the whole stepper. `step` indexes
+/// into it. Only step boundaries and notable events set `log`; byte-level
+/// download ticks only set `detail`, otherwise a 70 MB download would flood
+/// the run log.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InstallProgress {
+    /// `engine`, `cli`, `compose` or `kind`.
+    pub target: &'static str,
+    /// Version being installed.
+    pub version: String,
+    /// Human label for the current step.
     pub label: String,
+    /// 0.0–1.0 across the whole run, when known.
     pub fraction: Option<f64>,
+    pub plan: Vec<String>,
+    pub step: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl InstallProgress {
+    fn build(
+        target: &'static str,
+        version: &str,
+        plan: &[String],
+        step: usize,
+        fraction: Option<f64>,
+        detail: Option<String>,
+        log: Option<String>,
+        done: bool,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            target,
+            version: version.to_string(),
+            label: plan.get(step).cloned().unwrap_or_default(),
+            fraction,
+            plan: plan.to_vec(),
+            step: Some(step),
+            detail,
+            log,
+            done,
+            error,
+        }
+    }
+
+    /// Enter a step; the step name is also the log line.
+    pub fn stage(
+        target: &'static str,
+        version: &str,
+        plan: &[String],
+        step: usize,
+        fraction: Option<f64>,
+    ) -> Self {
+        let label = plan.get(step).cloned();
+        Self::build(
+            target,
+            version,
+            plan,
+            step,
+            fraction,
+            None,
+            label,
+            false,
+            None,
+        )
+    }
+
+    /// High-frequency update inside a step: detail only, no log line.
+    pub fn tick(
+        target: &'static str,
+        version: &str,
+        plan: &[String],
+        step: usize,
+        fraction: Option<f64>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::build(
+            target,
+            version,
+            plan,
+            step,
+            fraction,
+            Some(detail.into()),
+            None,
+            false,
+            None,
+        )
+    }
+
+    /// An extra log line inside the current step (size, digest, skip reason).
+    pub fn note(
+        target: &'static str,
+        version: &str,
+        plan: &[String],
+        step: usize,
+        fraction: Option<f64>,
+        line: impl Into<String>,
+    ) -> Self {
+        Self::build(
+            target,
+            version,
+            plan,
+            step,
+            fraction,
+            None,
+            Some(line.into()),
+            false,
+            None,
+        )
+    }
+
+    /// Terminal success event.
+    pub fn finished(target: &'static str, version: &str, plan: &[String]) -> Self {
+        let step = plan.len().saturating_sub(1);
+        Self::build(
+            target,
+            version,
+            plan,
+            step,
+            Some(1.0),
+            None,
+            Some("Update complete".to_string()),
+            true,
+            None,
+        )
+    }
+
+    /// Terminal failure event: keeps the step that failed and the message.
+    pub fn failed(
+        target: &'static str,
+        version: &str,
+        plan: &[String],
+        step: usize,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::build(
+            target,
+            version,
+            plan,
+            step,
+            None,
+            None,
+            None,
+            true,
+            Some(error.into()),
+        )
+    }
 }
 
 /// Download, verify and stage `release`, then atomically point `current` at it.
@@ -1200,6 +1450,8 @@ where
 
     // 1. Fetch the two Docker tarballs + the compose plugin, verifying each
     //    before anything is unpacked.
+    let plan = step_plan(ENGINE_UPDATE_STEPS);
+    let version = release.version;
     let artifacts = [
         (docker_url(release.version), "docker", release.docker_sha256),
         (
@@ -1217,26 +1469,46 @@ where
         let dest = tmp.join(name);
         let base = i as f64;
         let mut last = 0u64;
+        on_progress(InstallProgress::stage(
+            "engine", version, &plan, 1, Some(0.05),
+        ));
         download(url, &dest, |done, total| {
             if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
                 return;
             }
             last = done;
-            on_progress(InstallProgress {
-                label: format!("Downloading {name}…"),
-                fraction: Some((base + fraction_of(done, total)) / artifacts.len() as f64),
-            });
+            let within = fraction_of(done, total);
+            on_progress(InstallProgress::tick(
+                "engine",
+                version,
+                &plan,
+                1,
+                Some(0.05 + 0.45 * ((base + within) / artifacts.len() as f64)),
+                match total {
+                    Some(t) if t > 0 => {
+                        format!("{name}: {} / {}", human_size(done), human_size(t))
+                    }
+                    _ => format!("{name}: {}", human_size(done)),
+                },
+            ));
         })
         .await?;
+        on_progress(InstallProgress::note(
+            "engine",
+            version,
+            &plan,
+            2,
+            Some(0.55),
+            format!("Verifying {name} checksum"),
+        ));
         verify(&dest, expected).with_context(|| format!("verifying {name}"))?;
     }
 
     // 2. Extract. Binaries keep only their file name; compose goes to the
     //    CLI-plugin path the bundled `docker` will look under DOCKER_CONFIG.
-    on_progress(InstallProgress {
-        label: "Extracting…".into(),
-        fraction: Some(0.9),
-    });
+    on_progress(InstallProgress::stage(
+        "engine", version, &plan, 3, Some(0.65),
+    ));
     extract_binaries(&tmp.join("docker"), &bin_dir)?;
     extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
     // Docker finds plugins under `$DOCKER_CONFIG/cli-plugins`, and every
@@ -1256,7 +1528,39 @@ where
     set_executable(&compose_dst)?;
     fs::write(staging.join("VERSION"), release.version)?;
 
-    // 3. Mark complete, move staging into place, then swap the symlink. The
+    // 3. Self-check the staged CLI: a tree that cannot report its own version
+    //    must never become `current`.
+    on_progress(InstallProgress::stage(
+        "engine", version, &plan, 4, Some(0.85),
+    ));
+    let probe = Command::new(bin_dir.join("docker"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("run the staged docker --version")?;
+    let probe_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let reported = reported_version(&probe_out);
+    if !probe.status.success() || normalize_version(reported) != version {
+        bail!(
+            "staged engine reported {}, but {version} was expected",
+            if reported.is_empty() { "nothing" } else { reported }
+        );
+    }
+    on_progress(InstallProgress::note(
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.9),
+        format!("Staged CLI reports Docker {reported}"),
+    ));
+
+    // 4. Mark complete, move staging into place, then swap the symlink. The
     //    marker is written *before* the move so a half-moved tree never looks
     //    installed; `is_installed()` is checked via the `current` symlink only.
     fs::write(staging.join(".complete"), "")?;
@@ -1267,17 +1571,37 @@ where
         .with_context(|| format!("move staged engine to {}", final_dir.display()))?;
     swap_current(paths, release.version)?;
 
-    on_progress(InstallProgress {
-        label: "Engine ready".into(),
-        fraction: Some(1.0),
-    });
+    on_progress(InstallProgress::note(
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.95),
+        format!("Docker Engine {version} activated"),
+    ));
     Ok(())
 }
 
-fn fraction_of(done: u64, total: Option<u64>) -> f64 {
+pub fn fraction_of(done: u64, total: Option<u64>) -> f64 {
     match total {
         Some(t) if t > 0 => (done as f64 / t as f64).clamp(0.0, 1.0),
         _ => 0.0,
+    }
+}
+
+/// Human byte count for live progress details (e.g. `67.2 MB`).
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -1352,6 +1676,12 @@ pub fn reported_version(output: &str) -> &str {
         .nth(1)
         .unwrap_or_default()
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+}
+
+/// A version token without its leading `v`, so `v2.39.4` and `2.39.4` compare
+/// equal. Compose and kind both print the `v` prefix; docker does not.
+pub fn normalize_version(version: &str) -> &str {
+    version.trim().trim_start_matches('v')
 }
 
 /// Highest `docker-<major.minor.patch>.tgz` version in a static-channel
@@ -1447,6 +1777,7 @@ where
         return install_release(paths, &DEFAULT_RELEASE, on_progress).await;
     }
 
+    let plan = step_plan(ENGINE_UPDATE_STEPS);
     let staging = paths.versions_dir.join(format!(".staging-{version}"));
     let _ = fs::remove_dir_all(&staging);
     let bin_dir = staging.join("bin");
@@ -1461,26 +1792,46 @@ where
         let dest = tmp.join(name);
         let base = i as f64;
         let mut last = 0u64;
+        on_progress(InstallProgress::stage(
+            "engine", version, &plan, 1, Some(0.05),
+        ));
         download(url, &dest, |done, total| {
             if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
                 return;
             }
             last = done;
-            on_progress(InstallProgress {
-                label: format!("Downloading {name}…"),
-                fraction: Some((base + fraction_of(done, total)) / artifacts.len() as f64),
-            });
+            let within = fraction_of(done, total);
+            on_progress(InstallProgress::tick(
+                "engine",
+                version,
+                &plan,
+                1,
+                Some(0.05 + 0.45 * ((base + within) / artifacts.len() as f64)),
+                match total {
+                    Some(t) if t > 0 => {
+                        format!("{name}: {} / {}", human_size(done), human_size(t))
+                    }
+                    _ => format!("{name}: {}", human_size(done)),
+                },
+            ));
         })
         .await?;
+        on_progress(InstallProgress::note(
+            "engine",
+            version,
+            &plan,
+            2,
+            Some(0.55),
+            format!("Verifying {name} checksum"),
+        ));
         checksums.push_str(&format!("{}  {}\n", sha256_file(&dest)?, name));
     }
     fs::write(staging.join("CHECKSUMS"), &checksums)?;
 
     // 2. Extract. Binaries keep only their file name, as in the pinned path.
-    on_progress(InstallProgress {
-        label: "Extracting…".into(),
-        fraction: Some(0.9),
-    });
+    on_progress(InstallProgress::stage(
+        "engine", version, &plan, 3, Some(0.65),
+    ));
     extract_binaries(&tmp.join("docker"), &bin_dir)?;
     extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
 
@@ -1510,10 +1861,9 @@ where
 
     // 4. Self-check before anything is swapped: a CLI that cannot report its
     //    own version must never become `current`.
-    on_progress(InstallProgress {
-        label: "Verifying…".into(),
-        fraction: Some(0.95),
-    });
+    on_progress(InstallProgress::stage(
+        "engine", version, &plan, 4, Some(0.85),
+    ));
     let probe = Command::new(bin_dir.join("docker"))
         .arg("--version")
         .stdin(Stdio::null())
@@ -1528,7 +1878,7 @@ where
     // `docker --version` prints `Docker version <ver>, build <hash>`; match the
     // version token exactly so `29.9.1` can never pass as `29.9.10`.
     let reported = reported_version(&probe_out);
-    if !probe.status.success() || reported != version {
+    if !probe.status.success() || normalize_version(reported) != version {
         bail!(
             "staged engine reported {}, but {version} was expected: {}",
             if reported.is_empty() {
@@ -1539,6 +1889,14 @@ where
             probe_out.trim()
         );
     }
+    on_progress(InstallProgress::note(
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.9),
+        format!("Staged CLI reports Docker {reported}"),
+    ));
 
     // 5. Mark complete, move staging into place, then swap the symlink. The
     //    marker is written *before* the move so a half-moved tree never looks
@@ -1552,10 +1910,14 @@ where
         .with_context(|| format!("move staged engine to {}", final_dir.display()))?;
     swap_current(paths, version)?;
 
-    on_progress(InstallProgress {
-        label: "Engine ready".into(),
-        fraction: Some(1.0),
-    });
+    on_progress(InstallProgress::note(
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.95),
+        format!("Docker Engine {version} activated"),
+    ));
     Ok(())
 }
 
@@ -2100,10 +2462,10 @@ pub async fn http_get(url: &str) -> Result<reqwest::Response> {
         .with_context(|| format!("GET {url}"))
 }
 
-/// Latest compose release from GitHub, stripped of a leading `v`.
-pub async fn fetch_latest_compose_version() -> Result<String> {
-    let url = "https://api.github.com/repos/docker/compose/releases/latest";
-    let body = http_get(url)
+/// Latest release tag for `repo` (e.g. `docker/compose`), sans leading `v`.
+pub async fn fetch_github_latest_version(repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let body = http_get(&url)
         .await?
         .text()
         .await
@@ -2113,41 +2475,40 @@ pub async fn fetch_latest_compose_version() -> Result<String> {
     let tag = json["tag_name"].as_str().unwrap_or_default();
     let version = tag.trim().trim_start_matches('v');
     if version.is_empty() {
-        bail!("could not read a compose release tag from GitHub");
+        bail!("could not read a release tag from GitHub ({repo})");
     }
     Ok(version.to_string())
 }
 
 /// GitHub's unauthenticated API allows ~60 requests/hour per IP. The Settings
-/// page can be opened repeatedly, so the "latest compose" answer is cached:
-/// successes for six hours, failures for two minutes (a flaky link must not
-/// turn into a rate-limit loop, but an explicit retry still goes out).
-const COMPOSE_OK_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-const COMPOSE_FAIL_TTL: Duration = Duration::from_secs(2 * 60);
+/// page can be opened repeatedly, so every "latest release" answer is cached
+/// per repo: successes for six hours, failures for two minutes (a flaky link
+/// must not turn into a rate-limit loop, but an explicit retry still goes out).
+const GITHUB_OK_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const GITHUB_FAIL_TTL: Duration = Duration::from_secs(2 * 60);
 
-static COMPOSE_LATEST: OnceLock<
-    tokio::sync::Mutex<Option<(Instant, std::result::Result<String, String>)>>,
-> = OnceLock::new();
+type GithubCache = HashMap<String, (Instant, std::result::Result<String, String>)>;
+static GITHUB_LATEST: OnceLock<tokio::sync::Mutex<GithubCache>> = OnceLock::new();
 
-/// Cached, single-flight wrapper around [`fetch_latest_compose_version`]:
+/// Cached, single-flight wrapper around [`fetch_github_latest_version`]:
 /// concurrent page mounts serialize on the mutex, so a burst costs one request.
-async fn fetch_latest_compose_version_cached() -> Result<String> {
-    let cache = COMPOSE_LATEST.get_or_init(|| tokio::sync::Mutex::new(None));
+pub async fn fetch_github_latest_cached(repo: &str) -> Result<String> {
+    let cache = GITHUB_LATEST.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
     let mut guard = cache.lock().await;
-    if let Some((at, cached)) = guard.as_ref() {
+    if let Some((at, cached)) = guard.get(repo) {
         let ttl = if cached.is_ok() {
-            COMPOSE_OK_TTL
+            GITHUB_OK_TTL
         } else {
-            COMPOSE_FAIL_TTL
+            GITHUB_FAIL_TTL
         };
         if at.elapsed() < ttl {
             return cached.clone().map_err(|e| anyhow::anyhow!(e));
         }
     }
-    let fresh = fetch_latest_compose_version()
+    let fresh = fetch_github_latest_version(repo)
         .await
         .map_err(|e| format!("{e:#}"));
-    *guard = Some((Instant::now(), fresh.clone()));
+    guard.insert(repo.to_string(), (Instant::now(), fresh.clone()));
     fresh.map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -2155,7 +2516,7 @@ pub async fn check_compose_update(paths: &EnginePaths) -> Result<ComposeUpdateIn
     let plugin = ensure_compose_layout(paths)?
         .unwrap_or_else(|| compose_plugin_dir(paths).join("docker-compose"));
     let installed = compose_plugin_version(&plugin);
-    let latest = fetch_latest_compose_version_cached().await?;
+    let latest = fetch_github_latest_cached("docker/compose").await?;
     let update = update_available(&latest, installed.as_deref());
     Ok(ComposeUpdateInfo {
         installed_version: installed,
@@ -2190,22 +2551,38 @@ where
         fs::remove_file(&staging).ok();
     }
 
-    on_progress(InstallProgress {
-        label: format!("Downloading compose {version}…"),
-        fraction: Some(0.15),
-    });
+    let plan = step_plan(COMPOSE_UPDATE_STEPS);
+    on_progress(InstallProgress::stage(
+        "compose", &version, &plan, 0, Some(0.05),
+    ));
     let file_name = "docker-compose-linux-x86_64";
-    download(
-        &compose_url(&version),
-        &staging,
-        |_, _| {},
-    )
+    let mut last = 0u64;
+    download(&compose_url(&version), &staging, |done, total| {
+        if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
+            return;
+        }
+        last = done;
+        on_progress(InstallProgress::tick(
+            "compose",
+            &version,
+            &plan,
+            0,
+            Some(0.05 + 0.45 * fraction_of(done, total)),
+            match total {
+                Some(t) if t > 0 => format!("{} / {}", human_size(done), human_size(t)),
+                _ => human_size(done),
+            },
+        ));
+    })
     .await?;
+    // The downloaded file is created 0644; the self-check below executes it,
+    // so make it runnable *before* probing (this is what used to fail every
+    // compose update at "Verify binary").
+    set_executable(&staging).context("make staged compose executable")?;
 
-    on_progress(InstallProgress {
-        label: "Verifying…".into(),
-        fraction: Some(0.6),
-    });
+    on_progress(InstallProgress::stage(
+        "compose", &version, &plan, 1, Some(0.55),
+    ));
     let sums = http_get(&compose_checksums_url(&version))
         .await?
         .text()
@@ -2215,36 +2592,211 @@ where
         .ok_or_else(|| anyhow::anyhow!("no {file_name} entry in compose {version} checksums.txt"))?;
     verify(&staging, &expected).context("verifying compose")?;
 
-    on_progress(InstallProgress {
-        label: "Verifying binary…".into(),
-        fraction: Some(0.75),
-    });
+    on_progress(InstallProgress::stage(
+        "compose", &version, &plan, 2, Some(0.7),
+    ));
     // A compose that cannot report its own version is not fit to install.
     let reported = probe_cli_version(&staging).ok_or_else(|| {
         anyhow::anyhow!("staged compose {version} failed `--version` — refusing to install")
     })?;
-    if reported != version {
+    if normalize_version(&reported) != version {
         bail!("staged compose reported {reported}, but {version} was expected");
     }
 
-    on_progress(InstallProgress {
-        label: "Installing…".into(),
-        fraction: Some(0.9),
-    });
-    set_executable(&staging)?;
+    on_progress(InstallProgress::note(
+        "compose",
+        &version,
+        &plan,
+        2,
+        Some(0.8),
+        format!("Staged compose reports {}", normalize_version(&reported)),
+    ));
+
+    on_progress(InstallProgress::stage(
+        "compose", &version, &plan, 3, Some(0.9),
+    ));
     fs::rename(&staging, &dest)
         .with_context(|| format!("install compose {version} to {}", dest.display()))?;
 
-    on_progress(InstallProgress {
-        label: "Compose ready".into(),
-        fraction: Some(1.0),
-    });
+    on_progress(InstallProgress::finished("compose", &version, &plan));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bundled Docker CLI updates (independent of the daemon lifecycle)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CliUpdateInfo {
+    /// Version the bundled `docker` reports, `None` when nothing is installed.
+    pub installed_version: Option<String>,
+    /// Newest stable version Docker publishes on the static channel.
+    pub latest_version: String,
+    pub update_available: bool,
+    /// Absolute path of the bundled CLI an update would replace.
+    pub path: PathBuf,
+}
+
+/// Version the bundled `docker` reports. Probed live so a manual replacement
+/// is reflected immediately instead of reading a stale `VERSION` file.
+pub fn bundled_cli_version(paths: &EnginePaths) -> Option<String> {
+    probe_cli_version(&paths.bin_dir().join("docker"))
+}
+
+pub async fn check_cli_update(paths: &EnginePaths) -> Result<CliUpdateInfo> {
+    let installed_version = bundled_cli_version(paths);
+    let latest_version = fetch_latest_engine_version().await?;
+    Ok(CliUpdateInfo {
+        update_available: update_available(&latest_version, installed_version.as_deref()),
+        installed_version,
+        latest_version,
+        path: paths.bin_dir().join("docker"),
+    })
+}
+
+/// Download just the `docker` CLI from Docker's static channel and swap it in.
+///
+/// `dockerd` already holds its own inode, so replacing the CLI under a running
+/// engine is safe: the next `docker` invocation simply execs the new file.
+/// Nothing else in the engine tree is touched.
+pub async fn install_cli_update<F>(
+    paths: &EnginePaths,
+    version: &str,
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(InstallProgress),
+{
+    let version = version.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        bail!("no CLI version given");
+    }
+    let bin_dir = paths.bin_dir();
+    if !bin_dir.is_dir() {
+        bail!("no bundled engine installed yet — install the engine first");
+    }
+
+    let plan = step_plan(CLI_UPDATE_STEPS);
+    let staging = paths.current_dir.join(format!(".cli-{version}.staging"));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    let tarball = staging.join("docker.tgz");
+
+    on_progress(InstallProgress::stage(
+        "cli", &version, &plan, 0, Some(0.05),
+    ));
+    let mut last = 0u64;
+    download(&docker_url(&version), &tarball, |done, total| {
+        if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
+            return;
+        }
+        last = done;
+        on_progress(InstallProgress::tick(
+            "cli",
+            &version,
+            &plan,
+            0,
+            Some(0.05 + 0.45 * fraction_of(done, total)),
+            match total {
+                Some(t) if t > 0 => format!("{} / {}", human_size(done), human_size(t)),
+                _ => human_size(done),
+            },
+        ));
+    })
+    .await?;
+
+    on_progress(InstallProgress::stage(
+        "cli", &version, &plan, 1, Some(0.55),
+    ));
+    // The pinned release has a maintainer-checked digest; any other version is
+    // fetched over TLS, and we record the digest we actually received.
+    let expected = if version == DEFAULT_RELEASE.version {
+        DEFAULT_RELEASE.docker_sha256.to_string()
+    } else {
+        sha256_file(&tarball)?
+    };
+    verify(&tarball, &expected).context("verifying docker CLI tarball")?;
+    on_progress(InstallProgress::note(
+        "cli",
+        &version,
+        &plan,
+        1,
+        Some(0.6),
+        format!("sha256 {expected}"),
+    ));
+
+    on_progress(InstallProgress::stage(
+        "cli", &version, &plan, 2, Some(0.7),
+    ));
+    let staged = staging.join("docker");
+    extract_member(&tarball, "docker", &staged)?;
+
+    on_progress(InstallProgress::stage(
+        "cli", &version, &plan, 3, Some(0.85),
+    ));
+    let reported = probe_cli_version(&staged).ok_or_else(|| {
+        anyhow::anyhow!("staged docker {version} failed `--version` — refusing to install")
+    })?;
+    if normalize_version(&reported) != version {
+        bail!("staged docker reported {reported}, but {version} was expected");
+    }
+    fs::rename(&staged, bin_dir.join("docker"))
+        .with_context(|| "replace bundled docker CLI".to_string())?;
+    if version != DEFAULT_RELEASE.version {
+        let _ = fs::write(
+            paths.current_dir.join("CLI-CHECKSUM"),
+            format!("{expected}  docker {version}\n"),
+        );
+    }
+    let _ = fs::remove_dir_all(&staging);
+
+    on_progress(InstallProgress::finished("cli", &version, &plan));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_prefix_is_ignored_when_comparing() {
+        assert_eq!(normalize_version("v2.39.4"), "2.39.4");
+        assert_eq!(normalize_version("2.39.4"), "2.39.4");
+        assert_eq!(
+            reported_version("Docker Compose version v2.39.4"),
+            "v2.39.4"
+        );
+        assert_eq!(
+            normalize_version(reported_version("Docker version 28.4.0, build abc")),
+            "28.4.0"
+        );
+    }
+
+    #[test]
+    fn engine_plan_names_every_step_in_order() {
+        let plan = step_plan(ENGINE_UPDATE_STEPS);
+        assert_eq!(plan.len(), 6);
+        assert_eq!(plan.first().map(String::as_str), Some("Stop Docker Engine"));
+        assert_eq!(plan.last().map(String::as_str), Some("Start Docker Engine"));
+    }
+
+    #[test]
+    fn failed_progress_marks_the_failing_step() {
+        let plan = step_plan(COMPOSE_UPDATE_STEPS);
+        let progress = InstallProgress::failed("compose", "2.40.0", &plan, 2, "boom");
+        assert!(progress.done);
+        assert_eq!(progress.step, Some(2));
+        assert_eq!(progress.error.as_deref(), Some("boom"));
+        assert_eq!(progress.plan.len(), COMPOSE_UPDATE_STEPS.len());
+        assert_eq!(progress.target, "compose");
+    }
+
+    #[test]
+    fn human_size_uses_binary_units() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(70 * 1024 * 1024), "70.0 MB");
+    }
 
     /// The netns resolv.conf we install must keep only reachable (non-loopback)
     /// host servers, in order, capped at three, with search domains merged.

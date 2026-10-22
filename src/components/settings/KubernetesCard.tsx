@@ -1,10 +1,20 @@
 import React, { useEffect, useState } from "react";
-import { Hexagon, Loader2, Save } from "lucide-react";
+import {
+  DownloadCloud,
+  Hexagon,
+  Loader2,
+  RefreshCw,
+  Save,
+} from "lucide-react";
 import { Card } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { api } from "../../lib/api";
 import { useToast } from "../ui/Toast";
-import type { KindInstallStatus } from "../../types";
+import {
+  UpdateProgressPanel,
+  useUpdateRun,
+} from "./UpdateProgressPanel";
+import type { KindInstallStatus, KindUpdateInfo } from "../../types";
 
 /**
  * kind (Kubernetes) preferences: the node count and node image pre-filled in
@@ -19,9 +29,15 @@ export const KubernetesCard: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [startDelay, setStartDelay] = useState(5);
+  const [kindUpdate, setKindUpdate] = useState<KindUpdateInfo | null>(null);
+  const [checkingKind, setCheckingKind] = useState(false);
+  const [updatingKind, setUpdatingKind] = useState(false);
+  const { run: kindRun, reset: resetKindRun } = useUpdateRun("kind");
 
   useEffect(() => {
     api.kindStatus().then(setStatus).catch(() => {});
+    // Background check: a failure simply means "no update known".
+    api.checkKindUpdate().then(setKindUpdate).catch(() => {});
     api
       .getAppConfig()
       .then((cfg) => {
@@ -32,6 +48,53 @@ export const KubernetesCard: React.FC = () => {
       })
       .catch(() => {});
   }, []);
+
+  const checkForKindUpdate = async (announce?: boolean) => {
+    setCheckingKind(true);
+    try {
+      const info = await api.checkKindUpdate();
+      setKindUpdate(info);
+      if (announce) {
+        if (info.update_available) {
+          toast.info(
+            "kind update available",
+            `${info.latest_version} ready to install`
+          );
+        } else {
+          toast.success(
+            "kind is up to date",
+            `Installed: ${info.installed_version ?? "none"}`
+          );
+        }
+      }
+    } catch (e) {
+      if (announce) toast.error("kind update check failed", String(e));
+    } finally {
+      setCheckingKind(false);
+    }
+  };
+
+  const applyKindUpdate = async () => {
+    setUpdatingKind(true);
+    resetKindRun();
+    try {
+      if (kindUpdate?.latest_version) {
+        await api.installKindUpdate(kindUpdate.latest_version);
+      } else {
+        await api.installKind();
+      }
+      toast.success(
+        "kind updated",
+        `kind ${kindUpdate?.latest_version ?? status?.latest ?? ""} is ready.`
+      );
+      setStatus(await api.kindStatus());
+      await checkForKindUpdate();
+    } catch (e) {
+      toast.error("kind update failed", String(e));
+    } finally {
+      setUpdatingKind(false);
+    }
+  };
 
   const handleSave = async () => {
     try {
@@ -65,10 +128,63 @@ export const KubernetesCard: React.FC = () => {
               ? `kind v${status.version ?? status.latest} installed — ${status.path}`
               : status && !status.supported
                 ? "kind has no published binary for this platform."
-                : "kind binary not installed — install it from the Kubernetes page."}
+                : "kind binary not installed — install it below."}
           </p>
         </div>
       </div>
+
+      {/* Binary updates: install when missing, update when a newer release
+          exists. Progress and log come from the unified update channel. */}
+      <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-zinc-200">kind binary</p>
+          <p className="text-[11px] text-zinc-500 mt-0.5">
+            {!status?.installed
+              ? "Not installed"
+              : kindUpdate
+                ? kindUpdate.update_available
+                  ? `Update ${kindUpdate.installed_version ?? "unknown"} → ${kindUpdate.latest_version}`
+                  : `Up to date · ${kindUpdate.installed_version ?? kindUpdate.latest_version}`
+                : "Not checked yet"}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={checkingKind || updatingKind}
+            onClick={() => checkForKindUpdate(true)}
+          >
+            <RefreshCw
+              className={`w-4 h-4 ${checkingKind ? "animate-spin" : ""}`}
+            />
+            <span>Check</span>
+          </Button>
+          {(!status?.installed || kindUpdate?.update_available) && (
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              disabled={updatingKind || status?.supported === false}
+              onClick={applyKindUpdate}
+            >
+              <DownloadCloud className="w-4 h-4" />
+              <span>
+                {updatingKind
+                  ? "Updating…"
+                  : status?.installed
+                    ? "Update kind"
+                    : "Install kind"}
+              </span>
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {kindRun && (
+        <UpdateProgressPanel run={kindRun} onDismiss={resetKindRun} />
+      )}
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div>

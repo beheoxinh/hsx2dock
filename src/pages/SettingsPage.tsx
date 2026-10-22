@@ -7,15 +7,19 @@ import { EndpointsCard } from "../components/settings/EndpointsCard";
 import { RegistriesCard } from "../components/settings/RegistriesCard";
 import { NotificationsCard } from "../components/settings/NotificationsCard";
 import { KubernetesCard } from "../components/settings/KubernetesCard";
-import { api, events } from "../lib/api";
+import {
+  UpdateProgressPanel,
+  useUpdateRun,
+} from "../components/settings/UpdateProgressPanel";
+import { api } from "../lib/api";
 import { invalidateTerminalSettings } from "../lib/terminalSettings";
 import type {
   AppConfig,
   CliBridgeStatus,
   EngineUpdateInfo,
-  EngineInstallProgress,
   CliResolution,
   CliShimStatus,
+  CliUpdateInfo,
   ComposeUpdateInfo,
 } from "../types";
 
@@ -39,6 +43,8 @@ let composeCheckedAt = 0;
 let composeCheckOk = true;
 let engineCheckedAt = 0;
 let engineCheckOk = true;
+let cliCheckedAt = 0;
+let cliCheckOk = true;
 
 export const SettingsPage: React.FC = () => {
   const toast = useToast();
@@ -79,7 +85,9 @@ export const SettingsPage: React.FC = () => {
   const [release, setRelease] = useState<EngineUpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [updating, setUpdating] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState<EngineInstallProgress | null>(null);
+  const { run: engineRun, reset: resetEngineRun } = useUpdateRun("engine");
+  const { run: cliRun, reset: resetCliRun } = useUpdateRun("cli");
+  const { run: composeRun, reset: resetComposeRun } = useUpdateRun("compose");
 
   const checkForEngineUpdate = async (announce?: boolean) => {
     if (!announce) {
@@ -111,7 +119,7 @@ export const SettingsPage: React.FC = () => {
   const applyEngineUpdate = async () => {
     if (!release) return;
     setUpdating(true);
-    setUpdateProgress(null);
+    resetEngineRun();
     try {
       const version = await api.installEngineUpdate(release.latest_version);
       toast.success("Engine updated", `Docker Engine ${version} is now active.`);
@@ -123,24 +131,80 @@ export const SettingsPage: React.FC = () => {
       toast.error("Engine update failed", String(e));
     } finally {
       setUpdating(false);
-      setUpdateProgress(null);
     }
   };
 
   const [cliResolution, setCliResolution] = useState<CliResolution | null>(null);
   const [shimStatus, setShimStatus] = useState<CliShimStatus | null>(null);
   const [shimBusy, setShimBusy] = useState(false);
+  const [cliUpdate, setCliUpdate] = useState<CliUpdateInfo | null>(null);
+  const [checkingCli, setCheckingCli] = useState(false);
+  const [updatingCli, setUpdatingCli] = useState(false);
   const [compose, setCompose] = useState<ComposeUpdateInfo | null>(null);
   const [checkingCompose, setCheckingCompose] = useState(false);
   const [updatingCompose, setUpdatingCompose] = useState(false);
 
-  const checkDockerCli = async () => {
+  const checkDockerCli = async (announce?: boolean) => {
     try {
       const res = await api.checkDockerCli();
       setCliResolution(res.resolution);
       setShimStatus(res.shim);
     } catch (e) {
-      toast.error("CLI check failed", String(e));
+      if (announce) toast.error("CLI check failed", String(e));
+      else console.warn("CLI check failed:", e);
+    }
+  };
+
+  // Bundled CLI updates are independent of the engine release: the `docker`
+  // binary is replaced in place while the daemon keeps running.
+  const checkCliForUpdate = async (announce?: boolean) => {
+    if (!announce) {
+      const ttl = cliCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
+      if (Date.now() - cliCheckedAt < ttl) return;
+    }
+    setCheckingCli(true);
+    try {
+      const info = await api.checkCliUpdate();
+      cliCheckedAt = Date.now();
+      cliCheckOk = true;
+      setCliUpdate(info);
+      if (announce) {
+        if (info.update_available) {
+          toast.info(
+            "Docker CLI update available",
+            `${info.latest_version} ready to install`
+          );
+        } else {
+          toast.success(
+            "Docker CLI is up to date",
+            `Bundled CLI: ${info.installed_version ?? "none"}`
+          );
+        }
+      }
+    } catch (e) {
+      cliCheckedAt = Date.now();
+      cliCheckOk = false;
+      // Background checks stay quiet; only an explicit click reports.
+      if (announce) toast.error("CLI update check failed", humanError(e));
+    } finally {
+      setCheckingCli(false);
+    }
+  };
+
+  const applyCliUpdate = async () => {
+    if (!cliUpdate?.update_available) return;
+    setUpdatingCli(true);
+    resetCliRun();
+    try {
+      const version = await api.installCliUpdate(cliUpdate.latest_version);
+      toast.success("Docker CLI updated", `Bundled CLI is now ${version}`);
+      cliCheckedAt = 0;
+      await checkCliForUpdate();
+      await checkDockerCli();
+    } catch (e) {
+      toast.error("Docker CLI update failed", String(e));
+    } finally {
+      setUpdatingCli(false);
     }
   };
 
@@ -193,6 +257,7 @@ export const SettingsPage: React.FC = () => {
   const applyComposeUpdate = async () => {
     if (!compose?.update_available) return;
     setUpdatingCompose(true);
+    resetComposeRun();
     try {
       const version = compose.latest_version;
       await api.installComposeUpdate(version);
@@ -214,16 +279,7 @@ export const SettingsPage: React.FC = () => {
     checkForEngineUpdate().catch(() => {});
     checkDockerCli().catch(() => {});
     checkCompose().catch(() => {});
-    let dispose: (() => void) | undefined;
-    events
-      .onEngineInstallProgress((progress) => setUpdateProgress(progress))
-      .then((fn) => {
-        dispose = fn;
-      })
-      .catch(() => {});
-    return () => {
-      dispose?.();
-    };
+    checkCliForUpdate().catch(() => {});
   }, []);
 
   const handleToggleCliBridge = async (enabled: boolean) => {
@@ -358,6 +414,55 @@ export const SettingsPage: React.FC = () => {
                   </span>
                 </div>
               </div>
+
+              {/* The system docker cannot be replaced without root, so this
+                  updates the bundled copy only. */}
+              <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-zinc-200">
+                    Bundled docker CLI
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-0.5">
+                    {cliUpdate
+                      ? cliUpdate.installed_version
+                        ? cliUpdate.update_available
+                          ? `Update ${cliUpdate.installed_version} → ${cliUpdate.latest_version}`
+                          : `Up to date · ${cliUpdate.installed_version}`
+                        : "No bundled CLI — install Docker Engine first"
+                      : "Not checked yet"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={checkingCli || updatingCli}
+                    onClick={() => checkCliForUpdate(true)}
+                  >
+                    <RefreshCw
+                      className={`w-4 h-4 ${checkingCli ? "animate-spin" : ""}`}
+                    />
+                    <span>Check</span>
+                  </Button>
+                  {cliUpdate?.update_available && cliUpdate.installed_version && (
+                    <Button
+                      type="button"
+                      variant="primary"
+                      size="sm"
+                      disabled={updatingCli}
+                      onClick={applyCliUpdate}
+                    >
+                      <DownloadCloud className="w-4 h-4" />
+                      <span>{updatingCli ? "Updating…" : "Update CLI"}</span>
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {cliRun && (
+                <UpdateProgressPanel run={cliRun} onDismiss={resetCliRun} />
+              )}
             </div>
           ) : (
             <p className="text-xs text-zinc-500">Checking which docker CLI is available…</p>
@@ -515,6 +620,9 @@ export const SettingsPage: React.FC = () => {
               )}
             </div>
           </div>
+          {composeRun && (
+            <UpdateProgressPanel run={composeRun} onDismiss={resetComposeRun} />
+          )}
         </Card>
 
         {/* Engine Update */}
@@ -616,7 +724,7 @@ export const SettingsPage: React.FC = () => {
                   <>
                     <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
                     <span className="text-zinc-200">
-                      {updateProgress?.label ?? "Starting…"}
+                      {engineRun?.label ?? "Starting…"}
                     </span>
                   </>
                 ) : release?.update_available ? (
@@ -674,18 +782,8 @@ export const SettingsPage: React.FC = () => {
             </div>
           </div>
 
-          {updating && (
-            <div className="space-y-2">
-              <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-sky-500 transition-all duration-300"
-                  style={{ width: `${Math.round((updateProgress?.fraction ?? 0) * 100)}%` }}
-                />
-              </div>
-              <p className="text-[11px] text-zinc-400">
-                The engine restarts when this finishes. Container and image data is untouched.
-              </p>
-            </div>
+          {engineRun && (
+            <UpdateProgressPanel run={engineRun} onDismiss={resetEngineRun} />
           )}
         </Card>
 

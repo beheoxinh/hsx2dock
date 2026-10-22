@@ -229,10 +229,46 @@ export interface EngineUpdateInfo {
   channel: string;
 }
 
-/** `engine-install-progress` payload streamed while an engine installs. */
-export interface EngineInstallProgress {
+/** Which binary a progress event belongs to. */
+export type UpdateTarget = "engine" | "cli" | "compose" | "kind";
+
+/**
+ * `engine-install-progress` payload streamed while any bundled binary updates.
+ *
+ * `plan` is the ordered checklist for the run (step names), `step` indexes it,
+ * and `log` carries lines to append to the run console. `done` is set exactly
+ * once, with `error` when the run failed.
+ */
+export interface InstallProgress {
+  target: UpdateTarget;
+  version: string;
   label: string;
   fraction: number | null;
+  plan: string[];
+  step: number | null;
+  detail?: string | null;
+  log?: string | null;
+  done?: boolean;
+  error?: string | null;
+}
+
+/** Kept as an alias: progress is shared by every updater now. */
+export type EngineInstallProgress = InstallProgress;
+
+/** Result of checking the bundled `docker` CLI against the static channel. */
+export interface CliUpdateInfo {
+  installed_version: string | null;
+  latest_version: string;
+  update_available: boolean;
+  /** Absolute path of the bundled CLI an update would replace. */
+  path: string;
+}
+
+/** Result of checking the kind GitHub release channel. */
+export interface KindUpdateInfo {
+  installed_version: string | null;
+  latest_version: string;
+  update_available: boolean;
 }
 
 /** Which docker binary the app decided to run. */
@@ -503,14 +539,6 @@ export interface KindProgressPayload {
   action?: string;
   name?: string;
   line: string;
-}
-
-/** Download progress for the kind binary (`kind-install-progress` event). */
-export interface KindInstallProgressPayload {
-  done?: number;
-  total?: number;
-  finished?: boolean;
-  error?: string;
 }
 
 // ---- Cluster monitoring (kubectl inside the kind control-plane node) ----

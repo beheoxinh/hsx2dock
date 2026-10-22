@@ -10,9 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::docker::kind::{
-    install_kind as install_kind_binary, kind_status as read_kind_status, KindInstallStatus, KindPaths,
-};
+use crate::docker::kind::{kind_status as read_kind_status, KindInstallStatus, KindPaths};
 use crate::state::AppState;
 
 /// Docker label kind puts on every node container; its value is the cluster name.
@@ -64,35 +62,60 @@ pub async fn kind_status(state: State<'_, AppState>) -> Result<KindInstallStatus
     Ok(read_kind_status(&state.kind))
 }
 
-/// Downloads and verifies the pinned kind binary. Emits `kind-install-progress`.
+/// Downloads and verifies the pinned kind binary, emitting step progress on
+/// `engine-install-progress` (target `kind`) like the other binary updaters.
 #[tauri::command]
-pub async fn install_kind(
+pub async fn install_kind(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    run_kind_install(&app, &state.kind, crate::docker::kind::KIND_VERSION).await
+}
+
+/// Update kind to a specific release chosen by the Settings page.
+#[tauri::command]
+pub async fn install_kind_update(
     app: AppHandle,
     state: State<'_, AppState>,
+    version: String,
 ) -> Result<(), String> {
-    let paths = &state.kind;
+    run_kind_install(&app, &state.kind, &version).await
+}
+
+/// Check the kind GitHub release channel against what is installed.
+#[tauri::command]
+pub async fn check_kind_update(
+    state: State<'_, AppState>,
+) -> Result<crate::docker::kind::KindUpdateInfo, String> {
+    crate::docker::kind::check_kind_update(&state.kind)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+async fn run_kind_install(app: &AppHandle, paths: &KindPaths, version: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let plan = crate::docker::engine::step_plan(crate::docker::kind::KIND_UPDATE_STEPS);
+    let step = Arc::new(AtomicUsize::new(0));
     let handle = app.clone();
-    let result = install_kind_binary(paths, move |done, total| {
-        let _ = handle.emit(
-            "kind-install-progress",
-            serde_json::json!({ "done": done, "total": total }),
-        );
+    let seen = step.clone();
+    let result = crate::docker::kind::install_kind_version(paths, version, move |progress| {
+        if let Some(index) = progress.step {
+            seen.store(index, Ordering::Relaxed);
+        }
+        let _ = handle.emit("engine-install-progress", &progress);
     })
     .await;
     match result {
-        Ok(_) => {
-            let _ = app.emit(
-                "kind-install-progress",
-                serde_json::json!({ "done": -1i64, "total": -1i64, "finished": true }),
-            );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(e) => {
             let msg = format!("{e:#}");
-            let _ = app.emit(
-                "kind-install-progress",
-                serde_json::json!({ "error": msg }),
+            let failed = crate::docker::engine::InstallProgress::failed(
+                "kind",
+                version,
+                &plan,
+                step.load(Ordering::Relaxed),
+                msg.clone(),
             );
+            let _ = app.emit("engine-install-progress", &failed);
             Err(msg)
         }
     }

@@ -248,6 +248,8 @@ pub fn run() {
             // Kind
             kind::kind_status,
             kind::install_kind,
+            kind::install_kind_update,
+            kind::check_kind_update,
             kind::list_kind_clusters,
             kind::create_kind_cluster,
             kind::delete_kind_cluster,
@@ -321,6 +323,8 @@ pub fn run() {
             system::check_engine_update,
             system::install_engine_update,
             system::check_docker_cli,
+            system::check_cli_update,
+            system::install_cli_update,
             system::toggle_cli_shim,
             system::check_compose_update,
             system::install_compose_update,

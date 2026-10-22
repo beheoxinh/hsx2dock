@@ -389,42 +389,127 @@ pub async fn install_engine_update(
     // A first-ever install leaves the engine stopped unless we start it here:
     // nothing else on this path triggers a boot.
     let should_start = was_running || state.engine.installed_version().is_none();
+    let plan = crate::docker::engine::step_plan(crate::docker::engine::ENGINE_UPDATE_STEPS);
+    let emit = |progress: &crate::docker::engine::InstallProgress| {
+        let _ = app.emit("engine-install-progress", progress);
+    };
+
+    // Step 0 — stop the daemon that holds the binaries being replaced.
     if was_running {
+        emit(&crate::docker::engine::InstallProgress::stage(
+            "engine",
+            &version,
+            &plan,
+            0,
+            Some(0.02),
+        ));
         let engine = state.engine.clone();
         crate::runtime::engine_op(move || engine.stop())
             .await
             .map_err(|e| e.to_string())
             .and_then(|inner| inner.map_err(|e| e.to_string()))?;
         let _ = app.emit("engine-state-changed", state.daemon_state());
+        emit(&crate::docker::engine::InstallProgress::note(
+            "engine",
+            &version,
+            &plan,
+            0,
+            Some(0.04),
+            "Docker Engine stopped",
+        ));
+    } else {
+        emit(&crate::docker::engine::InstallProgress::note(
+            "engine",
+            &version,
+            &plan,
+            0,
+            Some(0.04),
+            "Engine already stopped — no daemon to stop",
+        ));
     }
 
+    // Steps 1–4 — download, verify, replace, verify version.
     let paths = state.engine.paths();
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let progress_app = app.clone();
+    let seen = step.clone();
     let install = crate::docker::engine::install_engine_update(&paths, &version, move |progress| {
+        if let Some(index) = progress.step {
+            seen.store(index, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = progress_app.emit("engine-install-progress", &progress);
     })
     .await;
 
-    let restart = if should_start {
+    if let Err(e) = install {
+        let msg = format!("{e:#}");
+        emit(&crate::docker::engine::InstallProgress::failed(
+            "engine",
+            &version,
+            &plan,
+            step.load(std::sync::atomic::Ordering::Relaxed),
+            msg.clone(),
+        ));
+        // A failed update leaves the previous engine intact; if we stopped it,
+        // bring it back so the app is not left without a daemon.
+        if was_running {
+            let engine = state.engine.clone();
+            let _ = crate::runtime::engine_op(move || engine.start()).await;
+            let _ = state.get_client().await;
+            let _ = app.emit("engine-state-changed", state.daemon_state());
+        }
+        return Err(msg);
+    }
+
+    // Step 5 — start the new engine.
+    if should_start {
+        emit(&crate::docker::engine::InstallProgress::stage(
+            "engine",
+            &version,
+            &plan,
+            5,
+            Some(0.97),
+        ));
         let engine = state.engine.clone();
-        crate::runtime::engine_op(move || engine.start())
+        if let Err(e) = crate::runtime::engine_op(move || engine.start())
             .await
             .map_err(|e| e.to_string())
             .and_then(|inner| inner.map_err(|e| e.to_string()))
-    } else {
-        Ok(())
-    };
-
-    install.map_err(|e| format!("{e:#}"))?;
-    restart?;
-    if should_start {
+        {
+            let msg = format!("Docker Engine {version} is installed but failed to start: {e}");
+            emit(&crate::docker::engine::InstallProgress::failed(
+                "engine", &version, &plan, 5, msg.clone(),
+            ));
+            let _ = app.emit("engine-state-changed", state.daemon_state());
+            return Err(msg);
+        }
         let _ = state.get_client().await;
         // A restarted engine gets a new socket, so the terminal bridge has to
         // re-attach before the next reconcile tick would.
         let _ = apply_cli_bridge(&state).await;
+        emit(&crate::docker::engine::InstallProgress::note(
+            "engine",
+            &version,
+            &plan,
+            5,
+            Some(0.99),
+            format!("Docker Engine {version} is running"),
+        ));
+    } else {
+        emit(&crate::docker::engine::InstallProgress::note(
+            "engine",
+            &version,
+            &plan,
+            5,
+            Some(0.99),
+            "Engine left stopped (it was not running before the update)",
+        ));
     }
 
     let _ = app.emit("engine-state-changed", state.daemon_state());
+    emit(&crate::docker::engine::InstallProgress::finished(
+        "engine", &version, &plan,
+    ));
     Ok(version)
 }
 
@@ -551,12 +636,87 @@ pub async fn install_compose_update(
     state: State<'_, AppState>,
     version: String,
 ) -> Result<String, String> {
+    let version = version.trim().trim_start_matches('v').to_string();
+    let plan = crate::docker::engine::step_plan(crate::docker::engine::COMPOSE_UPDATE_STEPS);
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let paths = state.engine.paths();
     let progress_app = app.clone();
-    crate::docker::engine::install_compose_update(&paths, &version, move |progress| {
+    let seen = step.clone();
+    let result = crate::docker::engine::install_compose_update(&paths, &version, move |progress| {
+        if let Some(index) = progress.step {
+            seen.store(index, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = progress_app.emit("engine-install-progress", &progress);
     })
-    .await
-    .map_err(|e| format!("{e:#}"))?;
-    Ok(version)
+    .await;
+    match result {
+        Ok(()) => Ok(version),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = app.emit(
+                "engine-install-progress",
+                crate::docker::engine::InstallProgress::failed(
+                    "compose",
+                    &version,
+                    &plan,
+                    step.load(std::sync::atomic::Ordering::Relaxed),
+                    msg.clone(),
+                ),
+            );
+            Err(msg)
+        }
+    }
+}
+
+/// Check the bundled `docker` CLI against Docker's static channel.
+#[tauri::command]
+pub async fn check_cli_update(
+    state: State<'_, AppState>,
+) -> Result<crate::docker::engine::CliUpdateInfo, String> {
+    let paths = state.engine.paths();
+    crate::docker::engine::check_cli_update(&paths)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Replace only the bundled `docker` binary; the daemon keeps running.
+#[tauri::command]
+pub async fn install_cli_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<String, String> {
+    let version = version.trim().trim_start_matches('v').to_string();
+    let plan = crate::docker::engine::step_plan(crate::docker::engine::CLI_UPDATE_STEPS);
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let paths = state.engine.paths();
+    let progress_app = app.clone();
+    let seen = step.clone();
+    let result = crate::docker::engine::install_cli_update(&paths, &version, move |progress| {
+        if let Some(index) = progress.step {
+            seen.store(index, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = progress_app.emit("engine-install-progress", &progress);
+    })
+    .await;
+    match result {
+        Ok(()) => {
+            let _ = apply_cli_bridge(&state).await;
+            Ok(version)
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = app.emit(
+                "engine-install-progress",
+                crate::docker::engine::InstallProgress::failed(
+                    "cli",
+                    &version,
+                    &plan,
+                    step.load(std::sync::atomic::Ordering::Relaxed),
+                    msg.clone(),
+                ),
+            );
+            Err(msg)
+        }
+    }
 }

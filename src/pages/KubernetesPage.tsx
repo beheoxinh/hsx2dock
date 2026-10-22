@@ -26,7 +26,7 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
-import { formatBytes, formatRelativeTime } from "../lib/utils";
+import { formatRelativeTime } from "../lib/utils";
 import type {
   KindCluster,
   KindClusterPrefs,
@@ -120,7 +120,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   // kind binary install state (driven by kind-install-progress events).
   const [installing, setInstalling] = useState(false);
   const [installPct, setInstallPct] = useState<number | null>(null);
-  const [installBytes, setInstallBytes] = useState<{ done: number; total: number | null } | null>(null);
+  const [installDetail, setInstallDetail] = useState<string | null>(null);
 
   // Create-cluster modal + form.
   const [createOpen, setCreateOpen] = useState(false);
@@ -329,20 +329,21 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
       if (payload.error) {
         setInstalling(false);
         setInstallPct(null);
+        setInstallDetail(null);
         toast.error("kind install failed", payload.error);
         return;
       }
-      if (payload.finished) {
+      if (payload.fraction != null) {
+        setInstallPct(Math.min(100, Math.round(payload.fraction * 100)));
+      }
+      if (payload.detail) {
+        setInstallDetail(payload.detail);
+      }
+      if (payload.done) {
         setInstalling(false);
         setInstallPct(100);
         toast.success("kind installed", "The isolated kind binary is ready.");
         api.kindStatus().then(setStatus).catch(() => {});
-        return;
-      }
-      if (typeof payload.done === "number") {
-        const total = typeof payload.total === "number" && payload.total > 0 ? payload.total : null;
-        setInstallBytes({ done: payload.done, total });
-        setInstallPct(total ? Math.min(100, Math.round((payload.done / total) * 100)) : null);
       }
     }).then((u) => (unlistenInstall = u));
 
@@ -363,11 +364,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     try {
       setInstalling(true);
       setInstallPct(0);
-      setInstallBytes(null);
+      setInstallDetail(null);
       await api.installKind();
     } catch (e) {
       setInstalling(false);
       setInstallPct(null);
+      setInstallDetail(null);
       toast.error("kind install failed", String(e));
     }
   };
@@ -577,13 +579,10 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                   ? `Installs pinned v${status.latest} into this app's own data directory, checksum-verified before first run — your system PATH and ~/.kube are never touched.`
                   : "Clusters need the kind binary; supported platforms are Linux (amd64/arm64), macOS (amd64/arm64) and Windows (amd64)."}
               </p>
-              {installing && installBytes && (
+              {installing && (
                 <div className="mt-3 max-w-md">
                   <div className="flex justify-between text-[11px] text-zinc-500 mb-1 font-mono">
-                    <span>
-                      {formatBytes(installBytes.done)}
-                      {installBytes.total ? ` / ${formatBytes(installBytes.total)}` : ""}
-                    </span>
+                    <span>{installDetail ?? "Starting…"}</span>
                     <span>{installPct !== null ? `${installPct}%` : "…"}</span>
                   </div>
                   <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">

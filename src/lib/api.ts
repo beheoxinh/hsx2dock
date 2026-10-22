@@ -17,6 +17,7 @@ import type {
   EngineInstallProgress,
   CliShimStatus,
   CliStatus,
+  CliUpdateInfo,
   ComposeUpdateInfo,
   AppConfig,
   CliBridgeStatus,
@@ -36,7 +37,7 @@ import type {
   KindCluster,
   KindInstallStatus,
   KindProgressPayload,
-  KindInstallProgressPayload,
+  KindUpdateInfo,
   K8sNodeInfo,
   K8sPodInfo,
   K8sEventInfo,
@@ -61,6 +62,9 @@ export const api = {
   installEngineUpdate: (version: string) =>
     invoke<string>("install_engine_update", { version }),
   checkDockerCli: () => invoke<CliStatus>("check_docker_cli"),
+  checkCliUpdate: () => invoke<CliUpdateInfo>("check_cli_update"),
+  installCliUpdate: (version: string) =>
+    invoke<string>("install_cli_update", { version }),
   toggleCliShim: (enabled: boolean) => invoke<CliShimStatus>("toggle_cli_shim", { enabled }),
   checkComposeUpdate: () => invoke<ComposeUpdateInfo>("check_compose_update"),
   installComposeUpdate: (version: string) =>
@@ -192,6 +196,9 @@ export const api = {
   // Kind (Kubernetes IN Docker) — isolated binary + app-managed kubeconfig
   kindStatus: () => invoke<KindInstallStatus>("kind_status"),
   installKind: () => invoke<void>("install_kind"),
+  checkKindUpdate: () => invoke<KindUpdateInfo>("check_kind_update"),
+  installKindUpdate: (version: string) =>
+    invoke<void>("install_kind_update", { version }),
   listKindClusters: () => invoke<KindCluster[]>("list_kind_clusters"),
   createKindCluster: (name: string, image?: string, nodes?: number) =>
     invoke<void>("create_kind_cluster", { name, image, nodes }),
@@ -306,6 +313,14 @@ export const events = {
       cb(event.payload)
     ),
 
+  /** Unified progress for every bundled binary (engine, CLI, compose, kind). */
+  onInstallProgress: (
+    cb: (progress: EngineInstallProgress) => void
+  ): Promise<UnlistenFn> =>
+    listen<EngineInstallProgress>("engine-install-progress", (event) =>
+      cb(event.payload)
+    ),
+
   onContainerStatsTick: (
     cb: (stats: Record<string, ContainerStats>) => void
   ): Promise<UnlistenFn> =>
@@ -334,8 +349,16 @@ export const events = {
   onKindProgress: (cb: (payload: KindProgressPayload) => void): Promise<UnlistenFn> =>
     listen<KindProgressPayload>("kind-progress", (event) => cb(event.payload)),
 
-  onKindInstallProgress: (cb: (payload: KindInstallProgressPayload) => void): Promise<UnlistenFn> =>
-    listen<KindInstallProgressPayload>("kind-install-progress", (event) => cb(event.payload)),
+  /**
+   * kind progress used to ride its own event; it now shares the unified
+   * `engine-install-progress` channel, filtered by `target`.
+   */
+  onKindInstallProgress: (
+    cb: (progress: EngineInstallProgress) => void
+  ): Promise<UnlistenFn> =>
+    listen<EngineInstallProgress>("engine-install-progress", (event) => {
+      if (event.payload.target === "kind") cb(event.payload);
+    }),
 
   /** Tray quick actions ask the shell to switch pages (`tray-navigate`). */
   onTrayNavigate: (cb: (tab: string) => void): Promise<UnlistenFn> =>
