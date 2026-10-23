@@ -106,9 +106,22 @@ pub fn notify_kind_event(app: &AppHandle, created: bool, name: &str) {
 }
 
 /// Shown when "Close to tray" hides the window, so the close does not read as
-/// a hang. Not preference-gated: it is the feedback for the action the user
-/// just took, not a background event.
+/// a hang. Gated by Settings → Notifications → "Hidden to tray" like every
+/// other category; the tray Quit path is what stops the app.
 pub fn notify_hidden_to_tray(app: &AppHandle) {
+    let enabled = app
+        .try_state::<AppState>()
+        .and_then(|state| {
+            state
+                .config
+                .try_read()
+                .ok()
+                .map(|cfg| cfg.notifications.tray_hidden)
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
     record_notice(
         app,
         "Hsx2Dock is still running",

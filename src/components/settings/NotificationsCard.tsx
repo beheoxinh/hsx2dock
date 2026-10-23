@@ -12,6 +12,7 @@ const DEFAULTS: NotificationPrefs = {
   transfer_done: true,
   engine_state: true,
   kind_events: true,
+  tray_hidden: true,
 };
 
 const ROWS: { key: keyof NotificationPrefs; label: string; desc: string }[] = [
@@ -34,6 +35,11 @@ const ROWS: { key: keyof NotificationPrefs; label: string; desc: string }[] = [
     key: "kind_events",
     label: "Kubernetes clusters",
     desc: "A kind cluster was created or deleted.",
+  },
+  {
+    key: "tray_hidden",
+    label: "Hidden to tray",
+    desc: "The window was closed into the tray — a reminder that the app and engine are still running.",
   },
 ];
 
@@ -85,8 +91,8 @@ export const NotificationsCard: React.FC = () => {
         <div>
           <h3 className="font-semibold text-white">Notifications</h3>
           <p className="text-xs text-zinc-400 mt-1">
-            Desktop alerts for long-running work. The tray menu mirrors these
-            toggles, so either place works.
+            Desktop alerts for background work and window events. The tray menu
+            mirrors these toggles, so either place works.
           </p>
         </div>
       </div>
@@ -98,6 +104,8 @@ export const NotificationsCard: React.FC = () => {
             <button
               key={row.key}
               type="button"
+              role="switch"
+              aria-checked={!!on}
               onClick={() => toggle(row.key)}
               className="w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-xl hover:bg-zinc-900/60 transition-colors text-left"
             >

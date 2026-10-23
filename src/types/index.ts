@@ -214,6 +214,8 @@ export interface NotificationPrefs {
   engine_state: boolean;
   /** kind cluster created / deleted. */
   kind_events: boolean;
+  /** The window was closed into the tray (app + engine keep running). */
+  tray_hidden: boolean;
 }
 
 /** `exec-output` payload streamed while an interactive exec session runs. */

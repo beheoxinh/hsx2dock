@@ -175,6 +175,9 @@ pub struct NotificationPrefs {
     /// Kind cluster created or deleted.
     #[serde(default = "default_true")]
     pub kind_events: bool,
+    /// The window was closed into the tray (the app and engine keep running).
+    #[serde(default = "default_true")]
+    pub tray_hidden: bool,
 }
 
 impl Default for NotificationPrefs {
@@ -184,6 +187,7 @@ impl Default for NotificationPrefs {
             transfer_done: default_true(),
             engine_state: default_true(),
             kind_events: default_true(),
+            tray_hidden: default_true(),
         }
     }
 }
@@ -580,7 +584,9 @@ mod tests {
     fn notification_prefs_default_all_on() {
         // Every category ships enabled; the Settings UI only turns them off.
         let p = NotificationPrefs::default();
-        assert!(p.build_done && p.transfer_done && p.engine_state && p.kind_events);
+        assert!(
+            p.build_done && p.transfer_done && p.engine_state && p.kind_events && p.tray_hidden
+        );
         // Configs written before this section existed deserialize to all-on.
         let from_toml: NotificationPrefs = toml::from_str("").expect("empty table parses");
         assert_eq!(from_toml, NotificationPrefs::default());
