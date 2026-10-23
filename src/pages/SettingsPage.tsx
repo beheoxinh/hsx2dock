@@ -52,33 +52,12 @@ type SettingsTab = "casual" | "engine" | "tools" | "registry";
 const SETTINGS_TABS: {
   id: SettingsTab;
   label: string;
-  hint: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
-  {
-    id: "casual",
-    label: "Casual",
-    hint: "Look & feel, alerts, terminal",
-    icon: Monitor,
-  },
-  {
-    id: "engine",
-    label: "Engine",
-    hint: "Docker engine, storage, Kind",
-    icon: Cpu,
-  },
-  {
-    id: "tools",
-    label: "Tools",
-    hint: "Docker CLI & Compose",
-    icon: Wrench,
-  },
-  {
-    id: "registry",
-    label: "Registry",
-    hint: "Logins & default push target",
-    icon: Boxes,
-  },
+  { id: "casual", label: "Casual", icon: Monitor },
+  { id: "engine", label: "Engine", icon: Cpu },
+  { id: "tools", label: "Tools", icon: Wrench },
+  { id: "registry", label: "Registry", icon: Boxes },
 ];
 
 export const SettingsPage: React.FC = () => {
@@ -386,21 +365,16 @@ export const SettingsPage: React.FC = () => {
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      {/* Page header + horizontal tab rail. Stays put while the active panel
-          scrolls underneath it. */}
-      <div className="shrink-0 px-8 pt-8">
+      {/* Horizontal tab rail. Stays put while the active panel scrolls
+          underneath it. */}
+      <div className="shrink-0 px-8 pt-6">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-2xl font-bold tracking-tight text-white">Application Settings</h2>
-          <p className="text-sm text-zinc-400 mt-1">
-            Tune bundled engine parameters, CLI socket bridges, and default paths
-          </p>
-
           <div
             role="tablist"
             aria-label="Settings sections"
-            className="mt-5 flex items-stretch gap-1 overflow-x-auto border-b border-zinc-800"
+            className="flex items-stretch gap-1 overflow-x-auto border-b border-zinc-800"
           >
-            {SETTINGS_TABS.map(({ id, label, hint, icon: Icon }) => {
+            {SETTINGS_TABS.map(({ id, label, icon: Icon }) => {
               const active = tab === id;
               return (
                 <button
@@ -410,7 +384,7 @@ export const SettingsPage: React.FC = () => {
                   aria-selected={active}
                   aria-controls={`settings-panel-${id}`}
                   onClick={() => setTab(id)}
-                  className={`group relative -mb-px flex items-center gap-2.5 rounded-t-lg border-b-2 px-4 py-3 text-left transition-colors ${
+                  className={`group relative -mb-px flex items-center gap-2 whitespace-nowrap rounded-t-lg border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
                     active
                       ? "border-emerald-500 text-white"
                       : "border-transparent text-zinc-400 hover:bg-zinc-900/40 hover:text-zinc-200"
@@ -421,12 +395,7 @@ export const SettingsPage: React.FC = () => {
                       active ? "text-emerald-400" : "text-zinc-500 group-hover:text-zinc-300"
                     }`}
                   />
-                  <span className="min-w-0">
-                    <span className="block whitespace-nowrap text-sm font-medium">{label}</span>
-                    <span className="block whitespace-nowrap text-[11px] text-zinc-500">
-                      {hint}
-                    </span>
-                  </span>
+                  {label}
                 </button>
               );
             })}
