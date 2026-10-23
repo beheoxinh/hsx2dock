@@ -14,6 +14,14 @@ export interface ContainerPort {
   type: string;
 }
 
+/** One host binding as reported by the engine (`ContainerSummary.ports`). */
+export interface PublishedPort {
+  host_ip: string;
+  host_port: number;
+  container_port: number;
+  protocol: string;
+}
+
 export interface ContainerItem {
   id: string;
   short_id: string;
@@ -23,6 +31,12 @@ export interface ContainerItem {
   status: string;
   created: number;
   ports: string;
+  /**
+   * The same bindings as `ports`, structured. `host_ip` is the address the
+   * port is published on; `""` and the wildcard addresses mean every
+   * interface — the case that bypasses the host firewall.
+   */
+  published_ports?: PublishedPort[];
   /** Compose project name from the container's labels; null for plain containers. */
   compose_project?: string | null;
   /** Compose service name from the container's labels. */

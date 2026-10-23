@@ -26,6 +26,11 @@ pub struct ContainerItem {
     pub created: i64,
     pub running: bool,
     pub ports: String,
+    /// Structured form of `ports`, so the UI can distinguish a loopback-only
+    /// mapping from one published on every interface. The display string above
+    /// stays authoritative for rendering; this is only for the exposure check.
+    #[serde(default)]
+    pub published_ports: Vec<PublishedPort>,
     /// Compose project name from the `com.docker.compose.project` label —
     /// `None` for containers that were not created by docker compose.
     #[serde(default)]
@@ -498,9 +503,23 @@ impl PortProtocol {
     }
 }
 
+/// One port binding as the engine reports it in `ContainerSummary.ports`.
+///
+/// `host_ip` is the address the port is published on. An empty string and the
+/// wildcard addresses (`0.0.0.0`, `::`) all mean "every interface" — the case
+/// where Docker's published ports bypass the host firewall.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPort {
+    pub host_ip: String,
+    pub host_port: u16,
+    pub container_port: u16,
+    pub protocol: String,
+}
+
 /// One published port, Docker Desktop style: host address + host port +
 /// container port + protocol.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PortMapping {
     /// Bind address on the host; empty means every interface.
     pub host_ip: String,
@@ -1266,6 +1285,7 @@ fn parse_duration_ns(s: &str) -> Option<i64> {
 /// Mirrors the Docker Desktop "Run a new container" form: every field the
 /// Engine accepts on create is representable here.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RunConfig {
     pub image: String,
     pub name: String,

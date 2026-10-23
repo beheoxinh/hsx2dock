@@ -4,6 +4,7 @@ import {
   Search,
   Plus,
   Layers,
+  ShieldAlert,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { EngineGate } from "../components/ui/EngineGate";
@@ -16,6 +17,7 @@ import {
 } from "../components/ContainerCard";
 import { useDraggable } from "../components/ContainerDragLayer";
 import { canonicalContainerIds, groupOf } from "../lib/containerGroups";
+import { exposedContainers, exposureSummary } from "../lib/portExposure";
 import { api, events } from "../lib/api";
 import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
 
@@ -196,6 +198,11 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   );
   const allGrouped = searchMatches.length > 0 && filteredContainers.length === 0;
 
+  // Containers publishing on 0.0.0.0/[::] are reachable from the network and
+  // bypass the host firewall. Computed over the full list, not the search
+  // result: the warning is about the machine, not about the current filter.
+  const exposed = useMemo(() => exposedContainers(containers), [containers]);
+
   // Engine off → designed feature panel instead of fetch errors.
   if (daemonState !== "Running") {
     return (
@@ -234,6 +241,30 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
           </Button>
         </div>
       </div>
+
+      {exposed.length > 0 && (
+        <div
+          data-testid="port-exposure-banner"
+          role="status"
+          className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3"
+        >
+          <ShieldAlert className="w-5 h-5 text-amber-500 dark:text-amber-400 shrink-0 mt-0.5" />
+          <div className="min-w-0 text-sm">
+            <p className="font-medium text-amber-800 dark:text-amber-200">
+              {exposed.length === 1
+                ? "1 container publishes ports on every interface"
+                : `${exposed.length} containers publish ports on every interface`}
+            </p>
+            <p className="text-xs text-amber-700/90 dark:text-amber-200/70 mt-1 break-words">
+              <span className="font-mono">{exposureSummary(containers)}</span>{" "}
+              can be reached from your network, and Docker&apos;s published
+              ports bypass the host firewall. Bind them to loopback instead
+              (e.g. <span className="font-mono">127.0.0.1:8080:80</span>) to
+              keep them local.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Groups. The ungrouped containers are rendered as children so they sit
           *inside* the Isolated bucket rather than floating below it. This whole

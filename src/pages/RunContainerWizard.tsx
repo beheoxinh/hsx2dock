@@ -21,7 +21,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   const [image, setImage] = useState("");
   const [name, setName] = useState("");
   const [restartPolicy, setRestartPolicy] = useState("unless-stopped");
-  const [ports, setPorts] = useState<PortMapping[]>([{ container_port: "80", host_port: "8080" }]);
+  const [ports, setPorts] = useState<PortMapping[]>([
+    { host_ip: "127.0.0.1", host_port: "8080", container_port: "80" },
+  ]);
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   const [memoryMb, setMemoryMb] = useState("");
   const [cpus, setCpus] = useState("");
@@ -30,7 +32,10 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   if (!isOpen) return null;
 
   const handleAddPort = () => {
-    setPorts([...ports, { container_port: "", host_port: "" }]);
+    setPorts([
+      ...ports,
+      { host_ip: "127.0.0.1", container_port: "", host_port: "" },
+    ]);
   };
 
   const handleRemovePort = (index: number) => {
@@ -163,6 +168,19 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                   <div key={idx} className="flex items-center gap-3">
                     <input
                       type="text"
+                      placeholder="Host IP"
+                      title="Bind address. 127.0.0.1 keeps the port on this machine; 0.0.0.0 exposes it on every interface."
+                      aria-label="Host IP to bind the port to"
+                      value={p.host_ip ?? ""}
+                      onChange={(e) => {
+                        const copy = [...ports];
+                        copy[idx].host_ip = e.target.value;
+                        setPorts(copy);
+                      }}
+                      className="w-28 shrink-0 h-9 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                    />
+                    <input
+                      type="text"
                       placeholder="Host Port (e.g. 8080)"
                       value={p.host_port}
                       onChange={(e) => {
@@ -170,7 +188,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                         copy[idx].host_port = e.target.value;
                         setPorts(copy);
                       }}
-                      className="flex-1 h-9 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500"
+                      className="flex-1 min-w-0 h-9 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500"
                     />
                     <ArrowRight className="w-4 h-4 text-zinc-600 shrink-0" />
                     <input
@@ -182,7 +200,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                         copy[idx].container_port = e.target.value;
                         setPorts(copy);
                       }}
-                      className="flex-1 h-9 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500"
+                      className="flex-1 min-w-0 h-9 px-3 rounded-lg bg-zinc-900 border border-zinc-800 text-xs text-white focus:outline-none focus:border-blue-500"
                     />
                     <Button
                       type="button"
@@ -197,6 +215,12 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                   </div>
                 ))}
               </div>
+              <p className="text-[11px] leading-relaxed text-zinc-500 mt-2">
+                <span className="font-mono">127.0.0.1</span> keeps the port on
+                this machine. Use <span className="font-mono">0.0.0.0</span>{" "}
+                only when another device must reach it — Docker publishes those
+                ports around the host firewall.
+              </p>
             </div>
 
             {/* Environment Variables */}

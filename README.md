@@ -17,6 +17,10 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   cpuset / pids), open an embedded terminal (`docker exec -it`, shell
   auto-detected, debug container fallback for distroless images) or a **Debug**
   shell that starts a stopped container first, and view tailed logs with Follow.
+- **Port-exposure guard** — bindings published on `0.0.0.0`/`[::]` are flagged
+  on the container card and in a page banner, because Docker's published ports
+  bypass the host firewall. The Run wizard binds new ports to `127.0.0.1` by
+  default; switch the host IP to `0.0.0.0` only when other devices need it.
 - **Monitoring** — per-container CPU % and memory usage/limit bars, refreshed
   every 3 seconds for running containers via the Docker stats API.
 - **Images** — list tags/size/age, search, pull new images with live progress

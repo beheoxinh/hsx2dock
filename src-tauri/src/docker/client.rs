@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use super::models::{
     BuildOptions, BuildStep, ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo,
     EnvVar, Healthcheck, ImageHistoryEntry, ImageItem, NetworkItem, PortMapping, PortProtocol,
-    ResourceLimits, RunConfig, VolumeItem, VolumeMount, limits_from_host_config,
+    PublishedPort, ResourceLimits, RunConfig, VolumeItem, VolumeMount, limits_from_host_config,
 };
 
 #[derive(Clone)]
@@ -286,6 +286,11 @@ impl DockerClient {
                         .as_deref()
                         .map(Self::format_ports_static)
                         .unwrap_or_default(),
+                    published_ports: c
+                        .ports
+                        .as_deref()
+                        .map(Self::published_ports_static)
+                        .unwrap_or_default(),
                     compose_project,
                     compose_service,
                     kind_cluster,
@@ -294,16 +299,48 @@ impl DockerClient {
             .collect())
     }
 
-    /// Format container port bindings as `PUBLIC:PRIVATE, ...`.
+    /// Format container port bindings the way `docker ps` does, e.g.
+    /// `0.0.0.0:8080->80/tcp, 127.0.0.1:5432->5432/tcp`, or `443/tcp` for a
+    /// port that is only exposed. The bind address is kept on purpose: the UI
+    /// flags mappings that are reachable beyond loopback.
     pub fn format_ports_static(ports: &[bollard::models::PortSummary]) -> String {
         ports
             .iter()
-            .map(|p| match p.public_port {
-                Some(pub_port) => format!("{pub_port}:{}", p.private_port),
-                None => format!("{}", p.private_port),
+            .map(|p| {
+                let proto = p.typ.as_ref().map(|t| t.to_string()).unwrap_or_default();
+                let target = if proto.is_empty() {
+                    p.private_port.to_string()
+                } else {
+                    format!("{}/{}", p.private_port, proto)
+                };
+                match p.public_port {
+                    Some(pub_port) => match p.ip.as_deref().filter(|ip| !ip.is_empty()) {
+                        Some(ip) => format!("{ip}:{pub_port}->{target}"),
+                        None => format!("{pub_port}->{target}"),
+                    },
+                    None => target,
+                }
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// Structured counterpart of [`Self::format_ports_static`]: only bindings
+    /// that are actually published on the host, which is what the exposure
+    /// check in the UI cares about.
+    pub fn published_ports_static(ports: &[bollard::models::PortSummary]) -> Vec<PublishedPort> {
+        ports
+            .iter()
+            .filter_map(|p| {
+                let host_port = p.public_port?;
+                Some(PublishedPort {
+                    host_ip: p.ip.clone().unwrap_or_default(),
+                    host_port,
+                    container_port: p.private_port,
+                    protocol: p.typ.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     pub async fn start_container(&self, id: &str) -> anyhow::Result<()> {
@@ -1697,26 +1734,92 @@ mod tests {
     }
 
     #[test]
+    fn run_config_accepts_a_partial_wizard_payload() {
+        // The Run wizard posts only the fields it edits. Everything else must
+        // fall back to Default instead of failing the whole invocation with
+        // "missing field ..." — that made the port-forwarding form unusable.
+        let cfg: RunConfig = serde_json::from_value(serde_json::json!({
+            "image": "nginx:latest",
+            "ports": [{ "container_port": "80" }]
+        }))
+        .expect("partial payload deserializes");
+
+        assert_eq!(cfg.ports.len(), 1);
+        assert_eq!(cfg.ports[0].container_port, "80");
+        // Omitted knobs keep the engine's own defaults.
+        assert_eq!(cfg.ports[0].host_ip, "");
+        assert_eq!(cfg.ports[0].host_port, "");
+        assert_eq!(cfg.ports[0].protocol, PortProtocol::Tcp);
+        assert!(cfg.command.is_empty());
+        assert!(!cfg.auto_remove);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn parse_lines_trims_and_skips_empty() {
         let out = RunConfig::parse_lines("  a=1\n\n  \n b=2\n");
         assert_eq!(out, vec!["a=1".to_string(), "b=2".to_string()]);
     }
 
     #[test]
-    fn format_ports_joins() {
+    fn format_ports_joins_like_docker_ps() {
         let ports = vec![
             bollard::models::PortSummary {
+                ip: Some("0.0.0.0".to_string()),
                 private_port: 80,
                 public_port: Some(8080),
+                typ: Some(bollard::models::PortSummaryTypeEnum::TCP),
+            },
+            bollard::models::PortSummary {
+                ip: Some("127.0.0.1".to_string()),
+                private_port: 5432,
+                public_port: Some(5432),
+                typ: Some(bollard::models::PortSummaryTypeEnum::TCP),
+            },
+            bollard::models::PortSummary {
+                private_port: 443,
+                public_port: None,
+                typ: Some(bollard::models::PortSummaryTypeEnum::TCP),
                 ..Default::default()
+            },
+        ];
+        assert_eq!(
+            DockerClient::format_ports_static(&ports),
+            "0.0.0.0:8080->80/tcp, 127.0.0.1:5432->5432/tcp, 443/tcp"
+        );
+    }
+
+    #[test]
+    fn published_ports_keep_only_host_bindings() {
+        let ports = vec![
+            bollard::models::PortSummary {
+                ip: Some(String::new()),
+                private_port: 80,
+                public_port: Some(8080),
+                typ: Some(bollard::models::PortSummaryTypeEnum::TCP),
             },
             bollard::models::PortSummary {
                 private_port: 443,
                 public_port: None,
                 ..Default::default()
             },
+            bollard::models::PortSummary {
+                ip: Some("127.0.0.1".to_string()),
+                private_port: 5353,
+                public_port: Some(5353),
+                typ: Some(bollard::models::PortSummaryTypeEnum::UDP),
+            },
         ];
-        assert_eq!(DockerClient::format_ports_static(&ports), "8080:80, 443");
+
+        let published = DockerClient::published_ports_static(&ports);
+        // Exposed-only ports are not published, so they carry no exposure risk.
+        assert_eq!(published.len(), 2);
+        // An empty bind address is preserved: the UI treats it as "every
+        // interface", which is what the engine means by it.
+        assert_eq!(published[0].host_ip, "");
+        assert_eq!(published[0].host_port, 8080);
+        assert_eq!(published[1].host_ip, "127.0.0.1");
+        assert_eq!(published[1].protocol, "udp");
     }
 
     #[test]

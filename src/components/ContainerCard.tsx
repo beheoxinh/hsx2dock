@@ -9,6 +9,7 @@ import {
   Pause,
   Play,
   RotateCw,
+  ShieldAlert,
   SlidersHorizontal,
   Square,
   Terminal,
@@ -18,6 +19,7 @@ import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
 import { StatusBadge } from "./ui/StatusBadge";
 import { formatBytes, truncateId } from "../lib/utils";
+import { describeBinding, publicBindings } from "../lib/portExposure";
 import type { ContainerItem, ContainerStats } from "../types";
 
 export type ContainerAction =
@@ -64,6 +66,9 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   const hostPort = c.ports?.includes("->")
     ? c.ports.split("->")[0].split(":").pop()
     : null;
+  // Docker publishes on 0.0.0.0/[::] by default, which bypasses the host
+  // firewall; loopback-only mappings are intentional and stay unflagged.
+  const exposed = publicBindings(c);
 
   return (
     <Card
@@ -125,6 +130,21 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             <span className="text-zinc-200 truncate block font-mono">
               {c.ports || "—"}
             </span>
+            {exposed.length > 0 && (
+              <span
+                role="img"
+                data-testid="port-exposure-warning"
+                aria-label={`${name} publishes ${exposed
+                  .map(describeBinding)
+                  .join(", ")} on every interface — reachable from your network`}
+                title={`Published on every interface (${exposed
+                  .map(describeBinding)
+                  .join(", ")}) — reachable from your network. Bind to 127.0.0.1 to keep it local.`}
+                className="shrink-0 text-amber-500 dark:text-amber-400 cursor-help"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+              </span>
+            )}
             {hostPort && (
               <a
                 href={`http://localhost:${hostPort}`}
