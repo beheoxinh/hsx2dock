@@ -31,7 +31,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 APP_ID="com.github.hsx2dock"
-SOURCE_ICON="/mnt/SubSystem/Downloads/google-container-optimized-os.svg"
+SOURCE_ICON="$ROOT_DIR/src-tauri/icons/app-icon.svg"
 LOCAL_ICON="$ROOT_DIR/data/icons/${APP_ID}.svg"
 
 echo "=========================================================="

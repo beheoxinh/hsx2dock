@@ -854,47 +854,29 @@ fn state_color(state: &DaemonState) -> [u8; 3] {
     }
 }
 
+/// The container glyph the app is branded with. It ships white, so tinting is
+/// a flat RGB swap: the alpha channel is the shape (anti-aliased edges
+/// included) and keeps the menu-bar silhouette.
+const TRAY_GLYPH_PNG: &[u8] = include_bytes!("../icons/tray-glyph.png");
+
 fn state_icon(rgb: [u8; 3]) -> Image<'static> {
-    const SIZE: u32 = 32;
-    Image::new_owned(rounded_square_rgba(rgb), SIZE, SIZE)
+    tinted_glyph(rgb)
+        .unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
 }
 
-/// Rounded square with 3x3 supersampling so menu-bar edges stay soft.
-fn rounded_square_rgba(rgb: [u8; 3]) -> Vec<u8> {
-    const W: usize = 32;
-    const PAD: f64 = 3.0;
-    const RADIUS: f64 = 7.0;
-    const SS: u32 = 3;
-    let mut out = vec![0u8; W * W * 4];
-    for y in 0..W {
-        for x in 0..W {
-            let mut hits = 0u32;
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let px = x as f64 + (sx as f64 + 0.5) / SS as f64;
-                    let py = y as f64 + (sy as f64 + 0.5) / SS as f64;
-                    if inside_rounded_rect(px, py, PAD, W as f64 - PAD, RADIUS) {
-                        hits += 1;
-                    }
-                }
-            }
-            let o = (y * W + x) * 4;
-            out[o] = rgb[0];
-            out[o + 1] = rgb[1];
-            out[o + 2] = rgb[2];
-            out[o + 3] = (hits * 255 / (SS * SS)) as u8;
-        }
+/// RGBA buffer of the glyph painted in `rgb`; `None` only if the bundled PNG
+/// fails to decode (a corrupt asset, i.e. a build error rather than a runtime
+/// condition) — the caller falls back to a blank icon instead of panicking.
+fn tinted_glyph(rgb: [u8; 3]) -> Option<Image<'static>> {
+    let glyph = Image::from_bytes(TRAY_GLYPH_PNG).ok()?;
+    let (width, height) = (glyph.width(), glyph.height());
+    let mut rgba = glyph.rgba().to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
     }
-    out
-}
-
-fn inside_rounded_rect(x: f64, y: f64, min: f64, max: f64, r: f64) -> bool {
-    if x < min || x > max || y < min || y > max {
-        return false;
-    }
-    let cx = x.clamp(min + r, max - r);
-    let cy = y.clamp(min + r, max - r);
-    (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+    Some(Image::new_owned(rgba, width, height))
 }
 
 /// Tooltip shown on hover (and, on Linux, whatever the host honours — many
@@ -960,12 +942,19 @@ mod tests {
     }
 
     #[test]
-    fn rounded_icon_has_transparent_corners_and_opaque_center() {
-        let rgba = rounded_square_rgba([36, 150, 237]);
-        let w = 32usize;
-        let alpha = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3];
-        assert_eq!(alpha(0, 0), 0, "corner must be fully transparent");
-        assert_eq!(alpha(w / 2, w / 2), 255, "center must be fully opaque");
+    fn tray_glyph_keeps_its_silhouette_and_takes_the_state_colour() {
+        let img = tinted_glyph([36, 150, 237]).expect("bundled glyph decodes");
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let rgba = img.rgba();
+        let px = |x: usize, y: usize| &rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+
+        assert_eq!(px(0, 0)[3], 0, "corner stays transparent");
+
+        let solid = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .find(|&(x, y)| px(x, y)[3] == 255)
+            .expect("glyph has opaque pixels");
+        assert_eq!(&px(solid.0, solid.1)[..3], &[36, 150, 237], "tinted");
     }
 
     #[test]

@@ -100,11 +100,6 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           {/* Per-cluster health only appears once there is something to report. */}
-          {health.nodes && (
-            <span title={`${health.nodes.label} across all clusters`}>
-              <StatusBadge status={health.nodes.label} tone={health.nodes.tone} />
-            </span>
-          )}
           {health.pods && (
             <span title={`${health.pods.label} across all clusters`}>
               <StatusBadge status={health.pods.label} tone={health.pods.tone} />

@@ -11,8 +11,6 @@ export interface HealthBadge {
 export interface ClusterHealth {
   /** Cluster-count badge, e.g. `2 Running`, `0/1 Running`, `None`. */
   clusters: HealthBadge & { pulse: boolean };
-  /** Node-container health; null while no cluster exists. */
-  nodes: HealthBadge | null;
   /** Pod health; null until a running control plane reports counts. */
   pods: HealthBadge | null;
   /** API readiness; null when no running cluster has answered yet. */
@@ -49,21 +47,6 @@ export const summarizeClusters = (
   const clusterTone: HealthTone =
     running === 0 ? "neutral" : running === total ? "success" : "warning";
 
-  const totalNodes = clusters.reduce((n, c) => n + c.node_count, 0);
-  const runningNodes = clusters.reduce((n, c) => n + c.running_nodes, 0);
-  const nodes: HealthBadge | null =
-    totalNodes === 0
-      ? null
-      : {
-          label: `${runningNodes}/${totalNodes} Nodes`,
-          tone:
-            runningNodes === 0
-              ? "neutral"
-              : runningNodes === totalNodes
-                ? "success"
-                : "warning",
-        };
-
   // A stopped or unreachable cluster reports null counts; `?? 0` keeps those
   // out of the totals so the badge reflects only what the control plane
   // actually told us.
@@ -93,10 +76,7 @@ export const summarizeClusters = (
   const detail = total
     ? clusters
         .map((c) => {
-          const bits = [
-            `${c.name}: ${c.running ? "running" : "stopped"}`,
-            `${c.running_nodes}/${c.node_count} nodes`,
-          ];
+          const bits = [`${c.name}: ${c.running ? "running" : "stopped"}`];
           if (c.running && c.pod_count != null) {
             bits.push(`${c.running_pod_count ?? 0}/${c.pod_count} pods`);
           }
@@ -116,7 +96,6 @@ export const summarizeClusters = (
       // reads as "activity" rather than "attention".
       pulse: running > 0 && running === total,
     },
-    nodes,
     pods,
     api,
     detail,

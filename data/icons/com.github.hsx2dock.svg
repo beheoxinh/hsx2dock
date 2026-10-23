@@ -1,1 +1,12 @@
-<svg fill="#4285F4" role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><title>Google Container Optimized OS</title><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm0 21.6a9.6 9.6 0 0 1-5.016-1.416L11.28 17.7v-5.4L6.612 9.6v5.424l3.3 1.908-4.152 2.4A9.6 9.6 0 0 1 7.296 3.6v4.8L12 11.136 16.68 8.4 12 5.724 8.688 7.632V2.964a9.6 9.6 0 0 1 12.372 5.64A9.72 9.72 0 0 1 21.672 12v.084L17.352 9.6l-4.68 2.712v5.412l4.68-2.7v-3.816l4.14 2.4A9.6 9.6 0 0 1 12 21.6z"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#10b981"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <g transform="translate(232,232) scale(11.6666667)" fill="#ffffff">
+    <path d="M42.9,12.2l-18-9L24,3l-.9.2-18,9a.1.1,0,0,0-.1.1l19,9.6,19-9.6A.1.1,0,0,0,42.9,12.2ZM26,25.4V44.2l16.9-8.6A1.9,1.9,0,0,0,44,33.8V16.3ZM4,16.3V33.8a1.9,1.9,0,0,0,1.1,1.8L22,44.2V25.4Z"/>
+  </g>
+</svg>

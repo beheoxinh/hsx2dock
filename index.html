@@ -4,6 +4,72 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hsx2Dock</title>
+    <!--
+      Critical boot styles. These are inline on purpose: the Tailwind bundle
+      only arrives with the JS module, so without them the window paints the
+      browser's default white before flipping to the dark app — the flash on
+      launch. Everything here is deliberately independent of Tailwind.
+    -->
+    <style>
+      html, body { margin: 0; height: 100%; }
+      body { background: #09090b; }
+      html.light body { background: #fafafa; }
+
+      #app-splash {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 14px; background: inherit; color: #fafafa;
+        font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+        -webkit-user-select: none; user-select: none;
+        transition: opacity 320ms ease, visibility 320ms ease;
+      }
+      #app-splash.is-leaving { opacity: 0; visibility: hidden; }
+      html.light #app-splash { color: #18181b; }
+
+      .splash-mark {
+        display: flex; align-items: center; justify-content: center;
+        width: 56px; height: 56px; border-radius: 16px;
+        background: linear-gradient(160deg, #10b981, #059669);
+        box-shadow: 0 10px 30px -8px rgba(16, 185, 129, 0.55);
+        animation: splash-breathe 2s ease-in-out infinite;
+      }
+      .splash-title { font-size: 15px; font-weight: 600; letter-spacing: 0.01em; }
+      .splash-sub { font-size: 12px; color: #a1a1aa; margin-top: -8px; }
+      html.light .splash-sub { color: #52525b; }
+
+      .splash-bar {
+        width: 168px; height: 3px; margin-top: 6px;
+        border-radius: 999px; overflow: hidden;
+        background: rgba(255, 255, 255, 0.1);
+      }
+      html.light .splash-bar { background: rgba(0, 0, 0, 0.08); }
+      .splash-bar > span {
+        display: block; width: 40%; height: 100%; border-radius: inherit;
+        background: linear-gradient(90deg, #10b981, #34d399);
+        animation: splash-slide 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+      }
+
+      #root { animation: splash-app-in 400ms ease both; }
+
+      @keyframes splash-breathe {
+        0%, 100% { transform: translateY(0) scale(1); }
+        50% { transform: translateY(-3px) scale(1.03); }
+      }
+      @keyframes splash-slide {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(360%); }
+      }
+      @keyframes splash-app-in {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #app-splash { transition: none; }
+        .splash-mark, .splash-bar > span, #root { animation: none; }
+        .splash-bar > span { width: 100%; opacity: 0.5; }
+      }
+    </style>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -24,6 +90,18 @@
     </script>
   </head>
   <body class="bg-zinc-950 text-zinc-100 antialiased overflow-hidden select-none font-sans">
+    <!-- Static boot screen: paints before any JS, removed once React mounts. -->
+    <div id="app-splash" role="status" aria-live="polite">
+      <div class="splash-mark" aria-hidden="true">
+        <svg width="30" height="30" viewBox="0 0 48 48">
+          <path fill="#fff"
+                d="M42.9,12.2l-18-9L24,3l-.9.2-18,9a.1.1,0,0,0-.1.1l19,9.6,19-9.6A.1.1,0,0,0,42.9,12.2ZM26,25.4V44.2l16.9-8.6A1.9,1.9,0,0,0,44,33.8V16.3ZM4,16.3V33.8a1.9,1.9,0,0,0,1.1,1.8L22,44.2V25.4Z" />
+        </svg>
+      </div>
+      <div class="splash-title">Hsx2Dock</div>
+      <div class="splash-sub">Starting engine…</div>
+      <div class="splash-bar" aria-hidden="true"><span></span></div>
+    </div>
     <div id="root" class="h-screen w-screen flex flex-col"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

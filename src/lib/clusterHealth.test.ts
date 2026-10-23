@@ -59,18 +59,6 @@ test("a partial count is a warning and does not pulse", () => {
 test("no clusters at all shows None while the engine is up", () => {
   assert.equal(summarizeClusters([], true).clusters.label, "None");
   assert.equal(summarizeClusters([], false).clusters.label, "—");
-  assert.equal(summarizeClusters([], true).nodes, null);
-});
-
-test("nodes aggregate across running and stopped clusters", () => {
-  const h = summarizeClusters(
-    [
-      cluster({ name: "a", running: true, node_count: 1, running_nodes: 1 }),
-      cluster({ name: "b", node_count: 2 }),
-    ],
-    true
-  );
-  assert.deepEqual(h.nodes, { label: "1/3 Nodes", tone: "warning" });
 });
 
 test("pods stay hidden until a running control plane reports counts", () => {
@@ -107,11 +95,11 @@ test("API badge is absent while every cluster is stopped", () => {
   assert.equal(h.api, null);
 });
 
-test("tooltip lists nodes, pods and API state per cluster", () => {
+test("tooltip lists pods and API state per cluster", () => {
   const h = summarizeClusters(
     [cluster({ name: "dev", running: true, running_nodes: 1, pod_count: 5, running_pod_count: 5, api_ready: true })],
     true
   );
-  assert.equal(h.detail, "dev: running · 1/1 nodes · 5/5 pods · API ready");
+  assert.equal(h.detail, "dev: running · 5/5 pods · API ready");
   assert.equal(summarizeClusters([], true).detail, "No kind clusters");
 });
