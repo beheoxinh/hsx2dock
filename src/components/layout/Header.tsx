@@ -3,6 +3,7 @@ import { Power, RefreshCw, Sun, Moon } from "lucide-react";
 import { useState, useEffect } from "react";
 import { Button } from "../ui/Button";
 import { StatusBadge } from "../ui/StatusBadge";
+import { summarizeClusters } from "../../lib/clusterHealth";
 import { api } from "../../lib/api";
 import type { DaemonState, KindCluster } from "../../types";
 
@@ -57,18 +58,7 @@ export const Header: React.FC<HeaderProps> = ({
     };
   }, [isRunning]);
 
-  const runningClusters = clusters.filter((c) => c.running).length;
-  const clusterLabel =
-    clusters.length === 0
-      ? isRunning
-        ? "None"
-        : "—"
-      : runningClusters === clusters.length
-        ? `${runningClusters} Running`
-        : `${runningClusters}/${clusters.length} Running`;
-  const clustersTitle = clusters.length
-    ? clusters.map((c) => `${c.name}: ${c.running ? "running" : "stopped"}`).join("\n")
-    : "No kind clusters";
+  const health = summarizeClusters(clusters, isRunning);
 
   const toggleTheme = () => {
     const nextDark = !isDark;
@@ -98,12 +88,33 @@ export const Header: React.FC<HeaderProps> = ({
             type="button"
             onClick={onOpenClusters}
             disabled={!onOpenClusters}
-            title={clustersTitle}
-            aria-label={`Kubernetes clusters: ${clusterLabel}`}
+            title={health.detail}
+            aria-label={`Kubernetes clusters: ${health.clusters.label}`}
             className="rounded-full transition-opacity hover:opacity-80 disabled:cursor-default disabled:hover:opacity-100"
           >
-            <StatusBadge status={clusterLabel} pulse={runningClusters > 0} />
+            <StatusBadge
+              status={health.clusters.label}
+              tone={health.clusters.tone}
+              pulse={health.clusters.pulse}
+            />
           </button>
+
+          {/* Per-cluster health only appears once there is something to report. */}
+          {health.nodes && (
+            <span title={`${health.nodes.label} across all clusters`}>
+              <StatusBadge status={health.nodes.label} tone={health.nodes.tone} />
+            </span>
+          )}
+          {health.pods && (
+            <span title={`${health.pods.label} across all clusters`}>
+              <StatusBadge status={health.pods.label} tone={health.pods.tone} />
+            </span>
+          )}
+          {health.api && (
+            <span title="Whether each running cluster's API server answers /readyz">
+              <StatusBadge status={health.api.label} tone={health.api.tone} />
+            </span>
+          )}
         </div>
       </div>
 

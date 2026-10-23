@@ -47,14 +47,14 @@ let cliCheckedAt = 0;
 let cliCheckOk = true;
 
 /** The four configuration domains, in the order the rail presents them. */
-type SettingsTab = "casual" | "engine" | "tools" | "registry";
+type SettingsTab = "general" | "engine" | "tools" | "registry";
 
 const SETTINGS_TABS: {
   id: SettingsTab;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
-  { id: "casual", label: "Casual", icon: Monitor },
+  { id: "general", label: "General", icon: Monitor },
   { id: "engine", label: "Engine", icon: Cpu },
   { id: "tools", label: "Tools", icon: Wrench },
   { id: "registry", label: "Registry", icon: Boxes },
@@ -62,7 +62,7 @@ const SETTINGS_TABS: {
 
 export const SettingsPage: React.FC = () => {
   const toast = useToast();
-  const [tab, setTab] = useState<SettingsTab>("casual");
+  const [tab, setTab] = useState<SettingsTab>("general");
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [cliStatus, setCliStatus] = useState<CliBridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
@@ -372,7 +372,7 @@ export const SettingsPage: React.FC = () => {
           <div
             role="tablist"
             aria-label="Settings sections"
-            className="flex items-stretch gap-1 overflow-x-auto border-b border-zinc-800"
+            className="grid grid-cols-2 gap-1 border-b border-zinc-800 sm:grid-cols-4"
           >
             {SETTINGS_TABS.map(({ id, label, icon: Icon }) => {
               const active = tab === id;
@@ -384,7 +384,7 @@ export const SettingsPage: React.FC = () => {
                   aria-selected={active}
                   aria-controls={`settings-panel-${id}`}
                   onClick={() => setTab(id)}
-                  className={`group relative -mb-px flex items-center gap-2 whitespace-nowrap rounded-t-lg border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
+                  className={`group relative -mb-px flex w-full items-center justify-center gap-2 whitespace-nowrap rounded-t-lg border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
                     active
                       ? "border-emerald-500 text-white"
                       : "border-transparent text-zinc-400 hover:bg-zinc-900/40 hover:text-zinc-200"
@@ -406,12 +406,12 @@ export const SettingsPage: React.FC = () => {
       <form onSubmit={handleSave} className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0 flex-1 overflow-y-auto px-8 py-6">
           <div className="max-w-4xl mx-auto space-y-6">
-        {/* Casual — appearance first, then alerts, then the terminal. */}
+        {/* General — appearance first, then alerts, then the terminal. */}
         <div
-          id="settings-panel-casual"
+          id="settings-panel-general"
           role="tabpanel"
-          aria-label="Casual"
-          hidden={tab !== "casual"}
+          aria-label="General"
+          hidden={tab !== "general"}
           className="space-y-6"
         >
           {/* Theme Settings */}
