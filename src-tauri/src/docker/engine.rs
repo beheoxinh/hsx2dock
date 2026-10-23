@@ -765,6 +765,15 @@ const SNAPSHOTTER_DTYPE_PLUGINS: [&str; 2] = [
 /// never deleted.
 pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
     if dir_supports_d_type(dir) != Some(false) {
+        // The filesystem is fine, but a link left over from when this root sat
+        // on a d_type-less volume would still dangle and still break containerd
+        // the same way. Repair, never create: on a healthy root with no
+        // containerd dir yet there is nothing to do (the common case).
+        if dir.join("containerd").join("daemon").is_dir() {
+            if let Some(compat) = dtype_compat_root() {
+                heal_dangling_snapshotter_links(dir, &compat)?;
+            }
+        }
         return Ok(());
     }
 
@@ -778,6 +787,42 @@ pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
         );
     };
 
+    heal_snapshotter_links(dir, &compat)
+}
+
+/// Repoint only the links that no longer resolve, leaving every real directory
+/// and every working link exactly as it is.
+///
+/// Used on a healthy data root, where the snapshotter dirs must not be created
+/// (that would be a pointless write on every boot) but a leftover dangling link
+/// still has to be repaired.
+fn heal_dangling_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
+    let daemon = dir.join("containerd").join("daemon");
+    for plugin in SNAPSHOTTER_DTYPE_PLUGINS {
+        let link = daemon.join(plugin);
+        let Ok(meta) = fs::symlink_metadata(&link) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() || symlink_resolves(&link) {
+            continue;
+        }
+        let target = compat.join(plugin);
+        fs::create_dir_all(&target)
+            .with_context(|| format!("create {}", target.display()))?;
+        fs::remove_file(&link)
+            .with_context(|| format!("remove dangling {}", link.display()))?;
+        std::os::unix::fs::symlink(&target, &link)
+            .with_context(|| format!("relink {}", link.display()))?;
+    }
+    Ok(())
+}
+
+/// Point every snapshotter plugin dir under `dir/containerd/daemon` at the
+/// matching directory under `compat`.
+///
+/// Split out from [`ensure_snapshotter_compat`] so the link handling can be
+/// unit-tested without a d_type-less filesystem (that needs a real volume).
+fn heal_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
     let daemon = dir.join("containerd").join("daemon");
     fs::create_dir_all(&daemon)
         .with_context(|| format!("create {}", daemon.display()))?;
@@ -789,8 +834,23 @@ pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
 
         let link = daemon.join(plugin);
         match fs::symlink_metadata(&link) {
-            // Already retargeted by a previous boot — nothing to do.
-            Ok(meta) if meta.file_type().is_symlink() => {}
+            // Already retargeted by a previous boot — nothing to do, *provided*
+            // the target still exists. A dangling link (the compat tree moved
+            // between app identities, or was pruned from /tmp) is worse than no
+            // link at all: containerd's `mkdir` on the snapshotter dir fails
+            // with "file exists", the leases plugin never registers, and every
+            // create/start dies with "unknown service
+            // containerd.services.leases.v1.Leases". Repoint it instead.
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // A link that still resolves is left exactly as it is.
+                if symlink_resolves(&link) {
+                    continue;
+                }
+                fs::remove_file(&link)
+                    .with_context(|| format!("remove dangling {}", link.display()))?;
+                std::os::unix::fs::symlink(&target, &link)
+                    .with_context(|| format!("relink {}", link.display()))?;
+            }
             // An empty real dir is safe to replace; a populated one is not.
             Ok(meta) if meta.is_dir() => {
                 let mut entries = fs::read_dir(&link)
@@ -815,6 +875,11 @@ pub fn ensure_snapshotter_compat(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// True when `link` is a symlink whose target exists (follows the chain).
+fn symlink_resolves(link: &Path) -> bool {
+    fs::metadata(link).is_ok()
 }
 
 /// A directory that does report real `d_type` values, to host the retargeted
@@ -2977,6 +3042,108 @@ mod tests {
             "detector and pre-flight gate disagree for {}",
             probe.display()
         );
+    }
+
+    /// A snapshotter link left behind by an older app identity (or a compat
+    /// root pruned from /tmp) points nowhere. containerd then cannot `mkdir`
+    /// the plugin dir — "file exists" — the leases plugin never registers, and
+    /// every create/start fails with "unknown service
+    /// containerd.services.leases.v1.Leases". The shim must repoint it.
+    #[test]
+    fn snapshotter_compat_repairs_a_dangling_link() {
+        let root = std::env::temp_dir().join(format!("dm-compat-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let compat = root.join("compat");
+        fs::create_dir_all(source.join("containerd/daemon")).unwrap();
+        fs::create_dir_all(&compat).unwrap();
+
+        let link = source
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        // Point at a directory that does not exist — the state found in the
+        // field after the compat tree moved between app identities.
+        std::os::unix::fs::symlink(root.join("gone"), &link).unwrap();
+        assert!(!symlink_resolves(&link), "fixture must start dangling");
+
+        heal_snapshotter_links(&source, &compat).unwrap();
+
+        assert!(symlink_resolves(&link), "dangling link must be repointed");
+        assert_eq!(fs::read_link(&link).unwrap(), compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0]));
+        assert!(link.is_dir(), "the healed link must resolve to a directory");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A link that already resolves is never touched: rewriting it every boot
+    /// would churn containerd's state for no reason.
+    #[test]
+    fn snapshotter_compat_leaves_a_working_link_alone() {
+        let root = std::env::temp_dir().join(format!("dm-compat-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let compat = root.join("compat");
+        fs::create_dir_all(source.join("containerd/daemon")).unwrap();
+        let live = compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("marker"), b"keep").unwrap();
+
+        let link = source
+            .join("containerd/daemon")
+            .join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        std::os::unix::fs::symlink(&live, &link).unwrap();
+
+        heal_snapshotter_links(&source, &compat).unwrap();
+
+        assert!(link.join("marker").exists(), "live link must be left untouched");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A healthy filesystem can still carry a dangling link from the days when
+    /// the same data root sat on a d_type-less volume. Nothing else would ever
+    /// repair it, and containerd keeps failing until it is.
+    #[test]
+    fn snapshotter_compat_repairs_dangling_link_on_healthy_root() {
+        let root = std::env::temp_dir().join(format!("dm-compat-heal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let daemon = root.join("containerd/daemon");
+        fs::create_dir_all(&daemon).unwrap();
+        assert_eq!(dir_supports_d_type(&root), Some(true), "fixture needs a healthy fs");
+
+        let link = daemon.join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
+        std::os::unix::fs::symlink(root.join("gone"), &link).unwrap();
+        assert!(!symlink_resolves(&link));
+
+        let compat = root.join("compat");
+        heal_dangling_snapshotter_links(&root, &compat).unwrap();
+
+        assert!(symlink_resolves(&link), "dangling link must be repaired");
+        assert_eq!(fs::read_link(&link).unwrap(), compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0]));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// On a healthy root with no snapshotter dirs the shim must not create
+    /// anything — this runs on every engine start.
+    #[test]
+    fn heal_does_not_create_dirs_on_a_clean_healthy_root() {
+        let root = std::env::temp_dir().join(format!("dm-compat-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("containerd/daemon")).unwrap();
+
+        let compat = root.join("compat");
+        heal_dangling_snapshotter_links(&root, &compat).unwrap();
+
+        assert!(!compat.exists(), "heal must not create the compat tree");
+        for plugin in SNAPSHOTTER_DTYPE_PLUGINS {
+            assert!(
+                !root.join("containerd/daemon").join(plugin).exists(),
+                "{plugin} must not be created"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// On a healthy filesystem the shim must be a pure no-op: no directories
