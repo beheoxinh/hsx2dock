@@ -105,6 +105,17 @@ pub fn notify_kind_event(app: &AppHandle, created: bool, name: &str) {
     }
 }
 
+/// Shown when "Close to tray" hides the window, so the close does not read as
+/// a hang. Not preference-gated: it is the feedback for the action the user
+/// just took, not a background event.
+pub fn notify_hidden_to_tray(app: &AppHandle) {
+    record_notice(
+        app,
+        "Hsx2Dock is still running",
+        "The window is in the tray and the engine keeps running. Click the tray icon to reopen, or Quit there to stop everything.",
+    );
+}
+
 struct MonitorCtx {
     notified: HashMap<String, Instant>,
     last_engine: Option<DaemonState>,

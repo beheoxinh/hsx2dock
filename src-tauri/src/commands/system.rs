@@ -107,6 +107,9 @@ pub async fn save_app_config(
     // The shim exports the active endpoint's DOCKER_HOST, so a remote switch
     // moves the terminal with the UI.
     refresh_shim(&state, &config);
+    // The close handler reads a lock-free mirror; update it before the config
+    // is moved so the very next window close honours the new setting.
+    state.set_close_to_tray(config.close_to_tray);
     *state.config.write().await = config;
     // Caps changed on a running engine apply immediately; never reject the
     // save over it (the next engine start re-applies them anyway).

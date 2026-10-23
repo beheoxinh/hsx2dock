@@ -167,6 +167,8 @@ export interface AppConfig {
   cli_bridge_prev_context: string;
   data_root?: string;
   theme?: string;
+  /** Close the window to the tray instead of quitting; the engine keeps running. */
+  close_to_tray?: boolean;
   /** Which docker CLI to run: `"auto"` (newer wins) | `"system"` | `"bundled"`. */
   cli_mode: string;
   /** Whether `~/.local/bin/docker` was installed to expose docker in a terminal. */

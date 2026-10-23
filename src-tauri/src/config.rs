@@ -39,6 +39,11 @@ pub struct AppConfig {
     /// UI Theme preference: "system" | "dark" | "light"
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Closing the window hides it to the tray instead of quitting. The app
+    /// (and the engine it supervises) keeps running in the background; only
+    /// the tray's Quit exits. Off by default, matching a plain window close.
+    #[serde(default)]
+    pub close_to_tray: bool,
     /// Which docker CLI the app runs: "auto" | "system" | "bundled".
     ///
     /// `auto` prefers the newer of the system and bundled binaries, so a
@@ -271,6 +276,7 @@ impl Default for AppConfig {
             cli_bridge_prev_context: String::new(),
             data_root: String::new(),
             theme: default_theme(),
+            close_to_tray: false,
             cli_mode: default_cli_mode(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -411,6 +417,8 @@ mod tests {
         );
         assert!(cfg.cli_bridge_enabled);
         assert!(cfg.cli_bridge_set_default);
+        // Closing the window quits unless the user opted into tray mode.
+        assert!(!cfg.close_to_tray);
 
         let cfg: AppConfig =
             toml::from_str("daemon_unit = \"docker.service\"\nprefer_socket = \"/tmp/x.sock\"\n")
@@ -420,6 +428,7 @@ mod tests {
             AppConfig::default().auto_start_daemon
         );
         assert!(cfg.cli_bridge_enabled);
+        assert!(!cfg.close_to_tray);
 
         let cfg: AppConfig =
             toml::from_str("auto_start_daemon = false\n").expect("partial file parses");
@@ -439,6 +448,7 @@ mod tests {
             cli_bridge_prev_context: "desktop-linux".to_string(),
             data_root: "/mnt/storage/docker".to_string(),
             theme: "dark".to_string(),
+            close_to_tray: false,
             cli_mode: "auto".to_string(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,

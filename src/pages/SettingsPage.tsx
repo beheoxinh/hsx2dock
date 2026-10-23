@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
@@ -339,6 +339,7 @@ export const SettingsPage: React.FC = () => {
         cli_mode: config.cli_mode,
         auto_start_daemon: config.auto_start_daemon,
         theme: config.theme,
+        close_to_tray: !!config.close_to_tray,
         compose_file: config.compose_file,
         terminal_shell: config.terminal_shell,
         terminal_font_size: config.terminal_font_size,
@@ -527,6 +528,55 @@ export const SettingsPage: React.FC = () => {
                 className="w-24 h-10 px-3.5 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 font-mono text-center"
               />
             </div>
+          </Card>
+
+          {/* Window behaviour — what the close button does. */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <Minimize2 className="w-5 h-5 text-indigo-400" />
+              <div>
+                <h3 className="font-semibold text-white">Window Behaviour</h3>
+                <p className="text-xs text-zinc-400">What closing the main window does</p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!config.close_to_tray}
+              onClick={() =>
+                setConfig({ ...config, close_to_tray: !config.close_to_tray })
+              }
+              className="w-full flex items-center justify-between gap-4 py-2 text-left"
+            >
+              <span>
+                <span className="block font-medium text-sm text-zinc-200">
+                  Close to tray icon
+                </span>
+                <span className="block text-xs text-zinc-400 mt-0.5">
+                  Closing the window keeps Hsx2Dock and its Docker engine running
+                  in the background. Reopen from the tray icon; use the tray&apos;s
+                  Quit to exit completely.
+                </span>
+              </span>
+              <span
+                aria-hidden="true"
+                className={`relative w-10 rounded-full border transition-colors shrink-0 ${
+                  config.close_to_tray
+                    ? "bg-emerald-500/30 border-emerald-500/50"
+                    : "bg-zinc-800 border-zinc-700"
+                }`}
+                style={{ height: "1.375rem" }}
+              >
+                <span
+                  className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-full transition-all ${
+                    config.close_to_tray
+                      ? "left-[1.3rem] bg-emerald-400"
+                      : "left-0.5 bg-zinc-500"
+                  }`}
+                />
+              </span>
+            </button>
           </Card>
         </div>
 

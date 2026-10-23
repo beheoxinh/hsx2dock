@@ -30,6 +30,10 @@ pub struct AppState {
     pub exec_sessions: Arc<RwLock<HashMap<String, ExecSession>>>,
     /// Isolated kind (Kubernetes IN Docker) binary + kubeconfig layout.
     pub kind: KindPaths,
+    /// Mirror of `AppConfig::close_to_tray`. The window-close handler runs on
+    /// the GTK thread and must decide synchronously, so it reads this instead
+    /// of awaiting the config lock.
+    pub close_to_tray: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -46,6 +50,8 @@ impl AppState {
             }
         };
 
+        let close_to_tray = config.close_to_tray;
+
         Self {
             client: Arc::new(RwLock::new(client)),
             engine,
@@ -54,6 +60,7 @@ impl AppState {
             build_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exec_sessions: Arc::new(RwLock::new(HashMap::new())),
             kind: KindPaths::for_app(),
+            close_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(close_to_tray)),
         }
     }
 
@@ -143,6 +150,21 @@ impl AppState {
     /// Persists the in-memory config to disk.
     pub async fn save_config(&self) -> Result<(), String> {
         let config = self.config.read().await.clone();
-        config.save().await.map_err(|e| e.to_string())
+        let result = config.save().await.map_err(|e| e.to_string());
+        self.set_close_to_tray(config.close_to_tray);
+        result
+    }
+
+    /// Mirrors the persisted preference into the flag the window-close handler
+    /// reads synchronously. Every writer of `config.close_to_tray` routes
+    /// through here so the two never disagree.
+    pub fn set_close_to_tray(&self, enabled: bool) {
+        self.close_to_tray
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_close_to_tray(&self) -> bool {
+        self.close_to_tray
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

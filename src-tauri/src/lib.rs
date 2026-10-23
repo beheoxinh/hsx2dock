@@ -128,6 +128,24 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state)
+        // Close to tray: the window is hidden, not destroyed, so the engine
+        // supervisor and every background task keep running. `AppHandle::exit`
+        // (tray → Quit) does not raise this event, so Quit still shuts down.
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let app = window.app_handle();
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if !state.is_close_to_tray() {
+                return;
+            }
+            api.prevent_close();
+            let _ = window.hide();
+            crate::tray::notify_hidden_to_tray(app);
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             
