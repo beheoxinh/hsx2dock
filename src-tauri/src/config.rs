@@ -41,9 +41,18 @@ pub struct AppConfig {
     pub theme: String,
     /// Closing the window hides it to the tray instead of quitting. The app
     /// (and the engine it supervises) keeps running in the background; only
-    /// the tray's Quit exits. Off by default, matching a plain window close.
-    #[serde(default)]
+    /// the tray's Quit exits. On by default: a desktop Docker manager is
+    /// expected to live in the tray like Docker Desktop does.
+    #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// Register an XDG autostart entry so the app (with its engine) comes up
+    /// at login. Off by default — enabling it is an explicit opt-in.
+    #[serde(default)]
+    pub auto_start_on_boot: bool,
+    /// Launched by the autostart entry, start hidden in the tray instead of
+    /// showing the window. Ignored unless `auto_start_on_boot` is on.
+    #[serde(default)]
+    pub start_minimized: bool,
     /// Which docker CLI the app runs: "auto" | "system" | "bundled".
     ///
     /// `auto` prefers the newer of the system and bundled binaries, so a
@@ -264,7 +273,7 @@ fn default_kind_nodes() -> u32 {
 }
 
 /// Current config schema. See [`AppConfig::schema_version`].
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -276,7 +285,9 @@ impl Default for AppConfig {
             cli_bridge_prev_context: String::new(),
             data_root: String::new(),
             theme: default_theme(),
-            close_to_tray: false,
+            close_to_tray: true,
+            auto_start_on_boot: false,
+            start_minimized: false,
             cli_mode: default_cli_mode(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -326,10 +337,10 @@ impl AppConfig {
     pub async fn load() -> anyhow::Result<Self> {
         if let Some(path) = Self::config_path() {
             if path.exists() {
-                let cfg = Self::load_from(&path).await?;
+                let (cfg, stale) = Self::load_and_migrate(&path).await?;
                 // Persist a one-time migration so it does not re-run and so
                 // the file is not misleadingly still showing the old values.
-                if cfg.schema_version < CONFIG_SCHEMA_VERSION {
+                if stale {
                     let _ = cfg.save().await;
                 }
                 return Ok(cfg);
@@ -339,10 +350,19 @@ impl AppConfig {
     }
 
     pub async fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self::load_and_migrate(path).await?.0)
+    }
+
+    /// Reads a config file and upgrades it, also reporting whether the file
+    /// predated the current schema. The caller needs that flag *before* the
+    /// migration is applied — checking `schema_version` afterwards would always
+    /// be false, which is why the upgrade was never persisted before.
+    async fn load_and_migrate(path: &std::path::Path) -> anyhow::Result<(Self, bool)> {
         let content = tokio::fs::read_to_string(path).await?;
         let mut cfg: AppConfig = toml::from_str(&content)?;
+        let stale = cfg.schema_version < CONFIG_SCHEMA_VERSION;
         cfg.migrate();
-        Ok(cfg)
+        Ok((cfg, stale))
     }
 
     /// One-time upgrades for files written by older versions. Idempotent: only
@@ -354,7 +374,21 @@ impl AppConfig {
             // the app's whole point is wiring `docker` to its engine.
             self.cli_bridge_enabled = true;
             self.cli_bridge_set_default = true;
+            // Schema 2 makes close-to-tray the default. Files written by the
+            // first release lack the key (already flipped by the serde default)
+            // or stored `false` from the toggle — both move to the new default
+            // so the installed app behaves like a fresh one.
+            self.close_to_tray = true;
             self.schema_version = CONFIG_SCHEMA_VERSION;
+        }
+    }
+
+    /// Drops settings that only mean something together. "Start minimized" is
+    /// driven by the autostart entry, so it is meaningless (and misleading in
+    /// the UI) once "Auto startup on boot" is off.
+    pub fn normalize(&mut self) {
+        if !self.auto_start_on_boot {
+            self.start_minimized = false;
         }
     }
 
@@ -392,6 +426,26 @@ mod tests {
     }
 
     #[test]
+    fn desktop_integration_defaults_and_normalization() {
+        let cfg = AppConfig::default();
+        // Tray-first out of the box, but starting at login stays an opt-in.
+        assert!(cfg.close_to_tray);
+        assert!(!cfg.auto_start_on_boot);
+        assert!(!cfg.start_minimized);
+
+        // Start-minimized only makes sense as a companion of autostart.
+        let mut cfg = AppConfig::default();
+        cfg.auto_start_on_boot = true;
+        cfg.start_minimized = true;
+        cfg.normalize();
+        assert!(cfg.start_minimized);
+
+        cfg.auto_start_on_boot = false;
+        cfg.normalize();
+        assert!(!cfg.start_minimized);
+    }
+
+    #[test]
     fn bridge_is_on_by_default() {
         // A fresh install must wire `docker` to the engine with no extra step.
         let cfg = AppConfig::default();
@@ -417,8 +471,8 @@ mod tests {
         );
         assert!(cfg.cli_bridge_enabled);
         assert!(cfg.cli_bridge_set_default);
-        // Closing the window quits unless the user opted into tray mode.
-        assert!(!cfg.close_to_tray);
+        // Closing the window hides to the tray unless the user turns it off.
+        assert!(cfg.close_to_tray);
 
         let cfg: AppConfig =
             toml::from_str("daemon_unit = \"docker.service\"\nprefer_socket = \"/tmp/x.sock\"\n")
@@ -428,11 +482,35 @@ mod tests {
             AppConfig::default().auto_start_daemon
         );
         assert!(cfg.cli_bridge_enabled);
-        assert!(!cfg.close_to_tray);
+        assert!(cfg.close_to_tray);
 
         let cfg: AppConfig =
             toml::from_str("auto_start_daemon = false\n").expect("partial file parses");
         assert!(!cfg.auto_start_daemon);
+    }
+
+    #[tokio::test]
+    async fn migration_is_persisted_and_reported_once() {
+        let dir = std::env::temp_dir().join(format!("dm-cfg-mig-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        tokio::fs::write(&path, "close_to_tray = false\n")
+            .await
+            .expect("seeds a legacy file");
+
+        let (cfg, stale) = AppConfig::load_and_migrate(&path).await.expect("loads");
+        assert!(stale, "a file below the current schema must report itself stale");
+        assert!(cfg.close_to_tray);
+        cfg.save_to(&path).await.expect("persists the upgrade");
+
+        let raw = tokio::fs::read_to_string(&path).await.expect("reads back");
+        assert!(raw.contains("close_to_tray = true"));
+        assert!(raw.contains(&format!("schema_version = {CONFIG_SCHEMA_VERSION}")));
+
+        // The upgrade is one-shot: the rewritten file is current.
+        let (_, stale_again) = AppConfig::load_and_migrate(&path).await.expect("loads");
+        assert!(!stale_again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -448,7 +526,9 @@ mod tests {
             cli_bridge_prev_context: "desktop-linux".to_string(),
             data_root: "/mnt/storage/docker".to_string(),
             theme: "dark".to_string(),
-            close_to_tray: false,
+            close_to_tray: true,
+            auto_start_on_boot: false,
+            start_minimized: false,
             cli_mode: "auto".to_string(),
             cli_shim_enabled: false,
             schema_version: CONFIG_SCHEMA_VERSION,
@@ -478,13 +558,18 @@ mod tests {
     fn legacy_config_migrates_bridge_on() {
         // A file written before the bridge was on-by-default carries
         // `false`; loading it must flip both flags and stamp the schema.
-        let mut cfg: AppConfig =
-            toml::from_str("cli_bridge_enabled = false\ncli_bridge_set_default = false\n")
-                .expect("parses");
+        let mut cfg: AppConfig = toml::from_str(
+            "cli_bridge_enabled = false\ncli_bridge_set_default = false\nclose_to_tray = false\n",
+        )
+        .expect("parses");
         assert!(!cfg.cli_bridge_enabled);
+        assert!(!cfg.close_to_tray);
         cfg.migrate();
         assert!(cfg.cli_bridge_enabled);
         assert!(cfg.cli_bridge_set_default);
+        // Schema 2 promotes close-to-tray to the default, including for a
+        // stored `false` written by the first build of the toggle.
+        assert!(cfg.close_to_tray);
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
         // Second run is a no-op.
         cfg.migrate();

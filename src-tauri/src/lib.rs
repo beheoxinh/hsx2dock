@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
+pub mod autostart;
 pub mod commands;
 pub mod config;
 pub mod docker;
@@ -167,6 +168,12 @@ pub fn run() {
                     let config = crate::runtime::runtime()
                         .block_on(async { state.config.read().await.clone() });
                     crate::commands::system::refresh_shim(&state, &config);
+                    // Keep the login entry in step with the saved settings; a
+                    // config dir restored from backup (or cleaned by hand) must
+                    // not silently drop autostart.
+                    if let Err(e) = crate::autostart::sync(&config) {
+                        tracing::warn!("could not sync the autostart entry: {e}");
+                    }
                 }
                 let should_autostart = crate::runtime::runtime().block_on(async {
                     state.config.read().await.auto_start_daemon
@@ -214,11 +221,40 @@ pub fn run() {
                 });
             }
 
+            // `--start-minimized` is only passed by our own autostart entry, and
+            // the config is re-checked so a stale entry can never hide a manual
+            // launch.
+            let start_hidden = std::env::args()
+                .any(|arg| arg == crate::autostart::START_MINIMIZED_ARG)
+                && handle
+                    .try_state::<AppState>()
+                    .map(|state| {
+                        crate::runtime::runtime().block_on(async {
+                            let cfg = state.config.read().await;
+                            cfg.auto_start_on_boot && cfg.start_minimized
+                        })
+                    })
+                    .unwrap_or(false);
+
             // Tray + desktop notifications. AppState is managed on the builder
             // so the tray can read daemon state immediately; a missing display
             // bus must not take the whole app down, hence the warn-and-continue.
-            if let Err(e) = crate::tray::init_tray(&handle) {
-                tracing::warn!("system tray unavailable: {e}");
+            let tray_ready = match crate::tray::init_tray(&handle) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("system tray unavailable: {e}");
+                    false
+                }
+            };
+
+            // The window is created hidden (tauri.conf.json) so a login launch
+            // never flashes the full window before dropping into the tray.
+            // Without a tray there is no way back, so always show in that case.
+            if !start_hidden || !tray_ready {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
             start_background_monitoring(handle);
             Ok(())

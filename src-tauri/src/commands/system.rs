@@ -93,8 +93,15 @@ pub fn refresh_shim(state: &AppState, config: &crate::config::AppConfig) {
 #[tauri::command]
 pub async fn save_app_config(
     state: State<'_, AppState>,
-    config: AppConfig,
+    mut config: AppConfig,
 ) -> Result<(), String> {
+    // Turning off "Auto startup on boot" also clears its dependent switch, so
+    // the persisted config never carries a setting the UI cannot show.
+    config.normalize();
+    // The login entry is part of the setting's contract: if it cannot be
+    // written, fail the save rather than pretend the toggle took effect.
+    crate::autostart::apply(config.auto_start_on_boot, config.start_minimized)
+        .map_err(|e| format!("Could not update the autostart entry: {e}"))?;
     config.save().await.map_err(|e| e.to_string())?;
     // Sync data_root immediately to engine paths so subsequent daemon restarts take effect without restarting the app
     state.engine.set_data_root(Some(&config.data_root));

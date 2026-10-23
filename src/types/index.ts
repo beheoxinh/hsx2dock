@@ -169,6 +169,10 @@ export interface AppConfig {
   theme?: string;
   /** Close the window to the tray instead of quitting; the engine keeps running. */
   close_to_tray?: boolean;
+  /** Register an autostart entry so the app comes up at login. */
+  auto_start_on_boot?: boolean;
+  /** Boot launches stay in the tray. Only meaningful with `auto_start_on_boot`. */
+  start_minimized?: boolean;
   /** Which docker CLI to run: `"auto"` (newer wins) | `"system"` | `"bundled"`. */
   cli_mode: string;
   /** Whether `~/.local/bin/docker` was installed to expose docker in a terminal. */

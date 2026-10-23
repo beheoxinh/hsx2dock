@@ -60,6 +60,50 @@ const SETTINGS_TABS: {
   { id: "registry", label: "Registry", icon: Boxes },
 ];
 
+/** Pill switch shared by the Window Behaviour rows. */
+const Switch: React.FC<{ on: boolean }> = ({ on }) => (
+  <span
+    aria-hidden="true"
+    className={`relative w-10 rounded-full border transition-colors shrink-0 ${
+      on ? "bg-emerald-500/30 border-emerald-500/50" : "bg-zinc-800 border-zinc-700"
+    }`}
+    style={{ height: "1.375rem" }}
+  >
+    <span
+      className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-full transition-all ${
+        on ? "left-[1.3rem] bg-emerald-400" : "left-0.5 bg-zinc-500"
+      }`}
+    />
+  </span>
+);
+
+/** One labelled switch row; `disabled` keeps the dependent option visible but
+ *  explains why it cannot be changed instead of hiding it outright. */
+const ToggleRow: React.FC<{
+  title: string;
+  desc: string;
+  on: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}> = ({ title, desc, on, disabled = false, onToggle }) => (
+  <button
+    type="button"
+    role="switch"
+    aria-checked={on}
+    disabled={disabled}
+    onClick={onToggle}
+    className={`w-full flex items-center justify-between gap-4 py-3 text-left ${
+      disabled ? "opacity-50 cursor-not-allowed" : ""
+    }`}
+  >
+    <span>
+      <span className="block font-medium text-sm text-zinc-200">{title}</span>
+      <span className="block text-xs text-zinc-400 mt-0.5">{desc}</span>
+    </span>
+    <Switch on={on} />
+  </button>
+);
+
 export const SettingsPage: React.FC = () => {
   const toast = useToast();
   const [tab, setTab] = useState<SettingsTab>("general");
@@ -340,6 +384,8 @@ export const SettingsPage: React.FC = () => {
         auto_start_daemon: config.auto_start_daemon,
         theme: config.theme,
         close_to_tray: !!config.close_to_tray,
+        auto_start_on_boot: !!config.auto_start_on_boot,
+        start_minimized: !!config.start_minimized,
         compose_file: config.compose_file,
         terminal_shell: config.terminal_shell,
         terminal_font_size: config.terminal_font_size,
@@ -536,47 +582,49 @@ export const SettingsPage: React.FC = () => {
               <Minimize2 className="w-5 h-5 text-indigo-400" />
               <div>
                 <h3 className="font-semibold text-white">Window Behaviour</h3>
-                <p className="text-xs text-zinc-400">What closing the main window does</p>
+                <p className="text-xs text-zinc-400">
+                  How the app behaves when you close it or sign in
+                </p>
               </div>
             </div>
 
-            <button
-              type="button"
-              role="switch"
-              aria-checked={!!config.close_to_tray}
-              onClick={() =>
-                setConfig({ ...config, close_to_tray: !config.close_to_tray })
-              }
-              className="w-full flex items-center justify-between gap-4 py-2 text-left"
-            >
-              <span>
-                <span className="block font-medium text-sm text-zinc-200">
-                  Close to tray icon
-                </span>
-                <span className="block text-xs text-zinc-400 mt-0.5">
-                  Closing the window keeps Hsx2Dock and its Docker engine running
-                  in the background. Reopen from the tray icon; use the tray&apos;s
-                  Quit to exit completely.
-                </span>
-              </span>
-              <span
-                aria-hidden="true"
-                className={`relative w-10 rounded-full border transition-colors shrink-0 ${
-                  config.close_to_tray
-                    ? "bg-emerald-500/30 border-emerald-500/50"
-                    : "bg-zinc-800 border-zinc-700"
-                }`}
-                style={{ height: "1.375rem" }}
-              >
-                <span
-                  className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-full transition-all ${
-                    config.close_to_tray
-                      ? "left-[1.3rem] bg-emerald-400"
-                      : "left-0.5 bg-zinc-500"
-                  }`}
-                />
-              </span>
-            </button>
+            <div className="divide-y divide-zinc-800/70">
+              <ToggleRow
+                title="Close to tray icon"
+                desc="Closing the window keeps Hsx2Dock and its Docker engine running in the background. Reopen from the tray icon; use the tray's Quit to exit completely."
+                on={!!config.close_to_tray}
+                onToggle={() =>
+                  setConfig({ ...config, close_to_tray: !config.close_to_tray })
+                }
+              />
+              <ToggleRow
+                title="Auto startup on boot"
+                desc="Launch Hsx2Dock (and its Docker engine) when you sign in. Needs a desktop session with XDG autostart support."
+                on={!!config.auto_start_on_boot}
+                onToggle={() => {
+                  const next = !config.auto_start_on_boot;
+                  setConfig({
+                    ...config,
+                    auto_start_on_boot: next,
+                    // The dependent switch cannot survive its parent.
+                    start_minimized: next ? config.start_minimized : false,
+                  });
+                }}
+              />
+              <ToggleRow
+                title="Start minimized"
+                desc={
+                  config.auto_start_on_boot
+                    ? "Boot launches go straight to the tray instead of opening the window."
+                    : "Enable Auto startup on boot first — there is no boot launch to minimize."
+                }
+                on={!!config.start_minimized}
+                disabled={!config.auto_start_on_boot}
+                onToggle={() =>
+                  setConfig({ ...config, start_minimized: !config.start_minimized })
+                }
+              />
+            </div>
           </Card>
         </div>
 

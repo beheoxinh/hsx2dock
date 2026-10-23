@@ -51,6 +51,10 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   Start/Stop engine, Open Dashboard), a `Notifications ▸` submenu with recent
   history, and per-category desktop notifications (build/pull/push, engine
   transitions, kind events), configurable from Settings → Notifications.
+- **Tray-first window behaviour** — closing the window hides it to the tray
+  (the engine keeps running) by default; Settings → General → Window Behaviour
+  can turn that off, register an autostart entry so the app comes up at login,
+  and start a boot launch straight in the tray.
 - **Bundled engine** — the app downloads its own Docker Engine (official
   static rootless binaries) into `~/.local/share/hsx2dock` on first run
   and runs `dockerd` rootless as a child process on a private socket. Fully
@@ -101,6 +105,13 @@ compose_file = ""
 - `compose_file` — default compose file used by the Compose page.
 - `data_root` — where containers/images/volumes live (survives engine updates).
 - `kind_auto_start` / `kind_cluster_prefs` — cluster auto-start switches.
+- `close_to_tray` — closing the window hides it to the tray instead of
+  quitting (on by default; the engine keeps running until you Quit from the
+  tray).
+- `auto_start_on_boot` — maintain `~/.config/autostart/hsx2dock.desktop` so
+  the app launches at login (off by default).
+- `start_minimized` — a login launch goes straight to the tray. Ignored unless
+  `auto_start_on_boot` is on.
 
 The internal directories are named `hsx2dock` too. An install created by an
 older build keeps working: on first launch the app renames the former
@@ -156,6 +167,7 @@ src-tauri/src/            Rust backend (Tauri commands + engine supervision)
   runtime.rs              shared Tokio runtime / engine-op marshalling
   config.rs               TOML config load/save
   tray.rs                 tray icon, menu, notifications
+  autostart.rs            XDG login entry for "Auto startup on boot"
   commands/               engine, containers, images, volumes, networks,
                           compose, kind/k8s, exec, registries, groups…
   docker/                 bollard client wrapper, bundled-engine management,
