@@ -217,7 +217,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
 
   const loadSizes = useCallback(async () => {
     try {
-      setSizes(await api.getContainerSizes());
+      setSizes((await api.getContainerSizes()) ?? {});
     } catch {
       /* engine offline — pills fall back to 0 */
     }

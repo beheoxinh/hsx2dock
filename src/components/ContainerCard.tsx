@@ -45,8 +45,9 @@ interface ContainerCardProps {
 
 /**
  * One container, rendered identically whether it sits in the flat list or
- * inside a group card. `compact` trims the padding and the stats strip for the
- * nested case, where the group already shows aggregate figures.
+ * inside a group card. `compact` trims the padding and tightens the stats grid
+ * for the nested case; the figures themselves stay, because the group header's
+ * aggregate pills are a summary, not a replacement for per-container data.
  */
 export const ContainerCard: React.FC<ContainerCardProps> = ({
   container: c,
@@ -108,54 +109,58 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
         </div>
       </div>
 
-      {/* Middle: live figures — the compact form relies on the group's pills */}
-      {!compact && (
-        <div className="flex-1 grid grid-cols-2 sm:grid-cols-3 gap-4 text-xs bg-zinc-950/50 border border-zinc-800/50 rounded-xl p-3">
-          <div>
-            <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
-              Ports
+      {/* Middle: live figures. Group members (compact) keep the same ports and
+          load readouts as isolated cards — only the spacing tightens; the
+          group header's aggregate pills are a summary, not a replacement. */}
+      <div
+        className={`flex-1 min-w-0 grid grid-cols-2 sm:grid-cols-3 text-xs bg-zinc-950/50 border border-zinc-800/50 rounded-xl ${
+          compact ? "gap-2 p-2" : "gap-4 p-3"
+        }`}
+      >
+        <div className="min-w-0">
+          <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
+            Ports
+          </span>
+          <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
+            <span className="text-zinc-200 truncate block font-mono">
+              {c.ports || "—"}
             </span>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="text-zinc-200 truncate block font-mono">
-                {c.ports || "—"}
-              </span>
-              {hostPort && (
-                <a
-                  href={`http://localhost:${hostPort}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="Open in browser"
-                  aria-label={`Open ${name} on port ${hostPort} in the browser`}
-                  className="text-blue-400 hover:text-blue-300"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <ExternalLink className="w-3 h-3 inline" />
-                </a>
-              )}
-            </div>
-          </div>
-
-          <div>
-            <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
-              CPU
-            </span>
-            <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
-              <Cpu className="w-3.5 h-3.5 text-blue-400" />
-              {isRunning && stats ? `${stats.cpu_percent.toFixed(1)}%` : "—"}
-            </span>
-          </div>
-
-          <div>
-            <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
-              Memory
-            </span>
-            <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
-              <Activity className="w-3.5 h-3.5 text-emerald-400" />
-              {isRunning && stats ? formatBytes(stats.mem_usage) : "—"}
-            </span>
+            {hostPort && (
+              <a
+                href={`http://localhost:${hostPort}`}
+                target="_blank"
+                rel="noreferrer"
+                title="Open in browser"
+                aria-label={`Open ${name} on port ${hostPort} in the browser`}
+                className="text-blue-400 hover:text-blue-300"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ExternalLink className="w-3 h-3 inline" />
+              </a>
+            )}
           </div>
         </div>
-      )}
+
+        <div>
+          <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
+            CPU
+          </span>
+          <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
+            <Cpu className="w-3.5 h-3.5 text-blue-400" />
+            {isRunning && stats ? `${stats.cpu_percent.toFixed(1)}%` : "—"}
+          </span>
+        </div>
+
+        <div>
+          <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
+            Memory
+          </span>
+          <span className="text-zinc-200 flex items-center gap-1 font-mono mt-0.5">
+            <Activity className="w-3.5 h-3.5 text-emerald-400" />
+            {isRunning && stats ? formatBytes(stats.mem_usage) : "—"}
+          </span>
+        </div>
+      </div>
 
       {/* Right: actions */}
       <div
