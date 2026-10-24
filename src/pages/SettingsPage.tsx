@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2 } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2, Stethoscope } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
 import { EndpointsCard } from "../components/settings/EndpointsCard";
+import { EngineHealthCard } from "../components/settings/EngineHealthCard";
 import { RegistriesCard } from "../components/settings/RegistriesCard";
 import { NotificationsCard } from "../components/settings/NotificationsCard";
 import { KubernetesCard } from "../components/settings/KubernetesCard";
@@ -844,6 +845,25 @@ export const SettingsPage: React.FC = () => {
                 * Note: Modifying the path uses an interactive wizard to safely check folder contents, offer data migration, and switch paths seamlessly.
               </p>
             </div>
+          </Card>
+
+          {/* Engine health & self-repair. Sits after storage because a moved or
+              freshly-cleared data root is the condition it exists to recover
+              from. */}
+          <Card className="space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <Stethoscope className="w-5 h-5 text-cyan-400" />
+              <div>
+                <h3 className="font-semibold text-white">Engine Diagnostics</h3>
+                <p className="text-xs text-zinc-400">
+                  Diagnose and repair the engine's install, storage and containerd
+                  plugins — the failures that otherwise surface as opaque
+                  &ldquo;unknown service&rdquo; errors.
+                </p>
+              </div>
+            </div>
+
+            <EngineHealthCard />
           </Card>
 
           <KubernetesCard />

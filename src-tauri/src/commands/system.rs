@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::config::AppConfig;
@@ -6,12 +7,12 @@ use crate::docker::models::{DaemonState, DfReport, EngineInfo};
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn get_engine_status(state: State<'_, AppState>) -> Result<DaemonState, String> {
+pub async fn get_engine_status(state: State<'_, Arc<AppState>>) -> Result<DaemonState, String> {
     Ok(state.daemon_state())
 }
 
 #[tauri::command]
-pub async fn toggle_engine(state: State<'_, AppState>) -> Result<DaemonState, String> {
+pub async fn toggle_engine(state: State<'_, Arc<AppState>>) -> Result<DaemonState, String> {
     let current = state.daemon_state();
     match current {
         DaemonState::Running => {
@@ -43,7 +44,9 @@ pub async fn toggle_engine(state: State<'_, AppState>) -> Result<DaemonState, St
 }
 
 #[tauri::command]
-pub async fn get_engine_info(state: State<'_, AppState>) -> Result<Option<EngineInfo>, String> {
+pub async fn get_engine_info(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<EngineInfo>, String> {
     let client = match state.get_client().await {
         Ok(c) => c,
         Err(_) => return Ok(None),
@@ -52,19 +55,19 @@ pub async fn get_engine_info(state: State<'_, AppState>) -> Result<Option<Engine
 }
 
 #[tauri::command]
-pub async fn get_disk_usage(state: State<'_, AppState>) -> Result<DfReport, String> {
+pub async fn get_disk_usage(state: State<'_, Arc<AppState>>) -> Result<DfReport, String> {
     let client = state.get_client().await?;
     client.system_df().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn prune_system(state: State<'_, AppState>) -> Result<u64, String> {
+pub async fn prune_system(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
     let client = state.get_client().await?;
     client.system_prune().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
+pub async fn get_app_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
     Ok(state.config.read().await.clone())
 }
 
@@ -81,18 +84,24 @@ pub fn refresh_shim(state: &AppState, config: &crate::config::AppConfig) {
         .and_then(|id| config.endpoints.iter().find(|e| e.id == id))
         .and_then(|e| crate::docker::models::endpoint_docker_host(&e.kind, &e.uri));
     let paths = state.engine.paths();
-    if let Err(e) = crate::docker::engine::ensure_shim_for(
-        &paths,
-        &config.cli_mode,
-        host.as_deref(),
-    ) {
+    if let Err(e) =
+        crate::docker::engine::ensure_shim_for(&paths, &config.cli_mode, host.as_deref())
+    {
         tracing::warn!("could not refresh the docker shim: {e:#}");
     }
 }
 
 #[tauri::command]
 pub async fn save_app_config(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    config: AppConfig,
+) -> Result<(), String> {
+    save_app_config_core(&state, config).await
+}
+
+/// App-free core of [`save_app_config`], shared with the MCP server.
+pub(crate) async fn save_app_config_core(
+    state: &AppState,
     mut config: AppConfig,
 ) -> Result<(), String> {
     // Turning off "Auto startup on boot" also clears its dependent switch, so
@@ -113,14 +122,14 @@ pub async fn save_app_config(
     // CLI no matter what Settings says.
     // The shim exports the active endpoint's DOCKER_HOST, so a remote switch
     // moves the terminal with the UI.
-    refresh_shim(&state, &config);
+    refresh_shim(state, &config);
     // The close handler reads a lock-free mirror; update it before the config
     // is moved so the very next window close honours the new setting.
     state.set_close_to_tray(config.close_to_tray);
     *state.config.write().await = config;
     // Caps changed on a running engine apply immediately; never reject the
     // save over it (the next engine start re-applies them anyway).
-    if let Err(e) = apply_engine_limits_now(&state).await {
+    if let Err(e) = apply_engine_limits_now(state).await {
         tracing::warn!("could not apply engine resource limits after save: {e}");
     }
     Ok(())
@@ -144,7 +153,7 @@ pub async fn apply_engine_limits_now(state: &AppState) -> Result<String, String>
 }
 
 #[tauri::command]
-pub async fn apply_engine_limits(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn apply_engine_limits(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     apply_engine_limits_now(&state).await
 }
 
@@ -155,7 +164,9 @@ pub struct CliBridgeStatus {
 }
 
 #[tauri::command]
-pub async fn get_cli_bridge_status(state: State<'_, AppState>) -> Result<CliBridgeStatus, String> {
+pub async fn get_cli_bridge_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CliBridgeStatus, String> {
     let config = state.config.read().await;
     let engine_paths = state.engine.paths();
     let engine_socket = &engine_paths.socket;
@@ -169,7 +180,7 @@ pub async fn get_cli_bridge_status(state: State<'_, AppState>) -> Result<CliBrid
 
 #[tauri::command]
 pub async fn toggle_cli_bridge(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     enabled: bool,
 ) -> Result<CliBridgeStatus, String> {
     state.engine_control_guard().await?;
@@ -219,7 +230,15 @@ pub struct InspectPathResult {
 
 #[tauri::command]
 pub async fn check_data_root_path(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<InspectPathResult, String> {
+    check_data_root_path_core(&state, path).await
+}
+
+/// App-free core of [`check_data_root_path`], shared with the MCP server.
+pub(crate) async fn check_data_root_path_core(
+    state: &AppState,
     path: String,
 ) -> Result<InspectPathResult, String> {
     let p = std::path::PathBuf::from(path.trim());
@@ -263,7 +282,18 @@ pub async fn check_data_root_path(
 
 #[tauri::command]
 pub async fn migrate_data_root(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    target_path: String,
+    move_data: bool,
+    clear_old: bool,
+) -> Result<(), String> {
+    migrate_data_root_core(&state, target_path, move_data, clear_old).await
+}
+
+/// App-free core of [`migrate_data_root`], shared with the MCP server. Keeps
+/// the engine-control guard: migrating rewrites the bundled engine's data root.
+pub(crate) async fn migrate_data_root_core(
+    state: &AppState,
     target_path: String,
     move_data: bool,
     clear_old: bool,
@@ -288,8 +318,7 @@ pub async fn migrate_data_root(
     // if source contains non-empty snapshotter dirs that must become symlinks on
     // a d_type-less target, refuse before moving 42M of data.
     if crate::docker::engine::dir_supports_d_type(&target) == Some(false) {
-        if let Some(msg) = crate::docker::engine::migrate_dtype_conflict(&old_data_root, &target)
-        {
+        if let Some(msg) = crate::docker::engine::migrate_dtype_conflict(&old_data_root, &target) {
             return Err(msg);
         }
         if crate::docker::engine::dtype_compat_root().is_none() {
@@ -369,7 +398,7 @@ pub async fn migrate_data_root(
 /// "couldn't check" instead of reporting a false "up to date".
 #[tauri::command]
 pub async fn check_engine_update(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::docker::engine::EngineUpdateInfo, String> {
     let paths = state.engine.paths();
     crate::docker::engine::check_engine_update(&paths)
@@ -386,7 +415,7 @@ pub async fn check_engine_update(
 #[tauri::command]
 pub async fn install_engine_update(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<String, String> {
     state.engine_control_guard().await?;
@@ -488,7 +517,11 @@ pub async fn install_engine_update(
         {
             let msg = format!("Docker Engine {version} is installed but failed to start: {e}");
             emit(&crate::docker::engine::InstallProgress::failed(
-                "engine", &version, &plan, 5, msg.clone(),
+                "engine",
+                &version,
+                &plan,
+                5,
+                msg.clone(),
             ));
             let _ = app.emit("engine-state-changed", state.daemon_state());
             return Err(msg);
@@ -554,7 +587,7 @@ pub struct CliStatus {
 /// Also normalises the compose plugin layout first: the answer is only
 /// truthful if `docker compose` will actually resolve to the bundled plugin.
 #[tauri::command]
-pub async fn check_docker_cli(state: State<'_, AppState>) -> Result<CliStatus, String> {
+pub async fn check_docker_cli(state: State<'_, Arc<AppState>>) -> Result<CliStatus, String> {
     let paths = state.engine.paths();
     let _ = crate::docker::engine::ensure_compose_layout(&paths);
     let config = state.config.read().await;
@@ -604,7 +637,7 @@ fn current_shim_status(expected: Option<&std::path::Path>) -> CliShimStatus {
 /// Install or remove the `~/.local/bin/docker` shim.
 #[tauri::command]
 pub async fn toggle_cli_shim(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     enabled: bool,
 ) -> Result<CliShimStatus, String> {
     state.engine_control_guard().await?;
@@ -627,10 +660,65 @@ pub async fn toggle_cli_shim(
     Ok(current_shim_status(expected.as_deref()))
 }
 
+/// Inspect the engine's install, data root, snapshotter links and containerd
+/// plugin load states. Read-only — safe to call while the engine runs.
+///
+/// Only the *bundled* engine can be diagnosed: `EnginePaths` describe its data
+/// root, and the checks read that filesystem. While a remote endpoint is active
+/// the card is shown as unavailable rather than reporting the wrong machine.
+#[tauri::command]
+pub async fn diagnose_engine(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::docker::doctor::EngineDoctorReport, String> {
+    state.engine_control_guard().await?;
+    let paths = state.engine.paths();
+    Ok(crate::docker::doctor::diagnose(&paths))
+}
+
+/// Apply repairs for the requested checks (or every auto-repairable one when
+/// `check_ids` is absent) and return what changed.
+///
+/// Repairs rewrite engine files under the data root, so they take the same
+/// control lock as a data-root migration: only one engine-mutating operation at
+/// a time. If the engine is running it keeps running — its registrations are
+/// re-read on the next start, which is why the UI restarts the engine after a
+/// repair.
+#[tauri::command]
+pub async fn repair_engine(
+    state: State<'_, Arc<AppState>>,
+    check_ids: Option<Vec<String>>,
+) -> Result<crate::docker::doctor::RepairReport, String> {
+    // Refused while a remote endpoint is active: repairing would rewrite the
+    // *bundled* engine's files, which that endpoint does not use — the user
+    // would see "repaired" and nothing would change.
+    state.engine_control_guard().await?;
+    let paths = state.engine.paths();
+    let auto = crate::docker::doctor::auto_repairable();
+
+    let ids: Vec<&str> = match check_ids.as_deref() {
+        Some(requested) => {
+            if requested.is_empty() {
+                auto
+            } else {
+                requested.iter().map(String::as_str).collect()
+            }
+        }
+        None => auto,
+    };
+
+    let report = crate::docker::doctor::repair(&paths, &ids);
+    if !report.failed.is_empty() {
+        for (id, reason) in &report.failed {
+            tracing::warn!("engine repair failed for {id}: {reason}");
+        }
+    }
+    Ok(report)
+}
+
 /// Check the docker-compose plugin against its own GitHub release channel.
 #[tauri::command]
 pub async fn check_compose_update(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::docker::engine::ComposeUpdateInfo, String> {
     let paths = state.engine.paths();
     crate::docker::engine::check_compose_update(&paths)
@@ -643,7 +731,7 @@ pub async fn check_compose_update(
 #[tauri::command]
 pub async fn install_compose_update(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<String, String> {
     let version = version.trim().trim_start_matches('v').to_string();
@@ -681,7 +769,7 @@ pub async fn install_compose_update(
 /// Check the bundled `docker` CLI against Docker's static channel.
 #[tauri::command]
 pub async fn check_cli_update(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::docker::engine::CliUpdateInfo, String> {
     let paths = state.engine.paths();
     crate::docker::engine::check_cli_update(&paths)
@@ -693,7 +781,7 @@ pub async fn check_cli_update(
 #[tauri::command]
 pub async fn install_cli_update(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<String, String> {
     let version = version.trim().trim_start_matches('v').to_string();

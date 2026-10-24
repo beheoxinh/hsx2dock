@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 
@@ -110,7 +110,7 @@ pub fn notify_kind_event(app: &AppHandle, created: bool, name: &str) {
 /// other category; the tray Quit path is what stops the app.
 pub fn notify_hidden_to_tray(app: &AppHandle) {
     let enabled = app
-        .try_state::<AppState>()
+        .try_state::<std::sync::Arc<AppState>>()
         .and_then(|state| {
             state
                 .config
@@ -249,8 +249,7 @@ fn build_menu(
         MenuItem::with_id(app, ID_NAV_CONTAINERS, "Containers", true, None::<&str>)?;
     let nav_images = MenuItem::with_id(app, ID_NAV_IMAGES, "Images", true, None::<&str>)?;
     let nav_volumes = MenuItem::with_id(app, ID_NAV_VOLUMES, "Volumes", true, None::<&str>)?;
-    let nav_clusters =
-        MenuItem::with_id(app, ID_NAV_CLUSTERS, "Kubernetes", true, None::<&str>)?;
+    let nav_clusters = MenuItem::with_id(app, ID_NAV_CLUSTERS, "Kubernetes", true, None::<&str>)?;
     let nav_settings = MenuItem::with_id(app, ID_NAV_SETTINGS, "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
@@ -311,7 +310,7 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Signal>();
 
     let daemon = app
-        .try_state::<AppState>()
+        .try_state::<std::sync::Arc<AppState>>()
         .map(|s| s.daemon_state())
         .unwrap_or_default();
     // Only the clusters that exist at build time get rows; `refresh` rebuilds
@@ -500,7 +499,11 @@ async fn handle_signal(app: &AppHandle, ctx: &mut MonitorCtx, signal: Signal) {
                 return;
             }
             let verb = if pushed { "push" } else { "pull" };
-            if !should_notify(&mut ctx.notified, &format!("{verb}:{image}"), NOTIFY_COOLDOWN) {
+            if !should_notify(
+                &mut ctx.notified,
+                &format!("{verb}:{image}"),
+                NOTIFY_COOLDOWN,
+            ) {
                 return;
             }
             match error {
@@ -514,7 +517,11 @@ async fn handle_signal(app: &AppHandle, ctx: &mut MonitorCtx, signal: Signal) {
                     record_notice(app, title, &format!("{image}: {last}"));
                 }
                 None => {
-                    let title = if pushed { "Image pushed" } else { "Image pulled" };
+                    let title = if pushed {
+                        "Image pushed"
+                    } else {
+                        "Image pulled"
+                    };
                     record_notice(app, title, &image);
                 }
             }
@@ -525,8 +532,11 @@ async fn handle_signal(app: &AppHandle, ctx: &mut MonitorCtx, signal: Signal) {
                 return;
             }
             let verb = if created { "create" } else { "delete" };
-            if !should_notify(&mut ctx.notified, &format!("kind:{verb}:{name}"), NOTIFY_COOLDOWN)
-            {
+            if !should_notify(
+                &mut ctx.notified,
+                &format!("kind:{verb}:{name}"),
+                NOTIFY_COOLDOWN,
+            ) {
                 return;
             }
             if created {
@@ -544,11 +554,7 @@ async fn handle_menu(app: &AppHandle, id: &str) {
         ID_TOGGLE => toggle_engine_from_tray(app).await,
         ID_RESTART => restart_engine_from_tray(app).await,
         // Page shortcuts mirror the sidebar one-for-one (no duplicate actions).
-        ID_NAV_DASHBOARD
-        | ID_NAV_CONTAINERS
-        | ID_NAV_IMAGES
-        | ID_NAV_VOLUMES
-        | ID_NAV_CLUSTERS
+        ID_NAV_DASHBOARD | ID_NAV_CONTAINERS | ID_NAV_IMAGES | ID_NAV_VOLUMES | ID_NAV_CLUSTERS
         | ID_NAV_SETTINGS => {
             show_main_window(app);
             let target = match id {
@@ -589,7 +595,9 @@ fn show_main_window(app: &AppHandle) {
 /// Tray Start/Stop: same EngineManager path as `toggle_engine`, but hard-gated
 /// on `engine_control_guard` so a remote endpoint can never be bypassed.
 async fn toggle_engine_from_tray(app: &AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else { return };
+    let Some(state) = app.try_state::<std::sync::Arc<AppState>>() else {
+        return;
+    };
     if let Err(e) = state.engine_control_guard().await {
         // Immediate feedback to a click — not a preference-gated broadcast.
         record_notice(app, "Engine controls unavailable", &e);
@@ -624,7 +632,9 @@ async fn toggle_engine_from_tray(app: &AppHandle) {
 /// Tray Restart: a stop followed by a start through the same gated path.
 /// Refuses to run against a remote endpoint, exactly like the toggle.
 async fn restart_engine_from_tray(app: &AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else { return };
+    let Some(state) = app.try_state::<std::sync::Arc<AppState>>() else {
+        return;
+    };
     if let Err(e) = state.engine_control_guard().await {
         record_notice(app, "Engine controls unavailable", &e);
         return;
@@ -657,7 +667,7 @@ async fn restart_engine_from_tray(app: &AppHandle) {
 }
 
 async fn notification_prefs(app: &AppHandle) -> crate::config::NotificationPrefs {
-    app.try_state::<AppState>()
+    app.try_state::<std::sync::Arc<AppState>>()
         .and_then(|s| s.config.try_read().ok().map(|c| c.notifications.clone()))
         .unwrap_or_default()
 }
@@ -669,13 +679,7 @@ fn record_notice(app: &AppHandle, title: &str, body: &str) {
 }
 
 fn show_toast(app: &AppHandle, title: &str, body: &str) {
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()
-    {
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
         tracing::warn!("desktop notification failed: {e}");
     }
 }
@@ -713,8 +717,12 @@ struct ClusterStat {
 }
 
 async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
-    let Some(parts) = app.try_state::<TrayState>().and_then(|t| t.parts()) else { return };
-    let Some(state) = app.try_state::<AppState>() else { return };
+    let Some(parts) = app.try_state::<TrayState>().and_then(|t| t.parts()) else {
+        return;
+    };
+    let Some(state) = app.try_state::<std::sync::Arc<AppState>>() else {
+        return;
+    };
     let daemon = state.daemon_state();
 
     let stats = fetch_stats(&state, &daemon).await;
@@ -771,12 +779,7 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
 
 /// Writes the live values into the current menu handles. Row count and names
 /// are owned by `build_menu`; this only updates text and enabled state.
-fn update_rows(
-    parts: &TrayParts,
-    daemon: &DaemonState,
-    _label: &str,
-    stats: Option<&TrayStats>,
-) {
+fn update_rows(parts: &TrayParts, daemon: &DaemonState, _label: &str, stats: Option<&TrayStats>) {
     let _ = parts.stats_row.set_text(format_status_row(daemon, stats));
     let running = *daemon == DaemonState::Running;
     let transitioning = matches!(
@@ -884,8 +887,7 @@ fn state_color(state: &DaemonState) -> [u8; 3] {
 const TRAY_GLYPH_PNG: &[u8] = include_bytes!("../icons/tray-glyph.png");
 
 fn state_icon(rgb: [u8; 3]) -> Image<'static> {
-    tinted_glyph(rgb)
-        .unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
+    tinted_glyph(rgb).unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
 }
 
 /// RGBA buffer of the glyph painted in `rgb`; `None` only if the bundled PNG
@@ -937,10 +939,7 @@ mod tests {
 
     #[test]
     fn tooltip_carries_stats_and_pluralizes() {
-        assert_eq!(
-            format_tooltip("Running", None),
-            "Hsx2Dock — Engine Running"
-        );
+        assert_eq!(format_tooltip("Running", None), "Hsx2Dock — Engine Running");
         assert_eq!(
             format_tooltip("Running", Some((12, 7, 3, 1))),
             "Hsx2Dock — Engine Running · 12 containers (7 running) · 3 images · 1 kind cluster"
@@ -1011,7 +1010,10 @@ mod tests {
             nodes: 3,
             running: 3,
         };
-        assert_eq!(format_cluster_row(&full), "kind-local · 3/3 nodes · running");
+        assert_eq!(
+            format_cluster_row(&full),
+            "kind-local · 3/3 nodes · running"
+        );
         let degraded = ClusterStat {
             name: "kind-mixed".into(),
             nodes: 3,
@@ -1026,7 +1028,10 @@ mod tests {
             nodes: 2,
             running: 0,
         };
-        assert_eq!(format_cluster_row(&stopped), "kind-off · 0/2 nodes · stopped");
+        assert_eq!(
+            format_cluster_row(&stopped),
+            "kind-off · 0/2 nodes · stopped"
+        );
     }
 
     #[test]
@@ -1048,8 +1053,14 @@ mod tests {
             nodes: 4,
             running: 4,
         };
-        assert_eq!(cluster_signature(&[a.clone()]), cluster_signature(&[a_running]));
-        assert_ne!(cluster_signature(&[a.clone()]), cluster_signature(&[a, b]));
+        assert_eq!(
+            cluster_signature(std::slice::from_ref(&a)),
+            cluster_signature(&[a_running])
+        );
+        assert_ne!(
+            cluster_signature(std::slice::from_ref(&a)),
+            cluster_signature(&[a, b])
+        );
         assert_eq!(cluster_signature(&[]), "");
     }
 }

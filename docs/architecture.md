@@ -20,6 +20,29 @@ Layer map of the codebase (`src/`).
 - `models.rs` — `ContainerItem`, `ContainerDetails`, `RunConfig`
   (with `validate()` + `parse_lines()`), `DfReport`, per-resource items.
 - `compose.rs` — `docker compose up/down/ps/logs` orchestration.
+- `doctor.rs` — engine health checks and idempotent repairs. `diagnose()` is
+  read-only; `auto_repair()` runs the safe subset before every engine start, so
+  a data root that was moved or whose snapshotter compat links went dangling
+  heals itself instead of surfacing as containerd's opaque lease error.
+
+## MCP layer (`mcp/`)
+
+The app is also an MCP server, so agents drive the same `AppState` the UI does.
+
+- `tools.rs` / `resources.rs` / `prompts.rs` — the advertised catalogue. Schemas
+  are hand-written JSON rather than `schemars`-derived, so the MCP surface does
+  not pin a `schemars` major version; `args.rs` validates each call against them.
+- `server.rs` — the `ServerHandler` implementation. Tools call the same
+  `*_core(state, …)` functions the `#[tauri::command]` wrappers do, which is why
+  those wrappers take `State<'_, Arc<AppState>>`: Tauri's `State` cannot be
+  constructed outside the IPC dispatcher, so the MCP path needs its own handle.
+  `ToolSpec::engine_only` is enforced here, mirroring
+  `AppState::engine_control_guard`.
+- `stdio.rs` + `bin/hsx2dock-mcp.rs` — the standalone binary agents launch; it
+  builds its own `AppState` and needs no Tauri app.
+- `http.rs` — the opt-in streamable-HTTP transport. Binds `127.0.0.1` only,
+  requires a bearer token compared in constant time, and keeps the token in
+  `mcp.json` (0600) rather than `config.toml`.
 
 ## UI layer (`ui/`)
 

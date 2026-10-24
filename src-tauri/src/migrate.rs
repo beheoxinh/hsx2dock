@@ -130,8 +130,8 @@ mod tests {
     use super::*;
 
     fn temp_case(name: &str) -> PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("hsx2dock-migrate-{}-{name}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("hsx2dock-migrate-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create temp root");
         root

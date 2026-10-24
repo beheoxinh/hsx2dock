@@ -73,6 +73,59 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   `$XDG_RUNTIME_DIR/docker.sock` and a `hsx2dock-engine` context, with an
   optional "set as default". Re-applied every 10s while enabled; never touches
   `/var/run/docker.sock` or other contexts.
+- **MCP server (AI agents)** — the whole app is exposed over the Model Context
+  Protocol: 109 tools, 12 resources and 4 prompts covering the engine,
+  diagnostics and self-repair, containers, groups, images, volumes, networks,
+  compose, kind/Kubernetes, endpoints, registries and storage. Agents launch
+  the standalone `hsx2dock-mcp` binary over stdio, or talk to a loopback HTTP
+  endpoint the app serves when enabled. Settings → MCP Server documents every
+  tool and hands out copyable client configs and an agent brief.
+
+## MCP server (AI agents)
+
+Two transports, same server:
+
+- **stdio** — the default. `hsx2dock-mcp` speaks MCP on stdin/stdout, so the
+  agent owns the process and nothing is listening on the machine. It needs no
+  setting; `./install.sh` puts the binary next to `hsx2dock` in
+  `~/.local/bin`.
+- **Streamable HTTP** — opt-in from Settings → MCP Server. Binds `127.0.0.1`
+  only, on `mcp_port` (default `45123`), at `http://127.0.0.1:<port>/mcp`.
+
+The HTTP transport requires `Authorization: Bearer <token>` on every request.
+The token is 32 random bytes, generated on first enable, and stored in
+`~/.config/hsx2dock/mcp.json` with owner-only permissions (`0600`) — never in
+`config.toml`, which people copy around and paste into bug reports. Rotating it
+from the MCP page invalidates every agent already configured.
+
+```sh
+# Claude Code
+claude mcp add hsx2dock -- ~/.local/bin/hsx2dock-mcp
+```
+
+```json
+// Claude Desktop / Cursor (mcpServers)
+{ "mcpServers": { "hsx2dock": { "command": "hsx2dock-mcp", "args": [] } } }
+```
+
+```json
+// HTTP transport (token from Settings → MCP Server)
+{
+  "mcpServers": {
+    "hsx2dock": {
+      "type": "http",
+      "url": "http://127.0.0.1:45123/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Tools are annotated `read`, `write` or `destructive`, and every tool that
+starts, stops or repairs the bundled engine is refused while a remote endpoint
+is active — an agent cannot tear down a local engine that is not the one it is
+talking to. Registry passwords are never returned by any tool; only whether one
+is set.
 
 ## Requirements (Nobara / GNOME)
 
@@ -93,6 +146,7 @@ pnpm tauri dev
 `./install.sh` builds the release binary and installs:
 
 - `~/.local/bin/hsx2dock`
+- `~/.local/bin/hsx2dock-mcp` (the MCP server agents launch)
 - `~/.local/share/applications/com.github.hsx2dock.desktop`
 - `~/.local/share/icons/hicolor/scalable/apps/com.github.hsx2dock.svg`
 
@@ -116,6 +170,9 @@ compose_file = ""
   the app launches at login (off by default).
 - `start_minimized` — a login launch goes straight to the tray. Ignored unless
   `auto_start_on_boot` is on.
+- `mcp_enabled` — serve the MCP server over loopback HTTP (off by default; the
+  stdio binary needs no setting).
+- `mcp_port` — port for that listener, default `45123`.
 
 The internal directories are named `hsx2dock` too. An install created by an
 older build keeps working: on first launch the app renames the former
@@ -173,12 +230,14 @@ src-tauri/src/            Rust backend (Tauri commands + engine supervision)
   tray.rs                 tray icon, menu, notifications
   autostart.rs            XDG login entry for "Auto startup on boot"
   commands/               engine, containers, images, volumes, networks,
-                          compose, kind/k8s, exec, registries, groups…
+                          compose, kind/k8s, exec, registries, groups, mcp…
   docker/                 bollard client wrapper, bundled-engine management,
-                          CLI bridge, kind paths
+                          CLI bridge, kind paths, engine doctor
+  mcp/                    MCP server: tool/resource/prompt catalogue, stdio
+                          and loopback-HTTP transports, `hsx2dock-mcp` binary
 src/                      React frontend
   pages/                  Dashboard, Containers, Images, Volumes, Networks,
-                          Compose, Kubernetes, Settings
+                          Compose, Kubernetes, MCP Server, Settings
   components/             UI primitives, k8s monitor, terminal, settings cards
   lib/api.ts              typed `invoke` wrappers for every Tauri command
   types/index.ts          shared payload types
@@ -187,6 +246,6 @@ src/                      React frontend
 ## Tests
 
 ```sh
-cd src-tauri && cargo test --lib    # unit tests (156)
+cd src-tauri && cargo test --lib    # unit tests (254)
 pnpm build                          # tsc + vite production build
 ```

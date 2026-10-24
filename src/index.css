@@ -206,7 +206,8 @@ html.light aside.bg-zinc-950\/80 {
 html.light .bg-zinc-900,
 html.light .bg-zinc-900\/90,
 html.light .bg-zinc-900\/60,
-html.light .bg-zinc-900\/40 {
+html.light .bg-zinc-900\/40,
+html.light .bg-zinc-900\/30 {
   background-color: #ffffff !important;
   box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.03), 0 1px 2px -1px rgba(0, 0, 0, 0.03);
 }

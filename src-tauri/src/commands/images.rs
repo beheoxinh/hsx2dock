@@ -1,13 +1,25 @@
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::docker::models::{
-    registry_host_for_image, BuildContextInfo, BuildOptions, BuildStep, ImageHistoryEntry, ImageItem,
+    registry_host_for_image, BuildContextInfo, BuildOptions, BuildStep, ImageHistoryEntry,
+    ImageItem,
 };
 use crate::state::AppState;
 
+/// Emits a progress event when there is a window to emit to.
+///
+/// The MCP server runs these same cores with no `AppHandle`; progress is a
+/// UI affordance there, not part of the operation's contract.
+fn emit_progress<P: serde::Serialize + Clone>(app: &Option<AppHandle>, event: &str, payload: P) {
+    if let Some(app) = app {
+        let _ = app.emit(event, payload);
+    }
+}
+
 #[tauri::command]
-pub async fn list_images(state: State<'_, AppState>) -> Result<Vec<ImageItem>, String> {
+pub async fn list_images(state: State<'_, Arc<AppState>>) -> Result<Vec<ImageItem>, String> {
     let client = state.get_client().await?;
     // kind's node images are core to this app: keep them out of the Images
     // page so they cannot be selected for removal.
@@ -20,7 +32,7 @@ pub async fn list_images(state: State<'_, AppState>) -> Result<Vec<ImageItem>, S
 
 #[tauri::command]
 pub async fn remove_image(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     id: String,
     force: bool,
 ) -> Result<(), String> {
@@ -43,29 +55,35 @@ pub async fn remove_image(
                 .to_string(),
         );
     }
-    client.remove_image(&id, force).await.map_err(|e| e.to_string())
+    client
+        .remove_image(&id, force)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn tag_image(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     id: String,
     repo: String,
     tag: String,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
-    client.tag_image(&id, &repo, &tag).await.map_err(|e| e.to_string())
+    client
+        .tag_image(&id, &repo, &tag)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn prune_images(state: State<'_, AppState>) -> Result<(u64, u64), String> {
+pub async fn prune_images(state: State<'_, Arc<AppState>>) -> Result<(u64, u64), String> {
     let client = state.get_client().await?;
     client.prune_images().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_image_history(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<Vec<ImageHistoryEntry>, String> {
     let client = state.get_client().await?;
@@ -81,11 +99,14 @@ pub struct SearchResult {
 
 #[tauri::command]
 pub async fn search_hub(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     term: String,
 ) -> Result<Vec<SearchResult>, String> {
     let client = state.get_client().await?;
-    let res = client.search_images(&term).await.map_err(|e| e.to_string())?;
+    let res = client
+        .search_images(&term)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(res
         .into_iter()
         .map(|(name, description, star_count)| SearchResult {
@@ -110,7 +131,17 @@ pub struct PullProgressPayload {
 #[tauri::command]
 pub async fn pull_image(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    image: String,
+) -> Result<(), String> {
+    pull_image_core(&state, Some(&app), image).await
+}
+
+/// App-free core of [`pull_image`]. Without an `AppHandle` the progress lines
+/// are dropped — the MCP server has no window to emit to.
+pub(crate) async fn pull_image_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     image: String,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
@@ -130,7 +161,7 @@ pub async fn pull_image(
     };
 
     let mut stream = docker.create_image(Some(opts), None, creds);
-    let app_handle = app.clone();
+    let app_handle = app.cloned();
     let img_name = image.clone();
 
     tokio::spawn(async move {
@@ -138,7 +169,10 @@ pub async fn pull_image(
             match msg {
                 Ok(info) => {
                     let (current, total) = if let Some(ref detail) = info.progress_detail {
-                        (detail.current.map(|v| v as u64), detail.total.map(|v| v as u64))
+                        (
+                            detail.current.map(|v| v as u64),
+                            detail.total.map(|v| v as u64),
+                        )
                     } else {
                         (None, None)
                     };
@@ -155,7 +189,7 @@ pub async fn pull_image(
                         done: false,
                         error: None,
                     };
-                    let _ = app_handle.emit("pull-progress", payload);
+                    emit_progress(&app_handle, "pull-progress", payload);
                 }
                 Err(e) => {
                     let payload = PullProgressPayload {
@@ -167,12 +201,13 @@ pub async fn pull_image(
                         done: true,
                         error: Some(e.to_string()),
                     };
-                    let _ = app_handle.emit("pull-progress", payload);
+                    emit_progress(&app_handle, "pull-progress", payload);
                     return;
                 }
             }
         }
-        let _ = app_handle.emit(
+        emit_progress(
+            &app_handle,
             "pull-progress",
             PullProgressPayload {
                 image: img_name,
@@ -205,7 +240,16 @@ pub struct PushProgressPayload {
 #[tauri::command]
 pub async fn push_image(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    image: String,
+) -> Result<(), String> {
+    push_image_core(&state, Some(&app), image).await
+}
+
+/// App-free core of [`push_image`].
+pub(crate) async fn push_image_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     image: String,
 ) -> Result<(), String> {
     let name = image.trim().to_string();
@@ -232,7 +276,7 @@ pub async fn push_image(
         Some(creds),
     );
 
-    let app_handle = app.clone();
+    let app_handle = app.cloned();
     let img_name = name.clone();
     tokio::spawn(async move {
         while let Some(msg) = stream.next().await {
@@ -250,11 +294,14 @@ pub async fn push_image(
                             done: true,
                             error: Some(message),
                         };
-                        let _ = app_handle.emit("push-progress", payload);
+                        emit_progress(&app_handle, "push-progress", payload);
                         return;
                     }
                     let (current, total) = if let Some(ref detail) = info.progress_detail {
-                        (detail.current.map(|v| v as u64), detail.total.map(|v| v as u64))
+                        (
+                            detail.current.map(|v| v as u64),
+                            detail.total.map(|v| v as u64),
+                        )
                     } else {
                         (None, None)
                     };
@@ -264,17 +311,14 @@ pub async fn push_image(
                     };
                     let payload = PushProgressPayload {
                         image: img_name.clone(),
-                        status: info
-                            .status
-                            .clone()
-                            .unwrap_or_else(|| "Pushing".to_string()),
+                        status: info.status.clone().unwrap_or_else(|| "Pushing".to_string()),
                         progress: progress_str,
                         current,
                         total,
                         done: false,
                         error: None,
                     };
-                    let _ = app_handle.emit("push-progress", payload);
+                    emit_progress(&app_handle, "push-progress", payload);
                 }
                 Err(e) => {
                     let payload = PushProgressPayload {
@@ -286,12 +330,13 @@ pub async fn push_image(
                         done: true,
                         error: Some(e.to_string()),
                     };
-                    let _ = app_handle.emit("push-progress", payload);
+                    emit_progress(&app_handle, "push-progress", payload);
                     return;
                 }
             }
         }
-        let _ = app_handle.emit(
+        emit_progress(
+            &app_handle,
             "push-progress",
             PushProgressPayload {
                 image: img_name,
@@ -366,7 +411,17 @@ fn build_final_payload(
 #[tauri::command]
 pub async fn build_image(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    req: BuildOptions,
+) -> Result<(), String> {
+    build_image_core(&state, Some(&app), req).await
+}
+
+/// App-free core of [`build_image`]. Without an `AppHandle` the step lines are
+/// dropped; the build itself is identical.
+pub(crate) async fn build_image_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     req: BuildOptions,
 ) -> Result<(), String> {
     // Validate up front so a bad path fails synchronously, before the modal
@@ -389,7 +444,9 @@ pub async fn build_image(
     let client = match state.get_client().await {
         Ok(client) => client,
         Err(e) => {
-            state.build_running.store(false, std::sync::atomic::Ordering::Relaxed);
+            state
+                .build_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(e);
         }
     };
@@ -398,14 +455,18 @@ pub async fn build_image(
     let running = state.build_running.clone();
     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    let app_handle = app.clone();
+    let app_handle = app.cloned();
     let tag = req.tag.trim().to_string();
 
     tokio::spawn(async move {
         let starting = build_final_payload(
             &tag,
             "Starting",
-            Some(format!("docker build -f {} -t {}", req.dockerfile.trim(), tag)),
+            Some(format!(
+                "docker build -f {} -t {}",
+                req.dockerfile.trim(),
+                tag
+            )),
             None,
             false,
             None,
@@ -414,12 +475,12 @@ pub async fn build_image(
             done: false,
             ..starting
         };
-        let _ = app_handle.emit("build-progress", starting);
+        emit_progress(&app_handle, "build-progress", starting);
 
         let result = client
             .build_image(&req, &cancel, |step: BuildStep| {
                 let payload = build_step_payload(&tag, &step, false, false, None, None);
-                let _ = app_handle.emit("build-progress", payload);
+                emit_progress(&app_handle, "build-progress", payload);
             })
             .await;
 
@@ -443,17 +504,12 @@ pub async fn build_image(
                     false,
                     image_id,
                 ),
-                Err(e) => build_final_payload(
-                    &tag,
-                    "Failed",
-                    None,
-                    Some(e.to_string()),
-                    false,
-                    None,
-                ),
+                Err(e) => {
+                    build_final_payload(&tag, "Failed", None, Some(e.to_string()), false, None)
+                }
             }
         };
-        let _ = app_handle.emit("build-progress", final_payload);
+        emit_progress(&app_handle, "build-progress", final_payload);
         running.store(false, std::sync::atomic::Ordering::Relaxed);
     });
 
@@ -461,8 +517,11 @@ pub async fn build_image(
 }
 
 #[tauri::command]
-pub async fn cancel_image_build(state: State<'_, AppState>) -> Result<(), String> {
-    if !state.build_running.load(std::sync::atomic::Ordering::Relaxed) {
+pub async fn cancel_image_build(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if !state
+        .build_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err("No build in progress".to_string());
     }
     state
@@ -475,6 +534,11 @@ pub async fn cancel_image_build(state: State<'_, AppState>) -> Result<(), String
 /// drift from what the app actually runs.
 #[tauri::command]
 pub async fn preview_build_command(req: BuildOptions) -> Result<String, String> {
+    preview_build_command_core(req)
+}
+
+/// App-free core of [`preview_build_command`].
+pub(crate) fn preview_build_command_core(req: BuildOptions) -> Result<String, String> {
     Ok(req.command_preview())
 }
 
@@ -482,6 +546,11 @@ pub async fn preview_build_command(req: BuildOptions) -> Result<String, String> 
 /// Dockerfiles it found without a native folder picker.
 #[tauri::command]
 pub async fn validate_build_context(path: String) -> Result<BuildContextInfo, String> {
+    validate_build_context_core(&path)
+}
+
+/// App-free core of [`validate_build_context`].
+pub(crate) fn validate_build_context_core(path: &str) -> Result<BuildContextInfo, String> {
     let mut info = BuildContextInfo {
         exists: false,
         is_dir: false,

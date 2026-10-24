@@ -216,6 +216,65 @@ export interface AppConfig {
   kind_cluster_prefs?: Record<string, KindClusterPrefs>;
   /** Id of the login new pushes default to; empty = first saved login. */
   default_registry?: string;
+  /** Serve the MCP front-end over loopback HTTP in addition to stdio. */
+  mcp_enabled?: boolean;
+  /** Loopback port for the MCP HTTP transport. */
+  mcp_port?: number;
+}
+
+/**
+ * What the backend reports about the MCP front-end (`mcp_status`).
+ *
+ * Deliberately carries no token: it is only ever fetched on demand through
+ * `api.mcpToken()`, and lives in `~/.config/hsx2dock/mcp.json` with 0600.
+ */
+export interface McpStatus {
+  enabled: boolean;
+  running: boolean;
+  url: string;
+  port: number;
+  hasToken: boolean;
+  tokenPath: string;
+  stdioPath: string;
+  toolCount: number;
+  resourceCount: number;
+  promptCount: number;
+  serverName: string;
+  serverVersion: string;
+}
+
+/** One tool as the server advertises it (`mcp_catalogue`). */
+export interface McpToolInfo {
+  name: string;
+  title: string;
+  description: string;
+  /** `"read"` | `"write"` | `"destructive"`. */
+  access: string;
+  /** Refused while a remote endpoint is active. */
+  engineOnly: boolean;
+}
+
+/** One resource (`mcp_resources`). */
+export interface McpResourceInfo {
+  uri: string;
+  title: string;
+  description: string;
+  mimeType: string;
+}
+
+/** One prompt argument. */
+export interface McpPromptArgInfo {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+/** One prompt (`mcp_prompts`). */
+export interface McpPromptInfo {
+  name: string;
+  title: string;
+  description: string;
+  arguments: McpPromptArgInfo[];
 }
 
 /** Per-feature desktop-notification toggles (tray menu + Settings card). */
@@ -349,6 +408,50 @@ export interface ComposeUpdateInfo {
   latest_version: string;
   update_available: boolean;
   pinned_version: string;
+}
+
+/** How one engine check (or one containerd plugin) is doing. */
+export type EngineHealth = "ok" | "warning" | "error" | "missing";
+
+/** One diagnosed engine condition. `id` is what `repairEngine` takes back. */
+export interface EngineCheck {
+  id: string;
+  label: string;
+  health: EngineHealth;
+  /** One actionable line — never a raw error dump. */
+  detail: string;
+  /** Filesystem path the check looks at, when there is one. */
+  path: string | null;
+  /** True when a repair exists that does not lose user data. */
+  repairable: boolean;
+  /** True when the engine applies this repair automatically on every start. */
+  auto: boolean;
+}
+
+/** One containerd plugin as reported by the engine log. */
+export interface ContainerdPlugin {
+  id: string;
+  health: EngineHealth;
+  detail: string;
+}
+
+/** Everything the Settings → Engine health card renders. */
+export interface EngineDoctorReport {
+  /** Worst health across every check — drives the card's colour. */
+  health: EngineHealth;
+  checks: EngineCheck[];
+  /** Empty until the engine has run at least once. */
+  plugins: ContainerdPlugin[];
+  data_root: string;
+  engine_running: boolean;
+}
+
+/** What a repair run changed. */
+export interface RepairReport {
+  /** Check ids that were fixed. */
+  repaired: string[];
+  /** `[check id, reason]` for checks that could not be fixed. */
+  failed: [string, string][];
 }
 
 export interface PortMapping {

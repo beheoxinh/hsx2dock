@@ -10,6 +10,12 @@ license = "MIT"
 name = "hsx2dock_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The MCP front-end is also built as a standalone stdio binary, so agents can
+# launch it without the GUI (`hsx2dock-mcp`).
+[[bin]]
+name = "hsx2dock-mcp"
+path = "src/mcp/bin/hsx2dock-mcp.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -42,3 +48,15 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Terminal exec output is streamed to the frontend as JSON events; base64 keeps
 # arbitrary ANSI/UTF-8 bytes intact across the boundary.
 base64 = "0.22"
+
+# MCP (Model Context Protocol) front-end: agents drive the app through this.
+# `server` + the stdio and streamable-HTTP transports are all we use; the macro
+# crate is not needed because the tool catalogue is hand-written (see
+# `src/mcp/tools.rs` for why).
+rmcp = { version = "3.7", default-features = false, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio-util = { version = "0.7", features = ["rt"] }

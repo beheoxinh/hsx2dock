@@ -15,6 +15,7 @@ import { VolumesPage } from "./pages/VolumesPage";
 import { NetworksPage } from "./pages/NetworksPage";
 import { KubernetesPage } from "./pages/KubernetesPage";
 import { ComposePage } from "./pages/ComposePage";
+import { McpPage } from "./pages/McpPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
 import type { DaemonState } from "./types";
@@ -228,6 +229,7 @@ const MainLayout: React.FC = () => {
                 />
               )}
               {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
+              {activeTab === "mcp" && <McpPage />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>
           </AnimatePresence>

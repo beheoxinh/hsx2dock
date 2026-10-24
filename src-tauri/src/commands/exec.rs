@@ -11,6 +11,7 @@ use bollard::exec::{ResizeExecOptions, StartExecResults};
 use bollard::models::{ContainerStateStatusEnum, ExecConfig};
 use futures_util::StreamExt;
 use serde::Serialize;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration, Instant};
@@ -255,7 +256,7 @@ async fn ensure_running_for_debug(state: &AppState, id: &str) -> Result<(), Stri
 /// Opens an interactive terminal session on a running container.
 #[tauri::command]
 pub async fn start_interactive_exec(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     app: AppHandle,
     id: String,
     cmd: Option<Vec<String>>,
@@ -269,7 +270,7 @@ pub async fn start_interactive_exec(
 /// in it. Used by the "Debug" action on stopped containers.
 #[tauri::command]
 pub async fn debug_container(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     app: AppHandle,
     id: String,
     cmd: Option<Vec<String>>,
@@ -282,7 +283,7 @@ pub async fn debug_container(
 /// Pushes keystrokes (or pasted text) into a live session's stdin.
 #[tauri::command]
 pub async fn write_exec_stdin(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
@@ -299,7 +300,7 @@ pub async fn write_exec_stdin(
 /// Re-sizes the pty backing a session (called by the terminal's fit observer).
 #[tauri::command]
 pub async fn resize_exec_session(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     session_id: String,
     cols: i32,
     rows: i32,
@@ -329,7 +330,7 @@ pub async fn resize_exec_session(
 /// output pump. Idempotent — a session that already ended is a no-op.
 #[tauri::command]
 pub async fn stop_exec_session(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<(), String> {
     if let Some(session) = state.exec_sessions.write().await.remove(&session_id) {
@@ -353,13 +354,18 @@ mod tests {
     #[test]
     fn stdout_chunks_encode_losslessly_as_base64() {
         let chunk = LogOutput::StdOut {
-            message: bytes::Bytes::from_static(b"\x1b[32mchao\x0a ti\xe1\xba\xbfng vi\xe1\xbb\x87t"),
+            message: bytes::Bytes::from_static(
+                b"\x1b[32mchao\x0a ti\xe1\xba\xbfng vi\xe1\xbb\x87t",
+            ),
         };
         let encoded = encode_output(&chunk);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&encoded)
             .expect("valid base64");
-        assert_eq!(decoded, b"\x1b[32mchao\x0a ti\xe1\xba\xbfng vi\xe1\xbb\x87t");
+        assert_eq!(
+            decoded,
+            b"\x1b[32mchao\x0a ti\xe1\xba\xbfng vi\xe1\xbb\x87t"
+        );
     }
 
     #[test]

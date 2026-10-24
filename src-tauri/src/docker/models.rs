@@ -294,9 +294,9 @@ pub fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
-    let plain = value.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '=' | '-' | '@')
-    });
+    let plain = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '=' | '-' | '@'));
     if plain {
         value.to_string()
     } else {
@@ -346,10 +346,16 @@ impl BuildOptions {
         }
         let context = std::path::PathBuf::from(raw_context);
         if !context.exists() {
-            return Err(format!("Build context does not exist: {}", context.display()));
+            return Err(format!(
+                "Build context does not exist: {}",
+                context.display()
+            ));
         }
         if !context.is_dir() {
-            return Err(format!("Build context is not a directory: {}", context.display()));
+            return Err(format!(
+                "Build context is not a directory: {}",
+                context.display()
+            ));
         }
         let dockerfile = self.dockerfile_arg(&context);
         let context_real = context
@@ -367,17 +373,28 @@ impl BuildOptions {
 
     /// Build-arg pairs for `--build-arg`, in the order the user typed them.
     pub fn build_arg_pairs(&self) -> Vec<(String, String)> {
-        self.build_args.iter().filter_map(BuildArg::as_pair).collect()
+        self.build_args
+            .iter()
+            .filter_map(BuildArg::as_pair)
+            .collect()
     }
 
     /// The `docker build …` line that mirrors this request, for the UI preview.
     pub fn command_preview(&self) -> String {
         let mut parts = vec!["docker build".to_string()];
-        parts.push(format!("-f {}", shell_quote(&self.dockerfile.trim().replace('\\', "/"))));
+        parts.push(format!(
+            "-f {}",
+            shell_quote(&self.dockerfile.trim().replace('\\', "/"))
+        ));
         if !self.tag.trim().is_empty() {
             parts.push(format!("-t {}", shell_quote(self.tag.trim())));
         }
-        if let Some(target) = self.target.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(target) = self
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             parts.push(format!("--target {}", shell_quote(target)));
         }
         if self.no_cache {
@@ -387,7 +404,10 @@ impl BuildOptions {
             parts.push("--pull".to_string());
         }
         for (key, value) in self.build_arg_pairs() {
-            parts.push(format!("--build-arg {}", shell_quote(&format!("{key}={value}"))));
+            parts.push(format!(
+                "--build-arg {}",
+                shell_quote(&format!("{key}={value}"))
+            ));
         }
         parts.push(".".to_string());
         parts.join(" ")
@@ -1034,9 +1054,7 @@ fn is_valid_cpuset(s: &str) -> bool {
 
 /// Derives the editable limits snapshot from the engine's `HostConfig`.
 /// `None` (engine sent no HostConfig) means every limit is unset.
-pub fn limits_from_host_config(
-    host: Option<&bollard::models::HostConfig>,
-) -> ResourceLimits {
+pub fn limits_from_host_config(host: Option<&bollard::models::HostConfig>) -> ResourceLimits {
     let Some(host) = host else {
         return ResourceLimits::default();
     };
@@ -1049,13 +1067,9 @@ pub fn limits_from_host_config(
         .nano_cpus
         .filter(|&n| n > 0)
         .map(|n| ((n as f64) / 1e9).to_string())
-        .or_else(|| {
-            match (host.cpu_quota, host.cpu_period) {
-                (Some(q), Some(p)) if q > 0 && p > 0 => {
-                    Some(((q as f64) / (p as f64)).to_string())
-                }
-                _ => None,
-            }
+        .or_else(|| match (host.cpu_quota, host.cpu_period) {
+            (Some(q), Some(p)) if q > 0 && p > 0 => Some(((q as f64) / (p as f64)).to_string()),
+            _ => None,
         })
         .unwrap_or_default();
     let cpuset_cpus = host
@@ -1130,9 +1144,7 @@ pub fn update_body_from_limits(
         let policy = RestartPolicy::parse(rp);
         let retries = if !limits.restart_max_retries.trim().is_empty() {
             if policy != RestartPolicy::OnFailure {
-                return Err(
-                    "Restart retries only apply to the 'on-failure' policy".to_string(),
-                );
+                return Err("Restart retries only apply to the 'on-failure' policy".to_string());
             }
             let raw = limits.restart_max_retries.trim();
             let v: i64 = raw.parse().map_err(|_| {
@@ -1575,7 +1587,10 @@ mod tests {
             registry_host_for_image("harbor.example.com:8443/team/app@sha256:abc"),
             "harbor.example.com:8443"
         );
-        assert_eq!(registry_host_for_image("localhost:5000/dev/x"), "localhost:5000");
+        assert_eq!(
+            registry_host_for_image("localhost:5000/dev/x"),
+            "localhost:5000"
+        );
     }
 
     fn cfg(image: &str, ports: &[&str], env: &[&str]) -> RunConfig {
@@ -2113,7 +2128,10 @@ mod tests {
     #[test]
     fn endpoint_host_port_fills_the_default_tcp_port() {
         assert_eq!(endpoint_host_port("tcp", "host:2376"), "host:2376");
-        assert_eq!(endpoint_host_port("tcp", "docker.example.com"), "docker.example.com:2375");
+        assert_eq!(
+            endpoint_host_port("tcp", "docker.example.com"),
+            "docker.example.com:2375"
+        );
         assert_eq!(endpoint_host_port("tcp", "tcp://host:2375"), "host:2375");
         assert_eq!(endpoint_host_port("ssh", "user@host"), "user@host");
         assert_eq!(endpoint_host_port("ssh", "ssh://user@host"), "user@host");
@@ -2130,7 +2148,10 @@ mod tests {
             Some("ssh://user@host".to_string())
         );
         // The local endpoint has no DOCKER_HOST override.
-        assert_eq!(endpoint_docker_host("local", "unix:///run/docker.sock"), None);
+        assert_eq!(
+            endpoint_docker_host("local", "unix:///run/docker.sock"),
+            None
+        );
     }
 
     #[test]

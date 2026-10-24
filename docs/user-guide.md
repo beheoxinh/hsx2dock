@@ -26,7 +26,8 @@ How to use Hsx2Dock day to day.
 | Compose | Pick a `compose.yaml` file, Up / Down (confirmed), live list, per-service logs |
 
 Every page follows the same layout: a **navigation sidebar** on the left lists
-all sections (Engine, Containers, Images, Volumes, Networks, Compose) — click a
+all sections (Engine, Containers, Images, Volumes, Networks, Kubernetes, Compose,
+MCP Server, Settings) — click a
 row to switch. The header bar shows the current section name plus the app-wide
 engine status and controls (status badge, Start/Stop, refresh, login,
 preferences). Each list page has a toolbar with search and its primary action
@@ -85,6 +86,26 @@ Pick the terminal in Preferences.
 1. Open the Compose view, choose a `compose.yaml` / `docker-compose.yml`.
 2. **Up** (`docker compose up -d`), **Down** asks for confirmation first.
 3. Service list + logs update while the project runs.
+
+## MCP server (AI agents)
+
+The **MCP Server** view exposes the app over the Model Context Protocol, so an
+agent can drive the same operations the UI does.
+
+- **stdio** is the default and needs no setup: point the agent at the
+  `hsx2dock-mcp` binary (`claude mcp add hsx2dock -- hsx2dock-mcp`). Nothing is
+  listening on the machine; only the process holding the pipe can call a tool.
+- **Loopback HTTP** is a switch on that page. It binds `127.0.0.1` only and
+  requires a bearer token, which the page can reveal or rotate. Use it only for
+  an agent that cannot spawn a child process.
+- The same page lists every tool with its access level (`read`, `write`,
+  `destructive`), the resources an agent can read, and copyable snippets for
+  Claude Code, JSON-configured clients, and the HTTP transport — plus a
+  **skill prompt** to paste into an agent's instructions.
+
+Engine start/stop and self-repair tools are refused while a remote endpoint is
+active, so an agent cannot touch the bundled engine's files through a remote
+daemon.
 
 ## Errors
 

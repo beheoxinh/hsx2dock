@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
 
@@ -9,7 +10,14 @@ use crate::docker::models::{
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn list_endpoints(state: State<'_, AppState>) -> Result<Vec<EndpointStatus>, String> {
+pub async fn list_endpoints(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<EndpointStatus>, String> {
+    list_endpoints_core(&state).await
+}
+
+/// App-free core of [`list_endpoints`], shared with the MCP server.
+pub(crate) async fn list_endpoints_core(state: &AppState) -> Result<Vec<EndpointStatus>, String> {
     let (active, endpoints) = {
         let cfg = state.config.read().await;
         (cfg.active_endpoint.clone(), cfg.endpoints.clone())
@@ -68,12 +76,15 @@ pub async fn test_endpoint(ep: EndpointInput) -> Result<EndpointStatus, String> 
     validate_endpoint(&ep.kind, &ep.uri)?;
     let socket = None;
     let t0 = Instant::now();
-    let client = DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, socket)
-        .map_err(|e| e.to_string())?;
+    let client =
+        DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, socket).map_err(|e| e.to_string())?;
     let version = client.version_string().await.map_err(|e| e.to_string())?;
     let latency = Some(t0.elapsed().as_millis() as u64);
     Ok(EndpointStatus {
-        id: ep.id.clone().unwrap_or_else(|| endpoint_id_from_name(&ep.name)),
+        id: ep
+            .id
+            .clone()
+            .unwrap_or_else(|| endpoint_id_from_name(&ep.name)),
         name: ep.name.clone(),
         kind: ep.kind.clone(),
         uri: ep.uri.clone(),
@@ -86,7 +97,15 @@ pub async fn test_endpoint(ep: EndpointInput) -> Result<EndpointStatus, String> 
 }
 
 #[tauri::command]
-pub async fn save_endpoint(state: State<'_, AppState>, ep: EndpointInput) -> Result<(), String> {
+pub async fn save_endpoint(
+    state: State<'_, Arc<AppState>>,
+    ep: EndpointInput,
+) -> Result<(), String> {
+    save_endpoint_core(&state, ep).await
+}
+
+/// App-free core of [`save_endpoint`].
+pub(crate) async fn save_endpoint_core(state: &AppState, ep: EndpointInput) -> Result<(), String> {
     validate_endpoint(&ep.kind, &ep.uri)?;
     // Verify reachability before saving (the UI will have tested it too; this
     // guards against TOCTOU while still keeping the form simple).
@@ -94,7 +113,10 @@ pub async fn save_endpoint(state: State<'_, AppState>, ep: EndpointInput) -> Res
     let probe = DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, socket)
         .map_err(|e| format!("{e:#}"))?;
     probe.ping().await.map_err(|e| format!("{e:#}"))?;
-    let id = ep.id.clone().unwrap_or_else(|| endpoint_id_from_name(&ep.name));
+    let id = ep
+        .id
+        .clone()
+        .unwrap_or_else(|| endpoint_id_from_name(&ep.name));
     let cfg = EndpointConfig {
         id: id.clone(),
         name: ep.name.clone(),
@@ -113,7 +135,12 @@ pub async fn save_endpoint(state: State<'_, AppState>, ep: EndpointInput) -> Res
 }
 
 #[tauri::command]
-pub async fn remove_endpoint(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn remove_endpoint(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    remove_endpoint_core(&state, &id).await
+}
+
+/// App-free core of [`remove_endpoint`].
+pub(crate) async fn remove_endpoint_core(state: &AppState, id: &str) -> Result<(), String> {
     if id == "local" {
         return Err("Cannot remove the bundled engine".to_string());
     }
@@ -125,7 +152,7 @@ pub async fn remove_endpoint(state: State<'_, AppState>, id: String) -> Result<(
             // Nothing removed: return a non-destructive error to the UI.
             return Err("Unknown endpoint".to_string());
         }
-        if config.active_endpoint.as_deref() == Some(id.as_str()) {
+        if config.active_endpoint.as_deref() == Some(id) {
             config.active_endpoint = None;
         }
     }
@@ -136,7 +163,7 @@ pub async fn remove_endpoint(state: State<'_, AppState>, id: String) -> Result<(
 #[tauri::command]
 pub async fn set_active_endpoint(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<(), String> {
     // Switching requires a live daemon for the new target. For the local
@@ -178,7 +205,16 @@ pub async fn set_active_endpoint(
 }
 
 #[tauri::command]
-pub async fn get_active_endpoint(state: State<'_, AppState>) -> Result<Option<EndpointStatus>, String> {
+pub async fn get_active_endpoint(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<EndpointStatus>, String> {
+    get_active_endpoint_core(&state).await
+}
+
+/// App-free core of [`get_active_endpoint`].
+pub(crate) async fn get_active_endpoint_core(
+    state: &AppState,
+) -> Result<Option<EndpointStatus>, String> {
     let (active, endpoints) = {
         let cfg = state.config.read().await;
         (cfg.active_endpoint.clone(), cfg.endpoints.clone())
@@ -232,7 +268,7 @@ pub async fn get_active_endpoint(state: State<'_, AppState>) -> Result<Option<En
 /// Helper for the UI: a compact host:port string for the currently active
 /// endpoint. For the local socket this is still the engine socket string.
 #[tauri::command]
-pub async fn active_endpoint_host(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn active_endpoint_host(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let (active, endpoints) = {
         let cfg = state.config.read().await;
         (cfg.active_endpoint.clone(), cfg.endpoints.clone())

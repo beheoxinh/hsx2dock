@@ -1,0 +1,1423 @@
+//! The MCP server: one `ServerHandler` over the app's own state.
+//!
+//! # Why dispatch does not call the Tauri commands
+//!
+//! Every `#[tauri::command]` takes `State<'_, Arc<AppState>>`, and a `State` can
+//! only be built by Tauri's IPC dispatcher — it is a borrow handed in by the
+//! macro. The MCP server runs on a different transport (stdio or HTTP) with no
+//! IPC involved, so it cannot call those functions. It holds an
+//! `Arc<AppState>` and performs the same operations directly.
+//!
+//! That duplication is deliberate but bounded: anything with real logic lives
+//! in an app-free `pub(crate)` core in `commands::*` (the image pull/push/build
+//! and kind cluster cores), and this module is the thin dispatch layer over
+//! them plus `DockerClient`. When a command gains logic, put it in a core and
+//! call it from both sides.
+//!
+//! # Safety
+//!
+//! Tools that drive the *bundled* engine's lifecycle are marked `engine_only`
+//! in the catalogue and refuse while a remote endpoint is active, mirroring
+//! `AppState::engine_control_guard`. Destructive tools carry
+//! `destructiveHint: true`. Neither of those is advisory: the checks are
+//! enforced here, in [`McpServer::call`].
+
+use std::sync::Arc;
+
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, ResourceContents, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer};
+use serde_json::{json, Value};
+
+use super::args::Args;
+use super::tools::{Access, ToolSpec};
+use crate::commands::kind;
+use crate::config::AppConfig;
+use crate::docker::models::{BuildOptions, DaemonState, EndpointInput, ResourceLimits, RunConfig};
+use crate::state::AppState;
+
+/// The MCP front-end over a running app.
+///
+/// `app` is present when the server was started by the GUI (so long operations
+/// can emit the same progress events the UI listens for) and `None` in the
+/// standalone `hsx2dock-mcp` binary.
+#[derive(Clone)]
+pub struct McpServer {
+    pub state: Arc<AppState>,
+    pub app: Option<tauri::AppHandle>,
+}
+
+impl McpServer {
+    pub fn new(state: Arc<AppState>, app: Option<tauri::AppHandle>) -> Self {
+        Self { state, app }
+    }
+
+    fn app_ref(&self) -> Option<&tauri::AppHandle> {
+        self.app.as_ref()
+    }
+}
+
+/// Turns a handler result into the MCP result the client renders.
+///
+/// Success is structured JSON (`structuredContent` plus a text rendering for
+/// clients that ignore it); failure is a *tool* error, not a protocol error,
+/// so the agent actually sees the message.
+fn ok(value: Value) -> CallToolResult {
+    CallToolResult::structured(value)
+}
+
+fn fail(message: impl Into<String>) -> CallToolResult {
+    let message = message.into();
+    CallToolResult::structured_error(json!({ "error": message }))
+}
+
+/// `Result<T, String>` → tool result, mapping the error into `fail`.
+fn done<T: serde::Serialize>(result: Result<T, String>) -> CallToolResult {
+    match result {
+        Ok(v) => match serde_json::to_value(v) {
+            Ok(value) => ok(value),
+            Err(e) => fail(format!("could not serialize result: {e}")),
+        },
+        Err(e) => fail(e),
+    }
+}
+
+/// For tools whose only meaningful output is "it worked".
+fn done_unit(result: Result<(), String>) -> CallToolResult {
+    match result {
+        Ok(()) => ok(json!({ "ok": true })),
+        Err(e) => fail(e),
+    }
+}
+
+/// Extracts the object a tool takes as one argument (a `RunConfig`,
+/// `BuildOptions`, `ResourceLimits`, …) and deserializes it.
+fn object_arg<T: serde::de::DeserializeOwned>(args: &Args, key: &str) -> Result<T, String> {
+    let value = args.req_object(key).map_err(|e| e.to_string())?;
+    serde_json::from_value(value)
+        .map_err(|e| format!("argument '{key}' does not match the expected object: {e}"))
+}
+
+/// Wraps a list-valued resource so a daemon error becomes a readable
+/// `{"<key>": [], "unavailable": "..."}` instead of a missing resource.
+///
+/// The distinction matters to an agent: "no resource at this URI" means the
+/// address is wrong and it should stop asking; `unavailable` means the address
+/// is right and the engine needs starting.
+fn unavailable_on_error<T: serde::Serialize>(key: &str, result: Result<T, String>) -> Value {
+    match result {
+        Ok(items) => json!({ key: items }),
+        Err(e) => json!({ key: [], "unavailable": e }),
+    }
+}
+
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            super::SERVER_NAME,
+            super::SERVER_VERSION,
+        ))
+        .with_instructions(super::INSTRUCTIONS)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(
+            super::tools::catalogue()
+                .iter()
+                .map(ToolSpec::to_tool)
+                .collect(),
+        ))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(
+            super::resources::catalogue()
+                .iter()
+                .map(super::resources::ResourceSpec::to_resource)
+                .collect(),
+        ))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(
+            super::prompts::catalogue()
+                .iter()
+                .map(super::prompts::PromptSpec::to_prompt)
+                .collect(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        match self.read_resource_body(&request.uri).await {
+            Some(text) => {
+                // Report the type the catalogue advertises, not a fixed one:
+                // `hsx2dock://guide` is markdown, and a client that renders by
+                // mime type would otherwise show it as raw JSON.
+                let mime = super::resources::catalogue()
+                    .iter()
+                    .find(|r| r.uri == request.uri)
+                    .map(|r| r.mime_type)
+                    .unwrap_or("application/json");
+                Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+                    vec![ResourceContents::text(text, request.uri).with_mime_type(mime)],
+                )))
+            }
+            None => Err(McpError::resource_not_found(
+                format!("no resource at '{}'", request.uri),
+                None,
+            )),
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, McpError> {
+        let empty = serde_json::Map::new();
+        let args = request.arguments.as_ref().unwrap_or(&empty);
+        match super::prompts::messages(&request.name, args) {
+            Some(messages) => Ok(rmcp::model::GetPromptResponse::Complete(
+                rmcp::model::GetPromptResult::new(messages),
+            )),
+            None => Err(McpError::invalid_params(
+                format!("no prompt named '{}'", request.name),
+                None,
+            )),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let Some(spec) = super::tools::find(&request.name) else {
+            return Err(McpError::invalid_params(
+                format!("no tool named '{}'", request.name),
+                None,
+            ));
+        };
+        let args = Args::new(request.arguments);
+
+        // Enforced, not advisory: a tool that touches the bundled engine's own
+        // files must not run against a remote endpoint.
+        if spec.engine_only {
+            if let Err(e) = self.state.engine_control_guard().await {
+                return Ok(CallToolResponse::Complete(fail(e)));
+            }
+        }
+
+        Ok(CallToolResponse::Complete(self.call(&spec, &args).await))
+    }
+}
+
+// ==================== dispatch ====================
+
+impl McpServer {
+    /// Routes one validated call to its handler.
+    ///
+    /// Split from [`ServerHandler::call_tool`] so the match reads as the
+    /// contract it is: one arm per catalogue entry, in catalogue order.
+    async fn call(&self, spec: &ToolSpec, args: &Args) -> CallToolResult {
+        let state = &self.state;
+        match spec.name {
+            // ------------------------------------------------ engine
+            "engine_get_status" => ok(json!({ "state": state.daemon_state() })),
+            "engine_get_info" => done(self.engine_info().await),
+            "engine_get_disk_usage" => done(self.disk_usage().await),
+            "engine_start" | "engine_stop" | "engine_toggle" => done(self.toggle_engine().await),
+            "engine_diagnose" => ok(json!(self.diagnose())),
+            "engine_repair" => {
+                let ids = args
+                    .opt_value("check_ids")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok());
+                ok(json!(self.repair(ids)))
+            }
+            "engine_get_config" => ok(json!(self.app_config().await)),
+            "engine_set_config" => match object_arg::<AppConfig>(args, "config") {
+                Ok(config) => done_unit(self.save_config(config).await),
+                Err(e) => fail(e),
+            },
+            "engine_get_cli_bridge_status" => ok(json!(self.cli_bridge_status().await)),
+            "engine_set_cli_bridge" => match args.req_bool("enabled") {
+                Ok(enabled) => done(self.set_cli_bridge(enabled).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "engine_apply_resource_limits" => done(self.apply_resource_limits().await),
+
+            // ------------------------------------------------ containers
+            "container_list" => match args.bool_or("all", true) {
+                Ok(all) => done(self.list_containers(all).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "container_inspect" => {
+                self.with_id(args, |id| async move {
+                    let client = state.get_client().await?;
+                    client
+                        .inspect_container(&id)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+            }
+            "container_logs" => match (args.req_str("id"), args.opt_u64("tail")) {
+                (Ok(id), Ok(tail)) => done(
+                    self.container_logs(&id, tail.unwrap_or(200).min(5000) as usize)
+                        .await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "container_stats" => {
+                self.with_id(args, |id| async move {
+                    let client = state.get_client().await?;
+                    client.container_stats(&id).await.map_err(|e| e.to_string())
+                })
+                .await
+            }
+            "container_sizes" => done(self.container_sizes().await),
+            "container_start" | "container_stop" | "container_restart" | "container_pause"
+            | "container_unpause" => self.container_power(spec.name, args).await,
+            "container_rename" => self.rename_container(args).await,
+            "container_remove" => match (args.req_str("id"), args.bool_or("force", false)) {
+                (Ok(id), Ok(force)) => done_unit(self.remove_container(&id, force).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "container_run" => match object_arg::<RunConfig>(args, "config") {
+                Ok(config) => done_unit(self.run_container(config).await),
+                Err(e) => fail(e),
+            },
+            "container_update_resources" => {
+                match (
+                    args.req_str("id"),
+                    object_arg::<ResourceLimits>(args, "limits"),
+                ) {
+                    (Ok(id), Ok(limits)) => done_unit(self.update_limits(&id, &limits).await),
+                    (Err(e), _) => fail(e.to_string()),
+                    (_, Err(e)) => fail(e),
+                }
+            }
+            "container_exec" => match (args.req_str("id"), args.req_str_vec("cmd")) {
+                (Ok(id), Ok(cmd)) => self.exec(&id, cmd).await,
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "container_prune" => done(self.prune_containers().await),
+
+            // ------------------------------------------------ groups
+            "group_list" => ok(json!(self.groups().await)),
+            "group_save" => match args.opt_value("groups") {
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(groups) => done_unit(self.save_groups(groups).await),
+                    Err(e) => fail(format!("argument 'groups' is not a group list: {e}")),
+                },
+                None => fail("missing required argument 'groups'"),
+            },
+            "group_start" | "group_stop" => match args.req_str("id") {
+                Ok(id) => {
+                    let start = spec.name == "group_start";
+                    done(self.set_group_power(&id, start).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+
+            // ------------------------------------------------ images
+            "image_list" => done(self.list_images().await),
+            "image_history" => match args.req_str("name") {
+                Ok(name) => done(self.image_history(&name).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "image_search" => match args.req_str("term") {
+                Ok(term) => done(self.search_images(&term).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "image_pull" => match args.req_str("image") {
+                Ok(image) => done_unit(
+                    crate::commands::images::pull_image_core(state, self.app_ref(), image).await,
+                ),
+                Err(e) => fail(e.to_string()),
+            },
+            "image_push" => match args.req_str("image") {
+                Ok(image) => done_unit(
+                    crate::commands::images::push_image_core(state, self.app_ref(), image).await,
+                ),
+                Err(e) => fail(e.to_string()),
+            },
+            "image_tag" => match (
+                args.req_str("id"),
+                args.req_str("repo"),
+                args.req_str("tag"),
+            ) {
+                (Ok(id), Ok(repo), Ok(tag)) => done_unit(self.tag_image(&id, &repo, &tag).await),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+            },
+            "image_build" => match object_arg::<BuildOptions>(args, "req") {
+                Ok(req) => done_unit(
+                    crate::commands::images::build_image_core(state, self.app_ref(), req).await,
+                ),
+                Err(e) => fail(e),
+            },
+            "image_cancel_build" => done_unit(self.cancel_build()),
+            "image_validate_build_context" => match args.req_str("path") {
+                Ok(path) => done(crate::commands::images::validate_build_context_core(&path)),
+                Err(e) => fail(e.to_string()),
+            },
+            "image_preview_build_command" => match object_arg::<BuildOptions>(args, "req") {
+                Ok(req) => done(crate::commands::images::preview_build_command_core(req)),
+                Err(e) => fail(e),
+            },
+            "image_remove" => match (args.req_str("id"), args.bool_or("force", false)) {
+                (Ok(id), Ok(force)) => done_unit(self.remove_image(&id, force).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "image_prune" => done(self.prune_images().await),
+
+            // ------------------------------------------------ volumes
+            "volume_list" => done(crate::commands::volumes::list_volumes_core(state).await),
+            "volume_create" => done_unit(self.create_volume(args).await),
+            "volume_remove" => match (args.req_str("name"), args.bool_or("force", false)) {
+                (Ok(name), Ok(force)) => done_unit(
+                    crate::commands::volumes::remove_volume_core(state, &name, force).await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "volume_prune" => done(crate::commands::volumes::prune_volumes_core(state).await),
+
+            // ------------------------------------------------ networks
+            "network_list" => done(crate::commands::networks::list_networks_core(state).await),
+            "network_create" => done_unit(self.create_network(args).await),
+            "network_remove" => match args.req_str("id") {
+                Ok(id) => {
+                    done_unit(crate::commands::networks::remove_network_core(state, &id).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "network_prune" => done(crate::commands::networks::prune_networks_core(state).await),
+
+            // ------------------------------------------------ compose
+            "compose_list_projects" => {
+                done(crate::commands::compose::list_compose_projects_core(state).await)
+            }
+            "compose_up" | "compose_down" => match args.req_str("file_path") {
+                Ok(path) => {
+                    let up = spec.name == "compose_up";
+                    done(crate::commands::compose::compose_lifecycle_core(&path, up).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_logs" => match (args.req_str("file_path"), args.opt_u64("tail")) {
+                (Ok(path), Ok(tail)) => done(
+                    crate::commands::compose::compose_logs_core(
+                        &path,
+                        tail.unwrap_or(100) as usize,
+                    )
+                    .await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "compose_project_action" => match (args.req_str("project"), args.req_str("action")) {
+                (Ok(project), Ok(action)) => done(
+                    crate::commands::compose::compose_project_action_core(&project, &action).await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+
+            // ------------------------------------------------ kind / clusters
+            "kind_get_status" => ok(json!(crate::docker::kind::kind_status(&state.kind))),
+            "cluster_list" => done(kind::list_kind_clusters_core(state).await),
+            "cluster_create" => {
+                match (
+                    args.req_str("name"),
+                    args.opt_str("image"),
+                    args.opt_u64("nodes"),
+                ) {
+                    (Ok(name), Ok(image), Ok(nodes)) => done_unit(
+                        kind::create_kind_cluster_core(
+                            state,
+                            self.app_ref(),
+                            name,
+                            image,
+                            nodes.map(|n| n as u32),
+                        )
+                        .await,
+                    ),
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_delete" => match args.req_str("name") {
+                Ok(name) => {
+                    done_unit(kind::delete_kind_cluster_core(state, self.app_ref(), name).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_start" | "cluster_stop" => match args.req_str("name") {
+                Ok(name) => {
+                    let start = spec.name == "cluster_start";
+                    done_unit(kind::set_cluster_power(self.app_ref(), state, &name, start).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_kubeconfig" => match args.req_str("name") {
+                Ok(name) => done(kind::get_kind_kubeconfig_core(state, name).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_load_image" => match (args.req_str("cluster"), args.req_str("image")) {
+                (Ok(cluster), Ok(image)) => done_unit(
+                    kind::load_image_to_cluster_core(state, self.app_ref(), cluster, image).await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_nodes" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_nodes_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_pods" => match (args.req_str("cluster"), args.opt_str("namespace")) {
+                (Ok(cluster), Ok(namespace)) => {
+                    done(kind::get_cluster_pods_core(state, cluster, namespace).await)
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_events" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_events_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_deployments" | "cluster_statefulsets" | "cluster_daemonsets" => {
+                let want = match spec.name {
+                    "cluster_deployments" => "Deployment",
+                    "cluster_statefulsets" => "StatefulSet",
+                    _ => "DaemonSet",
+                };
+                match args.req_str("cluster") {
+                    Ok(cluster) => done(
+                        kind::get_cluster_workloads_core(state, cluster)
+                            .await
+                            .map(|ws| {
+                                ws.into_iter()
+                                    .filter(|w| w.kind.eq_ignore_ascii_case(want))
+                                    .collect::<Vec<_>>()
+                            }),
+                    ),
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            "cluster_jobs" | "cluster_cronjobs" => {
+                let resource = if spec.name == "cluster_jobs" {
+                    "jobs"
+                } else {
+                    "cronjobs"
+                };
+                match args.req_str("cluster") {
+                    Ok(cluster) => {
+                        done(kind::get_cluster_jobs_core(state, cluster, resource).await)
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            "cluster_services" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_services_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_namespaces" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_namespaces_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_ingresses" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_ingresses_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_pvcs" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_pvcs_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_pvs" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_pvs_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_config_resources" => {
+                match (
+                    args.req_str("cluster"),
+                    args.bool_or("include_secrets", false),
+                ) {
+                    (Ok(cluster), Ok(include_secrets)) => done(
+                        kind::get_cluster_config_resources_core(
+                            state,
+                            cluster,
+                            Some(include_secrets),
+                        )
+                        .await,
+                    ),
+                    (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_summary" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_summary_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_metrics" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::get_cluster_metrics_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_metrics_server_status" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::metrics_server_status_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_install_metrics_server" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind::install_metrics_server_core(state, cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_pod_logs" => {
+                match (
+                    args.req_str("cluster"),
+                    args.req_str("namespace"),
+                    args.req_str("pod"),
+                    args.opt_str("container"),
+                    args.opt_u64("tail"),
+                ) {
+                    (Ok(cluster), Ok(namespace), Ok(pod), Ok(_container), Ok(tail)) => done(
+                        kind::get_pod_logs_core(
+                            state,
+                            cluster,
+                            namespace,
+                            pod,
+                            tail.map(|t| t as u32),
+                        )
+                        .await,
+                    ),
+                    (Err(e), _, _, _, _)
+                    | (_, Err(e), _, _, _)
+                    | (_, _, Err(e), _, _)
+                    | (_, _, _, Err(e), _)
+                    | (_, _, _, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_delete_workload" | "cluster_restart_workload" => {
+                match (
+                    args.req_str("cluster"),
+                    args.req_str("kind"),
+                    args.req_str("namespace"),
+                    args.req_str("name"),
+                ) {
+                    (Ok(cluster), Ok(kind_name), Ok(namespace), Ok(name)) => {
+                        if spec.name == "cluster_delete_workload" {
+                            done_unit(
+                                kind::delete_k8s_resource_core(
+                                    state,
+                                    cluster,
+                                    kind_name,
+                                    Some(namespace),
+                                    name,
+                                )
+                                .await,
+                            )
+                        } else {
+                            done_unit(
+                                kind::restart_workload_core(
+                                    state, cluster, kind_name, namespace, name,
+                                )
+                                .await,
+                            )
+                        }
+                    }
+                    (Err(e), _, _, _)
+                    | (_, Err(e), _, _)
+                    | (_, _, Err(e), _)
+                    | (_, _, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_scale_workload" => {
+                match (
+                    args.req_str("cluster"),
+                    args.req_str("kind"),
+                    args.req_str("namespace"),
+                    args.req_str("name"),
+                    args.opt_u64("replicas"),
+                ) {
+                    (Ok(cluster), Ok(kind), Ok(namespace), Ok(name), Ok(replicas)) => done_unit(
+                        kind::scale_workload_core(
+                            state,
+                            cluster,
+                            kind,
+                            namespace,
+                            name,
+                            replicas.unwrap_or(1) as u32,
+                        )
+                        .await,
+                    ),
+                    (Err(e), _, _, _, _)
+                    | (_, Err(e), _, _, _)
+                    | (_, _, Err(e), _, _)
+                    | (_, _, _, Err(e), _)
+                    | (_, _, _, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_delete_pod" => {
+                match (
+                    args.req_str("cluster"),
+                    args.req_str("namespace"),
+                    args.req_str("pod"),
+                ) {
+                    (Ok(cluster), Ok(namespace), Ok(pod)) => {
+                        done_unit(kind::delete_pod_core(state, cluster, namespace, pod, None).await)
+                    }
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "cluster_create_namespace" => match (args.req_str("cluster"), args.req_str("name")) {
+                (Ok(cluster), Ok(name)) => {
+                    done_unit(kind::create_namespace_core(state, cluster, name).await)
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_drain_node" => match (args.req_str("cluster"), args.req_str("node")) {
+                (Ok(cluster), Ok(node)) => done(kind::drain_node_core(state, cluster, node).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_set_node_schedulable" => match (
+                args.req_str("cluster"),
+                args.req_str("node"),
+                args.req_bool("schedulable"),
+            ) {
+                (Ok(cluster), Ok(node), Ok(schedulable)) => done_unit(
+                    kind::set_node_schedulable_core(state, cluster, node, schedulable).await,
+                ),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_apply_yaml" => match (args.req_str("cluster"), args.req_str("yaml")) {
+                (Ok(cluster), Ok(yaml)) => {
+                    done(kind::apply_yaml_core(state, &cluster, &yaml).await)
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_get_cluster_prefs" => match args.req_str("cluster") {
+                Ok(cluster) => ok(json!(kind::get_cluster_prefs_core(state, &cluster).await)),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_set_cluster_prefs" => {
+                match (args.req_str("cluster"), args.opt_value("prefs")) {
+                    (Ok(cluster), Some(v)) => match serde_json::from_value(v) {
+                        Ok(prefs) => {
+                            done_unit(kind::set_cluster_prefs_core(state, &cluster, prefs).await)
+                        }
+                        Err(e) => fail(format!("argument 'prefs' is not a prefs object: {e}")),
+                    },
+                    (Err(e), _) => fail(e.to_string()),
+                    (_, None) => fail("missing required argument 'prefs'"),
+                }
+            }
+
+            // ------------------------------------------------ endpoints
+            "endpoint_list" => done(self.list_endpoints().await),
+            "endpoint_get_active" => done(self.active_endpoint().await),
+            "endpoint_test" => match args.opt_value("endpoint") {
+                Some(v) => match serde_json::from_value::<EndpointInput>(v) {
+                    Ok(ep) => done(crate::commands::endpoints::test_endpoint(ep).await),
+                    Err(e) => fail(format!(
+                        "argument 'endpoint' is not an endpoint object: {e}"
+                    )),
+                },
+                None => fail("missing required argument 'endpoint'"),
+            },
+            "endpoint_save" => match args.opt_value("endpoint") {
+                Some(v) => match serde_json::from_value::<EndpointInput>(v) {
+                    Ok(ep) => done_unit(self.save_endpoint(ep).await),
+                    Err(e) => fail(format!(
+                        "argument 'endpoint' is not an endpoint object: {e}"
+                    )),
+                },
+                None => fail("missing required argument 'endpoint'"),
+            },
+            "endpoint_set_active" => match args.req_str("id") {
+                Ok(id) => done_unit(self.set_active_endpoint(id).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "endpoint_remove" => match args.req_str("id") {
+                Ok(id) => done_unit(self.remove_endpoint(&id).await),
+                Err(e) => fail(e.to_string()),
+            },
+
+            // ------------------------------------------------ registries
+            "registry_list" => done(self.list_registries().await),
+            "registry_test" => match args.opt_value("input") {
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(input) => done(crate::commands::registries::test_registry_auth(input).await),
+                    Err(e) => fail(format!("argument 'input' is not a registry login: {e}")),
+                },
+                None => fail("missing required argument 'input'"),
+            },
+            "registry_save" => match args.opt_value("input") {
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(input) => done_unit(self.save_registry(input).await),
+                    Err(e) => fail(format!("argument 'input' is not a registry login: {e}")),
+                },
+                None => fail("missing required argument 'input'"),
+            },
+            "registry_set_default" => match args.opt_str("id") {
+                Ok(id) => done_unit(self.set_default_registry(id.unwrap_or_default()).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "registry_remove" => match args.req_str("id") {
+                Ok(id) => done_unit(self.remove_registry(&id).await),
+                Err(e) => fail(e.to_string()),
+            },
+
+            // ------------------------------------------------ storage / system
+            "storage_check_path" => match args.req_str("path") {
+                Ok(path) => {
+                    done(crate::commands::system::check_data_root_path_core(state, path).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "storage_migrate_data_root" => match (
+                args.req_str("target_path"),
+                args.bool_or("move_data", true),
+                args.bool_or("clear_old", false),
+            ) {
+                (Ok(target_path), Ok(move_data), Ok(clear_old)) => done_unit(
+                    crate::commands::system::migrate_data_root_core(
+                        state,
+                        target_path,
+                        move_data,
+                        clear_old,
+                    )
+                    .await,
+                ),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+            },
+            "system_prune" => done(self.prune_system().await),
+
+            other => fail(format!(
+                "tool '{other}' is advertised but has no handler — this is a bug in \
+                 hsx2dock; please report it"
+            )),
+        }
+    }
+}
+
+// ==================== helpers ====================
+//
+// Each of these is the MCP-side body of one or more Tauri commands. Where the
+// command has real logic it lives in a `*_core` in `commands::*` and both
+// sides call it; what is repeated here is the one-or-two-line glue.
+
+impl McpServer {
+    async fn engine_info(&self) -> Result<Option<crate::docker::models::EngineInfo>, String> {
+        let client = match self.state.get_client().await {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        Ok(client.engine_info().await.ok())
+    }
+
+    async fn disk_usage(&self) -> Result<crate::docker::models::DfReport, String> {
+        let client = self.state.get_client().await?;
+        client.system_df().await.map_err(|e| e.to_string())
+    }
+
+    async fn prune_system(&self) -> Result<u64, String> {
+        let client = self.state.get_client().await?;
+        client.system_prune().await.map_err(|e| e.to_string())
+    }
+
+    /// Mirrors `commands::system::toggle_engine`, including the resource-limit
+    /// pass after a start so an agent-started engine obeys the saved caps.
+    async fn toggle_engine(&self) -> Result<DaemonState, String> {
+        let state = &self.state;
+        match state.daemon_state() {
+            DaemonState::Running => {
+                let engine = state.engine.clone();
+                crate::runtime::engine_op(move || engine.stop())
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                *state.client.write().await = None;
+                Ok(state.daemon_state())
+            }
+            DaemonState::Stopped | DaemonState::NotInstalled => {
+                let engine = state.engine.clone();
+                crate::runtime::engine_op(move || engine.start())
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                let _ = state.get_client().await;
+                if let Err(e) = crate::commands::system::apply_engine_limits_now(state).await {
+                    tracing::warn!("could not apply engine resource limits: {e}");
+                }
+                Ok(state.daemon_state())
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn diagnose(&self) -> crate::docker::doctor::EngineDoctorReport {
+        crate::docker::doctor::diagnose(&self.state.engine.paths())
+    }
+
+    /// Same selection rules as `commands::system::repair_engine`: `None` or an
+    /// empty list means every auto-repairable check.
+    fn repair(&self, check_ids: Option<Vec<String>>) -> crate::docker::doctor::RepairReport {
+        let auto = crate::docker::doctor::auto_repairable();
+        let ids: Vec<&str> = match check_ids.as_deref() {
+            Some(requested) if !requested.is_empty() => {
+                requested.iter().map(String::as_str).collect()
+            }
+            _ => auto,
+        };
+        let report = crate::docker::doctor::repair(&self.state.engine.paths(), &ids);
+        for (id, reason) in &report.failed {
+            tracing::warn!("engine repair failed for {id}: {reason}");
+        }
+        report
+    }
+
+    /// The saved config with registry secrets reduced to `has_password`.
+    async fn app_config(&self) -> Value {
+        let cfg = self.state.config.read().await;
+        let mut value = serde_json::to_value(&*cfg).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            let logins: Vec<Value> = cfg
+                .registries
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "name": r.name,
+                        "host": r.host,
+                        "username": r.username,
+                        "insecure": r.insecure,
+                        "has_password": !r.auth.is_empty(),
+                    })
+                })
+                .collect();
+            obj.insert("registries".into(), Value::Array(logins));
+        }
+        value
+    }
+
+    /// Saves through the same core the Settings page uses, so an agent write
+    /// cannot skip the autostart entry, the data-root sync, the shim refresh or
+    /// the engine-limits pass — and so the two paths cannot drift apart.
+    ///
+    /// The MCP settings are the one exception: a config write from an agent can
+    /// flip `mcp_enabled` or `mcp_port`, so the listener is reconciled here.
+    /// Without this, an agent could leave the config saying "enabled" while
+    /// nothing is listening until the next app launch.
+    async fn save_config(&self, config: AppConfig) -> Result<(), String> {
+        crate::commands::system::save_app_config_core(&self.state, config).await?;
+        crate::commands::mcp::reconcile_http_server(&self.state).await
+    }
+
+    async fn cli_bridge_status(&self) -> crate::commands::system::CliBridgeStatus {
+        let config = self.state.config.read().await;
+        let engine_socket = &self.state.engine.paths().socket;
+        let link_state = crate::docker::cli_bridge::xdg_symlink_state(engine_socket);
+        crate::commands::system::CliBridgeStatus {
+            enabled: config.cli_bridge_enabled,
+            link_state,
+        }
+    }
+
+    async fn set_cli_bridge(
+        &self,
+        enabled: bool,
+    ) -> Result<crate::commands::system::CliBridgeStatus, String> {
+        {
+            let mut config = self.state.config.write().await;
+            config.cli_bridge_enabled = enabled;
+            config.save().await.map_err(|e| e.to_string())?;
+        }
+        let link_state = crate::commands::system::apply_cli_bridge(&self.state).await;
+        let config = self.state.config.read().await;
+        Ok(crate::commands::system::CliBridgeStatus {
+            enabled: config.cli_bridge_enabled,
+            link_state,
+        })
+    }
+
+    async fn apply_resource_limits(&self) -> Result<String, String> {
+        crate::commands::system::apply_engine_limits_now(&self.state).await
+    }
+
+    async fn list_containers(
+        &self,
+        all: bool,
+    ) -> Result<Vec<crate::docker::models::ContainerItem>, String> {
+        let client = self.state.get_client().await?;
+        client.list_containers(all).await.map_err(|e| e.to_string())
+    }
+
+    /// Runs `f` with the `id` argument, returning its result as a tool result.
+    async fn with_id<F, Fut, T>(&self, args: &Args, f: F) -> CallToolResult
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+        T: serde::Serialize,
+    {
+        match args.req_str("id") {
+            Ok(id) => done(f(id).await),
+            Err(e) => fail(e.to_string()),
+        }
+    }
+
+    async fn container_logs(&self, id: &str, tail: usize) -> Result<String, String> {
+        let client = self.state.get_client().await?;
+        client
+            .container_logs(id, &tail.to_string())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn container_sizes(&self) -> Result<std::collections::HashMap<String, u64>, String> {
+        let client = self.state.get_client().await?;
+        client.container_sizes().await.map_err(|e| e.to_string())
+    }
+
+    async fn container_power(&self, tool: &str, args: &Args) -> CallToolResult {
+        let id = match args.req_str("id") {
+            Ok(id) => id,
+            Err(e) => return fail(e.to_string()),
+        };
+        let client = match self.state.get_client().await {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        let result = match tool {
+            "container_start" => client.start_container(&id).await,
+            "container_stop" => client.stop_container(&id).await,
+            "container_restart" => client.restart_container(&id).await,
+            "container_pause" => client.pause_container(&id).await,
+            _ => client.unpause_container(&id).await,
+        };
+        done_unit(result.map_err(|e| e.to_string()))
+    }
+
+    async fn rename_container(&self, args: &Args) -> CallToolResult {
+        let (id, new_name) = match (args.req_str("id"), args.req_str("new_name")) {
+            (Ok(id), Ok(name)) => (id, name),
+            (Err(e), _) | (_, Err(e)) => return fail(e.to_string()),
+        };
+        let client = match self.state.get_client().await {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        done_unit(
+            client
+                .rename_container(&id, &new_name)
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    }
+
+    async fn remove_container(&self, id: &str, force: bool) -> Result<(), String> {
+        let client = self.state.get_client().await?;
+        client
+            .remove_container(id, force)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn run_container(&self, config: RunConfig) -> Result<(), String> {
+        config.validate().map_err(|e| e.to_string())?;
+        let client = self.state.get_client().await?;
+        client
+            .create_container(&config, true)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_limits(&self, id: &str, limits: &ResourceLimits) -> Result<(), String> {
+        let client = self.state.get_client().await?;
+        client
+            .update_container_limits(id, limits)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn exec(&self, id: &str, cmd: Vec<String>) -> CallToolResult {
+        let client = match self.state.get_client().await {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        match client.exec_capture(id, cmd).await {
+            Ok(out) => ok(json!({ "output": out })),
+            Err(e) => fail(format!("{e:#}")),
+        }
+    }
+
+    async fn prune_containers(&self) -> Result<u64, String> {
+        let client = self.state.get_client().await?;
+        client.prune_containers().await.map_err(|e| e.to_string())
+    }
+
+    async fn groups(&self) -> Vec<crate::config::ContainerGroup> {
+        self.state.config.read().await.container_groups.clone()
+    }
+
+    async fn save_groups(&self, groups: Vec<crate::config::ContainerGroup>) -> Result<(), String> {
+        crate::commands::groups::save_container_groups_core(&self.state, groups).await
+    }
+
+    async fn set_group_power(&self, id: &str, start: bool) -> Result<String, String> {
+        if start {
+            crate::commands::groups::start_container_group_core(&self.state, id).await
+        } else {
+            crate::commands::groups::stop_container_group_core(&self.state, id).await
+        }
+    }
+
+    async fn list_images(&self) -> Result<Vec<crate::docker::models::ImageItem>, String> {
+        let client = self.state.get_client().await?;
+        let configured = {
+            let cfg = self.state.config.read().await;
+            cfg.kind_default_image.clone()
+        };
+        let configured = Some(configured.as_str()).filter(|s| !s.is_empty());
+        client
+            .list_images_visible(configured)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn image_history(
+        &self,
+        name: &str,
+    ) -> Result<Vec<crate::docker::models::ImageHistoryEntry>, String> {
+        let client = self.state.get_client().await?;
+        client.image_history(name).await.map_err(|e| e.to_string())
+    }
+
+    async fn search_images(&self, term: &str) -> Result<Vec<Value>, String> {
+        let client = self.state.get_client().await?;
+        let results = client
+            .search_images(term)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(results
+            .into_iter()
+            .map(|(name, description, star_count)| {
+                json!({ "name": name, "description": description, "star_count": star_count })
+            })
+            .collect())
+    }
+
+    async fn tag_image(&self, id: &str, repo: &str, tag: &str) -> Result<(), String> {
+        let client = self.state.get_client().await?;
+        client
+            .tag_image(id, repo, tag)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn cancel_build(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.state.build_running.load(Relaxed) {
+            return Err("No build in progress".to_string());
+        }
+        self.state.build_cancel.store(true, Relaxed);
+        Ok(())
+    }
+
+    async fn remove_image(&self, id: &str, force: bool) -> Result<(), String> {
+        let client = self.state.get_client().await?;
+        client
+            .remove_image(id, force)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn prune_images(&self) -> Result<Value, String> {
+        let client = self.state.get_client().await?;
+        let (deleted, reclaimed) = client.prune_images().await.map_err(|e| e.to_string())?;
+        Ok(json!({ "deleted": deleted, "reclaimed_bytes": reclaimed }))
+    }
+
+    async fn create_volume(&self, args: &Args) -> Result<(), String> {
+        let name = args.req_str("name").map_err(|e| e.to_string())?;
+        let driver = args
+            .opt_str("driver")
+            .map_err(|e| e.to_string())?
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let driver_opts = match args.opt_value("driver_opts") {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| format!("argument 'driver_opts' must be a string map: {e}"))?,
+            None => Default::default(),
+        };
+        let labels = match args.opt_value("labels") {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| format!("argument 'labels' must be a string map: {e}"))?,
+            None => Default::default(),
+        };
+        let client = self.state.get_client().await?;
+        client
+            .create_volume(&name, &driver, driver_opts, labels)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn create_network(&self, args: &Args) -> Result<(), String> {
+        let name = args.req_str("name").map_err(|e| e.to_string())?;
+        let driver = args
+            .opt_str("driver")
+            .map_err(|e| e.to_string())?
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| "bridge".to_string());
+        let subnet = args.opt_str("subnet").map_err(|e| e.to_string())?;
+        let gateway = args.opt_str("gateway").map_err(|e| e.to_string())?;
+        let internal = args.bool_or("internal", false).map_err(|e| e.to_string())?;
+        let attachable = args
+            .bool_or("attachable", true)
+            .map_err(|e| e.to_string())?;
+        let labels = match args.opt_value("labels") {
+            Some(v) => serde_json::from_value(v)
+                .map_err(|e| format!("argument 'labels' must be a string map: {e}"))?,
+            None => Default::default(),
+        };
+        let client = self.state.get_client().await?;
+        client
+            .create_network(
+                &name,
+                &driver,
+                subnet.as_deref().unwrap_or_default(),
+                gateway.as_deref().unwrap_or_default(),
+                internal,
+                attachable,
+                labels,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn list_endpoints(&self) -> Result<Vec<crate::docker::models::EndpointStatus>, String> {
+        crate::commands::endpoints::list_endpoints_core(&self.state).await
+    }
+
+    async fn active_endpoint(
+        &self,
+    ) -> Result<Option<crate::docker::models::EndpointStatus>, String> {
+        crate::commands::endpoints::get_active_endpoint_core(&self.state).await
+    }
+
+    async fn save_endpoint(&self, ep: EndpointInput) -> Result<(), String> {
+        crate::commands::endpoints::save_endpoint_core(&self.state, ep).await
+    }
+
+    async fn remove_endpoint(&self, id: &str) -> Result<(), String> {
+        crate::commands::endpoints::remove_endpoint_core(&self.state, id).await
+    }
+
+    /// Mirrors `commands::endpoints::set_active_endpoint`: probe the new target
+    /// before committing, then refresh the shim so the terminal follows.
+    async fn set_active_endpoint(&self, id: String) -> Result<(), String> {
+        let state = &self.state;
+        if id == "local" {
+            {
+                let mut config = state.config.write().await;
+                config.active_endpoint = None;
+            }
+            state.save_config().await?;
+            state.invalidate_client();
+            crate::commands::system::refresh_shim(state, &*state.config.read().await);
+            let _ = crate::commands::system::apply_cli_bridge(state).await;
+            return Ok(());
+        }
+        let target = {
+            let cfg = state.config.read().await;
+            cfg.endpoints.iter().find(|x| x.id == id).cloned()
+        }
+        .ok_or_else(|| format!("No saved endpoint with id '{id}'"))?;
+        let socket = None;
+        let probe = crate::docker::client::DockerClient::connect_for_endpoint(
+            &target.kind,
+            &target.uri,
+            socket,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        probe.ping().await.map_err(|e| format!("{e:#}"))?;
+        {
+            let mut config = state.config.write().await;
+            config.active_endpoint = Some(id);
+        }
+        state.save_config().await?;
+        state.invalidate_client();
+        crate::commands::system::refresh_shim(state, &*state.config.read().await);
+        Ok(())
+    }
+
+    async fn list_registries(
+        &self,
+    ) -> Result<Vec<crate::commands::registries::RegistryStatus>, String> {
+        crate::commands::registries::list_registries_core(&self.state).await
+    }
+
+    async fn save_registry(
+        &self,
+        input: crate::commands::registries::RegistryInput,
+    ) -> Result<(), String> {
+        crate::commands::registries::save_registry_auth_core(&self.state, input).await
+    }
+
+    async fn set_default_registry(&self, id: String) -> Result<(), String> {
+        crate::commands::registries::set_default_registry_core(&self.state, &id).await
+    }
+
+    async fn remove_registry(&self, id: &str) -> Result<(), String> {
+        crate::commands::registries::remove_registry_auth_core(&self.state, id).await
+    }
+
+    /// Resolves one resource URI to its text body.
+    ///
+    /// Resources mirror the read tools but are pull-based: a client can read
+    /// `hsx2dock://containers` without spending a tool call. Errors are turned
+    /// into a JSON body rather than `None` so a client that asks for
+    /// `hsx2dock://engine/status` while the engine is down gets the reason.
+    async fn read_resource_body(&self, uri: &str) -> Option<String> {
+        let state = &self.state;
+        let to_text = |v: Value| Some(v.to_string());
+        let joined = |prefix: &str| {
+            let prefix = prefix.to_string();
+            move |v: Value| Some(serde_json::json!({ prefix.as_str(): v }).to_string())
+        };
+        match uri {
+            "hsx2dock://guide" => Some(super::INSTRUCTIONS.to_string()),
+            "hsx2dock://tool-catalogue" => {
+                let tools: Vec<Value> = super::tools::catalogue()
+                    .into_iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "title": t.title,
+                            "description": t.description,
+                            "access": match t.access {
+                                Access::Read => "read",
+                                Access::Write => "write",
+                                Access::Destructive => "destructive",
+                            },
+                            "engine_only": t.engine_only,
+                            "input_schema": t.input_schema,
+                        })
+                    })
+                    .collect();
+                to_text(Value::Array(tools))
+            }
+            "hsx2dock://engine/status" => to_text(json!({
+                "state": state.daemon_state(),
+                "installed": state.engine.is_installed(),
+                "installed_version": state.engine.installed_version(),
+                "socket": state.engine.socket().display().to_string(),
+                "socket_live": state.engine.socket_live(),
+            })),
+            "hsx2dock://engine/doctor" => match state.engine_control_guard().await {
+                Ok(()) => to_text(json!(self.diagnose())),
+                Err(e) => to_text(json!({ "unavailable": e })),
+            },
+            // Resources that need a live daemon report *why* they are empty
+            // rather than vanishing: a stopped engine must not look like a
+            // resource that does not exist, or an agent reads it as a bad URI
+            // and gives up instead of starting the engine.
+            "hsx2dock://containers" => to_text(unavailable_on_error(
+                "containers",
+                self.list_containers(true).await,
+            )),
+            "hsx2dock://images" => {
+                to_text(unavailable_on_error("images", self.list_images().await))
+            }
+            "hsx2dock://volumes" => to_text(unavailable_on_error(
+                "volumes",
+                crate::commands::volumes::list_volumes_core(state).await,
+            )),
+            "hsx2dock://networks" => to_text(unavailable_on_error(
+                "networks",
+                crate::commands::networks::list_networks_core(state).await,
+            )),
+            "hsx2dock://clusters" => to_text(unavailable_on_error(
+                "clusters",
+                kind::list_kind_clusters_core(state).await,
+            )),
+            "hsx2dock://groups" => joined("groups")(json!(self.groups().await)),
+            "hsx2dock://config" => Some(self.app_config().await.to_string()),
+            "hsx2dock://endpoints" => {
+                let active = state.config.read().await.active_endpoint.clone();
+                let list = match self.list_endpoints().await {
+                    Ok(list) => json!(list),
+                    Err(e) => json!({ "error": e }),
+                };
+                to_text(json!({
+                    "active": active.unwrap_or_else(|| "local".to_string()),
+                    "endpoints": list,
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A resource whose backing daemon is down must still resolve. Reporting
+    /// "no resource at this URI" instead would read as a bad address to an
+    /// agent, which then never learns that starting the engine fixes it.
+    #[test]
+    fn unavailable_on_error_keeps_the_uri_and_names_the_cause() {
+        let value = unavailable_on_error::<Vec<String>>("containers", Err("daemon down".into()));
+        assert_eq!(value["containers"], json!([]));
+        assert_eq!(value["unavailable"], json!("daemon down"));
+    }
+
+    #[test]
+    fn unavailable_on_error_is_a_plain_list_when_the_call_worked() {
+        let value = unavailable_on_error("containers", Ok::<_, String>(vec!["a"]));
+        assert_eq!(value["containers"], json!(["a"]));
+        assert!(
+            value.get("unavailable").is_none(),
+            "a working read must not claim to be unavailable"
+        );
+    }
+
+    /// The guide is markdown and is rendered as such by clients; the rest are
+    /// JSON. A single hardcoded mime type in `read_resource` used to make the
+    /// guide render as raw JSON.
+    #[test]
+    fn every_resource_advertises_a_usable_mime_type() {
+        for spec in super::super::resources::catalogue() {
+            assert!(
+                matches!(spec.mime_type, "text/markdown" | "application/json"),
+                "{} has unexpected mime type {}",
+                spec.uri,
+                spec.mime_type
+            );
+        }
+        let guide = super::super::resources::catalogue()
+            .into_iter()
+            .find(|r| r.uri == "hsx2dock://guide")
+            .expect("the guide is the first thing an agent reads");
+        assert_eq!(guide.mime_type, "text/markdown");
+    }
+}

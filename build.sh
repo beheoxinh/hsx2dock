@@ -7,6 +7,7 @@ set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
@@ -16,6 +17,10 @@ info() {
 
 success() {
     echo -e "${GREEN}[OK]${NC} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
 error() {
@@ -43,7 +48,19 @@ fi
 info "Tiến hành build ứng dụng với Tauri CLI (Release mode, nhúng offline assets)..."
 pnpm tauri build --no-bundle
 
+# Tauri chỉ build binary GUI; MCP server (stdio) là binary riêng, agent
+# khởi chạy trực tiếp nên phải build tường minh.
+info "Build MCP server (stdio) cho agent AI..."
+cargo build --release --manifest-path "$ROOT_DIR/src-tauri/Cargo.toml" --bin hsx2dock-mcp
+
 BIN_PATH="$ROOT_DIR/src-tauri/target/release/hsx2dock"
+MCP_BIN_PATH="$ROOT_DIR/src-tauri/target/release/hsx2dock-mcp"
+if [ -f "$MCP_BIN_PATH" ]; then
+    info "MCP binary path: $MCP_BIN_PATH"
+else
+    warn "Không build được hsx2dock-mcp — MCP qua stdio sẽ không khả dụng."
+fi
+
 if [ -f "$BIN_PATH" ]; then
     success "Build hoàn tất thành công!"
     info "Binary path: $BIN_PATH"

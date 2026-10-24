@@ -1,16 +1,16 @@
 /**
- * Published-port exposure checks.
+ * Published-port presentation.
  *
  * Docker publishes `-p 8080:80` on every interface (`0.0.0.0` and `[::]`).
- * Those listeners are DNAT rules, so they bypass ufw/firewalld — the same
- * advisory Docker Desktop shows. Binding `127.0.0.1:8080:80` keeps the port on
- * loopback instead. This module is the single place that decides which
- * bindings count as exposed, so the card badge, the page banner and the run
- * wizard cannot drift apart.
+ * Those listeners are DNAT rules, so they bypass ufw/firewalld — worth knowing
+ * about, which is why a wildcard binding is marked on the card, but not worth a
+ * page-wide banner. This module is the single place that decides which
+ * bindings count as public and how a binding is labelled, so the card badge
+ * and any future surface cannot drift apart.
  *
  * Pure logic only: no DOM, no Tauri IPC, no engine.
  */
-import type { ContainerItem, PublishedPort } from "../types";
+import type { PublishedPort } from "../types";
 
 /** Bind addresses that mean "listen on every interface". */
 const WILDCARD_HOSTS = new Set([
@@ -27,41 +27,96 @@ export function isPublicBinding(hostIp?: string | null): boolean {
   return WILDCARD_HOSTS.has((hostIp ?? "").trim().toLowerCase());
 }
 
-/** A container's published ports that are reachable beyond the host itself. */
-export function publicBindings(
-  container: Pick<ContainerItem, "published_ports">
-): PublishedPort[] {
-  return (container.published_ports ?? []).filter((p) =>
-    isPublicBinding(p.host_ip)
-  );
+/**
+ * A binding as the card should render it: one row per published port, with the
+ * bits the user actually needs (which host port maps where, and whether it is
+ * reachable beyond this machine).
+ */
+export interface PortChip {
+  /** Host port to open in the browser; null for an exposed-only port. */
+  hostPort: number | null;
+  containerPort: number;
+  protocol: string;
+  /** True when bound on every interface (reachable from the network). */
+  public: boolean;
+  /** `8080 → 80` or just `443` when the port is not published. */
+  label: string;
+  /** URL to open, when the binding is reachable from this machine. */
+  url: string | null;
 }
 
-/** `0.0.0.0:8080→80/tcp` — the form used in tooltips and the banner. */
-export function describeBinding(p: PublishedPort): string {
-  const ip = p.host_ip.trim() || "0.0.0.0";
-  const proto = (p.protocol ?? "").trim() || "tcp";
-  return `${ip}:${p.host_port}→${p.container_port}/${proto}`;
-}
-
-/** Every container currently publishing at least one port on every interface. */
-export function exposedContainers(containers: ContainerItem[]): ContainerItem[] {
-  return containers.filter((c) => publicBindings(c).length > 0);
+/** The port fields `portChips` reads — a subset of `ContainerItem`. */
+export interface PortSource {
+  published_ports?: PublishedPort[];
+  ports?: string;
 }
 
 /**
- * Compact list for the banner: `web (8080), api (8000, 8001)` — capped so a
- * host with many containers stays readable.
+ * Turn a container's structured bindings into render-ready chips.
+ *
+ * Loopback bindings get a `localhost` URL; wildcard bindings get one too, since
+ * a listener on every interface is by definition reachable on localhost. Ports
+ * that are only exposed (never published) have no URL.
+ *
+ * Falls back to parsing the legacy `ports` string for containers whose summary
+ * came from an older backend, so the card never regresses to raw text.
  */
-export function exposureSummary(
-  containers: ContainerItem[],
-  limit = 3
-): string {
-  const entries = exposedContainers(containers).map((c) => {
-    const ports = publicBindings(c)
-      .map((p) => p.host_port)
-      .join(", ");
-    return `${c.name.replace(/^\//, "")} (${ports})`;
-  });
-  if (entries.length <= limit) return entries.join(", ");
-  return `${entries.slice(0, limit).join(", ")} +${entries.length - limit} more`;
+export function portChips(container: PortSource): PortChip[] {
+  const structured = container.published_ports ?? [];
+  if (structured.length > 0) {
+    return structured.map((p) => {
+      const proto = (p.protocol ?? "").trim() || "tcp";
+      const publicBinding = isPublicBinding(p.host_ip);
+      return {
+        hostPort: p.host_port,
+        containerPort: p.container_port,
+        protocol: proto,
+        public: publicBinding,
+        label: `${p.host_port} → ${p.container_port}`,
+        // Only TCP has a browsable scheme; udp/sctp ports have no URL.
+        url: proto === "tcp" ? `http://localhost:${p.host_port}` : null,
+      };
+    });
+  }
+
+  // Legacy fallback: `8080->80/tcp, 443/tcp`.
+  return parseLegacyPorts(container.ports ?? "");
+}
+
+/** Parse `docker ps`-style port text when no structured data is available. */
+function parseLegacyPorts(ports: string): PortChip[] {
+  if (!ports?.trim()) return [];
+
+  return ports
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .flatMap((part) => {
+      const [left, right] = part.includes("->") ? part.split("->") : [null, part];
+      const [portText, protoText] = (right ?? "").split("/");
+      const containerPort = Number.parseInt(portText ?? "", 10);
+      if (Number.isNaN(containerPort)) return [];
+
+      const proto = (protoText ?? "tcp").trim() || "tcp";
+      // `0.0.0.0:8080`, `127.0.0.1:8080`, or bare `8080`.
+      const hostPort = left
+        ? Number.parseInt(left.split(":").pop() ?? "", 10)
+        : NaN;
+      const published = !Number.isNaN(hostPort);
+      const ip = left?.includes(":") ? left.slice(0, left.lastIndexOf(":")) : "";
+      const isPublic = published && isPublicBinding(ip);
+
+      return [
+        {
+          hostPort: published ? hostPort : null,
+          containerPort,
+          protocol: proto,
+          public: isPublic,
+          label: published
+            ? `${hostPort} → ${containerPort}`
+            : `${containerPort}`,
+          url: published && proto === "tcp" ? `http://localhost:${hostPort}` : null,
+        },
+      ];
+    });
 }

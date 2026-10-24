@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tauri::State;
 
 use crate::docker::models::VolumeItem;
@@ -10,7 +11,12 @@ use crate::state::AppState;
 /// directory, attaches the on-disk size. Drivers that expose a non-local path
 /// (or an unreadable one) get `size: None` rather than failing the whole list.
 #[tauri::command]
-pub async fn list_volumes(state: State<'_, AppState>) -> Result<Vec<VolumeItem>, String> {
+pub async fn list_volumes(state: State<'_, Arc<AppState>>) -> Result<Vec<VolumeItem>, String> {
+    list_volumes_core(&state).await
+}
+
+/// App-free core of [`list_volumes`], shared with the MCP server.
+pub(crate) async fn list_volumes_core(state: &AppState) -> Result<Vec<VolumeItem>, String> {
     let client = state.get_client().await?;
     let mut volumes = client.list_volumes().await.map_err(|e| e.to_string())?;
 
@@ -40,7 +46,7 @@ pub async fn list_volumes(state: State<'_, AppState>) -> Result<Vec<VolumeItem>,
 
 #[tauri::command]
 pub async fn create_volume(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     name: String,
     driver: String,
     driver_opts: HashMap<String, String>,
@@ -55,16 +61,22 @@ pub async fn create_volume(
 
 #[tauri::command]
 pub async fn remove_volume(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     name: String,
+    force: bool,
+) -> Result<(), String> {
+    remove_volume_core(&state, &name, force).await
+}
+
+/// App-free core of [`remove_volume`].
+pub(crate) async fn remove_volume_core(
+    state: &AppState,
+    name: &str,
     force: bool,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
     let volumes = client.list_volumes().await.map_err(|e| e.to_string())?;
-    if volumes
-        .iter()
-        .any(|v| v.protected && v.name == name)
-    {
+    if volumes.iter().any(|v| v.protected && v.name == name) {
         return Err(
             "This volume is managed by kind. Remove the cluster from the \
              Kubernetes page instead."
@@ -78,7 +90,12 @@ pub async fn remove_volume(
 }
 
 #[tauri::command]
-pub async fn prune_volumes(state: State<'_, AppState>) -> Result<u64, String> {
+pub async fn prune_volumes(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
+    prune_volumes_core(&state).await
+}
+
+/// App-free core of [`prune_volumes`].
+pub(crate) async fn prune_volumes_core(state: &AppState) -> Result<u64, String> {
     let client = state.get_client().await?;
     client.prune_volumes().await.map_err(|e| e.to_string())
 }

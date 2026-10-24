@@ -217,7 +217,11 @@ where
     let url = format!("{KIND_BASE}/v{version}/{asset}");
 
     on_progress(InstallProgress::stage(
-        "kind", &version, &plan, 0, Some(0.05),
+        "kind",
+        &version,
+        &plan,
+        0,
+        Some(0.05),
     ));
     let mut last = 0u64;
     download(&url, &staging, |done, total| {
@@ -245,7 +249,11 @@ where
     .with_context(|| format!("download kind v{version}"))?;
 
     on_progress(InstallProgress::stage(
-        "kind", &version, &plan, 1, Some(0.6),
+        "kind",
+        &version,
+        &plan,
+        1,
+        Some(0.6),
     ));
     // The pinned release carries a maintainer-checked digest; every other tag
     // publishes `<asset>.sha256sum` next to the binary.
@@ -267,7 +275,11 @@ where
     ));
 
     on_progress(InstallProgress::stage(
-        "kind", &version, &plan, 2, Some(0.75),
+        "kind",
+        &version,
+        &plan,
+        2,
+        Some(0.75),
     ));
     let dest = paths.binary_at(&version);
     let _ = std::fs::remove_file(&dest);
@@ -282,7 +294,11 @@ where
     }
 
     on_progress(InstallProgress::stage(
-        "kind", &version, &plan, 3, Some(0.9),
+        "kind",
+        &version,
+        &plan,
+        3,
+        Some(0.9),
     ));
     // A binary that cannot report its own version never becomes current.
     let reported = probe_kind_version(&dest)
@@ -306,8 +322,7 @@ async fn fetch_kind_checksum(version: &str, asset: &str) -> Result<String> {
         .text()
         .await
         .context("read kind checksum file")?;
-    parse_sha256sum(&text)
-        .ok_or_else(|| anyhow::anyhow!("no usable checksum in {url}"))
+    parse_sha256sum(&text).ok_or_else(|| anyhow::anyhow!("no usable checksum in {url}"))
 }
 
 /// A `sha256sum` file is `<64 hex chars>  <file name>`; keep only the digest.
@@ -407,9 +422,15 @@ mod tests {
         // Official node image seen through any tag.
         assert!(is_kind_image(&["kindest/node:v1.33.0".into()], None));
         // A custom node image configured in settings is equally load-bearing.
-        assert!(is_kind_image(&["myreg/node:v1".into()], Some("myreg/node:v1")));
+        assert!(is_kind_image(
+            &["myreg/node:v1".into()],
+            Some("myreg/node:v1")
+        ));
         // Same repository, different tag: not the configured image.
-        assert!(!is_kind_image(&["myreg/node:v2".into()], Some("myreg/node:v1")));
+        assert!(!is_kind_image(
+            &["myreg/node:v2".into()],
+            Some("myreg/node:v1")
+        ));
         // Blank configured value must not match anything.
         assert!(!is_kind_image(&["nginx:latest".into()], Some("  ")));
         assert!(!is_kind_image(&[], None));
@@ -430,7 +451,9 @@ mod tests {
         assert!(bin.to_string_lossy().contains(KIND_VERSION));
         assert!(p.kubeconfig.to_string_lossy().contains("kind-kubeconfig"));
         // Never points at ~/.kube.
-        assert!(!p.kubeconfig.starts_with(dirs::home_dir().unwrap_or_default().join(".kube")));
+        assert!(!p
+            .kubeconfig
+            .starts_with(dirs::home_dir().unwrap_or_default().join(".kube")));
     }
 
     #[test]
@@ -493,7 +516,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing pinned checksum for {os}-{arch}"));
             assert_eq!(sha.len(), 64, "{os}-{arch} checksum must be 64 chars");
             assert!(
-                sha.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                sha.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
                 "{os}-{arch} checksum must be lowercase hex"
             );
         }
@@ -503,7 +527,10 @@ mod tests {
     fn asset_names_follow_kind_convention() {
         assert_eq!(asset_name("linux", "x86_64").unwrap(), "kind-linux-amd64");
         assert_eq!(asset_name("macos", "aarch64").unwrap(), "kind-darwin-arm64");
-        assert_eq!(asset_name("windows", "x86_64").unwrap(), "kind-windows-amd64");
+        assert_eq!(
+            asset_name("windows", "x86_64").unwrap(),
+            "kind-windows-amd64"
+        );
         assert!(asset_name("linux", "riscv64").is_none());
     }
 

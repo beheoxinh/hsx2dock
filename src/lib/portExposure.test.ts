@@ -8,34 +8,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  describeBinding,
-  exposedContainers,
-  exposureSummary,
   isPublicBinding,
-  publicBindings,
+  portChips,
 } from "./portExposure.ts";
-import type { ContainerItem, PublishedPort } from "../types/index.ts";
+import type { PublishedPort } from "../types/index.ts";
 
 const port = (host_ip: string, host_port: number, container_port = host_port): PublishedPort => ({
   host_ip,
   host_port,
   container_port,
   protocol: "tcp",
-});
-
-const container = (
-  name: string,
-  published_ports?: PublishedPort[]
-): ContainerItem => ({
-  id: name,
-  short_id: name,
-  name: `/${name}`,
-  image: "nginx",
-  state: "running",
-  status: "Up",
-  created: 0,
-  ports: "",
-  published_ports,
 });
 
 test("wildcard and empty bind addresses count as public", () => {
@@ -51,41 +33,52 @@ test("loopback and a specific interface address are not flagged", () => {
   }
 });
 
-test("publicBindings keeps only exposed ports", () => {
-  const bindings = publicBindings(
-    container("web", [port("0.0.0.0", 8080), port("127.0.0.1", 5432), port("", 9000)])
-  );
-  assert.deepEqual(
-    bindings.map((p) => p.host_port),
-    [8080, 9000]
-  );
+test("portChips renders one row per published port with a browser URL", () => {
+  const chips = portChips({
+    published_ports: [
+      port("127.0.0.1", 8080, 80),
+      port("0.0.0.0", 5432, 5432),
+    ],
+  });
+
+  assert.equal(chips.length, 2);
+  assert.deepEqual(chips[0], {
+    hostPort: 8080,
+    containerPort: 80,
+    protocol: "tcp",
+    public: false,
+    label: "8080 → 80",
+    url: "http://localhost:8080",
+  });
+  assert.equal(chips[1].public, true, "a wildcard binding is flagged public");
+  assert.equal(chips[1].url, "http://localhost:5432");
 });
 
-test("a container without structured ports is never exposed", () => {
-  assert.deepEqual(publicBindings(container("legacy")), []);
+test("portChips gives udp ports no browser URL", () => {
+  const [chip] = portChips({
+    published_ports: [
+      { host_ip: "127.0.0.1", host_port: 5353, container_port: 53, protocol: "udp" },
+    ],
+  });
+  assert.equal(chip.url, null, "a udp port cannot be opened in a browser");
+  assert.equal(chip.public, false);
 });
 
-test("describeBinding spells the wildcard out for the tooltip", () => {
-  assert.equal(describeBinding(port("", 8080, 80)), "0.0.0.0:8080→80/tcp");
-  assert.equal(
-    describeBinding(port("127.0.0.1", 5432)),
-    "127.0.0.1:5432→5432/tcp"
-  );
+test("portChips falls back to the legacy ports string", () => {
+  const chips = portChips({ ports: "0.0.0.0:8080->80/tcp, 127.0.0.1:5432->5432/tcp, 443/tcp" });
+
+  assert.equal(chips.length, 3);
+  assert.equal(chips[0].hostPort, 8080);
+  assert.equal(chips[0].containerPort, 80);
+  assert.equal(chips[0].public, true);
+  assert.equal(chips[1].public, false);
+  // Exposed-only: no host port, no URL.
+  assert.equal(chips[2].hostPort, null);
+  assert.equal(chips[2].url, null);
+  assert.equal(chips[2].label, "443");
 });
 
-test("exposureSummary names containers and caps the list", () => {
-  const containers = [
-    container("web", [port("0.0.0.0", 8080)]),
-    container("api", [port("", 8000), port("", 8001), port("127.0.0.1", 9000)]),
-    container("db", [port("127.0.0.1", 5432)]),
-    container("cache", [port("::", 6379)]),
-    container("worker", [port("[::]", 7000)]),
-  ];
-
-  assert.equal(exposedContainers(containers).length, 4);
-  assert.equal(
-    exposureSummary(containers),
-    "web (8080), api (8000, 8001), cache (6379) +1 more"
-  );
-  assert.equal(exposureSummary(containers, 10), "web (8080), api (8000, 8001), cache (6379), worker (7000)");
+test("portChips handles an empty or absent ports value", () => {
+  assert.deepEqual(portChips({ ports: "" }), []);
+  assert.deepEqual(portChips({ ports: "—" }), []);
 });

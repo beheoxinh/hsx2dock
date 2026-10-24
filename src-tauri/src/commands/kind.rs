@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -57,14 +58,14 @@ pub struct KindCluster {
 }
 
 #[tauri::command]
-pub async fn kind_status(state: State<'_, AppState>) -> Result<KindInstallStatus, String> {
+pub async fn kind_status(state: State<'_, Arc<AppState>>) -> Result<KindInstallStatus, String> {
     Ok(read_kind_status(&state.kind))
 }
 
 /// Downloads and verifies the pinned kind binary, emitting step progress on
 /// `engine-install-progress` (target `kind`) like the other binary updaters.
 #[tauri::command]
-pub async fn install_kind(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn install_kind(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     run_kind_install(&app, &state.kind, crate::docker::kind::KIND_VERSION).await
 }
 
@@ -72,7 +73,7 @@ pub async fn install_kind(app: AppHandle, state: State<'_, AppState>) -> Result<
 #[tauri::command]
 pub async fn install_kind_update(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<(), String> {
     run_kind_install(&app, &state.kind, &version).await
@@ -81,7 +82,7 @@ pub async fn install_kind_update(
 /// Check the kind GitHub release channel against what is installed.
 #[tauri::command]
 pub async fn check_kind_update(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::docker::kind::KindUpdateInfo, String> {
     crate::docker::kind::check_kind_update(&state.kind)
         .await
@@ -124,10 +125,15 @@ async fn run_kind_install(app: &AppHandle, paths: &KindPaths, version: &str) -> 
 /// whether or not the kind binary is installed (clusters live in the engine).
 #[tauri::command]
 pub async fn list_kind_clusters(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<KindCluster>, String> {
+    list_kind_clusters_core(&state).await
+}
+
+/// App-free core of [`list_kind_clusters`], shared with the MCP server.
+pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<KindCluster>, String> {
     // kind targets the bundled engine even when a remote endpoint is active.
-    let client = local_client(&state).await?;
+    let client = local_client(state).await?;
     // Docker's filter grammar: {"label": ["key"]} = "has this label key".
     let filters: HashMap<String, Vec<String>> =
         HashMap::from([("label".to_string(), vec![CLUSTER_LABEL.to_string()])]);
@@ -227,12 +233,17 @@ async fn enrich_cluster_card(
     for id in &ids {
         let Ok(details) = client
             .docker()
-            .inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
             .await
         else {
             continue;
         };
-        let Some(state) = details.state else { continue; };
+        let Some(state) = details.state else {
+            continue;
+        };
         if state.running.unwrap_or(false) {
             if let Some(started) = state.started_at.as_deref().and_then(parse_docker_ts) {
                 started_times.push(started);
@@ -413,7 +424,7 @@ pub async fn count_kind_clusters(state: &AppState) -> Result<usize, String> {
 }
 
 /// Builds a kind `Command` wired to this app's isolated layout and engine.
-fn kind_command(paths: &KindPaths, docker_host: &str) -> Command {
+pub(crate) fn kind_command(paths: &KindPaths, docker_host: &str) -> Command {
     let mut cmd = Command::new(paths.binary());
     // Keep kubeconfig inside the app dir — never `~/.kube/config`.
     cmd.env("KUBECONFIG", &paths.kubeconfig);
@@ -428,11 +439,15 @@ fn kind_command(paths: &KindPaths, docker_host: &str) -> Command {
 }
 
 /// Streams a kind subprocess's combined output, echoing each line to `event`.
-async fn run_kind_streaming(
+///
+/// `app` is optional so the MCP server (which has no window) can run the same
+/// code paths: without an `AppHandle` the output is read and discarded instead
+/// of being emitted to the frontend.
+pub(crate) async fn run_kind_streaming(
     paths: &KindPaths,
     docker_host: &str,
     args: &[&str],
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     event: &str,
 ) -> Result<(), String> {
     let mut cmd = kind_command(paths, docker_host);
@@ -454,24 +469,30 @@ async fn run_kind_streaming(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    fn spawn_line_reader<R>(pipe: R, app: AppHandle, event: String) -> tokio::task::JoinHandle<()>
+    fn spawn_line_reader<R>(
+        pipe: R,
+        app: Option<AppHandle>,
+        event: String,
+    ) -> tokio::task::JoinHandle<()>
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit(&event, serde_json::json!({ "line": line }));
+                if let Some(app) = &app {
+                    let _ = app.emit(&event, serde_json::json!({ "line": line }));
+                }
             }
         })
     }
 
     let mut readers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(out) = stdout {
-        readers.push(spawn_line_reader(out, app.clone(), event.to_string()));
+        readers.push(spawn_line_reader(out, app.cloned(), event.to_string()));
     }
     if let Some(err) = stderr {
-        readers.push(spawn_line_reader(err, app.clone(), event.to_string()));
+        readers.push(spawn_line_reader(err, app.cloned(), event.to_string()));
     }
 
     let status = child.wait().await.map_err(|e| format!("wait kind: {e}"))?;
@@ -493,11 +514,13 @@ async fn run_kind_streaming(
 /// kind always rides this app's bundled engine (kubeconfig points at the
 /// engine host's localhost API port, which only resolves when kind runs here —
 /// never through a remote endpoint).
-fn docker_host_for(state: &AppState) -> String {
+pub(crate) fn docker_host_for(state: &AppState) -> String {
     format!("unix://{}", state.engine.socket().display())
 }
 
-async fn local_client(state: &AppState) -> Result<crate::docker::client::DockerClient, String> {
+pub(crate) async fn local_client(
+    state: &AppState,
+) -> Result<crate::docker::client::DockerClient, String> {
     crate::docker::client::DockerClient::connect(Some(&state.engine.socket()))
         .map_err(|e| format!("Docker daemon not reachable: {e}"))
 }
@@ -505,7 +528,19 @@ async fn local_client(state: &AppState) -> Result<crate::docker::client::DockerC
 #[tauri::command]
 pub async fn create_kind_cluster(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    image: Option<String>,
+    nodes: Option<u32>,
+) -> Result<(), String> {
+    create_kind_cluster_core(&state, Some(&app), name, image, nodes).await
+}
+
+/// App-free core of [`create_kind_cluster`], shared with the MCP server: with
+/// no `AppHandle` the progress lines are dropped instead of emitted.
+pub(crate) async fn create_kind_cluster_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     name: String,
     image: Option<String>,
     nodes: Option<u32>,
@@ -520,7 +555,7 @@ pub async fn create_kind_cluster(
     {
         return Err("Cluster name may only contain letters, digits, '-' and '.'".into());
     }
-    let host = docker_host_for(&state);
+    let host = docker_host_for(state);
     let paths = &state.kind;
     if !paths.is_installed() {
         return Err("kind is not installed yet".into());
@@ -543,11 +578,9 @@ pub async fn create_kind_cluster(
     // itself uses for its own containerd — keeps image layers and snapshotter
     // state on a filesystem containerd accepts. Per-node dirs, or two nodes
     // would share one content store on the host.
-    let dtype_root = crate::docker::engine::dtype_compat_root()
-        .ok_or_else(|| {
-            "no d_type-capable directory is available for the kind node containerd state"
-                .to_string()
-        })?;
+    let dtype_root = crate::docker::engine::dtype_compat_root().ok_or_else(|| {
+        "no d_type-capable directory is available for the kind node containerd state".to_string()
+    })?;
     let cluster_state = dtype_root.join("kind-nodes").join(&name);
     let mut nodes_yaml = String::new();
     for i in 0..n {
@@ -571,9 +604,8 @@ pub async fn create_kind_cluster(
         nodes_yaml.push_str("        containerPath: /var/lib/containerd\n");
         nodes_yaml.push_str("        readOnly: false\n");
     }
-    let config_yaml = format!(
-        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n{nodes_yaml}"
-    );
+    let config_yaml =
+        format!("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n{nodes_yaml}");
     let config_path = paths
         .kubeconfig
         .parent()
@@ -596,56 +628,77 @@ pub async fn create_kind_cluster(
     ];
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let _ = app.emit(
-        "kind-progress",
+    emit_kind_progress(
+        app,
         serde_json::json!({ "action": "create", "name": name, "line": format!("Creating cluster {name}…") }),
     );
-    let result = run_kind_streaming(paths, &host, &arg_refs, &app, "kind-progress")
+    let result = run_kind_streaming(paths, &host, &arg_refs, app, "kind-progress")
         .await
-        .map_err(|e| {
-            format!("create cluster '{name}' failed: {e}")
-        });
+        .map_err(|e| format!("create cluster '{name}' failed: {e}"));
     if result.is_ok() {
         // Creation "succeeds" as soon as kind exits 0; the cluster is usable
         // because the create command waits for nodes by default.
-        crate::tray::notify_kind_event(&app, true, &name);
+        if let Some(app) = app {
+            crate::tray::notify_kind_event(app, true, &name);
+        }
         // kind ships nodes with on-failure:1 — pin them so a later engine
         // start cannot resurrect a cluster the user stopped.
-        let _ = enforce_kind_restart_policy(&state).await;
+        let _ = enforce_kind_restart_policy(state).await;
     }
     result
+}
+
+/// Emits a `kind-progress` line when there is a window to emit to; the MCP
+/// server runs the same cores without one.
+fn emit_kind_progress(app: Option<&AppHandle>, payload: serde_json::Value) {
+    if let Some(app) = app {
+        let _ = app.emit("kind-progress", payload);
+    }
 }
 
 #[tauri::command]
 pub async fn delete_kind_cluster(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<(), String> {
+    delete_kind_cluster_core(&state, Some(&app), name).await
+}
+
+/// App-free core of [`delete_kind_cluster`].
+pub(crate) async fn delete_kind_cluster_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     name: String,
 ) -> Result<(), String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Cluster name is required".into());
     }
-    let host = docker_host_for(&state);
+    let host = docker_host_for(state);
     let paths = &state.kind;
     if !paths.is_installed() {
         // Fall back to removing the node containers directly so a stale
         // cluster can still be cleaned up without the binary.
-        let result = delete_cluster_containers(&state, &name).await;
+        let result = delete_cluster_containers(state, &name).await;
         if result.is_ok() {
-            crate::tray::notify_kind_event(&app, false, &name);
+            if let Some(app) = app {
+                crate::tray::notify_kind_event(app, false, &name);
+            }
             cleanup_cluster_state(&name);
         }
         return result;
     }
-    let _ = app.emit(
-        "kind-progress",
+    emit_kind_progress(
+        app,
         serde_json::json!({ "action": "delete", "name": name, "line": format!("Deleting cluster {name}…") }),
     );
     let args = ["delete", "cluster", "--name", name.as_str()];
-    let result = run_kind_streaming(paths, &host, &args, &app, "kind-progress").await;
+    let result = run_kind_streaming(paths, &host, &args, app, "kind-progress").await;
     if result.is_ok() {
-        crate::tray::notify_kind_event(&app, false, &name);
+        if let Some(app) = app {
+            crate::tray::notify_kind_event(app, false, &name);
+        }
         cleanup_cluster_state(&name);
     }
     result
@@ -654,7 +707,7 @@ pub async fn delete_kind_cluster(
 /// Removes the d_type-compat bind-mount dirs a created cluster left behind.
 /// Best-effort: image layers can be gigabytes, and a failure here must not
 /// fail the delete itself (the containers are already gone).
-fn cleanup_cluster_state(name: &str) {
+pub(crate) fn cleanup_cluster_state(name: &str) {
     if let Some(root) = crate::docker::engine::dtype_compat_root() {
         let dir = root.join("kind-nodes").join(name);
         if dir.is_dir() {
@@ -665,14 +718,11 @@ fn cleanup_cluster_state(name: &str) {
     }
 }
 
-async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), String> {
+pub(crate) async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), String> {
     let client = local_client(state).await?;
     let mut filters = HashMap::new();
     // {"label": ["key=value"]} narrows to this cluster's node containers.
-    filters.insert(
-        "label".to_string(),
-        vec![format!("{CLUSTER_LABEL}={name}")],
-    );
+    filters.insert("label".to_string(), vec![format!("{CLUSTER_LABEL}={name}")]);
     let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
         .all(true)
         .filters(&filters)
@@ -688,7 +738,11 @@ async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), S
                 .docker()
                 .remove_container(
                     &id,
-                    Some(bollard::query_parameters::RemoveContainerOptionsBuilder::default().force(true).build()),
+                    Some(
+                        bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+                            .force(true)
+                            .build(),
+                    ),
                 )
                 .await;
         }
@@ -701,24 +755,24 @@ async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), S
 #[tauri::command]
 pub async fn start_kind_cluster(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
-    set_cluster_power(&app, &*state, &name, true).await
+    set_cluster_power(Some(&app), &state, &name, true).await
 }
 
 /// Stops every node container of a cluster (state persists; Start resumes it).
 #[tauri::command]
 pub async fn stop_kind_cluster(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
-    set_cluster_power(&app, &*state, &name, false).await
+    set_cluster_power(Some(&app), &state, &name, false).await
 }
 
-async fn set_cluster_power(
-    app: &AppHandle,
+pub(crate) async fn set_cluster_power(
+    app: Option<&AppHandle>,
     state: &AppState,
     name: &str,
     start: bool,
@@ -763,8 +817,8 @@ async fn set_cluster_power(
 
     let action = if start { "start" } else { "stop" };
     let verb = if start { "Starting" } else { "Stopping" };
-    let _ = app.emit(
-        "kind-progress",
+    emit_kind_progress(
+        app,
         serde_json::json!({ "action": action, "name": name, "line": format!("{verb} cluster {name}…") }),
     );
 
@@ -805,8 +859,8 @@ async fn set_cluster_power(
             if changed == 1 { "" } else { "s" }
         )
     };
-    let _ = app.emit(
-        "kind-progress",
+    emit_kind_progress(
+        app,
         serde_json::json!({ "action": action, "name": name, "line": summary }),
     );
     Ok(())
@@ -818,7 +872,15 @@ async fn set_cluster_power(
 /// would wipe every other cluster's context from the shared file.
 #[tauri::command]
 pub async fn get_kind_kubeconfig(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<String, String> {
+    get_kind_kubeconfig_core(&state, name).await
+}
+
+/// App-free core of [`get_kind_kubeconfig`], shared with the MCP server.
+pub(crate) async fn get_kind_kubeconfig_core(
+    state: &AppState,
     name: String,
 ) -> Result<String, String> {
     let name = name.trim().to_string();
@@ -831,13 +893,12 @@ pub async fn get_kind_kubeconfig(
     }
 
     if let Some(parent) = paths.kubeconfig.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create kubeconfig dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create kubeconfig dir: {e}"))?;
     }
 
     // kind_command pins KUBECONFIG to the app file, so the exported context
     // lands there and nowhere near ~/.kube.
-    let host = docker_host_for(&state);
+    let host = docker_host_for(state);
     let mut cmd = kind_command(paths, &host);
     cmd.args(["export", "kubeconfig", "--name", &name]);
     let output = cmd
@@ -876,7 +937,17 @@ async fn kubeconfig_has_context(paths: &KindPaths, name: &str) -> bool {
 #[tauri::command]
 pub async fn load_image_to_cluster(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    image: String,
+) -> Result<(), String> {
+    load_image_to_cluster_core(&state, Some(&app), cluster, image).await
+}
+
+/// App-free core of [`load_image_to_cluster`].
+pub(crate) async fn load_image_to_cluster_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
     cluster: String,
     image: String,
 ) -> Result<(), String> {
@@ -885,13 +956,13 @@ pub async fn load_image_to_cluster(
     if cluster.is_empty() || image.is_empty() {
         return Err("Cluster and image are required".into());
     }
-    let host = docker_host_for(&state);
+    let host = docker_host_for(state);
     let paths = &state.kind;
     if !paths.is_installed() {
         return Err("kind is not installed yet".into());
     }
-    let _ = app.emit(
-        "kind-progress",
+    emit_kind_progress(
+        app,
         serde_json::json!({ "action": "load", "name": cluster, "line": format!("Loading {image} into {cluster}…") }),
     );
     let args = [
@@ -901,7 +972,27 @@ pub async fn load_image_to_cluster(
         "--name",
         cluster.as_str(),
     ];
-    run_kind_streaming(paths, &host, &args, &app, "kind-progress").await
+    run_kind_streaming(paths, &host, &args, app, "kind-progress").await
+}
+
+/// Applies a Kubernetes manifest to a cluster (`kubectl apply -f -`).
+///
+/// `DockerClient::exec_capture` has no stdin, so the manifest travels as
+/// base64 inside the shell command rather than through a pipe. The payload is
+/// single-quoted and base64 is `[A-Za-z0-9+/=]` only, so nothing in it can
+/// escape the quoting.
+pub(crate) async fn apply_yaml_core(
+    state: &AppState,
+    cluster: &str,
+    yaml: &str,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    if yaml.trim().is_empty() {
+        return Err("Manifest yaml is required".into());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(yaml.as_bytes());
+    let script = format!("printf '%s' '{encoded}' | base64 -d | kubectl apply -f -");
+    kubectl_raw(state, cluster, &["sh", "-c", &script]).await
 }
 
 // ==================== Cluster monitoring (kubectl inside the control-plane node) ====================
@@ -911,12 +1002,12 @@ pub async fn load_image_to_cluster(
 // parsing is factored into pure functions so it unit-tests without a cluster.
 
 /// Container name kind gives the control-plane node of `cluster`.
-fn control_plane_node(cluster: &str) -> String {
+pub(crate) fn control_plane_node(cluster: &str) -> String {
     format!("{cluster}-control-plane")
 }
 
 /// Runs `kubectl <args>` inside the cluster's control-plane node, returning stdout.
-async fn kubectl_raw(
+pub(crate) async fn kubectl_raw(
     state: &AppState,
     cluster: &str,
     args: &[&str],
@@ -936,7 +1027,7 @@ async fn kubectl_raw(
 /// Same as [`kubectl_raw`] but parses stdout as JSON. kubectl warnings can land
 /// in the merged exec stream ahead of the payload, so a first failed parse
 /// retries from the first `{`/`[`.
-async fn kubectl_json(
+pub(crate) async fn kubectl_json(
     state: &AppState,
     cluster: &str,
     args: &[&str],
@@ -946,7 +1037,7 @@ async fn kubectl_json(
 }
 
 /// Parses `out` as JSON, tolerating leading warning lines.
-fn extract_json(out: &str) -> Option<serde_json::Value> {
+pub(crate) fn extract_json(out: &str) -> Option<serde_json::Value> {
     let trimmed = out.trim();
     if let Ok(v) = serde_json::from_str(trimmed) {
         return Some(v);
@@ -1106,7 +1197,7 @@ pub struct K8sClusterSummary {
 
 // ---- Pure parsers (unit-tested) ----
 
-fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
+pub(crate) fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1147,14 +1238,13 @@ fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
                     labels
                         .keys()
                         .filter_map(|k| {
-                            k.strip_prefix("node-role.kubernetes.io/")
-                                .map(|r| {
-                                    if r.is_empty() {
-                                        "worker".to_string()
-                                    } else {
-                                        r.to_string()
-                                    }
-                                })
+                            k.strip_prefix("node-role.kubernetes.io/").map(|r| {
+                                if r.is_empty() {
+                                    "worker".to_string()
+                                } else {
+                                    r.to_string()
+                                }
+                            })
                         })
                         .collect()
                 })
@@ -1206,7 +1296,10 @@ fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
                 // kubectl serializes capacity quantities as strings ("110").
                 pods_capacity: kubelet
                     .get("podsCapacity")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .unwrap_or(0) as u32,
                 unschedulable: n
                     .pointer("/spec/unschedulable")
@@ -1218,7 +1311,7 @@ fn parse_nodes(json: &serde_json::Value) -> Vec<K8sNodeInfo> {
         .collect()
 }
 
-fn parse_pods(json: &serde_json::Value) -> Vec<K8sPodInfo> {
+pub(crate) fn parse_pods(json: &serde_json::Value) -> Vec<K8sPodInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1261,7 +1354,11 @@ fn parse_pods(json: &serde_json::Value) -> Vec<K8sPodInfo> {
                 .sum::<u64>() as u32;
             let mut images: Vec<String> = cstatuses
                 .iter()
-                .filter_map(|c| c.get("image").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                .filter_map(|c| {
+                    c.get("image")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
             if images.is_empty() {
                 images = p
@@ -1270,7 +1367,11 @@ fn parse_pods(json: &serde_json::Value) -> Vec<K8sPodInfo> {
                     .and_then(|c| c.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|c| c.get("image").and_then(|i| i.as_str()).map(|s| s.to_string()))
+                            .filter_map(|c| {
+                                c.get("image")
+                                    .and_then(|i| i.as_str())
+                                    .map(|s| s.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1302,7 +1403,7 @@ fn parse_pods(json: &serde_json::Value) -> Vec<K8sPodInfo> {
         .collect()
 }
 
-fn parse_events(json: &serde_json::Value) -> Vec<K8sEventInfo> {
+pub(crate) fn parse_events(json: &serde_json::Value) -> Vec<K8sEventInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1351,7 +1452,96 @@ fn parse_events(json: &serde_json::Value) -> Vec<K8sEventInfo> {
         .collect()
 }
 
-fn parse_workloads(json: &serde_json::Value) -> Vec<K8sWorkloadInfo> {
+/// Jobs (`resource = "jobs"`) or CronJobs (`"cronjobs"`) in every namespace,
+/// reduced to the fields an agent needs to judge them.
+///
+/// Returned as JSON rather than a bespoke struct: the two kinds carry
+/// different status shapes (completions vs. schedule/last-run), and inventing
+/// one struct with half-empty fields would be less useful than the real values.
+pub(crate) async fn get_cluster_jobs_core(
+    state: &AppState,
+    cluster: String,
+    resource: &str,
+) -> Result<serde_json::Value, String> {
+    if !matches!(resource, "jobs" | "cronjobs") {
+        return Err(format!("unsupported job resource '{resource}'"));
+    }
+    let v = kubectl_json(
+        state,
+        &cluster,
+        &["get", resource, "--all-namespaces", "-o", "json"],
+    )
+    .await?;
+    Ok(parse_jobs(&v, resource))
+}
+
+fn ts(v: &serde_json::Value, key: &str) -> Option<i64> {
+    parse_docker_ts(v.get(key)?.as_str()?)
+}
+
+pub(crate) fn parse_jobs(json: &serde_json::Value, resource: &str) -> serde_json::Value {
+    let items = json
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let out: Vec<serde_json::Value> = items
+        .iter()
+        .map(|j| {
+            let meta = j.get("metadata").cloned().unwrap_or(serde_json::json!({}));
+            let status = j.get("status").cloned().unwrap_or(serde_json::json!({}));
+            if resource == "cronjobs" {
+                serde_json::json!({
+                    "name": meta.get("name").cloned().unwrap_or_default(),
+                    "namespace": meta.get("namespace").cloned().unwrap_or_default(),
+                    "schedule": j.get("spec").and_then(|s| s.get("schedule")).cloned().unwrap_or_default(),
+                    "suspend": j.get("spec").and_then(|s| s.get("suspend")).cloned().unwrap_or(serde_json::json!(false)),
+                    "active": status.get("active").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0),
+                    "last_schedule": ts(&status, "lastScheduleTime"),
+                    "created": ts(&meta, "creationTimestamp"),
+                })
+            } else {
+                let succeeded = status.get("succeeded").and_then(|v| v.as_u64()).unwrap_or(0);
+                let completions = j
+                    .get("spec")
+                    .and_then(|s| s.get("completions"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                let active = status.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
+                let failed = status.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                let state = if active > 0 {
+                    "Running"
+                } else if failed > 0 && succeeded < completions {
+                    "Failed"
+                } else if succeeded >= completions {
+                    "Complete"
+                } else {
+                    "Pending"
+                };
+                let reason = status
+                    .get("conditions")
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.iter().find(|x| x.get("status").and_then(|s| s.as_str()) == Some("True")))
+                    .and_then(|x| x.get("reason"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or(state);
+                serde_json::json!({
+                    "name": meta.get("name").cloned().unwrap_or_default(),
+                    "namespace": meta.get("namespace").cloned().unwrap_or_default(),
+                    "completions": completions,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "active": active,
+                    "state": reason,
+                    "created": ts(&meta, "creationTimestamp"),
+                })
+            }
+        })
+        .collect();
+    serde_json::Value::Array(out)
+}
+
+pub(crate) fn parse_workloads(json: &serde_json::Value) -> Vec<K8sWorkloadInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1391,7 +1581,7 @@ fn parse_workloads(json: &serde_json::Value) -> Vec<K8sWorkloadInfo> {
         .collect()
 }
 
-fn parse_node_metrics(json: &serde_json::Value) -> Vec<K8sNodeMetric> {
+pub(crate) fn parse_node_metrics(json: &serde_json::Value) -> Vec<K8sNodeMetric> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1417,7 +1607,7 @@ fn parse_node_metrics(json: &serde_json::Value) -> Vec<K8sNodeMetric> {
         .collect()
 }
 
-fn parse_pod_metrics(json: &serde_json::Value) -> Vec<K8sPodMetric> {
+pub(crate) fn parse_pod_metrics(json: &serde_json::Value) -> Vec<K8sPodMetric> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -1439,7 +1629,9 @@ fn parse_pod_metrics(json: &serde_json::Value) -> Vec<K8sPodMetric> {
             let mut cpu_m = 0.0;
             let mut mem_bytes = 0u64;
             for c in &containers {
-                let Some(usage) = c.get("usage") else { continue };
+                let Some(usage) = c.get("usage") else {
+                    continue;
+                };
                 cpu_m += usage
                     .get("cpu")
                     .and_then(|v| v.as_str())
@@ -1495,10 +1687,18 @@ fn readyz_verdict(out: &str) -> (bool, Option<String>) {
 
 #[tauri::command]
 pub async fn get_cluster_nodes(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<Vec<K8sNodeInfo>, String> {
-    let v = kubectl_json(&state, &cluster, &["get", "nodes", "-o", "json"]).await?;
+    get_cluster_nodes_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_nodes`], shared with the MCP server.
+pub(crate) async fn get_cluster_nodes_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<Vec<K8sNodeInfo>, String> {
+    let v = kubectl_json(state, &cluster, &["get", "nodes", "-o", "json"]).await?;
     Ok(parse_nodes(&v))
 }
 
@@ -1508,7 +1708,17 @@ pub async fn get_cluster_nodes(
 /// writes. Reversible, so it needs no confirmation beyond the button itself.
 #[tauri::command]
 pub async fn set_node_schedulable(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    node: String,
+    schedulable: bool,
+) -> Result<(), String> {
+    set_node_schedulable_core(&state, cluster, node, schedulable).await
+}
+
+/// App-free core of [`set_node_schedulable`], shared with the MCP server.
+pub(crate) async fn set_node_schedulable_core(
+    state: &AppState,
     cluster: String,
     node: String,
     schedulable: bool,
@@ -1520,7 +1730,7 @@ pub async fn set_node_schedulable(
     let unschedulable = if schedulable { "false" } else { "true" };
     let patch = format!(r#"{{"spec":{{"unschedulable":{unschedulable}}}}}"#);
     kubectl_raw(
-        &state,
+        state,
         &cluster,
         &["patch", "node", node, "--type", "merge", "-p", &patch],
     )
@@ -1535,7 +1745,16 @@ pub async fn set_node_schedulable(
 /// of rotation" means in practice.
 #[tauri::command]
 pub async fn drain_node(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    node: String,
+) -> Result<String, String> {
+    drain_node_core(&state, cluster, node).await
+}
+
+/// App-free core of [`drain_node`], shared with the MCP server.
+pub(crate) async fn drain_node_core(
+    state: &AppState,
     cluster: String,
     node: String,
 ) -> Result<String, String> {
@@ -1544,7 +1763,7 @@ pub async fn drain_node(
         return Err("Invalid node name".to_string());
     }
     kubectl_raw(
-        &state,
+        state,
         &cluster,
         &[
             "drain",
@@ -1560,12 +1779,21 @@ pub async fn drain_node(
 
 #[tauri::command]
 pub async fn get_cluster_pods(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    namespace: Option<String>,
+) -> Result<Vec<K8sPodInfo>, String> {
+    get_cluster_pods_core(&state, cluster, namespace).await
+}
+
+/// App-free core of [`get_cluster_pods`], shared with the MCP server.
+pub(crate) async fn get_cluster_pods_core(
+    state: &AppState,
     cluster: String,
     namespace: Option<String>,
 ) -> Result<Vec<K8sPodInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "pods", "--all-namespaces", "-o", "json"],
     )
@@ -1579,11 +1807,19 @@ pub async fn get_cluster_pods(
 
 #[tauri::command]
 pub async fn get_cluster_events(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<Vec<K8sEventInfo>, String> {
+    get_cluster_events_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_events`], shared with the MCP server.
+pub(crate) async fn get_cluster_events_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<Vec<K8sEventInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &[
             "get",
@@ -1602,11 +1838,19 @@ pub async fn get_cluster_events(
 
 #[tauri::command]
 pub async fn get_cluster_workloads(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<Vec<K8sWorkloadInfo>, String> {
+    get_cluster_workloads_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_workloads`], shared with the MCP server.
+pub(crate) async fn get_cluster_workloads_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<Vec<K8sWorkloadInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &[
             "get",
@@ -1622,7 +1866,15 @@ pub async fn get_cluster_workloads(
 
 #[tauri::command]
 pub async fn get_cluster_metrics(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<K8sMetrics, String> {
+    get_cluster_metrics_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_metrics`], shared with the MCP server.
+pub(crate) async fn get_cluster_metrics_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<K8sMetrics, String> {
     // Both metric queries are best-effort: without metrics-server the API
@@ -1631,13 +1883,13 @@ pub async fn get_cluster_metrics(
     // flag at all — so asking it for JSON fails even with a healthy
     // metrics-server. The Metrics API returns the same data as real JSON.
     let nodes_res = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
     )
     .await;
     let pods_res = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"],
     )
@@ -1653,20 +1905,25 @@ pub async fn get_cluster_metrics(
             .as_ref()
             .map(parse_node_metrics)
             .unwrap_or_default(),
-        pods: pods_res
-            .as_ref()
-            .map(parse_pod_metrics)
-            .unwrap_or_default(),
+        pods: pods_res.as_ref().map(parse_pod_metrics).unwrap_or_default(),
         error,
     })
 }
 
 #[tauri::command]
 pub async fn get_cluster_summary(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<K8sClusterSummary, String> {
-    let ver = kubectl_json(&state, &cluster, &["version", "-o", "json"])
+    get_cluster_summary_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_summary`], shared with the MCP server.
+pub(crate) async fn get_cluster_summary_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<K8sClusterSummary, String> {
+    let ver = kubectl_json(state, &cluster, &["version", "-o", "json"])
         .await
         .unwrap_or(serde_json::json!({}));
     let server = ver.get("serverVersion").unwrap_or(&ver);
@@ -1683,20 +1940,15 @@ pub async fn get_cluster_summary(
 
     // /readyz is plain text: non-verbose = "ok" or a failure list; verbose
     // = one `[+]check ok` / `[-]check failed: …` line per check.
-    let (ready, ready_message) = match kubectl_raw(
-        &state,
-        &cluster,
-        &["get", "--raw", "/readyz?verbose"],
-    )
-    .await
-    {
-        Ok(out) => readyz_verdict(&out),
-        Err(e) => (false, Some(e)),
-    };
+    let (ready, ready_message) =
+        match kubectl_raw(state, &cluster, &["get", "--raw", "/readyz?verbose"]).await {
+            Ok(out) => readyz_verdict(&out),
+            Err(e) => (false, Some(e)),
+        };
 
     let mut errors: Vec<String> = Vec::new();
     let pods = match kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "pods", "--all-namespaces", "-o", "json"],
     )
@@ -1719,7 +1971,7 @@ pub async fn get_cluster_summary(
         }
     }
 
-    let nodes = match kubectl_json(&state, &cluster, &["get", "nodes", "-o", "json"]).await {
+    let nodes = match kubectl_json(state, &cluster, &["get", "nodes", "-o", "json"]).await {
         Ok(v) => parse_nodes(&v),
         Err(e) => {
             errors.push(format!("nodes: {e}"));
@@ -1729,7 +1981,7 @@ pub async fn get_cluster_summary(
     let ready_nodes = nodes.iter().filter(|n| n.ready).count();
 
     let namespace_count =
-        match kubectl_json(&state, &cluster, &["get", "namespaces", "-o", "json"]).await {
+        match kubectl_json(state, &cluster, &["get", "namespaces", "-o", "json"]).await {
             Ok(v) => v
                 .get("items")
                 .and_then(|i| i.as_array())
@@ -1847,9 +2099,9 @@ fn parse_metrics_pods(json: &serde_json::Value) -> Vec<MetricsPodStatus> {
                     let ready = cs
                         .map(|list| {
                             !list.is_empty()
-                                && list
-                                    .iter()
-                                    .all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
+                                && list.iter().all(|c| {
+                                    c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false)
+                                })
                         })
                         .unwrap_or(false);
                     let restarts = cs
@@ -1949,8 +2201,7 @@ fn diagnose_metrics(
     }
     if !top_works {
         return Some(
-            "metrics-server is running — usage data usually shows up within a minute."
-                .to_string(),
+            "metrics-server is running — usage data usually shows up within a minute.".to_string(),
         );
     }
     None
@@ -1972,7 +2223,10 @@ fn apiservice_available_condition(json: &serde_json::Value) -> Option<bool> {
 /// Turns a Deployment `spec.selector` (with `matchLabels`) or a Service
 /// `spec.selector` (a flat map) into a `kubectl -l` argument.
 fn selector_arg(selector: &serde_json::Value) -> Option<String> {
-    let map = selector.get("matchLabels").unwrap_or(selector).as_object()?;
+    let map = selector
+        .get("matchLabels")
+        .unwrap_or(selector)
+        .as_object()?;
     let mut parts: Vec<String> = map
         .iter()
         .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
@@ -2084,7 +2338,7 @@ async fn metrics_pods(
 ///    one matching the APIService's Service selector);
 /// 3. its pods, so "starting" and "crash-looping" can be told apart;
 /// 4. `kubectl get --raw` — whether usage actually answers yet.
-async fn read_metrics_status(
+pub(crate) async fn read_metrics_status(
     state: &AppState,
     cluster: &str,
 ) -> Result<MetricsServerStatus, String> {
@@ -2096,9 +2350,7 @@ async fn read_metrics_status(
     .await
     .ok();
     let apiservice_found = apiservice.is_some();
-    let apiservice_available = apiservice
-        .as_ref()
-        .and_then(apiservice_available_condition);
+    let apiservice_available = apiservice.as_ref().and_then(apiservice_available_condition);
 
     // Namespace/name the APIService points at; Helm installs can move it.
     let service_ns = apiservice
@@ -2147,7 +2399,14 @@ async fn read_metrics_status(
                 if let Ok(list) = kubectl_json(
                     state,
                     cluster,
-                    &["get", "deployments", "-n", service_ns.as_str(), "-o", "json"],
+                    &[
+                        "get",
+                        "deployments",
+                        "-n",
+                        service_ns.as_str(),
+                        "-o",
+                        "json",
+                    ],
                 )
                 .await
                 {
@@ -2247,10 +2506,18 @@ async fn read_metrics_status(
 /// "installed but broken", or "working" instead of only "no usage numbers".
 #[tauri::command]
 pub async fn metrics_server_status(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<MetricsServerStatus, String> {
-    read_metrics_status(&state, &cluster).await
+    metrics_server_status_core(&state, cluster).await
+}
+
+/// App-free core of [`metrics_server_status`], shared with the MCP server.
+pub(crate) async fn metrics_server_status_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<MetricsServerStatus, String> {
+    read_metrics_status(state, &cluster).await
 }
 
 /// Installs metrics-server the way kind needs it: upstream manifest, the
@@ -2259,20 +2526,23 @@ pub async fn metrics_server_status(
 /// Idempotent — running it again on an existing install repairs/updates it.
 #[tauri::command]
 pub async fn install_metrics_server(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<MetricsServerStatus, String> {
-    kubectl_raw(
-        &state,
-        &cluster,
-        &["apply", "-f", METRICS_SERVER_MANIFEST],
-    )
-    .await?;
+    install_metrics_server_core(&state, cluster).await
+}
+
+/// App-free core of [`install_metrics_server`], shared with the MCP server.
+pub(crate) async fn install_metrics_server_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<MetricsServerStatus, String> {
+    kubectl_raw(state, &cluster, &["apply", "-f", METRICS_SERVER_MANIFEST]).await?;
 
     // Only patch when the flag is missing: a second `add` would append a
     // duplicate argument on every re-install.
     let deployment = kubectl_json(
-        &state,
+        state,
         &cluster,
         &[
             "get",
@@ -2287,7 +2557,7 @@ pub async fn install_metrics_server(
     .await?;
     if !deployment_has_arg(&deployment, "--kubelet-insecure-tls") {
         kubectl_raw(
-            &state,
+            state,
             &cluster,
             &[
                 "patch",
@@ -2306,7 +2576,7 @@ pub async fn install_metrics_server(
     // Bounded wait for the rollout; a timeout is not fatal — the status read
     // below reports whatever actually happened (ImagePullBackOff, slow pull…).
     let _ = kubectl_raw(
-        &state,
+        state,
         &cluster,
         &[
             "rollout",
@@ -2322,7 +2592,7 @@ pub async fn install_metrics_server(
     // metrics-server needs one scrape cycle before the Metrics API answers.
     for _ in 0..12 {
         if kubectl_json(
-            &state,
+            state,
             &cluster,
             &["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
         )
@@ -2334,7 +2604,7 @@ pub async fn install_metrics_server(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 
-    read_metrics_status(&state, &cluster).await
+    read_metrics_status(state, &cluster).await
 }
 
 /// Shells probed, in order, when opening a pod terminal. Absolute paths only —
@@ -2347,7 +2617,7 @@ const POD_SHELL_CANDIDATES: &[&str] = &["/bin/sh", "/bin/bash", "/bin/ash", "/bu
 /// `exec: "sh": executable file not found in $PATH`.
 #[tauri::command]
 pub async fn detect_pod_shell(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
     namespace: String,
     name: String,
@@ -2457,9 +2727,11 @@ mod metrics_status_tests {
         let msg = diagnose_metrics(true, false, Some(false), false, &pending, None).unwrap();
         assert!(msg.contains("metrics-server-abc"), "unexpected: {msg}");
         // APIService unavailable is the specific reason when known.
-        assert!(diagnose_metrics(true, false, Some(false), false, &[], Some(false))
-            .unwrap()
-            .contains("API service"));
+        assert!(
+            diagnose_metrics(true, false, Some(false), false, &[], Some(false))
+                .unwrap()
+                .contains("API service")
+        );
         // Ready but missing the kind flag → the real misconfiguration.
         assert!(diagnose_metrics(true, true, Some(false), false, &[], None)
             .unwrap()
@@ -2531,7 +2803,6 @@ mod metrics_status_tests {
     }
 }
 
-
 // ==================== Cluster prefs: auto-start + per-node caps ====================
 
 use crate::config::KindClusterPrefs;
@@ -2539,8 +2810,16 @@ use crate::config::KindClusterPrefs;
 /// Reads a cluster's persisted prefs (defaults when none were set).
 #[tauri::command]
 pub async fn get_cluster_prefs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
+) -> Result<KindClusterPrefs, String> {
+    get_cluster_prefs_core(&state, &cluster).await
+}
+
+/// App-free core of [`get_cluster_prefs`], shared with the MCP server.
+pub(crate) async fn get_cluster_prefs_core(
+    state: &AppState,
+    cluster: &str,
 ) -> Result<KindClusterPrefs, String> {
     Ok(state
         .config
@@ -2555,8 +2834,17 @@ pub async fn get_cluster_prefs(
 /// Saves a cluster's prefs and applies the node caps immediately.
 #[tauri::command]
 pub async fn set_cluster_prefs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
+    prefs: KindClusterPrefs,
+) -> Result<(), String> {
+    set_cluster_prefs_core(&state, &cluster, prefs).await
+}
+
+/// App-free core of [`set_cluster_prefs`], shared with the MCP server.
+pub(crate) async fn set_cluster_prefs_core(
+    state: &AppState,
+    cluster: &str,
     prefs: KindClusterPrefs,
 ) -> Result<(), String> {
     let cluster = cluster.trim().to_string();
@@ -2565,11 +2853,12 @@ pub async fn set_cluster_prefs(
     }
     {
         let mut cfg = state.config.write().await;
-        cfg.kind_cluster_prefs.insert(cluster.clone(), prefs.clone());
+        cfg.kind_cluster_prefs
+            .insert(cluster.clone(), prefs.clone());
         cfg.save().await.map_err(|e| e.to_string())?;
     }
     if prefs.node_cpu_m > 0 || prefs.node_memory_mb > 0 {
-        let capped = apply_cluster_limits(&state, &cluster, &prefs).await?;
+        let capped = apply_cluster_limits(state, &cluster, &prefs).await?;
         tracing::info!("applied node caps to {capped} container(s) of '{cluster}'");
     }
     Ok(())
@@ -2577,7 +2866,7 @@ pub async fn set_cluster_prefs(
 
 /// CPU/memory-caps every node container of `cluster` via `docker update`.
 /// Returns how many containers were capped.
-async fn apply_cluster_limits(
+pub(crate) async fn apply_cluster_limits(
     state: &AppState,
     cluster: &str,
     prefs: &KindClusterPrefs,
@@ -2596,7 +2885,7 @@ async fn apply_cluster_limits(
 }
 
 /// Ids of every (running or stopped) node container of a cluster.
-async fn cluster_node_ids(
+pub(crate) async fn cluster_node_ids(
     client: &crate::docker::client::DockerClient,
     cluster: &str,
 ) -> Result<Vec<String>, String> {
@@ -2651,13 +2940,15 @@ pub async fn auto_start_kind_clusters(app: AppHandle, state: &AppState) -> Resul
         }
         // Skip clusters whose node containers are gone (deleted outside the app).
         let exists = {
-            let Ok(client) = local_client(state).await else { break };
+            let Ok(client) = local_client(state).await else {
+                break;
+            };
             matches!(cluster_node_ids(&client, name).await, Ok(ids) if !ids.is_empty())
         };
         if !exists {
             continue;
         }
-        match set_cluster_power(&app, state, name, true).await {
+        match set_cluster_power(Some(&app), state, name, true).await {
             Ok(()) => started += 1,
             Err(e) => tracing::warn!("auto-start cluster '{name}' failed: {e}"),
         }
@@ -2740,11 +3031,7 @@ pub async fn reconcile_kind_auto_start(
                     // Only touch containers this engine launch brought up;
                     // ones that predate the launch were deliberate.
                     let started = client.container_started_at(&c.id).await.unwrap_or(0);
-                    if !should_stop_restored(
-                        allowed.contains(cluster),
-                        started,
-                        restored_since,
-                    ) {
+                    if !should_stop_restored(allowed.contains(cluster), started, restored_since) {
                         continue;
                     }
                     let _ = client.stop_container(&c.id).await;
@@ -2766,7 +3053,7 @@ pub async fn reconcile_kind_auto_start(
 
 // ==================== Pod & resource management ====================
 
-fn k8s_name_check(s: &str) -> Result<(), String> {
+pub(crate) fn k8s_name_check(s: &str) -> Result<(), String> {
     let s = s.trim();
     if s.is_empty() || s.contains(char::is_whitespace) {
         return Err("invalid name".into());
@@ -2777,7 +3064,18 @@ fn k8s_name_check(s: &str) -> Result<(), String> {
 /// Container logs of a pod (its first container). `tail` lines, default 200.
 #[tauri::command]
 pub async fn get_pod_logs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    namespace: String,
+    name: String,
+    tail: Option<u32>,
+) -> Result<String, String> {
+    get_pod_logs_core(&state, cluster, namespace, name, tail).await
+}
+
+/// App-free core of [`get_pod_logs`], shared with the MCP server.
+pub(crate) async fn get_pod_logs_core(
+    state: &AppState,
     cluster: String,
     namespace: String,
     name: String,
@@ -2787,15 +3085,9 @@ pub async fn get_pod_logs(
     k8s_name_check(&namespace)?;
     let tail = tail.unwrap_or(200).clamp(10, 5000);
     kubectl_raw(
-        &state,
+        state,
         &cluster,
-        &[
-            "logs",
-            &name,
-            "-n",
-            &namespace,
-            &format!("--tail={tail}"),
-        ],
+        &["logs", &name, "-n", &namespace, &format!("--tail={tail}")],
     )
     .await
 }
@@ -2845,7 +3137,18 @@ fn is_yaml_kind(kind: &str) -> bool {
 /// `namespace` is ignored for cluster-scoped kinds (node, namespace).
 #[tauri::command]
 pub async fn get_resource_yaml(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<String, String> {
+    get_resource_yaml_core(&state, cluster, kind, namespace, name).await
+}
+
+/// App-free core of [`get_resource_yaml`], shared with the MCP server.
+pub(crate) async fn get_resource_yaml_core(
+    state: &AppState,
     cluster: String,
     kind: String,
     namespace: Option<String>,
@@ -2866,13 +3169,23 @@ pub async fn get_resource_yaml(
         args.extend(["-n", ns]);
     }
     args.extend(["-o", "yaml"]);
-    kubectl_raw(&state, &cluster, &args).await
+    kubectl_raw(state, &cluster, &args).await
 }
 
 /// Events whose `involvedObject` is the given object (oldest first).
 #[tauri::command]
 pub async fn get_resource_events(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    namespace: String,
+    name: String,
+) -> Result<Vec<K8sEventInfo>, String> {
+    get_resource_events_core(&state, cluster, namespace, name).await
+}
+
+/// App-free core of [`get_resource_events`], shared with the MCP server.
+pub(crate) async fn get_resource_events_core(
+    state: &AppState,
     cluster: String,
     namespace: String,
     name: String,
@@ -2881,7 +3194,7 @@ pub async fn get_resource_events(
     k8s_name_check(&namespace)?;
     let selector = format!("involvedObject.name={name}");
     let v = match kubectl_json(
-        &state,
+        state,
         &cluster,
         &[
             "get",
@@ -2904,7 +3217,7 @@ pub async fn get_resource_events(
         // here gives the same answer without the server-side selector.
         Err(_) => {
             let mut all = kubectl_json(
-                &state,
+                state,
                 &cluster,
                 &["get", "events", "-n", &namespace, "-o", "json"],
             )
@@ -2927,7 +3240,19 @@ pub async fn get_resource_events(
 /// its pods) across all containers.
 #[tauri::command]
 pub async fn get_workload_logs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    tail: Option<u32>,
+) -> Result<String, String> {
+    get_workload_logs_core(&state, cluster, kind, namespace, name, tail).await
+}
+
+/// App-free core of [`get_workload_logs`], shared with the MCP server.
+pub(crate) async fn get_workload_logs_core(
+    state: &AppState,
     cluster: String,
     kind: String,
     namespace: String,
@@ -2945,7 +3270,7 @@ pub async fn get_workload_logs(
     let tail = tail.unwrap_or(300).clamp(10, 5000);
     let target = format!("{kind_l}/{name}");
     kubectl_raw(
-        &state,
+        state,
         &cluster,
         &[
             "logs",
@@ -2980,7 +3305,18 @@ mod resource_view_tests {
 /// Deletes a pod (the owning controller recreates it unless it's bare).
 #[tauri::command]
 pub async fn delete_pod(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    namespace: String,
+    name: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    delete_pod_core(&state, cluster, namespace, name, force).await
+}
+
+/// App-free core of [`delete_pod`], shared with the MCP server.
+pub(crate) async fn delete_pod_core(
+    state: &AppState,
     cluster: String,
     namespace: String,
     name: String,
@@ -2993,13 +3329,24 @@ pub async fn delete_pod(
         args.push("--force");
         args.push("--grace-period=0");
     }
-    kubectl_raw(&state, &cluster, &args).await.map(|_| ())
+    kubectl_raw(state, &cluster, &args).await.map(|_| ())
 }
 
 /// Generic delete for services/configmaps/secrets/PVCs/namespaces/workloads.
 #[tauri::command]
 pub async fn delete_k8s_resource(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    delete_k8s_resource_core(&state, cluster, kind, namespace, name).await
+}
+
+/// App-free core of [`delete_k8s_resource`], shared with the MCP server.
+pub(crate) async fn delete_k8s_resource_core(
+    state: &AppState,
     cluster: String,
     kind: String,
     namespace: Option<String>,
@@ -3028,13 +3375,25 @@ pub async fn delete_k8s_resource(
         args.push("-n");
         args.push(ns.trim());
     }
-    kubectl_raw(&state, &cluster, &args).await.map(|_| ())
+    kubectl_raw(state, &cluster, &args).await.map(|_| ())
 }
 
 /// Scales a Deployment/StatefulSet to `replicas`.
 #[tauri::command]
 pub async fn scale_workload(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    replicas: u32,
+) -> Result<(), String> {
+    scale_workload_core(&state, cluster, kind, namespace, name, replicas).await
+}
+
+/// App-free core of [`scale_workload`], shared with the MCP server.
+pub(crate) async fn scale_workload_core(
+    state: &AppState,
     cluster: String,
     kind: String,
     namespace: String,
@@ -3046,7 +3405,7 @@ pub async fn scale_workload(
         return Err("only deployments and statefulsets are scalable".into());
     }
     kubectl_raw(
-        &state,
+        state,
         &cluster,
         &[
             "scale",
@@ -3064,7 +3423,18 @@ pub async fn scale_workload(
 /// Rolling-restarts a workload (`kubectl rollout restart`).
 #[tauri::command]
 pub async fn restart_workload(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    kind: String,
+    namespace: String,
+    name: String,
+) -> Result<(), String> {
+    restart_workload_core(&state, cluster, kind, namespace, name).await
+}
+
+/// App-free core of [`restart_workload`], shared with the MCP server.
+pub(crate) async fn restart_workload_core(
+    state: &AppState,
     cluster: String,
     kind: String,
     namespace: String,
@@ -3072,7 +3442,7 @@ pub async fn restart_workload(
 ) -> Result<(), String> {
     k8s_name_check(&name)?;
     kubectl_raw(
-        &state,
+        state,
         &cluster,
         &["rollout", "restart", &kind, &name, "-n", &namespace],
     )
@@ -3083,12 +3453,21 @@ pub async fn restart_workload(
 /// Creates a namespace.
 #[tauri::command]
 pub async fn create_namespace(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    name: String,
+) -> Result<(), String> {
+    create_namespace_core(&state, cluster, name).await
+}
+
+/// App-free core of [`create_namespace`], shared with the MCP server.
+pub(crate) async fn create_namespace_core(
+    state: &AppState,
     cluster: String,
     name: String,
 ) -> Result<(), String> {
     k8s_name_check(&name)?;
-    kubectl_raw(&state, &cluster, &["create", "namespace", name.trim()])
+    kubectl_raw(state, &cluster, &["create", "namespace", name.trim()])
         .await
         .map(|_| ())
 }
@@ -3130,7 +3509,7 @@ pub struct K8sPvcInfo {
     pub created: Option<i64>,
 }
 
-fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
+pub(crate) fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3146,8 +3525,7 @@ fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
                     arr.iter()
                         .map(|p| {
                             let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let proto =
-                                p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
+                            let proto = p.get("protocol").and_then(|v| v.as_str()).unwrap_or("TCP");
                             let node = p
                                 .get("nodePort")
                                 .and_then(|v| v.as_u64())
@@ -3188,7 +3566,10 @@ fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
         .collect()
 }
 
-fn parse_config_resources(json: &serde_json::Value, resource_kind: &str) -> Vec<K8sConfigInfo> {
+pub(crate) fn parse_config_resources(
+    json: &serde_json::Value,
+    resource_kind: &str,
+) -> Vec<K8sConfigInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3219,7 +3600,7 @@ fn parse_config_resources(json: &serde_json::Value, resource_kind: &str) -> Vec<
         .collect()
 }
 
-fn parse_pvcs(json: &serde_json::Value) -> Vec<K8sPvcInfo> {
+pub(crate) fn parse_pvcs(json: &serde_json::Value) -> Vec<K8sPvcInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3273,11 +3654,19 @@ fn parse_pvcs(json: &serde_json::Value) -> Vec<K8sPvcInfo> {
 
 #[tauri::command]
 pub async fn get_cluster_services(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<Vec<K8sServiceInfo>, String> {
+    get_cluster_services_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_services`], shared with the MCP server.
+pub(crate) async fn get_cluster_services_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<Vec<K8sServiceInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "services", "--all-namespaces", "-o", "json"],
     )
@@ -3287,13 +3676,22 @@ pub async fn get_cluster_services(
 
 #[tauri::command]
 pub async fn get_cluster_config_resources(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+    include_secrets: Option<bool>,
+) -> Result<Vec<K8sConfigInfo>, String> {
+    get_cluster_config_resources_core(&state, cluster, include_secrets).await
+}
+
+/// App-free core of [`get_cluster_config_resources`], shared with the MCP server.
+pub(crate) async fn get_cluster_config_resources_core(
+    state: &AppState,
     cluster: String,
     include_secrets: Option<bool>,
 ) -> Result<Vec<K8sConfigInfo>, String> {
     let mut out = Vec::new();
     let cm = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "configmaps", "--all-namespaces", "-o", "json"],
     )
@@ -3301,7 +3699,7 @@ pub async fn get_cluster_config_resources(
     out.extend(parse_config_resources(&cm, "ConfigMap"));
     if include_secrets.unwrap_or(true) {
         let sec = kubectl_json(
-            &state,
+            state,
             &cluster,
             &["get", "secrets", "--all-namespaces", "-o", "json"],
         )
@@ -3313,11 +3711,19 @@ pub async fn get_cluster_config_resources(
 
 #[tauri::command]
 pub async fn get_cluster_pvcs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<Vec<K8sPvcInfo>, String> {
+    get_cluster_pvcs_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_pvcs`], shared with the MCP server.
+pub(crate) async fn get_cluster_pvcs_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<Vec<K8sPvcInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &[
             "get",
@@ -3369,7 +3775,7 @@ pub struct K8sPvInfo {
     pub created: Option<i64>,
 }
 
-fn parse_namespaces(json: &serde_json::Value) -> Vec<K8sNamespaceInfo> {
+pub(crate) fn parse_namespaces(json: &serde_json::Value) -> Vec<K8sNamespaceInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3394,7 +3800,7 @@ fn parse_namespaces(json: &serde_json::Value) -> Vec<K8sNamespaceInfo> {
         .collect()
 }
 
-fn parse_ingresses(json: &serde_json::Value) -> Vec<K8sIngressInfo> {
+pub(crate) fn parse_ingresses(json: &serde_json::Value) -> Vec<K8sIngressInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3467,7 +3873,7 @@ fn parse_ingresses(json: &serde_json::Value) -> Vec<K8sIngressInfo> {
         .collect()
 }
 
-fn parse_pvs(json: &serde_json::Value) -> Vec<K8sPvInfo> {
+pub(crate) fn parse_pvs(json: &serde_json::Value) -> Vec<K8sPvInfo> {
     let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
         return vec![];
     };
@@ -3534,20 +3940,36 @@ fn parse_pvs(json: &serde_json::Value) -> Vec<K8sPvInfo> {
 
 #[tauri::command]
 pub async fn get_cluster_namespaces(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<Vec<K8sNamespaceInfo>, String> {
-    let v = kubectl_json(&state, &cluster, &["get", "namespaces", "-o", "json"]).await?;
+    get_cluster_namespaces_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_namespaces`], shared with the MCP server.
+pub(crate) async fn get_cluster_namespaces_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<Vec<K8sNamespaceInfo>, String> {
+    let v = kubectl_json(state, &cluster, &["get", "namespaces", "-o", "json"]).await?;
     Ok(parse_namespaces(&v))
 }
 
 #[tauri::command]
 pub async fn get_cluster_ingresses(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    cluster: String,
+) -> Result<Vec<K8sIngressInfo>, String> {
+    get_cluster_ingresses_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_ingresses`], shared with the MCP server.
+pub(crate) async fn get_cluster_ingresses_core(
+    state: &AppState,
     cluster: String,
 ) -> Result<Vec<K8sIngressInfo>, String> {
     let v = kubectl_json(
-        &state,
+        state,
         &cluster,
         &["get", "ingresses", "--all-namespaces", "-o", "json"],
     )
@@ -3557,15 +3979,18 @@ pub async fn get_cluster_ingresses(
 
 #[tauri::command]
 pub async fn get_cluster_pvs(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     cluster: String,
 ) -> Result<Vec<K8sPvInfo>, String> {
-    let v = kubectl_json(
-        &state,
-        &cluster,
-        &["get", "persistentvolumes", "-o", "json"],
-    )
-    .await?;
+    get_cluster_pvs_core(&state, cluster).await
+}
+
+/// App-free core of [`get_cluster_pvs`], shared with the MCP server.
+pub(crate) async fn get_cluster_pvs_core(
+    state: &AppState,
+    cluster: String,
+) -> Result<Vec<K8sPvInfo>, String> {
+    let v = kubectl_json(state, &cluster, &["get", "persistentvolumes", "-o", "json"]).await?;
     Ok(parse_pvs(&v))
 }
 
@@ -3579,7 +4004,8 @@ mod monitor_tests {
         // Clean payloads parse directly.
         assert_eq!(extract_json(r#"{"items":[]}"#), Some(json!({"items": []})));
         // kubectl warnings merged into the exec stream must not break parsing.
-        let noisy = "Warning: v1 PodMetrics is deprecated\n{\"items\":[{\"metadata\":{\"name\":\"p\"}}]}";
+        let noisy =
+            "Warning: v1 PodMetrics is deprecated\n{\"items\":[{\"metadata\":{\"name\":\"p\"}}]}";
         assert_eq!(
             extract_json(noisy),
             Some(json!({"items":[{"metadata":{"name":"p"}}]}))
@@ -3810,103 +4236,113 @@ mod monitor_tests {
     }
 }
 
-    /// Debug: exec_capture against the live engine + cluster (opt-in via
-    /// `cargo test -- --ignored`). Not part of the suite — needs a running cluster.
-    #[tokio::test]
-    #[ignore]
-    async fn exec_capture_real_cluster_roundtrip() {
-        let sock = std::path::Path::new("/run/user/1000/hsx2dock/docker.sock");
-        if !sock.exists() {
-            eprintln!("engine socket absent, skipping");
-            return;
-        }
-        let client = crate::docker::client::DockerClient::connect(Some(sock)).unwrap();
-        async fn kjson(
-            client: &crate::docker::client::DockerClient,
-            args: &[&str],
-        ) -> serde_json::Value {
+/// Debug: exec_capture against the live engine + cluster (opt-in via
+/// `cargo test -- --ignored`). Not part of the suite — needs a running cluster.
+#[tokio::test]
+#[ignore]
+async fn exec_capture_real_cluster_roundtrip() {
+    let sock = std::path::Path::new("/run/user/1000/hsx2dock/docker.sock");
+    if !sock.exists() {
+        eprintln!("engine socket absent, skipping");
+        return;
+    }
+    let client = crate::docker::client::DockerClient::connect(Some(sock)).unwrap();
+    async fn kjson(
+        client: &crate::docker::client::DockerClient,
+        args: &[&str],
+    ) -> serde_json::Value {
+        let mut cmd = vec![
+            "kubectl".to_string(),
+            "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+        ];
+        cmd.extend(args.iter().map(|s| s.to_string()));
+        let out = client
+            .exec_capture("cluster-control-plane", cmd)
+            .await
+            .expect("exec");
+        serde_json::from_str(out.trim()).expect("json")
+    }
+    let nodes_v = kjson(&client, &["get", "nodes", "-o", "json"]).await;
+    let nodes = parse_nodes(&nodes_v);
+    eprintln!(
+        "parsed nodes: {} (ready flags: {:?})",
+        nodes.len(),
+        nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.ready))
+            .collect::<Vec<_>>()
+    );
+    let pods_v = kjson(&client, &["get", "pods", "--all-namespaces", "-o", "json"]).await;
+    let pods = parse_pods(&pods_v);
+    eprintln!(
+        "parsed pods: {} (phases: {:?})",
+        pods.len(),
+        pods.iter()
+            .map(|p| format!("{}/{}", p.namespace, p.phase))
+            .collect::<Vec<_>>()
+    );
+    let ns_v = kjson(&client, &["get", "namespaces", "-o", "json"]).await;
+    let active = ns_v["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|n| n["status"]["phase"] == "Active")
+                .count()
+        })
+        .unwrap_or(0);
+    eprintln!("parsed active namespaces: {active}");
+    let out = client
+        .exec_capture(
+            "cluster-control-plane",
+            vec![
+                "kubectl".to_string(),
+                "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+                "get".into(),
+                "--raw".into(),
+                "/readyz?verbose".into(),
+            ],
+        )
+        .await
+        .expect("readyz");
+    eprintln!(
+        "readyz starts_with_ok={} contains_failed={} first_line={:?}",
+        out.trim_start().starts_with("ok"),
+        out.contains("failed"),
+        out.trim().lines().next().unwrap_or("")
+    );
+
+    // Hammer: 10 back-to-back poll rounds like the UI does (summary-ish
+    // burst: 5 execs per round, overlapping rounds allowed) to catch
+    // intermittent failures under load.
+    let mut fails = 0;
+    for round in 0..10 {
+        for args in [
+            vec!["version", "-o", "json"],
+            vec!["get", "nodes", "-o", "json"],
+            vec!["get", "pods", "--all-namespaces", "-o", "json"],
+            vec!["get", "namespaces", "-o", "json"],
+            vec![
+                "get",
+                "events",
+                "--all-namespaces",
+                "--sort-by=.lastTimestamp",
+                "-o",
+                "json",
+            ],
+        ] {
             let mut cmd = vec![
                 "kubectl".to_string(),
                 "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
             ];
             cmd.extend(args.iter().map(|s| s.to_string()));
-            let out = client
-                .exec_capture("cluster-control-plane", cmd)
-                .await
-                .expect("exec");
-            serde_json::from_str(out.trim()).expect("json")
-        }
-        let nodes_v = kjson(&client, &["get", "nodes", "-o", "json"]).await;
-        let nodes = parse_nodes(&nodes_v);
-        eprintln!(
-            "parsed nodes: {} (ready flags: {:?})",
-            nodes.len(),
-            nodes.iter().map(|n| (n.name.clone(), n.ready)).collect::<Vec<_>>()
-        );
-        let pods_v = kjson(&client, &["get", "pods", "--all-namespaces", "-o", "json"]).await;
-        let pods = parse_pods(&pods_v);
-        eprintln!(
-            "parsed pods: {} (phases: {:?})",
-            pods.len(),
-            pods.iter()
-                .map(|p| format!("{}/{}", p.namespace, p.phase))
-                .collect::<Vec<_>>()
-        );
-        let ns_v = kjson(&client, &["get", "namespaces", "-o", "json"]).await;
-        let active = ns_v["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|n| n["status"]["phase"] == "Active")
-                    .count()
-            })
-            .unwrap_or(0);
-        eprintln!("parsed active namespaces: {active}");
-        let out = client
-            .exec_capture(
-                "cluster-control-plane",
-                vec![
-                    "kubectl".to_string(),
-                    "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
-                    "get".into(),
-                    "--raw".into(),
-                    "/readyz?verbose".into(),
-                ],
-            )
-            .await
-            .expect("readyz");
-        eprintln!(
-            "readyz starts_with_ok={} contains_failed={} first_line={:?}",
-            out.trim_start().starts_with("ok"),
-            out.contains("failed"),
-            out.trim().lines().next().unwrap_or("")
-        );
-
-        // Hammer: 10 back-to-back poll rounds like the UI does (summary-ish
-        // burst: 5 execs per round, overlapping rounds allowed) to catch
-        // intermittent failures under load.
-        let mut fails = 0;
-        for round in 0..10 {
-            for args in [
-                vec!["version", "-o", "json"],
-                vec!["get", "nodes", "-o", "json"],
-                vec!["get", "pods", "--all-namespaces", "-o", "json"],
-                vec!["get", "namespaces", "-o", "json"],
-                vec!["get", "events", "--all-namespaces", "--sort-by=.lastTimestamp", "-o", "json"],
-            ] {
-                let mut cmd = vec![
-                    "kubectl".to_string(),
-                    "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
-                ];
-                cmd.extend(args.iter().map(|s| s.to_string()));
-                if let Err(e) = client.exec_capture("cluster-control-plane", cmd).await {
-                    fails += 1;
-                    eprintln!("round {round} FAIL {:?} -> {e:#}", args.first());
-                }
+            if let Err(e) = client.exec_capture("cluster-control-plane", cmd).await {
+                fails += 1;
+                eprintln!("round {round} FAIL {:?} -> {e:#}", args.first());
             }
         }
-        eprintln!("hammer: {fails} failures / 50 execs");
     }
+    eprintln!("hammer: {fails} failures / 50 execs");
+}
 
 #[cfg(test)]
 mod listing_parsers_tests {

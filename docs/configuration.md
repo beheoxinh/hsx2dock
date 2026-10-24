@@ -20,6 +20,14 @@ refresh_interval = 3              # stats polling, seconds
 - `terminal` — terminal used for `docker exec -it`: `ptyxis`,
   `gnome-terminal`, or `auto` (prefer ptyxis, fall back).
 - `refresh_interval` — container stats polling period in seconds.
+- `mcp_enabled` — serve the MCP server over loopback HTTP (off by default; the
+  `hsx2dock-mcp` stdio binary needs no setting).
+- `mcp_port` — port for that listener, default `45123`.
+
+The MCP bearer token is **not** in this file: it lives in
+`~/.config/hsx2dock/mcp.json` with `0600` permissions, because `config.toml` is
+routinely copied between machines and pasted into bug reports. Rotate it from
+the MCP Server page, which invalidates every agent already configured.
 
 ## Preferences dialog
 

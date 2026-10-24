@@ -121,10 +121,24 @@ pub struct AppConfig {
     /// start, unlimited nodes).
     #[serde(default)]
     pub kind_cluster_prefs: std::collections::BTreeMap<String, KindClusterPrefs>,
+    // ---- MCP (Model Context Protocol) ----
+    /// Serve the app to AI agents over loopback HTTP. Off by default: the
+    /// stdio binary needs no setting, and this one opens a listening socket.
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// Port for the loopback HTTP transport. `0` = pick a free port on start.
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
 }
 
 fn default_kind_start_delay() -> u32 {
     5
+}
+
+/// Deliberately obscure: it only has to beat other dev servers on the machine,
+/// and a stable number means a saved agent config survives an app restart.
+pub(crate) fn default_mcp_port() -> u16 {
+    45123
 }
 
 /// Per-cluster preferences persisted in the app config.
@@ -237,7 +251,10 @@ impl RegistryConfig {
 /// Docker's canonical server address for an index-style host. The daemon
 /// matches saved auth against this string for Docker Hub pulls/pushes.
 pub fn server_address_for_host(host: &str) -> String {
-    if matches!(host, "docker.io" | "index.docker.io" | "registry-1.docker.io") {
+    if matches!(
+        host,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    ) {
         "https://index.docker.io/v1/".to_string()
     } else {
         format!("https://{host}")
@@ -277,7 +294,7 @@ fn default_kind_nodes() -> u32 {
 }
 
 /// Current config schema. See [`AppConfig::schema_version`].
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -310,6 +327,8 @@ impl Default for AppConfig {
             kind_auto_start: false,
             kind_auto_start_delay: default_kind_start_delay(),
             kind_cluster_prefs: Default::default(),
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
         }
     }
 }
@@ -383,6 +402,9 @@ impl AppConfig {
             // or stored `false` from the toggle — both move to the new default
             // so the installed app behaves like a fresh one.
             self.close_to_tray = true;
+            // Schema 3 adds the MCP settings. They default to "off, no token",
+            // so nothing needs rewriting here — bumping the version is what
+            // makes the app rewrite the file with the new keys.
             self.schema_version = CONFIG_SCHEMA_VERSION;
         }
     }
@@ -393,6 +415,11 @@ impl AppConfig {
     pub fn normalize(&mut self) {
         if !self.auto_start_on_boot {
             self.start_minimized = false;
+        }
+        // A zero port means "pick one at start"; anything else must be a real
+        // port, and the server only ever binds it on loopback.
+        if self.mcp_port == 0 {
+            self.mcp_port = default_mcp_port();
         }
     }
 
@@ -503,7 +530,10 @@ mod tests {
             .expect("seeds a legacy file");
 
         let (cfg, stale) = AppConfig::load_and_migrate(&path).await.expect("loads");
-        assert!(stale, "a file below the current schema must report itself stale");
+        assert!(
+            stale,
+            "a file below the current schema must report itself stale"
+        );
         assert!(cfg.close_to_tray);
         cfg.save_to(&path).await.expect("persists the upgrade");
 
@@ -551,6 +581,8 @@ mod tests {
             kind_auto_start: false,
             kind_auto_start_delay: default_kind_start_delay(),
             kind_cluster_prefs: Default::default(),
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");

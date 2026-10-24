@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useCallback } from "react";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   Activity,
   Bug,
@@ -9,7 +10,6 @@ import {
   Pause,
   Play,
   RotateCw,
-  ShieldAlert,
   SlidersHorizontal,
   Square,
   Terminal,
@@ -18,8 +18,9 @@ import {
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
 import { StatusBadge } from "./ui/StatusBadge";
+import { useToast } from "./ui/Toast";
 import { formatBytes, truncateId } from "../lib/utils";
-import { describeBinding, publicBindings } from "../lib/portExposure";
+import { portChips, type PortChip } from "../lib/portExposure";
 import type { ContainerItem, ContainerStats } from "../types";
 
 export type ContainerAction =
@@ -46,6 +47,85 @@ interface ContainerCardProps {
 }
 
 /**
+ * One published port. A published port is a link that opens it in the browser;
+ * an exposed-only port (never published) is inert text. A wildcard binding gets
+ * a small amber dot rather than a whole warning banner — it is worth knowing,
+ * not worth shouting about.
+ */
+const PortChipBadge: React.FC<{ chip: PortChip; containerName: string }> = ({
+  chip,
+  containerName,
+}) => {
+  const toast = useToast();
+  const base =
+    "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] leading-none";
+  const tone = chip.public
+    ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
+    : "border-zinc-700/60 bg-zinc-800/60 text-zinc-200";
+  const title = chip.public
+    ? `${chip.label}/${chip.protocol} — published on every interface, reachable from your network`
+    : `${chip.label}/${chip.protocol}${chip.hostPort === null ? " — exposed, not published" : " — loopback only"}`;
+
+  const inner = (
+    <>
+      {chip.public && (
+        <span
+          aria-hidden="true"
+          className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
+        />
+      )}
+      <span>{chip.label}</span>
+      {chip.protocol !== "tcp" && (
+        <span className="text-zinc-400">/{chip.protocol}</span>
+      )}
+      {chip.url && <ExternalLink className="w-2.5 h-2.5 opacity-60" />}
+    </>
+  );
+
+  /**
+   * A `target="_blank"` anchor does not leave the Tauri webview — it either
+   * does nothing or opens a second app window. Hand the URL to the shell
+   * plugin instead, which runs the desktop's own opener (`xdg-open`).
+   * The href stays so the URL is still visible, copyable and middle-clickable.
+   */
+  const openInBrowser = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!chip.url) return;
+      openExternal(chip.url).catch((err) => {
+        // A failed open used to be invisible; say what happened and hand the
+        // user the URL so the click is never a dead end.
+        toast.error("Could not open the browser", `${chip.url} — ${err}`);
+      });
+    },
+    [chip.url, toast]
+  );
+
+  if (!chip.url) {
+    return (
+      <span className={`${base} ${tone}`} title={title}>
+        {inner}
+      </span>
+    );
+  }
+
+  return (
+    <a
+      href={chip.url}
+      target="_blank"
+      rel="noreferrer"
+      title={`${title} — click to open in the browser`}
+      aria-label={`Open ${containerName} port ${chip.hostPort} in the browser`}
+      onClick={openInBrowser}
+      className={`${base} ${tone} hover:border-blue-500/60 hover:text-white transition-colors`}
+    >
+      {inner}
+    </a>
+  );
+};
+
+/**
  * One container, rendered identically whether it sits in the flat list or
  * inside a group card. `compact` trims the padding and tightens the stats grid
  * for the nested case; the figures themselves stay, because the group header's
@@ -63,12 +143,9 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
 }) => {
   const isRunning = c.state === "running";
   const name = c.name.replace(/^\//, "");
-  const hostPort = c.ports?.includes("->")
-    ? c.ports.split("->")[0].split(":").pop()
-    : null;
-  // Docker publishes on 0.0.0.0/[::] by default, which bypasses the host
-  // firewall; loopback-only mappings are intentional and stay unflagged.
-  const exposed = publicBindings(c);
+  // One chip per published port: the host→container mapping is readable at a
+  // glance, and clicking a published port opens it in the browser.
+  const chips = portChips(c);
 
   return (
     <Card
@@ -122,43 +199,23 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
           compact ? "gap-2 p-2" : "gap-4 p-3"
         }`}
       >
-        <div className="min-w-0">
+        <div className="min-w-0 sm:col-span-1">
           <span className="text-zinc-500 block text-[10px] uppercase font-semibold">
             Ports
           </span>
-          <div className="flex items-center gap-1.5 mt-0.5 min-w-0">
-            <span className="text-zinc-200 truncate block font-mono">
-              {c.ports || "—"}
-            </span>
-            {exposed.length > 0 && (
-              <span
-                role="img"
-                data-testid="port-exposure-warning"
-                aria-label={`${name} publishes ${exposed
-                  .map(describeBinding)
-                  .join(", ")} on every interface — reachable from your network`}
-                title={`Published on every interface (${exposed
-                  .map(describeBinding)
-                  .join(", ")}) — reachable from your network. Bind to 127.0.0.1 to keep it local.`}
-                className="shrink-0 text-amber-500 dark:text-amber-400 cursor-help"
-              >
-                <ShieldAlert className="w-3.5 h-3.5" />
-              </span>
-            )}
-            {hostPort && (
-              <a
-                href={`http://localhost:${hostPort}`}
-                target="_blank"
-                rel="noreferrer"
-                title="Open in browser"
-                aria-label={`Open ${name} on port ${hostPort} in the browser`}
-                className="text-blue-400 hover:text-blue-300"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <ExternalLink className="w-3 h-3 inline" />
-              </a>
-            )}
-          </div>
+          {chips.length === 0 ? (
+            <span className="text-zinc-600 font-mono mt-0.5 block">—</span>
+          ) : (
+            <div className="flex flex-wrap items-center gap-1 mt-1 min-w-0">
+              {chips.map((chip, i) => (
+                <PortChipBadge
+                  key={`${chip.hostPort}-${chip.containerPort}-${chip.protocol}-${i}`}
+                  chip={chip}
+                  containerName={name}
+                />
+              ))}
+            </div>
+          )}
         </div>
 
         <div>

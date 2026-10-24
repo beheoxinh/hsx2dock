@@ -5,9 +5,10 @@ use bollard::Docker;
 use futures_util::StreamExt;
 
 use super::models::{
-    BuildOptions, BuildStep, ContainerDetails, ContainerItem, ContainerStats, DfReport, EngineInfo,
-    EnvVar, Healthcheck, ImageHistoryEntry, ImageItem, NetworkItem, PortMapping, PortProtocol,
-    PublishedPort, ResourceLimits, RunConfig, VolumeItem, VolumeMount, limits_from_host_config,
+    limits_from_host_config, BuildOptions, BuildStep, ContainerDetails, ContainerItem,
+    ContainerStats, DfReport, EngineInfo, EnvVar, Healthcheck, ImageHistoryEntry, ImageItem,
+    NetworkItem, PortMapping, PortProtocol, PublishedPort, ResourceLimits, RunConfig, VolumeItem,
+    VolumeMount,
 };
 
 #[derive(Clone)]
@@ -136,11 +137,7 @@ impl DockerClient {
 
     /// One-shot exec: runs `cmd` inside `container`, returns combined stdout+stderr.
     /// Errors on non-zero exit. Used for kubectl queries inside kind nodes.
-    pub async fn exec_capture(
-        &self,
-        container: &str,
-        cmd: Vec<String>,
-    ) -> anyhow::Result<String> {
+    pub async fn exec_capture(&self, container: &str, cmd: Vec<String>) -> anyhow::Result<String> {
         use anyhow::Context;
         use bollard::container::LogOutput;
         use bollard::exec::StartExecResults;
@@ -221,9 +218,7 @@ impl DockerClient {
     /// the engine starts; the app pins them to `"no"` so only its own
     /// auto-start logic decides what runs.
     pub async fn update_restart_policy(&self, id: &str, policy: &str) -> anyhow::Result<()> {
-        use bollard::models::{
-            ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum as B,
-        };
+        use bollard::models::{ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum as B};
         let name = match policy {
             "always" => B::ALWAYS,
             "unless-stopped" => B::UNLESS_STOPPED,
@@ -575,10 +570,8 @@ impl DockerClient {
     pub async fn prune_images(&self) -> anyhow::Result<(u64, u64)> {
         // Dangling-only for two reasons: it matches the UI copy ("unused
         // images") and it can never touch a tagged kind node image.
-        let filters = std::collections::HashMap::from([(
-            "dangling".to_string(),
-            vec!["true".to_string()],
-        )]);
+        let filters =
+            std::collections::HashMap::from([("dangling".to_string(), vec!["true".to_string()])]);
         let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
             .filters(&filters)
             .build();
@@ -914,7 +907,12 @@ impl DockerClient {
         if !tag.is_empty() {
             builder = builder.t(tag);
         }
-        if let Some(target) = options.target.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(target) = options
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             builder = builder.target(target);
         }
         if options.no_cache {
@@ -925,7 +923,11 @@ impl DockerClient {
         }
         let args = options.build_arg_pairs();
         if !args.is_empty() {
-            builder = builder.buildargs(&args.into_iter().collect::<std::collections::HashMap<_, _>>());
+            builder = builder.buildargs(
+                &args
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>(),
+            );
         }
 
         let opts = builder.build();
@@ -1048,7 +1050,8 @@ impl DockerClient {
             .unwrap_or(0)
             .max(0) as u64;
 
-        let total_reclaimable = img_reclaimable + cnt_reclaimable + vol_reclaimable + cache_reclaimable;
+        let total_reclaimable =
+            img_reclaimable + cnt_reclaimable + vol_reclaimable + cache_reclaimable;
 
         Ok(DfReport {
             images_count: df
@@ -1333,7 +1336,6 @@ impl DockerClient {
     }
 }
 
-
 fn container_details_from_inspect(
     info: &bollard::models::ContainerInspectResponse,
 ) -> ContainerDetails {
@@ -1493,9 +1495,7 @@ fn container_details_from_inspect(
                 .as_ref()
                 .and_then(|h| h.restart_policy.clone())
                 .and_then(|r| r.name)
-                .map(|n| {
-                    crate::docker::models::RestartPolicy::from_bollard_name(&n).to_string()
-                })
+                .map(|n| crate::docker::models::RestartPolicy::from_bollard_name(&n).to_string())
                 .unwrap_or_default(),
             restart_max_retries: info
                 .host_config
@@ -1664,13 +1664,15 @@ fn append_dir_all(
     Ok(())
 }
 
-
 fn normalize_tcp_uri(uri: &str) -> anyhow::Result<String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() {
         anyhow::bail!("TCP URI cannot be empty");
     }
-    if trimmed.starts_with("tcp://") || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.starts_with("tcp://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+    {
         return Ok(trimmed.to_string());
     }
     if trimmed.contains("://") {
@@ -1824,12 +1826,27 @@ mod tests {
 
     #[test]
     fn tcp_uri_normalization_adds_scheme_and_default_port() {
-        assert_eq!(normalize_tcp_uri("localhost:2375").unwrap(), "tcp://localhost:2375");
-        assert_eq!(normalize_tcp_uri(" 10.0.0.5:2376 ").unwrap(), "tcp://10.0.0.5:2376");
-        assert_eq!(normalize_tcp_uri("docker.example.com").unwrap(), "tcp://docker.example.com:2375");
+        assert_eq!(
+            normalize_tcp_uri("localhost:2375").unwrap(),
+            "tcp://localhost:2375"
+        );
+        assert_eq!(
+            normalize_tcp_uri(" 10.0.0.5:2376 ").unwrap(),
+            "tcp://10.0.0.5:2376"
+        );
+        assert_eq!(
+            normalize_tcp_uri("docker.example.com").unwrap(),
+            "tcp://docker.example.com:2375"
+        );
         // An explicit scheme is passed through untouched.
-        assert_eq!(normalize_tcp_uri("tcp://host:2375").unwrap(), "tcp://host:2375");
-        assert_eq!(normalize_tcp_uri("http://host:9000").unwrap(), "http://host:9000");
+        assert_eq!(
+            normalize_tcp_uri("tcp://host:2375").unwrap(),
+            "tcp://host:2375"
+        );
+        assert_eq!(
+            normalize_tcp_uri("http://host:9000").unwrap(),
+            "http://host:9000"
+        );
     }
 
     #[test]
@@ -1842,7 +1859,10 @@ mod tests {
     #[test]
     fn ssh_uri_normalization_adds_the_scheme() {
         assert_eq!(normalize_ssh_uri("user@host").unwrap(), "ssh://user@host");
-        assert_eq!(normalize_ssh_uri("ssh://user@host:22").unwrap(), "ssh://user@host:22");
+        assert_eq!(
+            normalize_ssh_uri("ssh://user@host:22").unwrap(),
+            "ssh://user@host:22"
+        );
         assert!(normalize_ssh_uri("").is_err());
         assert!(normalize_ssh_uri("tcp://host:2375").is_err());
     }

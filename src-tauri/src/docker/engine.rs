@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+use super::doctor;
+
 /// Base URL for Docker's official static binaries (Apache-2.0).
 const STATIC_BASE: &str = "https://download.docker.com/linux/static/stable/x86_64";
 /// Base URL for the compose v2 release binaries (Apache-2.0).
@@ -169,11 +171,7 @@ impl EngineManager {
 
     /// Applies the configured cgroup caps to the running engine. Both limits
     /// at zero is a no-op ("limits disabled").
-    pub fn apply_resource_limits(
-        &self,
-        memory_mb: u64,
-        cpu_cores: f64,
-    ) -> Result<String, String> {
+    pub fn apply_resource_limits(&self, memory_mb: u64, cpu_cores: f64) -> Result<String, String> {
         let pid = self
             .child_pid()
             .ok_or_else(|| "the engine is not running".to_string())?;
@@ -279,14 +277,32 @@ impl EngineManager {
 
         let paths = self.paths();
 
-        // Retarget containerd's snapshotter dirs when the data root sits on a
-        // filesystem without d_type, *before* spawning: dockerd would
-        // otherwise boot and then fail every pull with an opaque lease error.
-        ensure_snapshotter_compat(&paths.data_root)?;
-        // Compose must sit under the `DOCKER_CONFIG` we hand every docker
-        // invocation, otherwise the app silently uses the host's copy (or
-        // none). Idempotent, and a no-op on trees that are already correct.
-        let _ = ensure_compose_layout(&paths);
+        // Pre-flight self-repair, before anything is spawned. Every fix here is
+        // idempotent and never deletes user data, so a data root that was moved,
+        // replaced with an empty directory, or whose compat links were left
+        // dangling by an earlier install heals itself on the next start instead
+        // of surfacing as containerd's opaque "unknown service leases" error.
+        // Retargeting containerd's snapshotter dirs has to happen *before*
+        // dockerd boots, and compose has to sit under the `DOCKER_CONFIG` we
+        // hand every docker invocation.
+        let healed = doctor::auto_repair(&paths);
+        for id in &healed.repaired {
+            tracing::info!("engine self-repair applied: {id}");
+        }
+        for (id, reason) in &healed.failed {
+            tracing::warn!("engine self-repair could not fix {id}: {reason}");
+        }
+        // Booting on a data root whose snapshotter links cannot be made
+        // resolvable only produces containerd's opaque "unknown service
+        // ...leases" failure a few seconds later. Stop here, where the cause is
+        // still known and the Settings card can repair it.
+        if let Some((_, reason)) = healed
+            .failed
+            .iter()
+            .find(|(id, _)| id == doctor::CHECK_SNAPSHOTTER_LINKS)
+        {
+            bail!("could not prepare containerd snapshotter links: {reason}");
+        }
 
         for d in [
             &paths.data_root,
@@ -535,9 +551,7 @@ where
     F: FnMut(u64, Option<u64>),
 {
     // `http_get` already turned any non-2xx into an error.
-    let resp = http_get(url)
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let resp = http_get(url).await.with_context(|| format!("GET {url}"))?;
     let total = resp.content_length();
     let mut file = File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let mut resp = resp;
@@ -747,7 +761,7 @@ pub fn dir_supports_d_type(dir: &Path) -> Option<bool> {
     }
 }
 
-const SNAPSHOTTER_DTYPE_PLUGINS: [&str; 2] = [
+pub(crate) const SNAPSHOTTER_DTYPE_PLUGINS: [&str; 2] = [
     "io.containerd.snapshotter.v1.overlayfs",
     "io.containerd.snapshotter.v1.erofs",
 ];
@@ -807,10 +821,8 @@ fn heal_dangling_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
             continue;
         }
         let target = compat.join(plugin);
-        fs::create_dir_all(&target)
-            .with_context(|| format!("create {}", target.display()))?;
-        fs::remove_file(&link)
-            .with_context(|| format!("remove dangling {}", link.display()))?;
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        fs::remove_file(&link).with_context(|| format!("remove dangling {}", link.display()))?;
         std::os::unix::fs::symlink(&target, &link)
             .with_context(|| format!("relink {}", link.display()))?;
     }
@@ -824,13 +836,11 @@ fn heal_dangling_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
 /// unit-tested without a d_type-less filesystem (that needs a real volume).
 fn heal_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
     let daemon = dir.join("containerd").join("daemon");
-    fs::create_dir_all(&daemon)
-        .with_context(|| format!("create {}", daemon.display()))?;
+    fs::create_dir_all(&daemon).with_context(|| format!("create {}", daemon.display()))?;
 
     for plugin in SNAPSHOTTER_DTYPE_PLUGINS {
         let target = compat.join(plugin);
-        fs::create_dir_all(&target)
-            .with_context(|| format!("create {}", target.display()))?;
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
 
         let link = daemon.join(plugin);
         match fs::symlink_metadata(&link) {
@@ -853,8 +863,8 @@ fn heal_snapshotter_links(dir: &Path, compat: &Path) -> Result<()> {
             }
             // An empty real dir is safe to replace; a populated one is not.
             Ok(meta) if meta.is_dir() => {
-                let mut entries = fs::read_dir(&link)
-                    .with_context(|| format!("read {}", link.display()))?;
+                let mut entries =
+                    fs::read_dir(&link).with_context(|| format!("read {}", link.display()))?;
                 if entries.next().is_some() {
                     bail!(
                         "{} already contains containerd data on a filesystem \
@@ -1396,15 +1406,7 @@ impl InstallProgress {
     ) -> Self {
         let label = plan.get(step).cloned();
         Self::build(
-            target,
-            version,
-            plan,
-            step,
-            fraction,
-            None,
-            label,
-            false,
-            None,
+            target, version, plan, step, fraction, None, label, false, None,
         )
     }
 
@@ -1535,7 +1537,11 @@ where
         let base = i as f64;
         let mut last = 0u64;
         on_progress(InstallProgress::stage(
-            "engine", version, &plan, 1, Some(0.05),
+            "engine",
+            version,
+            &plan,
+            1,
+            Some(0.05),
         ));
         download(url, &dest, |done, total| {
             if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
@@ -1572,7 +1578,11 @@ where
     // 2. Extract. Binaries keep only their file name; compose goes to the
     //    CLI-plugin path the bundled `docker` will look under DOCKER_CONFIG.
     on_progress(InstallProgress::stage(
-        "engine", version, &plan, 3, Some(0.65),
+        "engine",
+        version,
+        &plan,
+        3,
+        Some(0.65),
     ));
     extract_binaries(&tmp.join("docker"), &bin_dir)?;
     extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
@@ -1596,7 +1606,11 @@ where
     // 3. Self-check the staged CLI: a tree that cannot report its own version
     //    must never become `current`.
     on_progress(InstallProgress::stage(
-        "engine", version, &plan, 4, Some(0.85),
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.85),
     ));
     let probe = Command::new(bin_dir.join("docker"))
         .arg("--version")
@@ -1613,7 +1627,11 @@ where
     if !probe.status.success() || normalize_version(reported) != version {
         bail!(
             "staged engine reported {}, but {version} was expected",
-            if reported.is_empty() { "nothing" } else { reported }
+            if reported.is_empty() {
+                "nothing"
+            } else {
+                reported
+            }
         );
     }
     on_progress(InstallProgress::note(
@@ -1724,7 +1742,9 @@ pub fn version_gt(a: &str, b: &str) -> bool {
 /// Nothing installed counts as an update, since the button performs the first
 /// install in that case.
 pub fn update_available(latest: &str, installed: Option<&str>) -> bool {
-    installed.map(|installed| version_gt(latest, installed)).unwrap_or(true)
+    installed
+        .map(|installed| version_gt(latest, installed))
+        .unwrap_or(true)
 }
 
 /// The version token out of `docker --version` output —
@@ -1760,20 +1780,23 @@ pub fn parse_latest_static_version(listing: &str) -> Option<String> {
     let mut best: Option<((u64, u64, u64), String)> = None;
     for (idx, _) in listing.match_indices("docker-") {
         let after = &listing[idx + "docker-".len()..];
-        let Some(end) = after.find(".tgz") else { continue };
+        let Some(end) = after.find(".tgz") else {
+            continue;
+        };
         let version = &after[..end];
         let mut parts = version.split('.');
-        let (Some(major), Some(minor), Some(patch)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
         if parts.next().is_some() {
             continue;
         }
-        let (Ok(major), Ok(minor), Ok(patch)) =
-            (major.parse::<u64>(), minor.parse::<u64>(), patch.parse::<u64>())
-        else {
+        let (Ok(major), Ok(minor), Ok(patch)) = (
+            major.parse::<u64>(),
+            minor.parse::<u64>(),
+            patch.parse::<u64>(),
+        ) else {
             continue;
         };
         let key = (major, minor, patch);
@@ -1834,7 +1857,11 @@ pub async fn check_engine_update(paths: &EnginePaths) -> Result<EngineUpdateInfo
 /// `download.docker.com`, their sha256 is recorded into the new version's
 /// `CHECKSUMS`, and the staged CLI must answer `docker --version` with its own
 /// version before anything becomes current.
-pub async fn install_engine_update<F>(paths: &EnginePaths, version: &str, mut on_progress: F) -> Result<()>
+pub async fn install_engine_update<F>(
+    paths: &EnginePaths,
+    version: &str,
+    mut on_progress: F,
+) -> Result<()>
 where
     F: FnMut(InstallProgress),
 {
@@ -1851,14 +1878,21 @@ where
     fs::create_dir_all(&tmp)?;
 
     // 1. Fetch both tarballs, recording what we actually received.
-    let artifacts = [(docker_url(version), "docker"), (rootless_url(version), "rootless-extras")];
+    let artifacts = [
+        (docker_url(version), "docker"),
+        (rootless_url(version), "rootless-extras"),
+    ];
     let mut checksums = String::new();
     for (i, (url, name)) in artifacts.iter().enumerate() {
         let dest = tmp.join(name);
         let base = i as f64;
         let mut last = 0u64;
         on_progress(InstallProgress::stage(
-            "engine", version, &plan, 1, Some(0.05),
+            "engine",
+            version,
+            &plan,
+            1,
+            Some(0.05),
         ));
         download(url, &dest, |done, total| {
             if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
@@ -1895,7 +1929,11 @@ where
 
     // 2. Extract. Binaries keep only their file name, as in the pinned path.
     on_progress(InstallProgress::stage(
-        "engine", version, &plan, 3, Some(0.65),
+        "engine",
+        version,
+        &plan,
+        3,
+        Some(0.65),
     ));
     extract_binaries(&tmp.join("docker"), &bin_dir)?;
     extract_binaries(&tmp.join("rootless-extras"), &bin_dir)?;
@@ -1927,7 +1965,11 @@ where
     // 4. Self-check before anything is swapped: a CLI that cannot report its
     //    own version must never become `current`.
     on_progress(InstallProgress::stage(
-        "engine", version, &plan, 4, Some(0.85),
+        "engine",
+        version,
+        &plan,
+        4,
+        Some(0.85),
     ));
     let probe = Command::new(bin_dir.join("docker"))
         .arg("--version")
@@ -2377,8 +2419,7 @@ pub fn ensure_shim_for(
     }
     let res = resolve_cli(paths, mode, &[]).map_err(anyhow::Error::msg)?;
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let script = format!(
         "#!/bin/sh\n\
@@ -2422,9 +2463,7 @@ pub fn remove_shim() -> Result<bool> {
 
 /// Canonical home of the bundled compose plugin, under our `DOCKER_CONFIG`.
 pub fn compose_plugin_dir(paths: &EnginePaths) -> PathBuf {
-    paths.current_dir
-        .join("docker-config")
-        .join("cli-plugins")
+    paths.current_dir.join("docker-config").join("cli-plugins")
 }
 
 /// Move a plugin into the directory Docker actually searches.
@@ -2438,8 +2477,7 @@ fn place_compose_plugin(src: &Path, dest: &Path) -> Result<()> {
     )?;
     // Copy rather than rename: the source may sit on another filesystem, and
     // a leftover legacy file is harmless next to a working canonical one.
-    fs::copy(src, dest)
-        .with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
+    fs::copy(src, dest).with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
     set_executable(dest)?;
     Ok(())
 }
@@ -2618,7 +2656,11 @@ where
 
     let plan = step_plan(COMPOSE_UPDATE_STEPS);
     on_progress(InstallProgress::stage(
-        "compose", &version, &plan, 0, Some(0.05),
+        "compose",
+        &version,
+        &plan,
+        0,
+        Some(0.05),
     ));
     let file_name = "docker-compose-linux-x86_64";
     let mut last = 0u64;
@@ -2646,19 +2688,28 @@ where
     set_executable(&staging).context("make staged compose executable")?;
 
     on_progress(InstallProgress::stage(
-        "compose", &version, &plan, 1, Some(0.55),
+        "compose",
+        &version,
+        &plan,
+        1,
+        Some(0.55),
     ));
     let sums = http_get(&compose_checksums_url(&version))
         .await?
         .text()
         .await
         .context("read compose checksums.txt")?;
-    let expected = parse_checksums(&sums, file_name)
-        .ok_or_else(|| anyhow::anyhow!("no {file_name} entry in compose {version} checksums.txt"))?;
+    let expected = parse_checksums(&sums, file_name).ok_or_else(|| {
+        anyhow::anyhow!("no {file_name} entry in compose {version} checksums.txt")
+    })?;
     verify(&staging, &expected).context("verifying compose")?;
 
     on_progress(InstallProgress::stage(
-        "compose", &version, &plan, 2, Some(0.7),
+        "compose",
+        &version,
+        &plan,
+        2,
+        Some(0.7),
     ));
     // A compose that cannot report its own version is not fit to install.
     let reported = probe_cli_version(&staging).ok_or_else(|| {
@@ -2678,7 +2729,11 @@ where
     ));
 
     on_progress(InstallProgress::stage(
-        "compose", &version, &plan, 3, Some(0.9),
+        "compose",
+        &version,
+        &plan,
+        3,
+        Some(0.9),
     ));
     fs::rename(&staging, &dest)
         .with_context(|| format!("install compose {version} to {}", dest.display()))?;
@@ -2748,7 +2803,11 @@ where
     let tarball = staging.join("docker.tgz");
 
     on_progress(InstallProgress::stage(
-        "cli", &version, &plan, 0, Some(0.05),
+        "cli",
+        &version,
+        &plan,
+        0,
+        Some(0.05),
     ));
     let mut last = 0u64;
     download(&docker_url(&version), &tarball, |done, total| {
@@ -2771,7 +2830,11 @@ where
     .await?;
 
     on_progress(InstallProgress::stage(
-        "cli", &version, &plan, 1, Some(0.55),
+        "cli",
+        &version,
+        &plan,
+        1,
+        Some(0.55),
     ));
     // The pinned release has a maintainer-checked digest; any other version is
     // fetched over TLS, and we record the digest we actually received.
@@ -2790,14 +2853,16 @@ where
         format!("sha256 {expected}"),
     ));
 
-    on_progress(InstallProgress::stage(
-        "cli", &version, &plan, 2, Some(0.7),
-    ));
+    on_progress(InstallProgress::stage("cli", &version, &plan, 2, Some(0.7)));
     let staged = staging.join("docker");
     extract_member(&tarball, "docker", &staged)?;
 
     on_progress(InstallProgress::stage(
-        "cli", &version, &plan, 3, Some(0.85),
+        "cli",
+        &version,
+        &plan,
+        3,
+        Some(0.85),
     ));
     let reported = probe_cli_version(&staged).ok_or_else(|| {
         anyhow::anyhow!("staged docker {version} failed `--version` — refusing to install")
@@ -2897,7 +2962,10 @@ mod tests {
         }))
         .is_err();
         std::panic::set_hook(quiet);
-        assert!(inner_panicked && paths_panicked, "poisoning steps must panic");
+        assert!(
+            inner_panicked && paths_panicked,
+            "poisoning steps must panic"
+        );
 
         // Every accessor recovers from the poisoned locks instead of panicking.
         let g1 = mgr.inner_lock();
@@ -3069,7 +3137,10 @@ mod tests {
         heal_snapshotter_links(&source, &compat).unwrap();
 
         assert!(symlink_resolves(&link), "dangling link must be repointed");
-        assert_eq!(fs::read_link(&link).unwrap(), compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0]));
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0])
+        );
         assert!(link.is_dir(), "the healed link must resolve to a directory");
 
         fs::remove_dir_all(&root).ok();
@@ -3095,7 +3166,10 @@ mod tests {
 
         heal_snapshotter_links(&source, &compat).unwrap();
 
-        assert!(link.join("marker").exists(), "live link must be left untouched");
+        assert!(
+            link.join("marker").exists(),
+            "live link must be left untouched"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3109,7 +3183,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let daemon = root.join("containerd/daemon");
         fs::create_dir_all(&daemon).unwrap();
-        assert_eq!(dir_supports_d_type(&root), Some(true), "fixture needs a healthy fs");
+        assert_eq!(
+            dir_supports_d_type(&root),
+            Some(true),
+            "fixture needs a healthy fs"
+        );
 
         let link = daemon.join(SNAPSHOTTER_DTYPE_PLUGINS[0]);
         std::os::unix::fs::symlink(root.join("gone"), &link).unwrap();
@@ -3119,7 +3197,10 @@ mod tests {
         heal_dangling_snapshotter_links(&root, &compat).unwrap();
 
         assert!(symlink_resolves(&link), "dangling link must be repaired");
-        assert_eq!(fs::read_link(&link).unwrap(), compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0]));
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            compat.join(SNAPSHOTTER_DTYPE_PLUGINS[0])
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3354,8 +3435,8 @@ mod tests {
             "io.containerd.snapshotter.v1.erofs",
         ] {
             let link = daemon.join(plugin);
-            let meta = fs::symlink_metadata(&link)
-                .unwrap_or_else(|e| panic!("{}: {e}", link.display()));
+            let meta =
+                fs::symlink_metadata(&link).unwrap_or_else(|e| panic!("{}: {e}", link.display()));
             assert!(
                 meta.file_type().is_symlink(),
                 "{} must be a symlink, got {meta:?}",
@@ -3614,10 +3695,16 @@ mod tests {
             rootless_state: tmp.join("rootless"),
         };
         std::fs::create_dir_all(p.current_dir.join("cli-plugins")).expect("legacy dir");
-        std::fs::write(p.current_dir.join("cli-plugins").join("docker-compose"), "# legacy")
-            .expect("legacy compose");
+        std::fs::write(
+            p.current_dir.join("cli-plugins").join("docker-compose"),
+            "# legacy",
+        )
+        .expect("legacy compose");
         // Legacy only → fallback points at the legacy file.
-        assert_eq!(p.compose_plugin(), p.current_dir.join("cli-plugins").join("docker-compose"));
+        assert_eq!(
+            p.compose_plugin(),
+            p.current_dir.join("cli-plugins").join("docker-compose")
+        );
         // Canonical exists → that one wins.
         let canonical = compose_plugin_dir(&p).join("docker-compose");
         std::fs::create_dir_all(canonical.parent().unwrap()).expect("canonical dir");
@@ -3647,7 +3734,8 @@ mod tests {
 
     #[test]
     fn parse_checksums_reads_the_matching_file() {
-        let sums = "abcdef0123456789  docker-compose-linux-x86_64\nfedcba9876543210  checksums.txt\n";
+        let sums =
+            "abcdef0123456789  docker-compose-linux-x86_64\nfedcba9876543210  checksums.txt\n";
         assert_eq!(
             parse_checksums(sums, "docker-compose-linux-x86_64").as_deref(),
             Some("abcdef0123456789")
@@ -3693,8 +3781,11 @@ mod tests {
         // build must still be recognised so startup can rewrite it instead of
         // refusing to overwrite it as a foreign file.
         let tmp = std::env::temp_dir().join(format!("dm_shim_legacy_{}", std::process::id()));
-        std::fs::write(&tmp, "#!/bin/sh\n# docker-manager shim\nexec /bin/true \"$@\"\n")
-            .expect("write legacy shim");
+        std::fs::write(
+            &tmp,
+            "#!/bin/sh\n# docker-manager shim\nexec /bin/true \"$@\"\n",
+        )
+        .expect("write legacy shim");
         assert!(is_our_shim(&tmp));
         let _ = std::fs::remove_file(&tmp);
     }
@@ -3702,9 +3793,15 @@ mod tests {
     #[test]
     fn parse_shim_exec_reads_the_target() {
         let body = "#!/bin/sh\n# hsx2dock shim\nexec /usr/bin/docker \"$@\"\n";
-        assert_eq!(parse_shim_exec(body), Some(PathBuf::from("/usr/bin/docker")));
+        assert_eq!(
+            parse_shim_exec(body),
+            Some(PathBuf::from("/usr/bin/docker"))
+        );
         let quoted = "#!/bin/sh\n# hsx2dock shim\nexec \"/usr/bin/docker\" \"$@\"\n";
-        assert_eq!(parse_shim_exec(quoted), Some(PathBuf::from("/usr/bin/docker")));
+        assert_eq!(
+            parse_shim_exec(quoted),
+            Some(PathBuf::from("/usr/bin/docker"))
+        );
         let args = "#!/bin/sh\n# hsx2dock shim\nexec /usr/local/bin/docker $*\n";
         assert_eq!(
             parse_shim_exec(args),
@@ -3714,5 +3811,3 @@ mod tests {
         assert!(parse_shim_exec("#!/bin/sh\n# hsx2dock shim\n").is_none());
     }
 }
-
-

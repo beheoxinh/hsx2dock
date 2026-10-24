@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tauri::State;
 
 use crate::config::RegistryConfig;
@@ -91,7 +92,14 @@ pub fn default_registry<'a>(cfg: &'a crate::config::AppConfig) -> Option<&'a Reg
 }
 
 #[tauri::command]
-pub async fn list_registries(state: State<'_, AppState>) -> Result<Vec<RegistryStatus>, String> {
+pub async fn list_registries(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<RegistryStatus>, String> {
+    list_registries_core(&state).await
+}
+
+/// App-free core of [`list_registries`], shared with the MCP server.
+pub(crate) async fn list_registries_core(state: &AppState) -> Result<Vec<RegistryStatus>, String> {
     let cfg = state.config.read().await;
     let default_id = default_registry(&cfg).map(|r| r.id.as_str()).unwrap_or("");
     Ok(cfg
@@ -104,12 +112,20 @@ pub async fn list_registries(state: State<'_, AppState>) -> Result<Vec<RegistryS
 /// Marks one saved login as the default for new pushes. An empty id clears
 /// the selection, which falls back to the first saved login.
 #[tauri::command]
-pub async fn set_default_registry(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn set_default_registry(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    set_default_registry_core(&state, &id).await
+}
+
+/// App-free core of [`set_default_registry`].
+pub(crate) async fn set_default_registry_core(state: &AppState, id: &str) -> Result<(), String> {
     let mut cfg = state.config.write().await;
     if !id.is_empty() && !cfg.registries.iter().any(|r| r.id == id) {
         return Err("No registry login with that id".into());
     }
-    cfg.default_registry = id;
+    cfg.default_registry = id.to_string();
     drop(cfg);
     state.save_config().await
 }
@@ -224,7 +240,11 @@ fn sanitize_reqwest_error(err: &reqwest::Error) -> String {
             let end = tail
                 .find(|c: char| c.is_whitespace() || c == '/')
                 .unwrap_or(tail.len());
-            format!("{} ({})", &tail[..end], full.split(':').last().unwrap_or("").trim())
+            format!(
+                "{} ({})",
+                &tail[..end],
+                full.split(':').next_back().unwrap_or("").trim()
+            )
         }
         None => full,
     }
@@ -233,7 +253,15 @@ fn sanitize_reqwest_error(err: &reqwest::Error) -> String {
 /// Upserts a login. An empty password on edit keeps the stored secret.
 #[tauri::command]
 pub async fn save_registry_auth(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    input: RegistryInput,
+) -> Result<(), String> {
+    save_registry_auth_core(&state, input).await
+}
+
+/// App-free core of [`save_registry_auth`].
+pub(crate) async fn save_registry_auth_core(
+    state: &AppState,
     input: RegistryInput,
 ) -> Result<(), String> {
     let host = normalize_host(&input.host);
@@ -308,7 +336,15 @@ pub async fn save_registry_auth(
 }
 
 #[tauri::command]
-pub async fn remove_registry_auth(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn remove_registry_auth(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    remove_registry_auth_core(&state, &id).await
+}
+
+/// App-free core of [`remove_registry_auth`].
+pub(crate) async fn remove_registry_auth_core(state: &AppState, id: &str) -> Result<(), String> {
     let mut cfg = state.config.write().await;
     let before = cfg.registries.len();
     cfg.registries.retain(|r| r.id != id);
@@ -425,7 +461,10 @@ mod tests {
         assert_eq!(default_registry(&cfg).map(|r| r.id.as_str()), Some("first"));
 
         cfg.default_registry = "second".into();
-        assert_eq!(default_registry(&cfg).map(|r| r.id.as_str()), Some("second"));
+        assert_eq!(
+            default_registry(&cfg).map(|r| r.id.as_str()),
+            Some("second")
+        );
 
         // A login removed outside the command leaves a dangling id; the
         // resolver must not hand back nothing while logins still exist.

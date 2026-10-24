@@ -34,6 +34,9 @@ pub struct AppState {
     /// the GTK thread and must decide synchronously, so it reads this instead
     /// of awaiting the config lock.
     pub close_to_tray: Arc<std::sync::atomic::AtomicBool>,
+    /// The loopback MCP HTTP server, when Settings has it enabled. Holding the
+    /// value is what keeps it alive; setting it to `None` stops it.
+    pub mcp_server: Arc<RwLock<Option<crate::mcp::http::RunningServer>>>,
 }
 
 impl AppState {
@@ -61,6 +64,7 @@ impl AppState {
             exec_sessions: Arc::new(RwLock::new(HashMap::new())),
             kind: KindPaths::for_app(),
             close_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(close_to_tray)),
+            mcp_server: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -97,12 +101,10 @@ impl AppState {
 
         let mut write_guard = self.client.write().await;
         let client = match remote {
-            Some(ep) => DockerClient::connect_for_endpoint(
-                &ep.kind,
-                &ep.uri,
-                Some(&self.engine.socket()),
-            )
-            .map_err(|e| format!("Endpoint '{}' unreachable: {e}", ep.name))?,
+            Some(ep) => {
+                DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, Some(&self.engine.socket()))
+                    .map_err(|e| format!("Endpoint '{}' unreachable: {e}", ep.name))?
+            }
             None => {
                 let socket = self.engine.socket();
                 DockerClient::connect(Some(&socket))

@@ -9,6 +9,7 @@ import {
   FileCode2,
   Settings,
   Activity,
+  Bot,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { cn } from "../../lib/utils";
@@ -21,6 +22,7 @@ export type NavTab =
   | "networks"
   | "kubernetes"
   | "compose"
+  | "mcp"
   | "settings";
 
 interface SidebarProps {
@@ -47,6 +49,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: "networks", label: "Networks", icon: Network },
     { id: "kubernetes", label: "Kubernetes", icon: Hexagon },
     { id: "compose", label: "Compose", icon: FileCode2 },
+    { id: "mcp", label: "MCP Server", icon: Bot },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 

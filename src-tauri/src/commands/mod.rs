@@ -5,6 +5,7 @@ pub mod exec;
 pub mod groups;
 pub mod images;
 pub mod kind;
+pub mod mcp;
 pub mod networks;
 pub mod registries;
 pub mod system;

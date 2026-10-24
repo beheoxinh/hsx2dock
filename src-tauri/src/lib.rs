@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod docker;
 pub mod fsutil;
+pub mod mcp;
 pub mod migrate;
 pub mod runtime;
 pub mod state;
@@ -27,7 +28,7 @@ fn start_background_monitoring(app_handle: AppHandle) {
         let mut last_state = None;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Some(state) = handle.try_state::<AppState>() {
+            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
                 let status = state.daemon_state();
                 if last_state.as_ref() != Some(&status) {
                     // The first tick after launch proves nothing about what the
@@ -49,7 +50,7 @@ fn start_background_monitoring(app_handle: AppHandle) {
                         // misbehaving container never stalls the tick.
                         let handle2 = handle.clone();
                         crate::runtime::spawn(async move {
-                            let Some(st) = handle2.try_state::<AppState>() else {
+                            let Some(st) = handle2.try_state::<std::sync::Arc<AppState>>() else {
                                 return;
                             };
                             if let Err(e) =
@@ -72,16 +73,15 @@ fn start_background_monitoring(app_handle: AppHandle) {
                             let app = handle.clone();
                             let restored_since = if had_previous_state { 0 } else { app_started };
                             tauri::async_runtime::spawn(async move {
-                                let Some(st2) = app.try_state::<AppState>() else {
+                                let Some(st2) = app.try_state::<std::sync::Arc<AppState>>() else {
                                     return;
                                 };
-                                if let Err(e) =
-                                    crate::commands::kind::reconcile_kind_auto_start(
-                                        app.clone(),
-                                        &st2,
-                                        restored_since,
-                                    )
-                                    .await
+                                if let Err(e) = crate::commands::kind::reconcile_kind_auto_start(
+                                    app.clone(),
+                                    &st2,
+                                    restored_since,
+                                )
+                                .await
                                 {
                                     tracing::warn!("kind auto-start reconcile failed: {e}");
                                 }
@@ -123,7 +123,9 @@ pub fn run() {
     // Rename any pre-rebrand (`docker-manager`) tree before anything reads a
     // path, so `AppState`/`EnginePaths` only ever see the new identity.
     crate::migrate::migrate_legacy_identity();
-    let app_state = crate::runtime::runtime().block_on(AppState::new());
+    // Shared rather than owned: the MCP HTTP server keeps its own handle so it
+    // can serve requests without going through Tauri's borrow of the state.
+    let app_state = std::sync::Arc::new(crate::runtime::runtime().block_on(AppState::new()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -137,7 +139,7 @@ pub fn run() {
                 return;
             };
             let app = window.app_handle();
-            let Some(state) = app.try_state::<AppState>() else {
+            let Some(state) = app.try_state::<std::sync::Arc<AppState>>() else {
                 return;
             };
             if !state.is_close_to_tray() {
@@ -149,9 +151,9 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
-            
+
             // Check auto-start engine daemon
-            if let Some(state) = handle.try_state::<AppState>() {
+            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
                 // Seed the process-wide CLI preference from the saved config so
                 // the first compose/docker invocation resolves the same binary
                 // the Settings card will report.
@@ -175,19 +177,37 @@ pub fn run() {
                         tracing::warn!("could not sync the autostart entry: {e}");
                     }
                 }
-                let should_autostart = crate::runtime::runtime().block_on(async {
-                    state.config.read().await.auto_start_daemon
-                });
-                if should_autostart && state.daemon_state() != docker::models::DaemonState::Running {
+                let should_autostart = crate::runtime::runtime()
+                    .block_on(async { state.config.read().await.auto_start_daemon });
+                if should_autostart && state.daemon_state() != docker::models::DaemonState::Running
+                {
                     let engine = state.engine.clone();
                     let h = handle.clone();
                     crate::runtime::spawn(async move {
                         tracing::info!("Auto-starting engine daemon...");
                         let _ = crate::runtime::engine_op(move || engine.start()).await;
                         // Trigger client reconnection
-                        if let Some(s) = h.try_state::<AppState>() {
+                        if let Some(s) = h.try_state::<std::sync::Arc<AppState>>() {
                             let _ = s.get_client().await;
                             let _ = h.emit("engine-state-changed", s.daemon_state());
+                        }
+                    });
+                }
+            }
+
+            // The MCP HTTP transport is opt-in from Settings. When it is on,
+            // it comes back up with the app so a configured agent keeps
+            // working across restarts. A failure here is logged, never fatal:
+            // an occupied port must not stop the GUI from opening.
+            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
+                let enabled = crate::runtime::runtime()
+                    .block_on(async { state.config.read().await.mcp_enabled });
+                if enabled {
+                    let state = state.inner().clone();
+                    crate::runtime::spawn(async move {
+                        if let Err(e) = crate::commands::mcp::apply_mcp_enabled(&state, true).await
+                        {
+                            tracing::warn!("could not start the MCP HTTP server: {e}");
                         }
                     });
                 }
@@ -199,7 +219,9 @@ pub fn run() {
                 // Spawn a short delayed task or perform on event loop so WebKitGTK / Wayland has realized the window
                 crate::runtime::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                    if let Ok(Some(monitor)) = win.primary_monitor().or_else(|_| win.current_monitor()) {
+                    if let Ok(Some(monitor)) =
+                        win.primary_monitor().or_else(|_| win.current_monitor())
+                    {
                         let scale_factor = monitor.scale_factor();
                         let screen_size = monitor.size();
                         let target_width = (screen_size.width as f64 * 0.90) as u32;
@@ -227,7 +249,7 @@ pub fn run() {
             let start_hidden = std::env::args()
                 .any(|arg| arg == crate::autostart::START_MINIMIZED_ARG)
                 && handle
-                    .try_state::<AppState>()
+                    .try_state::<std::sync::Arc<AppState>>()
                     .map(|state| {
                         crate::runtime::runtime().block_on(async {
                             let cfg = state.config.read().await;
@@ -339,7 +361,6 @@ pub fn run() {
             kind::install_metrics_server,
             kind::metrics_server_status,
             kind::detect_pod_shell,
-
             // Registries
             registries::list_registries,
             registries::test_registry_auth,
@@ -371,6 +392,14 @@ pub fn run() {
             system::prune_system,
             system::get_app_config,
             system::save_app_config,
+            // MCP front-end (Settings → MCP)
+            commands::mcp::mcp_status,
+            commands::mcp::mcp_set_enabled,
+            commands::mcp::mcp_rotate_token,
+            commands::mcp::mcp_token,
+            commands::mcp::mcp_catalogue,
+            commands::mcp::mcp_resources,
+            commands::mcp::mcp_prompts,
             system::get_cli_bridge_status,
             system::toggle_cli_bridge,
             system::check_data_root_path,
@@ -383,6 +412,8 @@ pub fn run() {
             system::toggle_cli_shim,
             system::check_compose_update,
             system::install_compose_update,
+            system::diagnose_engine,
+            system::repair_engine,
             endpoints::list_endpoints,
             endpoints::test_endpoint,
             endpoints::save_endpoint,

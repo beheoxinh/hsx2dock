@@ -19,7 +19,13 @@ import type {
   CliStatus,
   CliUpdateInfo,
   ComposeUpdateInfo,
+  EngineDoctorReport,
+  RepairReport,
   AppConfig,
+  McpStatus,
+  McpToolInfo,
+  McpResourceInfo,
+  McpPromptInfo,
   CliBridgeStatus,
   DaemonState,
   RunConfig,
@@ -69,12 +75,32 @@ export const api = {
   checkComposeUpdate: () => invoke<ComposeUpdateInfo>("check_compose_update"),
   installComposeUpdate: (version: string) =>
     invoke<string>("install_compose_update", { version }),
+  /** Read-only engine health: install, data root, snapshotter links, plugins. */
+  diagnoseEngine: () => invoke<EngineDoctorReport>("diagnose_engine"),
+  /**
+   * Apply repairs. Omit `checkIds` to run every auto-repairable fix (the same
+   * set the engine applies before each start).
+   */
+  repairEngine: (checkIds?: string[]) =>
+    invoke<RepairReport>("repair_engine", { checkIds: checkIds ?? null }),
   toggleEngine: () => invoke<DaemonState>("toggle_engine"),
   getEngineInfo: () => invoke<EngineInfo | null>("get_engine_info"),
   getDiskUsage: () => invoke<DfReport>("get_disk_usage"),
   pruneSystem: () => invoke<number>("prune_system"),
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
   saveAppConfig: (config: AppConfig) => invoke<void>("save_app_config", { config }),
+
+  // MCP front-end (Settings → MCP, and the MCP page)
+  mcpStatus: () => invoke<McpStatus>("mcp_status"),
+  /** Enables/disables the loopback HTTP transport; `port` omitted = keep current. */
+  mcpSetEnabled: (enabled: boolean, port?: number) =>
+    invoke<McpStatus>("mcp_set_enabled", { enabled, port }),
+  mcpRotateToken: () => invoke<McpStatus>("mcp_rotate_token"),
+  /** Returns the bearer token itself — call only when the user asks to see it. */
+  mcpToken: () => invoke<string>("mcp_token"),
+  mcpCatalogue: () => invoke<McpToolInfo[]>("mcp_catalogue"),
+  mcpResources: () => invoke<McpResourceInfo[]>("mcp_resources"),
+  mcpPrompts: () => invoke<McpPromptInfo[]>("mcp_prompts"),
   getCliBridgeStatus: () => invoke<CliBridgeStatus>("get_cli_bridge_status"),
   toggleCliBridge: (enabled: boolean) => invoke<CliBridgeStatus>("toggle_cli_bridge", { enabled }),
 

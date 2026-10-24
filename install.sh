@@ -74,6 +74,16 @@ info "Đang cài đặt binary 'hsx2dock' vào $USER_BIN_DIR/..."
 install -m 755 "$BIN_SRC" "$USER_BIN_DIR/hsx2dock"
 success "Đã cài đặt binary thành công."
 
+# 4b. Binary MCP (stdio) — agent khởi chạy nó trực tiếp, không cần GUI.
+MCP_SRC="$ROOT_DIR/src-tauri/target/release/hsx2dock-mcp"
+if [ -f "$MCP_SRC" ]; then
+    info "Đang cài đặt binary 'hsx2dock-mcp' vào $USER_BIN_DIR/..."
+    install -m 755 "$MCP_SRC" "$USER_BIN_DIR/hsx2dock-mcp"
+    success "Đã cài đặt MCP server (stdio)."
+else
+    warn "Không tìm thấy $MCP_SRC — bỏ qua MCP server. (Kiểm tra [[bin]] trong src-tauri/Cargo.toml)"
+fi
+
 # 5. Cài đặt icon SVG
 if [ -f "$LOCAL_ICON" ]; then
     info "Đang cài đặt icon '${APP_ID}.svg' vào $USER_ICONS_DIR/..."

@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use std::sync::Arc;
 use tauri::State;
 
 use crate::config::ContainerGroup;
@@ -11,7 +12,14 @@ use crate::state::AppState;
 /// All saved container groups, in config order.
 #[tauri::command]
 pub async fn list_container_groups(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ContainerGroup>, String> {
+    list_container_groups_core(&state).await
+}
+
+/// App-free core of [`list_container_groups`], shared with the MCP server.
+pub(crate) async fn list_container_groups_core(
+    state: &AppState,
 ) -> Result<Vec<ContainerGroup>, String> {
     Ok(state.config.read().await.container_groups.clone())
 }
@@ -20,7 +28,15 @@ pub async fn list_container_groups(
 /// the result, which keeps renames/removals/reorders in one round trip.
 #[tauri::command]
 pub async fn save_container_groups(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
+    groups: Vec<ContainerGroup>,
+) -> Result<(), String> {
+    save_container_groups_core(&state, groups).await
+}
+
+/// App-free core of [`save_container_groups`].
+pub(crate) async fn save_container_groups_core(
+    state: &AppState,
     groups: Vec<ContainerGroup>,
 ) -> Result<(), String> {
     validate_groups(&groups)?;
@@ -34,19 +50,35 @@ pub async fn save_container_groups(
 /// could be started.
 #[tauri::command]
 pub async fn start_container_group(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<String, String> {
-    set_group_power(&state, &id, true).await
+    start_container_group_core(&state, &id).await
+}
+
+/// App-free core of [`start_container_group`].
+pub(crate) async fn start_container_group_core(
+    state: &AppState,
+    id: &str,
+) -> Result<String, String> {
+    set_group_power(state, id, true).await
 }
 
 /// Stops every running member of a group; same summary contract as start.
 #[tauri::command]
 pub async fn stop_container_group(
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<String, String> {
-    set_group_power(&state, &id, false).await
+    stop_container_group_core(&state, &id).await
+}
+
+/// App-free core of [`stop_container_group`].
+pub(crate) async fn stop_container_group_core(
+    state: &AppState,
+    id: &str,
+) -> Result<String, String> {
+    set_group_power(state, id, false).await
 }
 
 fn validate_groups(groups: &[ContainerGroup]) -> Result<(), String> {
@@ -85,7 +117,7 @@ fn validate_groups(groups: &[ContainerGroup]) -> Result<(), String> {
     Ok(())
 }
 
-async fn set_group_power(
+pub(crate) async fn set_group_power(
     state: &AppState,
     id: &str,
     start: bool,
@@ -196,11 +228,8 @@ mod tests {
 
     #[test]
     fn a_container_cannot_belong_to_two_groups() {
-        let err = validate_groups(&[
-            group("g1", "A", &["abc"]),
-            group("g2", "B", &["abc"]),
-        ])
-        .unwrap_err();
+        let err =
+            validate_groups(&[group("g1", "A", &["abc"]), group("g2", "B", &["abc"])]).unwrap_err();
         assert!(err.contains("more than one group"), "{err}");
         // The same container listed twice inside one group is fine to reject
         // too — it is still one membership claimed twice.
