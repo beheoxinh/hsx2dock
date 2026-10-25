@@ -6,7 +6,6 @@ import {
   Trash2,
   Box,
   ArrowRight,
-  AlertTriangle,
   RotateCw,
   ChevronDown,
   ChevronUp,
@@ -60,7 +59,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   const [network, setNetwork] = useState("");
 
   // UI state
-  const [showAdvanced, setShowAdvanced] = useState(!isEdit);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
 
   // Sync state when dialog opens or editTarget changes
@@ -125,8 +124,8 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       setCommand(d.command || (d.command_vec ? d.command_vec.join(" ") : ""));
       setNetwork(d.network || "");
 
-      // In edit mode, default to showing the recreate section collapsed or open depending on need
-      setShowAdvanced(true);
+      // Default collapsed when opened
+      setShowAdvanced(false);
     } else {
       // New container defaults
       setImage("");
@@ -141,7 +140,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       setNetwork("");
       setMemoryMb("");
       setCpus("");
-      setShowAdvanced(true);
+      setShowAdvanced(false);
     }
   }, [isOpen, editTarget]);
 
@@ -297,32 +296,11 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
             onSubmit={handleSubmit}
             className="flex-1 overflow-y-auto p-6 space-y-6"
           >
-            {/* Warning banner in Edit mode */}
-            {isEdit && (
-              <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 flex items-start gap-3">
-                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                <div className="text-xs space-y-1">
-                  <p className="font-semibold text-amber-200">
-                    Cơ chế Recreate của Docker
-                  </p>
-                  <p className="text-zinc-300 leading-relaxed">
-                    Port forward, ENV, mounts và command được gắn cố định lúc tạo container.
-                    Khi bấm <strong>Save & Recreate</strong>, app sẽ dừng container cũ, xoá và tạo lại container mới với cấu hình đã sửa mà vẫn giữ nguyên tên và các Volume dữ liệu.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Section 1: Standard & Resource Settings (Available without recreate) */}
+            {/* Section 1: Standard & Resource Settings */}
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h4 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider flex items-center gap-2">
                   <span>General & Resources</span>
-                  {isEdit && (
-                    <span className="text-[10px] lowercase font-normal px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      in-place or recreate
-                    </span>
-                  )}
                 </h4>
               </div>
 
@@ -440,6 +418,13 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
 
               {showAdvanced && (
                 <div className="space-y-6 pt-2">
+                  {/* Informational note for edit & recreate */}
+                  {isEdit && (
+                    <p className="text-xs text-zinc-300 leading-relaxed">
+                      Network mappings, environment variables, mounts, and command are fixed at container creation time. Saving changes here will automatically stop, remove, and recreate the container while preserving its name and volume data.
+                    </p>
+                  )}
+
                   {/* Port Forwarding */}
                   <div>
                     <div className="flex items-center justify-between mb-2">
