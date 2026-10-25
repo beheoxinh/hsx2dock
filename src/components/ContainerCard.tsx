@@ -14,6 +14,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Settings2,
 } from "lucide-react";
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
@@ -44,6 +45,7 @@ interface ContainerCardProps {
     tab?: "logs" | "inspect" | "stats" | "terminal",
     debug?: boolean
   ) => void;
+  onEditContainer?: () => void;
 }
 
 /**
@@ -140,6 +142,7 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   compact = false,
   onAction,
   onOpenDetails,
+  onEditContainer,
 }) => {
   const isRunning = c.state === "running";
   const name = c.name.replace(/^\//, "");
@@ -342,6 +345,18 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             >
               <SlidersHorizontal className="w-4 h-4" />
             </Button>
+            {onEditContainer && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onEditContainer}
+                title="Edit & Recreate (ports, env, mounts...)"
+                aria-label={`Edit and recreate ${name}`}
+                className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+              >
+                <Settings2 className="w-4 h-4" />
+              </Button>
+            )}
           </>
         )}
 

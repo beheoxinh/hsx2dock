@@ -4,7 +4,7 @@
 //! particular job looks like when done well. They exist because the same
 //! three jobs (diagnose the engine, audit container health, audit a cluster)
 //! are what this app is actually for, and an agent asked "fix my docker" has
-//! no idea which of 109 tools to start with.
+//! no idea which of 110 tools to start with.
 //!
 //! The text here is the single source of truth for the `hsx2dock://guide`
 //! resource too, so an agent that only reads resources still gets the same

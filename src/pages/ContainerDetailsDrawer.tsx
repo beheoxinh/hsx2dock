@@ -11,6 +11,7 @@ import {
   RotateCw,
   Pencil,
   SlidersHorizontal,
+  Settings2,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { TerminalViewer } from "../components/ui/TerminalViewer";
@@ -28,6 +29,8 @@ interface ContainerDetailsDrawerProps {
   debug?: boolean;
   /** Open straight into the resource-limits editor (row-level Edit button). */
   editLimits?: boolean;
+  /** Open full configuration editor (recreate wizard) with container details. */
+  onOpenEditConfig?: (details: ContainerDetails) => void;
   onClose: () => void;
 }
 
@@ -36,6 +39,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
   initialTab = "logs",
   debug = false,
   editLimits = false,
+  onOpenEditConfig,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<"logs" | "inspect" | "stats" | "terminal">(initialTab);
@@ -278,6 +282,18 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               <Button variant="ghost" size="icon" onClick={loadAll} title="Reload Data">
                 <RotateCw className="w-4 h-4" />
               </Button>
+              {onOpenEditConfig && details && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => onOpenEditConfig(details)}
+                  title="Edit container & recreate (ports, env, mounts, command)"
+                  aria-label="Edit container configuration"
+                  className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                >
+                  <Settings2 className="w-4 h-4" />
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="icon"
@@ -452,6 +468,29 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                     <span>{copied ? "Copied" : "Copy JSON"}</span>
                   </Button>
                 </div>
+
+                {/* Quick actions banner */}
+                {details && onOpenEditConfig && (
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-3 flex items-center justify-between">
+                    <div>
+                      <span className="text-xs font-semibold text-white block">
+                        Edit Full Configuration
+                      </span>
+                      <span className="text-[11px] text-zinc-400 block mt-0.5">
+                        Modify ports, environment variables, mounts, command or image (recreate)
+                      </span>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => onOpenEditConfig(details)}
+                      className="gap-1.5 text-xs text-amber-400 border-amber-500/30 hover:bg-amber-500/10"
+                    >
+                      <Settings2 className="w-3.5 h-3.5" />
+                      Edit & Recreate
+                    </Button>
+                  </div>
+                )}
 
                 {/* Resource limits snapshot + inline editor */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-3">

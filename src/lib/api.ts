@@ -154,6 +154,8 @@ export const api = {
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),
   updateContainerResources: (id: string, limits: ResourceLimits) =>
     invoke<void>("update_container_resources", { id, limits }),
+  recreateContainer: (id: string, config: RunConfig) =>
+    invoke<string>("recreate_container", { id, config }),
 
   // Interactive exec / debug
   startInteractiveExec: (

@@ -9,7 +9,10 @@ import { ContainerDragProvider } from "./components/ContainerDragLayer";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ContainersPage } from "./pages/ContainersPage";
 import { ContainerDetailsDrawer } from "./pages/ContainerDetailsDrawer";
-import { RunContainerWizard } from "./pages/RunContainerWizard";
+import {
+  RunContainerWizard,
+  type EditContainerTarget,
+} from "./pages/RunContainerWizard";
 import { ImagesPage } from "./pages/ImagesPage";
 import { VolumesPage } from "./pages/VolumesPage";
 import { NetworksPage } from "./pages/NetworksPage";
@@ -30,6 +33,7 @@ const MainLayout: React.FC = () => {
   const [drawerDebug, setDrawerDebug] = useState(false);
   const [drawerEdit, setDrawerEdit] = useState(false);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
+  const [wizardEditTarget, setWizardEditTarget] = useState<EditContainerTarget | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   // Cluster requested by a tray row click; consumed by KubernetesPage.
   const [trayCluster, setTrayCluster] = useState<string | null>(null);
@@ -162,6 +166,16 @@ const MainLayout: React.FC = () => {
     setDrawerEdit(edit);
   };
 
+  const handleOpenEditContainer = async (containerId: string) => {
+    try {
+      const details = await api.inspectContainer(containerId);
+      setWizardEditTarget({ id: containerId, details });
+      setIsWizardOpen(true);
+    } catch (err) {
+      toast.error("Cannot inspect container", String(err));
+    }
+  };
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-950 font-sans">
       {/* Sidebar Navigation */}
@@ -215,7 +229,11 @@ const MainLayout: React.FC = () => {
                 <ContainersPage
                   daemonState={daemonState}
                   onOpenDetails={handleOpenDetails}
-                  onOpenWizard={() => setIsWizardOpen(true)}
+                  onOpenWizard={() => {
+                    setWizardEditTarget(null);
+                    setIsWizardOpen(true);
+                  }}
+                  onEditContainer={handleOpenEditContainer}
                 />
               )}
               {activeTab === "images" && <ImagesPage refreshKey={refreshKey} daemonState={daemonState} />}
@@ -243,6 +261,10 @@ const MainLayout: React.FC = () => {
           initialTab={drawerTab}
           debug={drawerDebug}
           editLimits={drawerEdit}
+          onOpenEditConfig={(details) => {
+            setWizardEditTarget({ id: details.id, details });
+            setIsWizardOpen(true);
+          }}
           onClose={() => {
             setSelectedContainerId(null);
             setDrawerDebug(false);
@@ -251,13 +273,23 @@ const MainLayout: React.FC = () => {
         />
       )}
 
-      {/* Run Container Wizard Modal */}
+      {/* Run / Edit Container Wizard Modal */}
       <RunContainerWizard
         isOpen={isWizardOpen}
-        onClose={() => setIsWizardOpen(false)}
-        onSuccess={() => {
+        editTarget={wizardEditTarget}
+        onClose={() => {
+          setIsWizardOpen(false);
+          setWizardEditTarget(null);
+        }}
+        onSuccess={(newId) => {
           setRefreshKey((k) => k + 1);
-          toast.success("Container Launched", "New container instance created.");
+          if (wizardEditTarget && selectedContainerId === wizardEditTarget.id) {
+            if (newId) {
+              setSelectedContainerId(newId);
+            } else {
+              setSelectedContainerId(null);
+            }
+          }
         }}
       />
     </div>

@@ -297,6 +297,7 @@ pub fn run() {
             containers::get_container_sizes,
             containers::run_container,
             containers::update_container_resources,
+            containers::recreate_container,
             // Interactive exec / debug
             exec::start_interactive_exec,
             exec::debug_container,

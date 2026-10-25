@@ -27,6 +27,7 @@ interface ContainersPageProps {
     edit?: boolean
   ) => void;
   onOpenWizard: () => void;
+  onEditContainer?: (id: string) => void;
   /** Engine state — the page renders an EngineGate panel unless Running. */
   daemonState?: DaemonState;
 }
@@ -42,7 +43,8 @@ const DraggableContainerCard: React.FC<{
   busy: boolean;
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
-}> = ({ container, stats, busy, onAction, onOpenDetails }) => {
+  onEditContainer?: () => void;
+}> = ({ container, stats, busy, onAction, onOpenDetails, onEditContainer }) => {
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
@@ -56,6 +58,7 @@ const DraggableContainerCard: React.FC<{
       dragHandle={dragHandle}
       onAction={onAction}
       onOpenDetails={onOpenDetails}
+      onEditContainer={onEditContainer}
     />
   );
 };
@@ -63,6 +66,7 @@ const DraggableContainerCard: React.FC<{
 export const ContainersPage: React.FC<ContainersPageProps> = ({
   onOpenDetails,
   onOpenWizard,
+  onEditContainer,
   daemonState = "Running",
 }) => {
   const [containers, setContainers] = useState<ContainerItem[]>([]);
@@ -271,6 +275,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                     busy={isBusy}
                     onAction={(action) => handleAction(c, action)}
                     onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                    onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
                   />
                 </motion.div>
               );

@@ -79,6 +79,25 @@ export interface ContainerDetails {
   limits: ResourceLimits;
   /** Current restart policy as inspect reports it ("" when unknown). */
   restart_policy?: string;
+  /** Structured fields from Rust ContainerDetails */
+  short_id?: string;
+  command_vec?: string[];
+  entrypoint?: string[];
+  port_mappings?: PortMapping[];
+  env_pairs?: EnvVar[];
+  volume_mounts?: VolumeMount[];
+  labels?: EnvVar[];
+  hostname?: string;
+  workdir?: string;
+  user?: string;
+  network?: string;
+  resources?: ResourceLimits;
+  restart_max_retries?: string;
+  privileged?: boolean;
+  tty?: boolean;
+  stdin_open?: boolean;
+  auto_remove?: boolean;
+  read_only_rootfs?: boolean;
 }
 
 export interface ImageItem {
@@ -467,6 +486,7 @@ export interface EnvVar {
 }
 
 export interface VolumeMount {
+  kind?: "bind" | "volume";
   source: string;
   target: string;
   read_only?: boolean;

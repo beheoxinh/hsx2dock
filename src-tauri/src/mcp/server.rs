@@ -311,6 +311,21 @@ impl McpServer {
                 (Ok(id), Ok(force)) => done_unit(self.remove_container(&id, force).await),
                 (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
             },
+            "container_recreate" => {
+                match (args.req_str("id"), object_arg::<RunConfig>(args, "config")) {
+                    (Ok(id), Ok(config)) => done(
+                        crate::commands::containers::recreate_container_core(
+                            &self.state,
+                            &id,
+                            config,
+                        )
+                        .await
+                        .map(|new_id| json!({ "id": new_id })),
+                    ),
+                    (Err(e), _) => fail(e.to_string()),
+                    (_, Err(e)) => fail(e),
+                }
+            }
             "container_run" => match object_arg::<RunConfig>(args, "config") {
                 Ok(config) => done_unit(self.run_container(config).await),
                 Err(e) => fail(e),

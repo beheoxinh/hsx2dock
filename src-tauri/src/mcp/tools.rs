@@ -407,6 +407,25 @@ pub fn catalogue() -> Vec<ToolSpec> {
             ]),
         },
         ToolSpec {
+            name: "container_recreate",
+            title: "Recreate container (edit configuration)",
+            description: "Edit immutable container configuration (ports, env, mounts, command, etc.) \
+                          by recreating the container. Stops and removes the old container, then \
+                          starts a new one with the updated RunConfig while preserving its name and group. \
+                          Returns the new container id.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                id_arg(),
+                (
+                    "config",
+                    object(),
+                    true,
+                    "Updated RunConfig object. Fields that are not provided or empty keep original values.",
+                ),
+            ]),
+        },
+        ToolSpec {
             name: "container_run",
             title: "Run container",
             description: "Create and start a container from an image. The `config` object is the \
@@ -1697,6 +1716,7 @@ mod tests {
     fn deleting_and_pruning_tools_are_destructive() {
         for name in [
             "container_remove",
+            "container_recreate",
             "container_prune",
             "image_remove",
             "image_prune",

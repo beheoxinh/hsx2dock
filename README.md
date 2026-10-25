@@ -74,7 +74,7 @@ Docker engine and manages kind (Kubernetes-in-Docker) clusters.
   optional "set as default". Re-applied every 10s while enabled; never touches
   `/var/run/docker.sock` or other contexts.
 - **MCP server (AI agents)** — the whole app is exposed over the Model Context
-  Protocol: 109 tools, 12 resources and 4 prompts covering the engine,
+  Protocol: 110 tools, 12 resources and 4 prompts covering the engine,
   diagnostics and self-repair, containers, groups, images, volumes, networks,
   compose, kind/Kubernetes, endpoints, registries and storage. Agents launch
   the standalone `hsx2dock-mcp` binary over stdio, or talk to a loopback HTTP
