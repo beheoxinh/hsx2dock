@@ -10,7 +10,6 @@ import {
   Check,
   RotateCw,
   Pencil,
-  SlidersHorizontal,
   Settings2,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
@@ -294,16 +293,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                   <Settings2 className="w-4 h-4" />
                 </Button>
               )}
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={openLimitsEditor}
-                disabled={!details}
-                title="Edit resource limits & restart policy"
-                aria-label="Edit resource limits"
-              >
-                <SlidersHorizontal className="w-4 h-4" />
-              </Button>
+
               <Button variant="ghost" size="icon" onClick={onClose} title="Close">
                 <X className="w-5 h-5" />
               </Button>

@@ -10,7 +10,6 @@ import {
   Pause,
   Play,
   RotateCw,
-  SlidersHorizontal,
   Square,
   Terminal,
   Trash2,
@@ -332,17 +331,6 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
           className="text-zinc-400 hover:text-white"
         >
           <FileText className="w-4 h-4" />
-        </Button>
-
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => onOpenDetails("inspect")}
-          title="Edit limits"
-          aria-label={`Edit resource limits for ${name}`}
-          className="text-zinc-400 hover:text-white"
-        >
-          <SlidersHorizontal className="w-4 h-4" />
         </Button>
 
         {onEditContainer && (
