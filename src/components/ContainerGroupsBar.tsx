@@ -328,6 +328,38 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     }
   };
 
+  const removeComposeProject = async (g: ContainerGroup) => {
+    const project = g.id.slice("compose:".length);
+    const members = membersOf(g);
+    const confirmed = await modal.showConfirm(
+      `This will stop and remove all ${members.length} containers belonging to this project (compose down).`,
+      `Delete Compose Project "${project}"?`,
+      "danger"
+    );
+    if (!confirmed) return;
+
+    setBusy((b) => ({ ...b, [g.id]: true }));
+    try {
+      const out = await api.composeProjectAction(project, "down");
+      toast.success("Project deleted", out.trim() ? `${project}: ${out.trim()}` : project);
+      // Clean up saved order entry if any
+      await saveAll(groups.filter((x) => x.id !== g.id));
+      onChanged?.();
+    } catch (e) {
+      // Fallback: remove containers directly if compose down fails
+      try {
+        await Promise.allSettled(members.map((c) => api.removeContainer(c.id, true)));
+        await saveAll(groups.filter((x) => x.id !== g.id));
+        toast.success("Project deleted", project);
+        onChanged?.();
+      } catch (err) {
+        toast.error("Could not delete compose project", String(e || err));
+      }
+    } finally {
+      setBusy((b) => ({ ...b, [g.id]: false }));
+    }
+  };
+
   const removeGroup = async (g: ContainerGroup) => {
     const members = membersOf(g);
     const choice = await modal.showChoice(
@@ -678,7 +710,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onAutoStart={() => undefined}
             onBulk={(action) => void runComposeBulk(g, action)}
             onRestart={() => void runComposeBulk(g, "restart")}
-            onDelete={() => undefined}
+            onDelete={() => void removeComposeProject(g)}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
             onContainerAction={onContainerAction}
@@ -935,29 +967,28 @@ const GroupCard: React.FC<GroupCardProps> = ({
             </>
           )}
           {!compose && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon"
-                title="Rename group"
-                aria-label={`Rename group ${g.name}`}
-                onClick={onRenameStart}
-                className="text-zinc-400 hover:text-white"
-              >
-                <Pencil className="w-3.5 h-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                title="Delete group"
-                aria-label={`Delete group ${g.name}`}
-                onClick={onDelete}
-                className="text-zinc-400 hover:text-rose-400"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-              </Button>
-            </>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Rename group"
+              aria-label={`Rename group ${g.name}`}
+              onClick={onRenameStart}
+              className="text-zinc-400 hover:text-white"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </Button>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            title={compose ? "Delete compose project" : "Delete group"}
+            aria-label={compose ? `Delete compose project ${g.name}` : `Delete group ${g.name}`}
+            disabled={busy}
+            onClick={onDelete}
+            className="text-zinc-400 hover:text-rose-400"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </Button>
         </div>
       </div>
 

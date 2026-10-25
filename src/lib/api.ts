@@ -323,7 +323,7 @@ export const api = {
   stopContainerGroup: (id: string) => invoke<string>("stop_container_group", { id }),
 
   // Compose project lifecycle addressed by project name (no compose file)
-  composeProjectAction: (project: string, action: "start" | "stop" | "restart") =>
+  composeProjectAction: (project: string, action: "start" | "stop" | "restart" | "down") =>
     invoke<string>("compose_project_action", { project, action }),
 };
 

@@ -64,7 +64,7 @@ pub async fn project_action(project: &str, subcommand: &str) -> anyhow::Result<S
         if project.is_empty() {
             bail!("project name is required");
         }
-        if !matches!(subcommand.as_str(), "start" | "stop" | "restart") {
+        if !matches!(subcommand.as_str(), "start" | "stop" | "restart" | "down") {
             bail!("unsupported compose project action '{subcommand}'");
         }
         let args = ["compose", "-p", project.as_str(), subcommand.as_str()];
