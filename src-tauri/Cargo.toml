@@ -5,6 +5,11 @@ edition = "2021"
 authors = ["Hsx2Coder"]
 description = "Modern cross-platform Docker GUI Manager powered by Tauri v2 and React"
 license = "MIT"
+default-run = "hsx2dock"
+
+[[bin]]
+name = "hsx2dock"
+path = "src/main.rs"
 
 [lib]
 name = "hsx2dock_lib"

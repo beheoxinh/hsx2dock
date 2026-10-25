@@ -323,41 +323,39 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
           <RotateCw className="w-4 h-4" />
         </Button>
 
-        {!compact && (
-          <>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => onOpenDetails("logs")}
-              title="View logs"
-              aria-label={`View logs for ${name}`}
-              className="text-zinc-400 hover:text-white"
-            >
-              <FileText className="w-4 h-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => onOpenDetails("inspect")}
-              title="Edit limits"
-              aria-label={`Edit resource limits for ${name}`}
-              className="text-zinc-400 hover:text-white"
-            >
-              <SlidersHorizontal className="w-4 h-4" />
-            </Button>
-            {onEditContainer && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onEditContainer}
-                title="Edit & Recreate (ports, env, mounts...)"
-                aria-label={`Edit and recreate ${name}`}
-                className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
-              >
-                <Settings2 className="w-4 h-4" />
-              </Button>
-            )}
-          </>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => onOpenDetails("logs")}
+          title="View logs"
+          aria-label={`View logs for ${name}`}
+          className="text-zinc-400 hover:text-white"
+        >
+          <FileText className="w-4 h-4" />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => onOpenDetails("inspect")}
+          title="Edit limits"
+          aria-label={`Edit resource limits for ${name}`}
+          className="text-zinc-400 hover:text-white"
+        >
+          <SlidersHorizontal className="w-4 h-4" />
+        </Button>
+
+        {onEditContainer && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onEditContainer}
+            title="Edit & Recreate (ports, env, mounts...)"
+            aria-label={`Edit and recreate ${name}`}
+            className="text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+          >
+            <Settings2 className="w-4 h-4" />
+          </Button>
         )}
 
         <Button

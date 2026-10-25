@@ -250,6 +250,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         statsMap={statsMap}
         onChanged={loadContainers}
         onOpenDetails={onOpenDetails}
+        onEditContainer={onEditContainer}
         onContainerAction={handleAction}
         busyMap={actionLoading}
       >

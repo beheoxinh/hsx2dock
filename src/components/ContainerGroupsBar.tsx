@@ -52,6 +52,7 @@ interface ContainerGroupsBarProps {
     tab?: "logs" | "inspect" | "stats" | "terminal",
     debug?: boolean
   ) => void;
+  onEditContainer?: (id: string) => void;
   /** Runs a lifecycle action on a member card. */
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
   /** Containers with an action in flight, so their buttons disable. */
@@ -113,7 +114,8 @@ const MemberCard: React.FC<{
   ownGroupId: string;
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
-}> = ({ c, stats, busy, ownGroupId, onAction, onOpenDetails }) => {
+  onEditContainer?: () => void;
+}> = ({ c, stats, busy, ownGroupId, onAction, onOpenDetails, onEditContainer }) => {
   const drag = useDraggable({
     id: c.id,
     label: c.name.replace(/^\//, ""),
@@ -129,6 +131,7 @@ const MemberCard: React.FC<{
       compact
       onAction={onAction}
       onOpenDetails={onOpenDetails}
+      onEditContainer={onEditContainer}
     />
   );
 };
@@ -196,6 +199,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   statsMap,
   onChanged,
   onOpenDetails,
+  onEditContainer,
   onContainerAction,
   busyMap,
   children,
@@ -676,6 +680,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onRestart={() => void runComposeBulk(g, "restart")}
             onDelete={() => undefined}
             onOpenDetails={onOpenDetails}
+            onEditContainer={onEditContainer}
             onContainerAction={onContainerAction}
           />
         ))}
@@ -701,6 +706,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onRestart={() => undefined}
             onDelete={() => void removeGroup(g)}
             onOpenDetails={onOpenDetails}
+            onEditContainer={onEditContainer}
             onContainerAction={onContainerAction}
           />
         ))}
@@ -742,6 +748,7 @@ interface GroupCardProps {
     tab?: "logs" | "inspect" | "stats" | "terminal",
     debug?: boolean
   ) => void;
+  onEditContainer?: (id: string) => void;
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
 }
 
@@ -765,6 +772,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
   onRestart,
   onDelete,
   onOpenDetails,
+  onEditContainer,
   onContainerAction,
 }) => {
   const drop = useDropTarget(g.id);
@@ -989,6 +997,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
                     ownGroupId={g.id}
                     onAction={(action) => onContainerAction(c, action)}
                     onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                    onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
                   />
                 </React.Fragment>
               ))}
