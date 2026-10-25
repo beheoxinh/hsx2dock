@@ -252,7 +252,8 @@ Read hsx2dock://guide for the full tool reference, and use the built-in prompts
 user's request matches one of those jobs.`;
 
   return (
-    <div className="p-8 space-y-6 max-w-7xl mx-auto">
+    <div className="h-full overflow-y-auto">
+      <div className="p-8 space-y-6 max-w-7xl mx-auto">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold tracking-tight text-white">MCP Server</h2>
@@ -532,10 +533,11 @@ user's request matches one of those jobs.`;
         </Section>
       </div>
 
-      <p className="text-xs text-zinc-600 pb-4">
-        {status ? `${status.serverName} v${status.serverVersion}` : "hsx2dock"} ·{" "}
-        {tools.length} tools · protocol: Model Context Protocol (stdio + streamable HTTP)
-      </p>
+        <p className="text-xs text-zinc-600 pb-4">
+          {status ? `${status.serverName} v${status.serverVersion}` : "hsx2dock"} ·{" "}
+          {tools.length} tools · protocol: Model Context Protocol (stdio + streamable HTTP)
+        </p>
+      </div>
     </div>
   );
 };
