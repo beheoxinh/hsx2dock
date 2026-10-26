@@ -148,7 +148,8 @@ export const api = {
   removeContainer: (id: string, force: boolean = false) => invoke<void>("remove_container", { id, force }),
   renameContainer: (id: string, newName: string) => invoke<void>("rename_container", { id, newName }),
   inspectContainer: (id: string) => invoke<ContainerDetails>("inspect_container", { id }),
-  getContainerLogs: (id: string, tail: string = "200") => invoke<string>("get_container_logs", { id, tail }),
+  getContainerLogs: (id: string, tail: string = "200", timestamps?: boolean) =>
+    invoke<string>("get_container_logs", { id, tail, timestamps }),
   getContainerStats: (id: string) => invoke<ContainerStats>("get_container_stats", { id }),
   getContainerSizes: () => invoke<Record<string, number>>("get_container_sizes"),
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),

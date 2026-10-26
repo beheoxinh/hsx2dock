@@ -13,7 +13,9 @@ import {
   Play,
   RotateCw,
   Square,
+  FileText,
 } from "lucide-react";
+import { GroupLogsModal } from "./groups/GroupLogsModal";
 import { Button } from "./ui/Button";
 import { Switch } from "./ui/Switch";
 import { useToast } from "./ui/Toast";
@@ -218,6 +220,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   // should be the deliberate action, not the default.
   const [isolatedOpen, setIsolatedOpen] = useState(true);
   const toggleIsolated = () => setIsolatedOpen((v) => !v);
+  const [logsGroup, setLogsGroup] = useState<{ name: string; containers: ContainerItem[] } | null>(null);
 
   const loadSizes = useCallback(async () => {
     try {
@@ -711,6 +714,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onBulk={(action) => void runComposeBulk(g, action)}
             onRestart={() => void runComposeBulk(g, "restart")}
             onDelete={() => void removeComposeProject(g)}
+            onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
             onContainerAction={onContainerAction}
@@ -737,6 +741,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onBulk={(action) => void runBulk(g, action)}
             onRestart={() => undefined}
             onDelete={() => void removeGroup(g)}
+            onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
             onContainerAction={onContainerAction}
@@ -747,6 +752,15 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           {children}
         </IsolatedCard>
       </div>
+
+      {logsGroup && (
+        <GroupLogsModal
+          isOpen={true}
+          onClose={() => setLogsGroup(null)}
+          groupName={logsGroup.name}
+          containers={logsGroup.containers}
+        />
+      )}
     </div>
   );
 };
@@ -775,6 +789,7 @@ interface GroupCardProps {
   /** Only used by compose project cards, which have a restart verb. */
   onRestart: () => void;
   onDelete: () => void;
+  onOpenLogs?: () => void;
   onOpenDetails: (
     id: string,
     tab?: "logs" | "inspect" | "stats" | "terminal",
@@ -803,6 +818,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
   onBulk,
   onRestart,
   onDelete,
+  onOpenLogs,
   onOpenDetails,
   onEditContainer,
   onContainerAction,
@@ -965,6 +981,18 @@ const GroupCard: React.FC<GroupCardProps> = ({
                 </Button>
               )}
             </>
+          )}
+          {hasMembers && onOpenLogs && (
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Group logs"
+              aria-label={`View group logs for ${g.name}`}
+              onClick={onOpenLogs}
+              className="text-zinc-400 hover:text-indigo-300 hover:bg-indigo-500/10"
+            >
+              <FileText className="w-3.5 h-3.5" />
+            </Button>
           )}
           {!compose && (
             <Button

@@ -1001,7 +1001,7 @@ impl McpServer {
     async fn container_logs(&self, id: &str, tail: usize) -> Result<String, String> {
         let client = self.state.get_client().await?;
         client
-            .container_logs(id, &tail.to_string())
+            .container_logs(id, &tail.to_string(), false)
             .await
             .map_err(|e| e.to_string())
     }

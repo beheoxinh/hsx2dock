@@ -459,12 +459,12 @@ impl DockerClient {
         Ok(ContainerStats::default())
     }
 
-    pub async fn container_logs(&self, id: &str, tail: &str) -> anyhow::Result<String> {
+    pub async fn container_logs(&self, id: &str, tail: &str, timestamps: bool) -> anyhow::Result<String> {
         let opts = bollard::query_parameters::LogsOptionsBuilder::default()
             .stdout(true)
             .stderr(true)
             .tail(tail)
-            .timestamps(false)
+            .timestamps(timestamps)
             .build();
         let mut out = String::new();
         let mut stream = self.docker.logs(id, Some(opts));
@@ -1280,8 +1280,8 @@ impl DockerClient {
     }
 
     /// Fetch the last `tail` lines of a container's logs (decoded text).
-    pub async fn logs_tail(&self, id: &str, tail: &str) -> anyhow::Result<String> {
-        self.container_logs(id, tail).await
+    pub async fn logs_tail(&self, id: &str, tail: &str, timestamps: bool) -> anyhow::Result<String> {
+        self.container_logs(id, tail, timestamps).await
     }
 
     /// Stream container logs line-by-line; `follow=true` keeps the

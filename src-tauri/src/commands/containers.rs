@@ -111,10 +111,11 @@ pub async fn get_container_logs(
     state: State<'_, Arc<AppState>>,
     id: String,
     tail: String,
+    timestamps: Option<bool>,
 ) -> Result<String, String> {
     let client = state.get_client().await?;
     client
-        .logs_tail(&id, &tail)
+        .logs_tail(&id, &tail, timestamps.unwrap_or(false))
         .await
         .map_err(|e| e.to_string())
 }
