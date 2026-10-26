@@ -202,22 +202,82 @@ pub(crate) async fn set_group_power(
     Ok(summary)
 }
 
-/// Starts every group flagged `auto_start` once the engine is up (app open,
-/// manual engine start). Failures are logged, never propagated — a missing
-/// container must not break startup.
-pub async fn auto_start_groups(state: &AppState) {
-    let ids: Vec<String> = {
+/// Reconciles container auto-start when the Docker engine starts up:
+/// 1. Stops any Compose projects or isolated/custom groups that Docker daemon
+///    auto-started via their container restart policy (unless_stopped / always)
+///    if their auto_start toggle is OFF.
+/// 2. Starts all groups/compose projects that have auto_start turned ON.
+pub async fn auto_start_groups(state: &AppState, restored_since: i64) {
+    // Give dockerd a brief moment to finish its internal container restore pass
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let (allowed_groups, all_configured_groups) = {
         let cfg = state.config.read().await;
-        cfg.container_groups
+        let allowed: std::collections::HashSet<String> = cfg
+            .container_groups
             .iter()
             .filter(|g| g.auto_start)
             .map(|g| g.id.clone())
-            .collect()
+            .collect();
+        let all: Vec<crate::config::ContainerGroup> = cfg.container_groups.clone();
+        (allowed, all)
     };
-    if ids.is_empty() {
-        return;
+
+    if let Ok(client) = state.get_client().await {
+        if let Ok(containers) = client.list_containers(true).await {
+            // Find all running containers that were brought up by this engine start
+            for c in containers.iter().filter(|c| c.state == "running") {
+                // Ignore kind cluster nodes (managed by reconcile_kind_auto_start)
+                if c.kind_cluster.is_some() {
+                    continue;
+                }
+
+                let started = client.container_started_at(&c.id).await.unwrap_or(0);
+                if started < restored_since {
+                    // Predates this engine launch; user or previous session left it running
+                    continue;
+                }
+
+                // Check if this container belongs to a Compose project
+                if let Some(project) = c.compose_project.as_deref() {
+                    let group_id = format!("compose:{project}");
+                    // If compose project auto_start is not enabled (either toggle is off or not in config),
+                    // stop this container
+                    if !allowed_groups.contains(&group_id) {
+                        tracing::info!("Stopping container {} of compose project {}: auto-start is OFF", c.name, project);
+                        let _ = client.stop_container(&c.id).await;
+                    }
+                    continue;
+                }
+
+                // Check if this container belongs to a custom group
+                let custom_group = all_configured_groups.iter().find(|g| {
+                    !g.id.starts_with("compose:")
+                        && g.id != "__isolated__"
+                        && g.container_ids.iter().any(|token| {
+                            token == &c.id || token == &c.short_id || token == &c.name
+                        })
+                });
+
+                if let Some(g) = custom_group {
+                    if !allowed_groups.contains(&g.id) {
+                        tracing::info!("Stopping container {} of group {}: auto-start is OFF", c.name, g.name);
+                        let _ = client.stop_container(&c.id).await;
+                    }
+                    continue;
+                }
+
+                // Otherwise, this container is isolated (ungrouped)
+                if !allowed_groups.contains("__isolated__") {
+                    tracing::info!("Stopping isolated container {}: auto-start is OFF", c.name);
+                    let _ = client.stop_container(&c.id).await;
+                }
+            }
+        }
     }
-    for id in ids {
+
+    // Now start all groups that have auto_start turned ON
+    for id in allowed_groups {
         match set_group_power(state, &id, true).await {
             Ok(summary) => tracing::info!("auto-start group {id}: {summary}"),
             Err(e) => tracing::warn!("auto-start group {id} failed: {e}"),

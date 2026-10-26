@@ -61,7 +61,8 @@ fn start_background_monitoring(app_handle: AppHandle) {
                             // Groups are this engine's lifecycle — never
                             // auto-start them into a remote endpoint.
                             if st.config.read().await.active_endpoint.is_none() {
-                                crate::commands::groups::auto_start_groups(&st).await;
+                                let restored_since = if had_previous_state { 0 } else { app_started };
+                                crate::commands::groups::auto_start_groups(&st, restored_since).await;
                             }
                         });
                         // Kind clusters: pin node restart policies (kind's
