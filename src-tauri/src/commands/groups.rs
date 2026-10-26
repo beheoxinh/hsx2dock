@@ -40,9 +40,72 @@ pub(crate) async fn save_container_groups_core(
     groups: Vec<ContainerGroup>,
 ) -> Result<(), String> {
     validate_groups(&groups)?;
-    let mut cfg = state.config.write().await;
-    cfg.container_groups = groups;
-    cfg.save().await.map_err(|e| e.to_string())
+    {
+        let mut cfg = state.config.write().await;
+        cfg.container_groups = groups.clone();
+        cfg.save().await.map_err(|e| e.to_string())?;
+    }
+    // Synchronize container restart policies with groups' auto_start setting
+    let _ = enforce_groups_restart_policy(state, &groups).await;
+    Ok(())
+}
+
+/// Enforces Docker restart policy (`"no"` vs `"unless-stopped"`) based on group auto-start settings.
+/// When auto-start is OFF, setting restart policy to `"no"` prevents dockerd from resurrecting
+/// containers independently upon engine restart.
+pub async fn enforce_groups_restart_policy(
+    state: &AppState,
+    groups: &[ContainerGroup],
+) -> Result<(), String> {
+    let Ok(client) = state.get_client().await else {
+        return Ok(());
+    };
+    let Ok(containers) = client.list_containers(true).await else {
+        return Ok(());
+    };
+
+    let allowed_groups: std::collections::HashSet<&str> = groups
+        .iter()
+        .filter(|g| g.auto_start)
+        .map(|g| g.id.as_str())
+        .collect();
+
+    for c in &containers {
+        // Skip kind cluster nodes (managed separately by kind supervisor)
+        if c.kind_cluster.is_some() {
+            continue;
+        }
+
+        let is_auto_start_on = if let Some(project) = c.compose_project.as_deref() {
+            let group_id = format!("compose:{project}");
+            allowed_groups.contains(group_id.as_str())
+        } else if let Some(g) = groups.iter().find(|g| {
+            !g.id.starts_with("compose:")
+                && g.id != "__isolated__"
+                && g.container_ids.iter().any(|token| {
+                    token == &c.id || token == &c.short_id || token == &c.name
+                })
+        }) {
+            allowed_groups.contains(g.id.as_str())
+        } else {
+            // Isolated container
+            allowed_groups.contains("__isolated__")
+        };
+
+        let target_policy = if is_auto_start_on {
+            "unless-stopped"
+        } else {
+            "no"
+        };
+
+        if let Ok(details) = client.inspect_container(&c.id).await {
+            if details.restart_policy != target_policy {
+                let _ = client.update_restart_policy(&c.id, target_policy).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Starts every stopped member of a group. Returns a one-line summary
@@ -207,7 +270,7 @@ pub(crate) async fn set_group_power(
 ///    auto-started via their container restart policy (unless_stopped / always)
 ///    if their auto_start toggle is OFF.
 /// 2. Starts all groups/compose projects that have auto_start turned ON.
-pub async fn auto_start_groups(state: &AppState, restored_since: i64) {
+pub async fn auto_start_groups(state: &AppState, _restored_since: i64) {
     // Give dockerd a brief moment to finish its internal container restore pass
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
@@ -223,18 +286,16 @@ pub async fn auto_start_groups(state: &AppState, restored_since: i64) {
         (allowed, all)
     };
 
+    // First enforce restart policies on all containers so dockerd won't resurrect
+    // containers whose auto-start toggle is off in future restarts
+    let _ = enforce_groups_restart_policy(state, &all_configured_groups).await;
+
     if let Ok(client) = state.get_client().await {
         if let Ok(containers) = client.list_containers(true).await {
-            // Find all running containers that were brought up by this engine start
+            // Find all running containers and stop those whose auto-start is OFF
             for c in containers.iter().filter(|c| c.state == "running") {
                 // Ignore kind cluster nodes (managed by reconcile_kind_auto_start)
                 if c.kind_cluster.is_some() {
-                    continue;
-                }
-
-                let started = client.container_started_at(&c.id).await.unwrap_or(0);
-                if started < restored_since {
-                    // Predates this engine launch; user or previous session left it running
                     continue;
                 }
 
