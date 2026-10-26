@@ -122,7 +122,37 @@ pub(crate) async fn set_group_power(
     id: &str,
     start: bool,
 ) -> Result<String, String> {
-    let members = {
+    if let Some(project) = id.strip_prefix("compose:") {
+        let action = if start { "start" } else { "stop" };
+        return crate::commands::compose::compose_project_action_core(project, action).await;
+    }
+
+    let client = state.get_client().await?;
+    let live = client
+        .list_containers(true)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let members: Vec<String> = if id == "__isolated__" {
+        let cfg = state.config.read().await;
+        let mut grouped_tokens = std::collections::HashSet::new();
+        for g in &cfg.container_groups {
+            if !g.id.starts_with("compose:") && g.id != "__isolated__" {
+                for token in &g.container_ids {
+                    grouped_tokens.insert(token.as_str());
+                }
+            }
+        }
+        live.iter()
+            .filter(|c| {
+                c.compose_project.is_none()
+                    && !grouped_tokens.contains(c.id.as_str())
+                    && !grouped_tokens.contains(c.short_id.as_str())
+                    && !grouped_tokens.contains(c.name.as_str())
+            })
+            .map(|c| c.id.clone())
+            .collect()
+    } else {
         let cfg = state.config.read().await;
         cfg.container_groups
             .iter()
@@ -130,21 +160,16 @@ pub(crate) async fn set_group_power(
             .map(|g| g.container_ids.clone())
             .ok_or_else(|| format!("Group '{id}' no longer exists"))?
     };
+
     if members.is_empty() {
         return Err("The group has no containers".to_string());
     }
-    let client = state.get_client().await?;
-    let live = client
-        .list_containers(true)
-        .await
-        .map_err(|e| e.to_string())?;
+
     let mut done = 0usize;
     let mut skipped = 0usize;
     let mut missing = 0usize;
     let mut errors: Vec<String> = Vec::new();
     for member in &members {
-        // Members are stored by id, but accepting names/short ids keeps
-        // groups working across engine data migrations.
         let Some(item) = live
             .iter()
             .find(|c| c.id == *member || c.short_id == *member || c.name == *member)

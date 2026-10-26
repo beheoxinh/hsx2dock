@@ -80,11 +80,11 @@ const newId = () =>
 const composeId = (project: string) => `compose:${project}`;
 
 /** The synthetic group wrapping one compose project's containers. */
-const composeGroup = (project: string, memberIds: string[]): ContainerGroup => ({
+const composeGroup = (project: string, memberIds: string[], autoStart: boolean = false): ContainerGroup => ({
   id: composeId(project),
   name: project,
   container_ids: memberIds,
-  auto_start: false,
+  auto_start: autoStart,
 });
 
 /**
@@ -96,12 +96,13 @@ const composeGroup = (project: string, memberIds: string[]): ContainerGroup => (
  */
 const persistedComposeGroup = (
   project: string,
-  memberIds: string[]
+  memberIds: string[],
+  autoStart: boolean = false
 ): ContainerGroup => ({
   id: composeId(project),
   name: composeId(project),
   container_ids: memberIds,
-  auto_start: false,
+  auto_start: autoStart,
 });
 
 /** True for a saved entry that only carries a compose project's card order. */
@@ -279,6 +280,51 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         groups.map((x) =>
           x.id === g.id ? { ...x, auto_start: !x.auto_start } : x
         )
+      );
+    } catch (e) {
+      toast.error("Could not update auto-start", String(e));
+    }
+  };
+
+  const toggleComposeAutoStart = async (g: ContainerGroup) => {
+    const project = g.id.slice("compose:".length);
+    const existing = groups.find((x) => x.id === g.id);
+    const nextAutoStart = !g.auto_start;
+    const others = groups.filter((x) => x.id !== g.id);
+    try {
+      const nextGroup = existing
+        ? { ...existing, auto_start: nextAutoStart }
+        : persistedComposeGroup(project, g.container_ids, nextAutoStart);
+      await saveAll([...others, nextGroup]);
+      toast.success(
+        `Compose auto-start ${nextAutoStart ? "enabled" : "disabled"}`,
+        `Project "${g.name}" will ${nextAutoStart ? "start" : "not start"} with the engine.`
+      );
+    } catch (e) {
+      toast.error("Could not update auto-start", String(e));
+    }
+  };
+
+  const isolatedGroup = groups.find((x) => x.id === "__isolated__");
+  const isolatedAutoStart = !!isolatedGroup?.auto_start;
+
+  const toggleIsolatedAutoStart = async () => {
+    const nextAutoStart = !isolatedAutoStart;
+    const existing = groups.find((x) => x.id === "__isolated__");
+    const others = groups.filter((x) => x.id !== "__isolated__");
+    try {
+      const nextGroup: ContainerGroup = existing
+        ? { ...existing, auto_start: nextAutoStart }
+        : {
+            id: "__isolated__",
+            name: "__isolated__",
+            container_ids: [],
+            auto_start: nextAutoStart,
+          };
+      await saveAll([...others, nextGroup]);
+      toast.success(
+        `Isolated auto-start ${nextAutoStart ? "enabled" : "disabled"}`,
+        `Ungrouped containers will ${nextAutoStart ? "start" : "not start"} with the engine.`
       );
     } catch (e) {
       toast.error("Could not update auto-start", String(e));
@@ -518,7 +564,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
           (order.get(b.id) ?? Number.MAX_SAFE_INTEGER)
       );
-      out.push(composeGroup(project, sorted.map((c) => c.id)));
+      out.push(composeGroup(project, sorted.map((c) => c.id), !!saved?.auto_start));
     }
     // Projects sort by name so the list does not reshuffle between polls.
     return out.sort((a, b) => a.name.localeCompare(b.name));
@@ -710,7 +756,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onRenameChange={() => undefined}
             onRenameCommit={() => undefined}
             onRenameCancel={() => undefined}
-            onAutoStart={() => undefined}
+            onAutoStart={() => void toggleComposeAutoStart(g)}
             onBulk={(action) => void runComposeBulk(g, action)}
             onRestart={() => void runComposeBulk(g, "restart")}
             onDelete={() => void removeComposeProject(g)}
@@ -748,7 +794,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           />
         ))}
 
-        <IsolatedCard isolated={isolated} isOpen={isolatedOpen} onToggle={toggleIsolated}>
+        <IsolatedCard
+          isolated={isolated}
+          isOpen={isolatedOpen}
+          autoStart={isolatedAutoStart}
+          onToggle={toggleIsolated}
+          onAutoStart={toggleIsolatedAutoStart}
+        >
           {children}
         </IsolatedCard>
       </div>
@@ -928,19 +980,17 @@ const GroupCard: React.FC<GroupCardProps> = ({
           {/* Auto-start is a policy, not an action, so it leads the row as a
               labelled switch — an icon button here read as "run once".
               Compose projects start with their project, not the engine. */}
-          {!compose && (
-            <Switch
-              checked={g.auto_start}
-              onChange={onAutoStart}
-              label="Auto-start"
-              title={
-                g.auto_start
-                  ? "Auto-start on — starts with the engine"
-                  : "Auto-start off — manual start only"
-              }
-              className="mr-1.5"
-            />
-          )}
+          <Switch
+            checked={g.auto_start}
+            onChange={onAutoStart}
+            label="Auto-start"
+            title={
+              g.auto_start
+                ? "Auto-start on — starts with the engine"
+                : "Auto-start off — manual start only"
+            }
+            className="mr-1.5"
+          />
           {hasMembers && (
             <>
               <Button
@@ -1099,7 +1149,9 @@ const GroupCard: React.FC<GroupCardProps> = ({
 interface IsolatedCardProps {
   isolated: ContainerItem[];
   isOpen: boolean;
+  autoStart: boolean;
   onToggle: () => void;
+  onAutoStart: () => void;
   /** The ungrouped container cards, rendered inside this bucket. */
   children?: React.ReactNode;
 }
@@ -1116,7 +1168,9 @@ interface IsolatedCardProps {
 const IsolatedCard: React.FC<IsolatedCardProps> = ({
   isolated,
   isOpen,
+  autoStart,
   onToggle,
+  onAutoStart,
   children,
 }) => {
   const drop = useDropTarget(null);
@@ -1157,6 +1211,19 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
               : "every container is grouped"}
           </span>
         </button>
+
+        <div className="flex shrink-0 items-center gap-1">
+          <Switch
+            checked={autoStart}
+            onChange={onAutoStart}
+            label="Auto-start"
+            title={
+              autoStart
+                ? "Auto-start on — starts with the engine"
+                : "Auto-start off — manual start only"
+            }
+          />
+        </div>
       </div>
 
       <div className="px-4 pb-3">
