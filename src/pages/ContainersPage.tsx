@@ -40,11 +40,12 @@ interface ContainersPageProps {
 const DraggableContainerCard: React.FC<{
   container: ContainerItem;
   stats?: ContainerStats;
+  sizeBytes?: number;
   busy: boolean;
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
   onEditContainer?: () => void;
-}> = ({ container, stats, busy, onAction, onOpenDetails, onEditContainer }) => {
+}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer }) => {
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
@@ -54,6 +55,7 @@ const DraggableContainerCard: React.FC<{
     <ContainerCard
       container={container}
       stats={stats}
+      sizeBytes={sizeBytes}
       busy={busy}
       dragHandle={dragHandle}
       onAction={onAction}
@@ -71,6 +73,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 }) => {
   const [containers, setContainers] = useState<ContainerItem[]>([]);
   const [statsMap, setStatsMap] = useState<Record<string, ContainerStats>>({});
+  const [sizesMap, setSizesMap] = useState<Record<string, number>>({});
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
@@ -88,8 +91,12 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const loadContainers = async () => {
     try {
       setLoading(true);
-      const data = await api.listContainers(true);
-      setContainers(data);
+      const [data, sizes] = await Promise.allSettled([
+        api.listContainers(true),
+        api.getContainerSizes(),
+      ]);
+      if (data.status === "fulfilled") setContainers(data.value);
+      if (sizes.status === "fulfilled") setSizesMap(sizes.value ?? {});
     } catch (e) {
       console.error(e);
     } finally {
@@ -273,6 +280,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                   <DraggableContainerCard
                     container={c}
                     stats={stats}
+                    sizeBytes={sizesMap[c.id]}
                     busy={isBusy}
                     onAction={(action) => handleAction(c, action)}
                     onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}

@@ -289,6 +289,11 @@ impl DockerClient {
                     compose_project,
                     compose_service,
                     kind_cluster,
+                    networks: c
+                        .network_settings
+                        .and_then(|n| n.networks)
+                        .map(|m| m.into_keys().collect())
+                        .unwrap_or_default(),
                 }
             })
             .collect())

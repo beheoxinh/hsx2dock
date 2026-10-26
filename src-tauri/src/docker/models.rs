@@ -41,6 +41,9 @@ pub struct ContainerItem {
     /// Kind cluster this container belongs to (from label `io.x-k8s.kind.cluster`).
     #[serde(default)]
     pub kind_cluster: Option<String>,
+    /// Primary or active network name(s).
+    #[serde(default)]
+    pub networks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

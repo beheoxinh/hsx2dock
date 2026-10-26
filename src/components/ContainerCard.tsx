@@ -6,7 +6,9 @@ import {
   Cpu,
   ExternalLink,
   FileText,
+  HardDrive,
   Layers,
+  Network,
   Pause,
   Play,
   RotateCw,
@@ -17,7 +19,6 @@ import {
 } from "lucide-react";
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
-import { StatusBadge } from "./ui/StatusBadge";
 import { useToast } from "./ui/Toast";
 import { formatBytes, truncateId } from "../lib/utils";
 import { portChips, type PortChip } from "../lib/portExposure";
@@ -33,6 +34,7 @@ export type ContainerAction =
 interface ContainerCardProps {
   container: ContainerItem;
   stats?: ContainerStats;
+  sizeBytes?: number;
   busy?: boolean;
   /** Pointer-down handle from `useDraggable`; omitted for non-draggable cards. */
   dragHandle?: { onPointerDown: (e: React.PointerEvent) => void };
@@ -135,6 +137,7 @@ const PortChipBadge: React.FC<{ chip: PortChip; containerName: string }> = ({
 export const ContainerCard: React.FC<ContainerCardProps> = ({
   container: c,
   stats,
+  sizeBytes,
   busy = false,
   dragHandle,
   isDragSource = false,
@@ -163,7 +166,7 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
       }`}
       {...(dragHandle ?? {})}
     >
-      {/* Left: identity (Name + ID on row 1, Image on row 2) */}
+      {/* Left: identity (Status dot + Name + ID on row 1, Image on row 2) */}
       <div className={`flex items-start min-w-0 flex-1 lg:max-w-[340px] xl:max-w-[420px] ${compact ? "gap-2.5" : "gap-3.5"}`}>
         <div
           className={`shrink-0 rounded-xl bg-zinc-800/80 border border-zinc-700/60 flex items-center justify-center text-zinc-300 mt-0.5 ${
@@ -174,6 +177,27 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
         </div>
         <div className="min-w-0 flex-1 space-y-1">
           <div className="flex items-center gap-2">
+            {/* Status indicator dot positioned directly in front of the container name */}
+            <span
+              className="relative flex h-2.5 w-2.5 shrink-0"
+              title={`Status: ${c.state}`}
+            >
+              {isRunning && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+                  isRunning
+                    ? "bg-emerald-400"
+                    : c.state.includes("pause")
+                    ? "bg-amber-400"
+                    : c.state.includes("restart")
+                    ? "bg-blue-400"
+                    : "bg-zinc-500"
+                }`}
+              />
+            </span>
+
             <span
               className={`font-semibold text-white tracking-tight truncate ${
                 compact ? "text-sm" : "text-sm"
@@ -182,11 +206,12 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             >
               {name}
             </span>
+
             <span className="font-mono text-[11px] text-zinc-400 shrink-0">
               {truncateId(c.id)}
             </span>
           </div>
-          <div className="flex items-center text-xs text-zinc-400">
+          <div className="flex items-center text-xs text-zinc-400 pl-4.5">
             <span
               className="truncate font-mono text-[11px] text-zinc-400 hover:text-zinc-300 transition-colors"
               title={c.image}
@@ -197,12 +222,10 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
         </div>
       </div>
 
-      {/* Middle: Status & Metrics on top row, Port tags on bottom row */}
+      {/* Middle: Metrics on top row (CPU, MEMORY, STORAGE), Network & Port tags on bottom row */}
       <div className="flex flex-col gap-1.5 flex-1 min-w-0 lg:px-2">
-        {/* Row 1: Status badge, CPU, Memory */}
+        {/* Row 1: CPU, Memory, Storage */}
         <div className="flex items-center gap-2 flex-wrap">
-          <StatusBadge status={c.state} />
-
           <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-950/60 border border-zinc-800/80 font-mono text-[11px] text-zinc-300">
             <Cpu className="w-3 h-3 text-blue-400 shrink-0" />
             <span className="text-zinc-500 text-[10px] font-sans uppercase font-medium mr-0.5">CPU</span>
@@ -214,10 +237,39 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             <span className="text-zinc-500 text-[10px] font-sans uppercase font-medium mr-0.5">MEM</span>
             <span>{isRunning && stats ? formatBytes(stats.mem_usage) : "—"}</span>
           </div>
+
+          <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-950/60 border border-zinc-800/80 font-mono text-[11px] text-zinc-300">
+            <HardDrive className="w-3 h-3 text-amber-400 shrink-0" />
+            <span className="text-zinc-500 text-[10px] font-sans uppercase font-medium mr-0.5">DISK</span>
+            <span>{sizeBytes !== undefined && sizeBytes > 0 ? formatBytes(sizeBytes) : "0 B"}</span>
+          </div>
         </div>
 
-        {/* Row 2: Ports inline badges */}
+        {/* Row 2: Network badge at start, followed by published Ports */}
         <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+          {/* Network badge */}
+          {c.networks && c.networks.length > 0 ? (
+            c.networks.map((net) => (
+              <span
+                key={net}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-500/10 border border-indigo-500/25 text-indigo-300 font-mono text-[10px] font-medium"
+                title={`Connected to network: ${net}`}
+              >
+                <Network className="w-2.5 h-2.5 text-indigo-400" />
+                <span>{net}</span>
+              </span>
+            ))
+          ) : (
+            <span
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-900 border border-zinc-800 text-zinc-400 font-mono text-[10px]"
+              title="Default bridge network"
+            >
+              <Network className="w-2.5 h-2.5 text-zinc-500" />
+              <span>bridge</span>
+            </span>
+          )}
+
+          {/* Published port tags */}
           {chips.length === 0 ? (
             <span className="text-[11px] text-zinc-600 font-mono italic">No published ports</span>
           ) : (

@@ -112,13 +112,14 @@ const isComposeOrderEntry = (g: ContainerGroup) => g.id.startsWith("compose:");
 const MemberCard: React.FC<{
   c: ContainerItem;
   stats?: ContainerStats;
+  sizeBytes?: number;
   busy: boolean;
   /** Groups this card is rendered in — enables the in-place reorder preview. */
   ownGroupId: string;
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
   onEditContainer?: () => void;
-}> = ({ c, stats, busy, ownGroupId, onAction, onOpenDetails, onEditContainer }) => {
+}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer }) => {
   const drag = useDraggable({
     id: c.id,
     label: c.name.replace(/^\//, ""),
@@ -129,6 +130,7 @@ const MemberCard: React.FC<{
     <ContainerCard
       container={c}
       stats={stats}
+      sizeBytes={sizeBytes}
       busy={busy}
       dragHandle={drag}
       compact
@@ -749,6 +751,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             isOpen={!!expanded[g.id]}
             editing={null}
             statsMap={statsMap}
+            sizesMap={sizes}
             busyMap={busyMap}
             compose
             onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
@@ -777,6 +780,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             isOpen={!!expanded[g.id]}
             editing={editing?.id === g.id ? editing.name : null}
             statsMap={statsMap}
+            sizesMap={sizes}
             busyMap={busyMap}
             onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
             onRenameStart={() => setEditing({ id: g.id, name: g.name })}
@@ -825,6 +829,7 @@ interface GroupCardProps {
   isOpen: boolean;
   editing: string | null;
   statsMap?: Record<string, ContainerStats>;
+  sizesMap?: Record<string, number>;
   busyMap?: Record<string, boolean>;
   /**
    * A compose project group: its membership is owned by the project, so it
@@ -859,6 +864,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
   isOpen,
   editing,
   statsMap,
+  sizesMap,
   busyMap,
   compose = false,
   onToggle,
@@ -1102,6 +1108,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
                   <MemberCard
                     c={c}
                     stats={statsMap?.[c.id]}
+                    sizeBytes={sizesMap?.[c.id]}
                     busy={!!busyMap?.[c.id]}
                     ownGroupId={g.id}
                     onAction={(action) => onContainerAction(c, action)}

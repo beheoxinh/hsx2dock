@@ -43,6 +43,8 @@ export interface ContainerItem {
   compose_service?: string | null;
   /** Kind cluster this node container belongs to; null for ordinary containers. */
   kind_cluster?: string | null;
+  /** Networks this container is connected to. */
+  networks?: string[];
 }
 
 /** A user-defined container group: bulk start/stop + optional engine-start auto-run. */
