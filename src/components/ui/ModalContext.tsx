@@ -197,35 +197,57 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
                     />
                   </form>
                 )}
+
+                {currentOptions?.choices && (
+                  <div className="space-y-2.5 pt-1">
+                    {currentOptions.choices.map((choice) => (
+                      <button
+                        key={choice.value}
+                        type="button"
+                        onClick={() => handleClose(choice.value)}
+                        className={`w-full group text-left px-4 py-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
+                          choice.variant === "danger"
+                            ? "border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 hover:border-rose-500/50"
+                            : "border-zinc-800 bg-zinc-950/60 hover:bg-zinc-800/60 hover:border-zinc-700"
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <p
+                            className={`text-sm font-semibold tracking-tight transition-colors ${
+                              choice.variant === "danger"
+                                ? "text-rose-300 group-hover:text-rose-200"
+                                : "text-zinc-100 group-hover:text-white"
+                            }`}
+                          >
+                            {choice.label}
+                          </p>
+                          {choice.hint && (
+                            <p className="text-xs text-zinc-400 mt-0.5 leading-normal">
+                              {choice.hint}
+                            </p>
+                          )}
+                        </div>
+                        <div
+                          className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 transition-transform group-hover:translate-x-0.5 ${
+                            choice.variant === "danger"
+                              ? "bg-rose-500/20 text-rose-300"
+                              : "bg-zinc-800 text-zinc-400 group-hover:text-white"
+                          }`}
+                        >
+                          <span className="text-sm font-bold">→</span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Footer Actions */}
               <div className="flex items-center justify-end gap-3 px-6 py-4 bg-zinc-950/40 border-t border-zinc-800/80">
                 {currentOptions?.choices ? (
-                  <>
-                    <Button type="button" variant="ghost" onClick={() => handleClose(null)}>
-                      Cancel
-                    </Button>
-                    <div className="flex flex-wrap items-center justify-end gap-2">
-                      {currentOptions.choices.map((choice) => (
-                        <Button
-                          key={choice.value}
-                          type="button"
-                          variant={choice.variant ?? "secondary"}
-                          onClick={() => handleClose(choice.value)}
-                          title={choice.hint}
-                          className="h-auto flex-col items-start gap-0 py-1.5 text-left"
-                        >
-                          <span>{choice.label}</span>
-                          {choice.hint && (
-                            <span className="text-[11px] font-normal opacity-70">
-                              {choice.hint}
-                            </span>
-                          )}
-                        </Button>
-                      ))}
-                    </div>
-                  </>
+                  <Button type="button" variant="ghost" onClick={() => handleClose(null)}>
+                    Cancel
+                  </Button>
                 ) : (
                   <>
                     {(currentOptions?.cancelText || currentOptions?.type === "confirm" || currentOptions?.type === "prompt") && (

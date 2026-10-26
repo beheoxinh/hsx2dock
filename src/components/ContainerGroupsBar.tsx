@@ -364,27 +364,27 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     const members = membersOf(g);
     const choice = await modal.showChoice(
       members.length === 0
-        ? `Delete group "${g.name}"?`
-        : `Delete group "${g.name}" and its ${members.length} container${members.length === 1 ? "" : "s"}?`,
+        ? `This group is empty. Removing it will not affect any containers.`
+        : `This group currently contains ${members.length} container${members.length === 1 ? "" : "s"}. Choose how you would like to proceed:`,
       members.length === 0
         ? [
-            { value: "keep", label: "Delete group", variant: "danger" },
+            { value: "keep", label: "Delete Group", variant: "danger" },
           ]
         : [
             {
               value: "keep",
-              label: "Group only",
-              hint: `Release ${members.length} container${members.length === 1 ? "" : "s"} to Isolated`,
+              label: "Delete Group Only",
+              hint: `Keep ${members.length} container${members.length === 1 ? "" : "s"} and move them to Isolated`,
               variant: "secondary",
             },
             {
               value: "delete",
-              label: "Group + containers",
-              hint: "Delete them from the engine",
+              label: "Delete Group and Containers",
+              hint: "Permanently stop and delete all member containers from the Docker engine",
               variant: "danger",
             },
           ],
-      "Delete group",
+      `Delete "${g.name}"`,
       "danger"
     );
     if (!choice) return;
