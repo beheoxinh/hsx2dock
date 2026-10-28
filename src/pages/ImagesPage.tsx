@@ -20,6 +20,7 @@ import {
   FileText,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
+import { SkeletonList } from "../components/ui/Skeleton";
 import { Button } from "../components/ui/Button";
 import { BuildImageModal } from "../components/images/BuildImageModal";
 import { LoadToKindModal } from "../components/images/LoadToKindModal";
@@ -409,6 +410,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
 
       {/* Images List */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
+        {loading && images.length === 0 && <SkeletonList rows={5} actions={4} />}
         <AnimatePresence>
           {filteredImages.map((img) => (
             <motion.div

@@ -143,10 +143,15 @@ export const HostsManagerModal: React.FC<{
 
   const handleDeleteEntry = async (index: number) => {
     if (!model) return;
-    const lines = rawText.split("\n");
     const target = model.entries[index];
     if (!target) return;
 
+    if (!target.is_managed_by_app) {
+      toast.info("Protected System Entry", "System host entries cannot be deleted directly. You can disable them by clicking the status toggle.");
+      return;
+    }
+
+    const lines = rawText.split("\n");
     const targetIdx = lines.findIndex((l) => l.trim() === target.raw_line.trim());
     if (targetIdx === -1) return;
 
@@ -155,7 +160,7 @@ export const HostsManagerModal: React.FC<{
     try {
       setSaving(true);
       await api.saveRawHosts(updated);
-      toast.success("Entry Deleted", `Removed entry from /etc/hosts.`);
+      toast.success("Entry Deleted", `Removed app entry from /etc/hosts.`);
       await loadData();
       onUpdated?.();
     } catch (err) {
@@ -377,23 +382,19 @@ export const HostsManagerModal: React.FC<{
                             {item.syntax_error}
                           </span>
                         )}
-
-                        {item.is_managed_by_app && (
-                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-violet-500/20 text-violet-300 uppercase font-semibold">
-                            App Managed
-                          </span>
-                        )}
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteEntry(idx)}
-                          className="p-1.5 text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 rounded transition"
-                          title="Delete Entry"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {item.is_managed_by_app ? (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteEntry(idx)}
+                            className="p-1.5 text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 rounded transition"
+                            title="Delete App Entry"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                   ))}

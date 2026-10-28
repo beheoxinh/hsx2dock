@@ -12,6 +12,7 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
+import { StatTileSkeleton } from "../components/ui/Skeleton";
 import { api, events } from "../lib/api";
 import { useSeries } from "../hooks/useSeries";
 import { AreaChart } from "../components/charts/AreaChart";
@@ -74,6 +75,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [images, setImages] = useState<ImageItem[]>([]);
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
+  // First-load gate for the summary tiles: placeholders instead of zeros that
+  // snap to real figures a moment later.
+  const [loading, setLoading] = useState(true);
   const [clusters, setClusters] = useState<KindCluster[]>([]);
   const [kindStatus, setKindStatus] = useState<KindInstallStatus | null>(null);
   const [embeddedBinaries, setEmbeddedBinaries] = useState<EmbeddedBinaryInfo[]>([]);
@@ -147,6 +151,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       if (binR.status === "fulfilled") setEmbeddedBinaries(binR.value);
     } catch (e) {
       toast.error("Failed to load dashboard data", String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -351,7 +357,11 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto p-4">
       {/* KPI strip — every metric appears exactly once */}
       <div className="grid shrink-0 auto-rows-fr grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        {kpiItems.map((k) => {
+        {loading &&
+          Array.from({ length: 5 }, (_, i) => (
+            <StatTileSkeleton key={`kpi-skeleton-${i}`} />
+          ))}
+        {!loading && kpiItems.map((k) => {
           const Icon = k.icon;
           const body = (
             <Card

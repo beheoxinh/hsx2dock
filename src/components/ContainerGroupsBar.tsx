@@ -14,7 +14,6 @@ import {
   RotateCw,
   Square,
   FileText,
-  Globe,
 } from "lucide-react";
 import { GroupLogsModal } from "./groups/GroupLogsModal";
 import { Button } from "./ui/Button";
@@ -47,6 +46,8 @@ interface ContainerGroupsBarProps {
   onSaveGroups: (next: ContainerGroup[]) => Promise<void>;
   /** Live per-container stats from the page's stats tick. */
   statsMap?: Record<string, ContainerStats>;
+  /** Disk usage per container. When omitted the bar polls for its own. */
+  sizesMap?: Record<string, number>;
   /** Called after a bulk start/stop so the page re-fetches row states. */
   onChanged?: () => void;
   /** Opens the details drawer for a member card. */
@@ -57,7 +58,6 @@ interface ContainerGroupsBarProps {
   ) => void;
   onEditContainer?: (id: string) => void;
   onRepairNetwork?: (container: ContainerItem) => void;
-  onMapEntireGroup?: (groupName: string, containers: ContainerItem[]) => void;
   gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
   /** Runs a lifecycle action on a member card. */
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
@@ -124,8 +124,9 @@ const MemberCard: React.FC<{
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
   onEditContainer?: () => void;
   onRepairNetwork?: () => void;
+  gatewayRoutes?: Array<{ domain: string; path?: string | null }> | null;
   gatewayDomain?: string | null;
-}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayDomain }) => {
+}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayRoutes, gatewayDomain }) => {
   const drag = useDraggable({
     id: c.id,
     label: c.name.replace(/^\//, ""),
@@ -144,6 +145,7 @@ const MemberCard: React.FC<{
       onOpenDetails={onOpenDetails}
       onEditContainer={onEditContainer}
       onRepairNetwork={onRepairNetwork}
+      gatewayRoutes={gatewayRoutes}
       gatewayDomain={gatewayDomain}
     />
   );
@@ -210,13 +212,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   groups,
   onSaveGroups,
   statsMap,
+  sizesMap,
   onChanged,
   onOpenDetails,
   onEditContainer,
   onRepairNetwork,
   onContainerAction,
   busyMap,
-  onMapEntireGroup,
   gatewayRoutes,
   children,
 }) => {
@@ -224,7 +226,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const modal = useModal();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [sizes, setSizes] = useState<Record<string, number>>({});
+  const [localSizes, setSizes] = useState<Record<string, number>>({});
+  // The page owns the app-wide size cache (primed at startup); self-polling is
+  // only the fallback when no map is supplied.
+  const sizes = sizesMap ?? localSizes;
   // Inline rename: which card is being edited and the text being typed.
   const [editing, setEditing] = useState<{ id: string; name: string } | null>(
     null
@@ -245,10 +250,11 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   }, []);
 
   useEffect(() => {
+    if (sizesMap) return;
     loadSizes();
     const t = setInterval(loadSizes, 30_000);
     return () => clearInterval(t);
-  }, [loadSizes]);
+  }, [loadSizes, sizesMap]);
 
   const saveAll = async (next: ContainerGroup[]) => {
     // Invariant: a compose container belongs to its project card. Older saved
@@ -309,10 +315,6 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         ? { ...existing, auto_start: nextAutoStart }
         : persistedComposeGroup(project, g.container_ids, nextAutoStart);
       await saveAll([...others, nextGroup]);
-      toast.success(
-        `Compose auto-start ${nextAutoStart ? "enabled" : "disabled"}`,
-        `Project "${g.name}" will ${nextAutoStart ? "start" : "not start"} with the engine.`
-      );
     } catch (e) {
       toast.error("Could not update auto-start", String(e));
     }
@@ -335,10 +337,6 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             auto_start: nextAutoStart,
           };
       await saveAll([...others, nextGroup]);
-      toast.success(
-        `Isolated auto-start ${nextAutoStart ? "enabled" : "disabled"}`,
-        `Ungrouped containers will ${nextAutoStart ? "start" : "not start"} with the engine.`
-      );
     } catch (e) {
       toast.error("Could not update auto-start", String(e));
     }
@@ -351,7 +349,8 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         action === "start"
           ? await api.startContainerGroup(g.id)
           : await api.stopContainerGroup(g.id);
-      toast.success(`Group ${action}`, `${g.name}: ${msg}`);
+      // Visual state updates via onChanged() — group/container states change visibly; no toast needed.
+      void msg;
       onChanged?.();
     } catch (e) {
       toast.error(`Could not ${action} group`, String(e));
@@ -375,13 +374,8 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     const project = g.id.slice("compose:".length);
     setBusy((b) => ({ ...b, [g.id]: true }));
     try {
-      const out = await api.composeProjectAction(project, action);
-      const past =
-        action === "stop" ? "stopped" : action === "start" ? "started" : "restarted";
-      toast.success(
-        `Project ${past}`,
-        out.trim() ? `${project}: ${out.trim()}` : project
-      );
+      await api.composeProjectAction(project, action);
+      // Visual feedback via onChanged() directly reflects in container status — no toast needed.
       onChanged?.();
     } catch (e) {
       toast.error(`Could not ${action} project`, String(e));
@@ -779,7 +773,6 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onEditContainer={onEditContainer}
             onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
-            onMapEntireGroup={onMapEntireGroup}
             gatewayRoutes={gatewayRoutes}
           />
         ))}
@@ -810,7 +803,6 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onEditContainer={onEditContainer}
             onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
-            onMapEntireGroup={onMapEntireGroup}
             gatewayRoutes={gatewayRoutes}
           />
         ))}
@@ -872,7 +864,6 @@ interface GroupCardProps {
   onEditContainer?: (id: string) => void;
   onRepairNetwork?: (container: ContainerItem) => void;
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
-  onMapEntireGroup?: (groupName: string, containers: ContainerItem[]) => void;
   gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
 }
 
@@ -901,7 +892,6 @@ const GroupCard: React.FC<GroupCardProps> = ({
   onEditContainer,
   onRepairNetwork,
   onContainerAction,
-  onMapEntireGroup,
   gatewayRoutes,
 }) => {
   const drop = useDropTarget(g.id);
@@ -1073,18 +1063,6 @@ const GroupCard: React.FC<GroupCardProps> = ({
               <FileText className="w-3.5 h-3.5" />
             </Button>
           )}
-          {hasMembers && onMapEntireGroup && (
-            <Button
-              variant="ghost"
-              size="icon"
-              title="Configure HTTPS Gateway routes for group services"
-              aria-label={`Configure Gateway routes for ${g.name}`}
-              onClick={() => onMapEntireGroup(g.name, members)}
-              className="text-violet-400 hover:text-violet-300 hover:bg-violet-500/10"
-            >
-              <Globe className="w-3.5 h-3.5" />
-            </Button>
-          )}
           {!compose && (
             <Button
               variant="ghost"
@@ -1142,7 +1120,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
                   )}
                   {(() => {
                     const cleanName = c.name.replace(/^\//, "");
-                    const matchedRoute = gatewayRoutes?.find(
+                    const matchedRoutes = gatewayRoutes?.filter(
                       (r) =>
                         r.container_name === cleanName ||
                         c.published_ports?.some(
@@ -1160,7 +1138,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
                         onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
                         onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
                         onRepairNetwork={onRepairNetwork ? () => onRepairNetwork(c) : undefined}
-                        gatewayDomain={matchedRoute?.domain}
+                        gatewayRoutes={matchedRoutes}
                       />
                     );
                   })()}

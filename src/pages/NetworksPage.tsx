@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Network, Plus, Trash2, Search, X } from "lucide-react";
 import { Card } from "../components/ui/Card";
+import { SkeletonList } from "../components/ui/Skeleton";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
 import { truncateId } from "../lib/utils";
@@ -154,6 +155,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
 
       {/* Networks List */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
+        {loading && networks.length === 0 && <SkeletonList rows={4} actions={3} />}
         <AnimatePresence>
           {filteredNetworks.map((net) => {
             const isDefault = ["bridge", "host", "none"].includes(net.name);

@@ -78,6 +78,11 @@ pub async fn save_gateway_routes(
             .map_err(|e| e.to_string())?;
     }
 
+    // Auto-sync /etc/hosts with new routes whenever routes are updated
+    if let Err(e) = update_hosts_file(&routes) {
+        tracing::warn!("Auto-syncing /etc/hosts encountered warning: {e}");
+    }
+
     Ok(())
 }
 

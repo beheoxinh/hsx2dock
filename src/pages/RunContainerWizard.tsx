@@ -62,10 +62,23 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
 
   // Gateway routing options
   const [enableGateway, setEnableGateway] = useState(false);
-  const [gatewayDomain, setGatewayDomain] = useState("");
+  const [gatewaySubdomain, setGatewaySubdomain] = useState("");
+  const [gatewaySuffix, setGatewaySuffix] = useState(".localhost");
+  const [gatewayCustomSuffix, setGatewayCustomSuffix] = useState("");
   const [gatewayPath, setGatewayPath] = useState("");
   const [gatewayStripPrefix, setGatewayStripPrefix] = useState(false);
 
+  // Construct full domain based on subdomain and selected suffix
+  const effectiveGatewayDomain = useMemo(() => {
+    const sub = gatewaySubdomain.trim().replace(/^\.+|\.+$/g, "");
+    if (!sub) return "";
+    if (gatewaySuffix === "custom") {
+      const cust = gatewayCustomSuffix.trim();
+      if (!cust) return sub;
+      return `${sub}${cust.startsWith(".") ? cust : `.${cust}`}`;
+    }
+    return `${sub}${gatewaySuffix}`;
+  }, [gatewaySubdomain, gatewaySuffix, gatewayCustomSuffix]);
   // UI state
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -196,12 +209,31 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
         const found = routes.find((r) => r.container_name === cName);
         if (found) {
           setEnableGateway(true);
-          setGatewayDomain(found.domain);
+          const dom = found.domain;
+          if (dom.endsWith(".localhost")) {
+            setGatewaySuffix(".localhost");
+            setGatewaySubdomain(dom.replace(/\.localhost$/, ""));
+          } else if (dom.endsWith(".local")) {
+            setGatewaySuffix(".local");
+            setGatewaySubdomain(dom.replace(/\.local$/, ""));
+          } else if (dom.endsWith(".internal")) {
+            setGatewaySuffix(".internal");
+            setGatewaySubdomain(dom.replace(/\.internal$/, ""));
+          } else if (dom.endsWith(".dev")) {
+            setGatewaySuffix(".dev");
+            setGatewaySubdomain(dom.replace(/\.dev$/, ""));
+          } else {
+            setGatewaySuffix("custom");
+            setGatewaySubdomain(dom);
+            setGatewayCustomSuffix("");
+          }
           setGatewayPath(found.path || "");
           setGatewayStripPrefix(!!found.strip_prefix);
         } else {
           setEnableGateway(false);
-          setGatewayDomain(`${cName.toLowerCase().replace(/[^a-z0-9-]/g, "-")}.localhost`);
+          setGatewaySubdomain(cName.toLowerCase().replace(/[^a-z0-9-]/g, "-"));
+          setGatewaySuffix(".localhost");
+          setGatewayCustomSuffix("");
           setGatewayPath("");
           setGatewayStripPrefix(false);
         }
@@ -224,7 +256,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       setMemoryMb("");
       setCpus("");
       setEnableGateway(false);
-      setGatewayDomain("");
+      setGatewaySubdomain("");
+      setGatewaySuffix(".localhost");
+      setGatewayCustomSuffix("");
       setGatewayPath("");
       setGatewayStripPrefix(false);
       setShowAdvanced(false);
@@ -331,12 +365,12 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
         const firstPort = currentPorts[0]?.host_port || "80";
         try {
           const routes = await api.listGatewayRoutes();
-          const cleanDomain = gatewayDomain.trim().toLowerCase();
+          const cleanDomain = effectiveGatewayDomain.toLowerCase();
           const updated = routes.filter(
-            (r) => r.container_name !== finalContainerName && r.domain !== cleanDomain
+            (r) => r.container_name !== finalContainerName && (cleanDomain ? r.domain !== cleanDomain : true)
           );
 
-          if (enableGateway && gatewayDomain.trim()) {
+          if (enableGateway && cleanDomain) {
             const routeId = `route-${Date.now()}`;
             const target = `127.0.0.1:${firstPort}`;
             updated.push({
@@ -368,11 +402,11 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
         );
 
         // Sync gateway route if configured
-        if (enableGateway && gatewayDomain.trim()) {
+        if (enableGateway && effectiveGatewayDomain) {
           const firstPort = config.ports?.[0]?.host_port || "80";
           try {
             const routes = await api.listGatewayRoutes();
-            const cleanDomain = gatewayDomain.trim().toLowerCase();
+            const cleanDomain = effectiveGatewayDomain.toLowerCase();
             const routeId = `route-${Date.now()}`;
             const target = `127.0.0.1:${firstPort}`;
             const updated = routes.filter((r) => r.domain !== cleanDomain);
@@ -567,9 +601,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                       checked={enableGateway}
                       onChange={(e) => {
                         setEnableGateway(e.target.checked);
-                        if (e.target.checked && !gatewayDomain) {
+                        if (e.target.checked && !gatewaySubdomain) {
                           const safe = (name || "app").toLowerCase().replace(/[^a-z0-9-]/g, "-");
-                          setGatewayDomain(`${safe}.localhost`);
+                          setGatewaySubdomain(safe);
                         }
                       }}
                       className="rounded border-zinc-700 text-violet-600 focus:ring-violet-500 w-4 h-4"
@@ -586,19 +620,66 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
 
                 {enableGateway && (
                   <div className="space-y-3 pt-2 border-t border-violet-500/20">
-                    <div>
-                      <label className="text-[11px] font-medium text-zinc-300 block mb-1">
-                        Virtual Domain Name
+                    <div className="space-y-1.5">
+                      <label className="text-[11px] font-medium text-zinc-300 block">
+                        Virtual Domain Name & Suffix
                       </label>
-                      <input
-                        type="text"
-                        value={gatewayDomain}
-                        onChange={(e) => setGatewayDomain(e.target.value)}
-                        placeholder="my-service.localhost or custom.dev"
-                        className="w-full h-8 px-2.5 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white font-mono focus:border-violet-500 focus:outline-none"
-                      />
-                      <p className="text-[10px] text-zinc-500 mt-1">
-                        Use .localhost for automatic resolution without editing hosts, or any custom domain (synced with /etc/hosts).
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 relative">
+                          <input
+                            type="text"
+                            value={gatewaySubdomain}
+                            onChange={(e) => setGatewaySubdomain(e.target.value)}
+                            placeholder="my-service"
+                            className="w-full h-8 px-2.5 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white font-mono focus:border-violet-500 focus:outline-none"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {[".localhost", ".local", ".internal", ".dev"].map((suff) => (
+                            <button
+                              key={suff}
+                              type="button"
+                              onClick={() => setGatewaySuffix(suff)}
+                              className={`px-2 py-1 rounded text-xs font-mono transition-colors border ${
+                                gatewaySuffix === suff
+                                  ? "bg-violet-600/25 border-violet-500/60 text-violet-300 font-semibold"
+                                  : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
+                              }`}
+                            >
+                              {suff}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={() => setGatewaySuffix("custom")}
+                            className={`px-2 py-1 rounded text-xs font-mono transition-colors border ${
+                              gatewaySuffix === "custom"
+                                ? "bg-violet-600/25 border-violet-500/60 text-violet-300 font-semibold"
+                                : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
+                            }`}
+                          >
+                            custom
+                          </button>
+                        </div>
+                      </div>
+
+                      {gatewaySuffix === "custom" && (
+                        <div className="flex items-center gap-2 pt-1">
+                          <span className="text-[11px] text-zinc-400">Custom Suffix / TLD:</span>
+                          <input
+                            type="text"
+                            placeholder=".example.com or .orb.local"
+                            value={gatewayCustomSuffix}
+                            onChange={(e) => setGatewayCustomSuffix(e.target.value)}
+                            className="flex-1 h-7 px-2 rounded bg-zinc-900 border border-zinc-700 text-xs text-white font-mono focus:border-violet-500 focus:outline-none"
+                          />
+                        </div>
+                      )}
+
+                      <p className="text-[10px] text-zinc-500">
+                        {gatewaySuffix === ".localhost"
+                          ? "RFC 6761 .localhost resolves automatically in all browsers without editing hosts."
+                          : "Non-.localhost domains will be automatically synchronized with /etc/hosts via Local DNS sync."}
                       </p>
                     </div>
 
@@ -629,9 +710,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                       </div>
                     </div>
 
-                    {gatewayDomain && (
+                    {effectiveGatewayDomain && (
                       <div className="p-2 rounded bg-violet-500/10 border border-violet-500/20 flex items-center justify-between text-[11px] font-mono text-violet-300">
-                        <span>https://{gatewayDomain}{gatewayPath || ""} &rarr; 127.0.0.1:{ports[0]?.host_port || "8080"}</span>
+                        <span>https://{effectiveGatewayDomain}{gatewayPath || ""} &rarr; 127.0.0.1:{ports[0]?.host_port || "8080"}</span>
                         <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                       </div>
                     )}

@@ -22,6 +22,7 @@ import { GatewayPage } from "./pages/GatewayPage";
 import { McpPage } from "./pages/McpPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
+import { primeContainerStore, startContainerStoreSync } from "./lib/containerStore";
 import type { DaemonState } from "./types";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
@@ -78,6 +79,11 @@ const MainLayout: React.FC = () => {
 
     fetchEngineStatus();
 
+    // Warm the Containers screen before it is ever opened: the list, sizes,
+    // groups and gateway routes are fetched once here so the tab paints from
+    // memory instead of waiting on Docker on first visit.
+    startContainerStoreSync();
+
     let unlisten: (() => void) | undefined;
     events.onEngineStateChanged((state) => {
       setDaemonState(state);
@@ -85,10 +91,11 @@ const MainLayout: React.FC = () => {
       // daemon instead of lingering stale or erroring behind the scenes.
       setRefreshKey((k) => k + 1);
       if (state === "Running") {
-        toast.success("Docker Daemon Ready", "Rootless engine daemon is running.");
-      } else if (state === "Stopped") {
-        toast.info("Docker Daemon Stopped", "Rootless engine has shut down.");
+        // The container cache belongs to the daemon that produced it.
+        void primeContainerStore(true);
       }
+      // Engine start/stop is visible in the header and every page gate, so it
+      // is not announced with a toast; only failures are.
     }).then((u) => (unlisten = u));
 
     // A different endpoint is a different daemon: every page must re-fetch,
@@ -97,6 +104,8 @@ const MainLayout: React.FC = () => {
     events
       .onEndpointChanged(() => {
         setRefreshKey((k) => k + 1);
+        // A different daemon means a different container list.
+        void primeContainerStore(true);
       })
       .then((u) => (unlistenEndpoint = u));
 
@@ -143,6 +152,7 @@ const MainLayout: React.FC = () => {
       // not leave a stale "Running" label on the button.
       const verified = await api.getEngineStatus();
       setDaemonState(verified);
+      if (verified === "Running") void primeContainerStore(true);
     } catch (e) {
       toast.error("Failed to toggle engine", String(e));
       // The daemon may have died mid-startup; never leave a stale "Running"
@@ -205,7 +215,8 @@ const MainLayout: React.FC = () => {
           }}
           onRefresh={() => {
             setRefreshKey((k) => k + 1);
-            toast.info("Data refreshed", "Updated dashboard state.");
+            // The refresh button spins and the page data visibly re-renders;
+            // a toast here would just be noise.
           }}
         />
 

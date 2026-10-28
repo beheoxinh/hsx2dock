@@ -352,3 +352,15 @@ html.light .toast-item button {
 html.light .toast-item button:hover {
   color: #0f172a !important;
 }
+
+/* Loading placeholders (components/ui/Skeleton.tsx) */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .skeleton.animate-pulse {
+    animation: none;
+  }
+}
+
+html.light .skeleton {
+  background-color: #e2e8f0 !important;
+}

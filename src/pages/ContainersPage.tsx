@@ -10,8 +10,8 @@ import { EngineGate } from "../components/ui/EngineGate";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
 import { ContainerGroupsBar } from "../components/ContainerGroupsBar";
-import { GroupGatewayModal } from "../components/groups/GroupGatewayModal";
 import { RepairContainerNetworkModal } from "../components/containers/RepairContainerNetworkModal";
+import { ContainerGroupsSkeleton } from "../components/containers/ContainerSkeletons";
 import {
   ContainerCard,
   type ContainerAction,
@@ -19,6 +19,12 @@ import {
 import { useDraggable } from "../components/ContainerDragLayer";
 import { canonicalContainerIds, groupOf } from "../lib/containerGroups";
 import { api, events } from "../lib/api";
+import {
+  primeContainerStore,
+  refreshContainers,
+  setContainerGroups,
+  useContainerStore,
+} from "../lib/containerStore";
 import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
 
 interface ContainersPageProps {
@@ -49,8 +55,9 @@ const DraggableContainerCard: React.FC<{
   onEditContainer?: () => void;
   onOpenGatewayMap?: (hostPort: number) => void;
   onRepairNetwork?: () => void;
+  gatewayRoutes?: Array<{ domain: string; path?: string | null }> | null;
   gatewayDomain?: string | null;
-}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayDomain }) => {
+}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayRoutes, gatewayDomain }) => {
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
@@ -67,6 +74,7 @@ const DraggableContainerCard: React.FC<{
       onOpenDetails={onOpenDetails}
       onEditContainer={onEditContainer}
       onRepairNetwork={onRepairNetwork}
+      gatewayRoutes={gatewayRoutes}
       gatewayDomain={gatewayDomain}
     />
   );
@@ -78,76 +86,49 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   onEditContainer,
   daemonState = "Running",
 }) => {
-  const [containers, setContainers] = useState<ContainerItem[]>([]);
+  // Containers, sizes, groups and gateway routes come from the app-wide cache
+  // that is primed when the app starts, so this screen paints instantly
+  // instead of showing an empty shell while Docker answers.
+  const store = useContainerStore();
+  const containers = store.containers;
+  const sizesMap = store.sizes;
+  const groups = store.groups;
+  const gatewayRoutes = store.gatewayRoutes;
+  const loading = !store.ready;
   const [statsMap, setStatsMap] = useState<Record<string, ContainerStats>>({});
-  const [sizesMap, setSizesMap] = useState<Record<string, number>>({});
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const toast = useToast();
   const modal = useModal();
-  // Groups live here so the flat list can hide containers already placed in
-  // one; the group bar edits and persists the same array.
-  const [groups, setGroups] = useState<ContainerGroup[]>([]);
-  const [gatewayRoutes, setGatewayRoutes] = useState<Array<{ id: string; domain: string; target: string; container_name?: string | null }>>([]);
+  // Groups live in the shared store so the flat list can hide containers
+  // already placed in one; the group bar edits and persists the same array.
 
-  // Gateway Modal states
-  const [groupGatewayTarget, setGroupGatewayTarget] = useState<{
-    name: string;
-    members: ContainerItem[];
-  } | null>(null);
-
-  // Network repair target state
   const [repairTarget, setRepairTarget] = useState<ContainerItem | null>(null);
 
   const saveGroups = async (next: ContainerGroup[]) => {
     await api.saveContainerGroups(next);
-    setGroups(next);
+    setContainerGroups(next);
   };
 
   const loadContainers = async () => {
-    try {
-      setLoading(true);
-      const [data, sizes] = await Promise.allSettled([
-        api.listContainers(true),
-        api.getContainerSizes(),
-      ]);
-      if (data.status === "fulfilled") setContainers(data.value);
-      if (sizes.status === "fulfilled") setSizesMap(sizes.value ?? {});
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoading(false);
-    }
+    // Refreshes the shared cache; every mounted view of it re-renders.
+    await refreshContainers();
   };
 
   useEffect(() => {
-    loadContainers();
-    api
-      .listContainerGroups()
-      .then(setGroups)
-      .catch((e) => console.error(e));
-
-    api
-      .listGatewayRoutes()
-      .then(setGatewayRoutes)
-      .catch((e) => console.error(e));
+    // Usually a no-op: the app primed this cache on startup. It still covers a
+    // cold deep-link into the tab and the case where the engine was stopped
+    // when the app opened.
+    void primeContainerStore();
 
     let unlistenStats: (() => void) | undefined;
-    let unlistenContainers: (() => void) | undefined;
 
     events.onContainerStatsTick((stats) => {
       setStatsMap((prev) => ({ ...prev, ...stats }));
     }).then((u) => (unlistenStats = u));
 
-    events.onContainersTick((updatedList) => {
-      setContainers(updatedList);
-      setLoading(false);
-    }).then((u) => (unlistenContainers = u));
-
     return () => {
       if (unlistenStats) unlistenStats();
-      if (unlistenContainers) unlistenContainers();
     };
   }, []);
 
@@ -160,19 +141,15 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
       setActionLoading((prev) => ({ ...prev, [c.id]: true }));
       if (action === "start") {
         await api.startContainer(c.id);
-        toast.success("Container started", `${cName} is now running.`);
+        // Status dot and action buttons switch instantly — no toast needed.
       } else if (action === "stop") {
         await api.stopContainer(c.id);
-        toast.info("Container stopped", `${cName} has been stopped.`);
       } else if (action === "restart") {
         await api.restartContainer(c.id);
-        toast.success("Container restarted", `${cName} rebooted successfully.`);
       } else if (action === "pause") {
         await api.pauseContainer(c.id);
-        toast.info("Container paused", `${cName} has been paused.`);
       } else if (action === "unpause") {
         await api.unpauseContainer(c.id);
-        toast.success("Container unpaused", `${cName} resumed.`);
       } else if (action === "clone") {
         const details = await api.inspectContainer(c.id);
         const newName = `${cName}-clone-${Math.floor(Math.random() * 1000)}`;
@@ -189,12 +166,11 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
           command: details.command ? details.command.split(" ") : undefined,
           restart_policy: "unless-stopped",
         });
-        toast.success("Container cloned", `Created duplicate container: ${newName}`);
+        // New container appears after refresh — no toast needed.
       } else if (action === "remove") {
         const confirmed = await modal.showConfirm(`Are you sure you want to remove container '${cName}'?\n\nThis action cannot be undone.`, "Remove Container", "danger");
         if (!confirmed) return;
         await api.removeContainer(c.id, true);
-        toast.success("Container removed", `${cName} was deleted.`);
       }
       await loadContainers();
     } catch (e) {
@@ -240,10 +216,6 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 
 
 
-  const handleMapEntireGroup = (groupName: string, groupContainers: ContainerItem[]) => {
-    setGroupGatewayTarget({ name: groupName, members: groupContainers });
-  };
-
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
       {/* Action Bar */}
@@ -278,18 +250,21 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
           *inside* the Isolated bucket rather than floating below it. This whole
           block scrolls as one region now that the list lives inside it. */}
       <div className="flex-1 overflow-y-auto pb-8">
+        {!store.ready ? (
+          <ContainerGroupsSkeleton />
+        ) : (
         <ContainerGroupsBar
         containers={containers}
         groups={groups}
         onSaveGroups={saveGroups}
         statsMap={statsMap}
+        sizesMap={sizesMap}
         onChanged={loadContainers}
         onOpenDetails={onOpenDetails}
         onEditContainer={onEditContainer}
         onRepairNetwork={(container) => setRepairTarget(container)}
         onContainerAction={handleAction}
         busyMap={actionLoading}
-        onMapEntireGroup={handleMapEntireGroup}
         gatewayRoutes={gatewayRoutes}
       >
         {/* Ungrouped containers — the body of the Isolated bucket. */}
@@ -310,7 +285,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                 >
                   {(() => {
                     const cleanName = c.name.replace(/^\//, "");
-                    const matchedRoute = gatewayRoutes.find(
+                    const matchedRoutes = gatewayRoutes.filter(
                       (r) =>
                         r.container_name === cleanName ||
                         c.published_ports?.some(
@@ -327,7 +302,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                         onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
                         onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
                         onRepairNetwork={() => setRepairTarget(c)}
-                        gatewayDomain={matchedRoute?.domain}
+                        gatewayRoutes={matchedRoutes}
                       />
                     );
                   })()}
@@ -353,20 +328,8 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
           )}
         </div>
         </ContainerGroupsBar>
+        )}
       </div>
-
-      {/* Group Gateway Configuration Modal */}
-      {groupGatewayTarget && (
-        <GroupGatewayModal
-          isOpen={!!groupGatewayTarget}
-          groupName={groupGatewayTarget.name}
-          members={groupGatewayTarget.members}
-          onClose={() => setGroupGatewayTarget(null)}
-          onSuccess={() => {
-            api.listGatewayRoutes().then(setGatewayRoutes).catch(console.error);
-          }}
-        />
-      )}
 
       {/* Repair Container Network Modal */}
       <RepairContainerNetworkModal

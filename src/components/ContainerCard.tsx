@@ -1,4 +1,4 @@
-import React, { useCallback } from "react";
+import React, { useCallback, useMemo } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   Activity,
@@ -51,6 +51,7 @@ interface ContainerCardProps {
   ) => void;
   onEditContainer?: () => void;
   onRepairNetwork?: () => void;
+  gatewayRoutes?: Array<{ domain: string; path?: string | null }> | null;
   gatewayDomain?: string | null;
 }
 
@@ -151,10 +152,37 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   onOpenDetails,
   onEditContainer,
   onRepairNetwork,
+  gatewayRoutes: propGatewayRoutes,
   gatewayDomain,
 }) => {
   const isRunning = c.state === "running";
   const name = c.name.replace(/^\//, "");
+  const toast = useToast();
+
+  // Combine gatewayDomain (legacy single prop) and gatewayRoutes (list)
+  const activeRoutes = useMemo(() => {
+    if (propGatewayRoutes && propGatewayRoutes.length > 0) {
+      return propGatewayRoutes;
+    }
+    if (gatewayDomain) {
+      return [{ domain: gatewayDomain, path: null }];
+    }
+    return [];
+  }, [propGatewayRoutes, gatewayDomain]);
+
+  const handleOpenRoute = useCallback(
+    (domain: string, path?: string | null) => (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!isRunning) return;
+      const url = `https://${domain}${path || ""}`;
+      openExternal(url).catch((err) => {
+        toast.error("Could not open browser", `${url} — ${err}`);
+      });
+    },
+    [isRunning, toast]
+  );
+
   // One chip per published port: the host→container mapping is readable at a
   // glance, and clicking a published port opens it in the browser.
   const chips = portChips(c);
@@ -217,24 +245,6 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             <span className="font-mono text-[11px] text-zinc-400 shrink-0">
               {truncateId(c.id)}
             </span>
-
-            {/* Gateway domain mapped badge */}
-            {gatewayDomain && (
-              <a
-                href={`https://${gatewayDomain}`}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(e) => {
-                  e.stopPropagation();
-                }}
-                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-violet-500/15 border border-violet-500/30 text-violet-300 font-mono text-[10px] font-medium hover:bg-violet-500/25 transition shrink-0"
-                title={`Mapped in Gateway: https://${gatewayDomain}`}
-              >
-                <Globe className="w-2.5 h-2.5 text-violet-400" />
-                <span>{gatewayDomain}</span>
-                <ExternalLink className="w-2.5 h-2.5 opacity-60" />
-              </a>
-            )}
           </div>
           <div className="flex items-center text-xs text-zinc-400 pl-4.5">
             <span
@@ -266,7 +276,7 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
           <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-950/60 border border-zinc-800/80 font-mono text-[11px] text-zinc-300">
             <HardDrive className="w-3 h-3 text-amber-400 shrink-0" />
             <span className="text-zinc-500 text-[10px] font-sans uppercase font-medium mr-0.5">DISK</span>
-            <span>{sizeBytes !== undefined && sizeBytes > 0 ? formatBytes(sizeBytes) : "0 B"}</span>
+            <span>{sizeBytes === undefined ? "—" : formatBytes(sizeBytes)}</span>
           </div>
         </div>
 
@@ -321,11 +331,46 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
                   chip={chip}
                   containerName={name}
                 />
-
               </div>
             ))
           )}
         </div>
+
+        {/* Row 3: Dedicated row for Gateway Virtual Domain Routes */}
+        {activeRoutes.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+            {activeRoutes.map((r: { domain: string; path?: string | null }, i: number) => {
+              if (!isRunning) {
+                return (
+                  <span
+                    key={`${r.domain}-${i}`}
+                    className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-zinc-900/80 border border-zinc-800 text-zinc-500 font-mono text-[10px] font-medium cursor-not-allowed select-none opacity-60"
+                    title={`Gateway Route: https://${r.domain}${r.path || ""} (Container stopped — cannot connect)`}
+                  >
+                    <Globe className="w-2.5 h-2.5 text-zinc-600 shrink-0" />
+                    <span>{r.domain}{r.path || ""}</span>
+                  </span>
+                );
+              }
+
+              return (
+                <a
+                  key={`${r.domain}-${i}`}
+                  href={`https://${r.domain}${r.path || ""}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={handleOpenRoute(r.domain, r.path)}
+                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-violet-500/15 border border-violet-500/30 text-violet-300 font-mono text-[10px] font-medium hover:bg-violet-500/25 hover:border-violet-400/50 hover:text-white transition cursor-pointer shadow-sm shadow-violet-950/30"
+                  title={`Gateway Route: https://${r.domain}${r.path || ""} — click to open in browser`}
+                >
+                  <Globe className="w-2.5 h-2.5 text-violet-400 shrink-0" />
+                  <span>{r.domain}{r.path || ""}</span>
+                  <ExternalLink className="w-2.5 h-2.5 opacity-60 shrink-0" />
+                </a>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Right: actions */}

@@ -658,9 +658,9 @@ pub fn update_hosts_file(routes: &[GatewayRoute]) -> Result<()> {
 
     if !status.managed_domains.is_empty() {
         lines.push(HOSTS_MARKER_BEGIN.to_string());
-        let domains_str = status.managed_domains.join(" ");
-        lines.push(format!("127.0.0.1\t{domains_str}"));
-        lines.push(format!("::1\t{domains_str}"));
+        for domain in &status.managed_domains {
+            lines.push(format!("127.0.0.1\t{domain}"));
+        }
         lines.push(HOSTS_MARKER_END.to_string());
     }
 

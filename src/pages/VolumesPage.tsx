@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { HardDrive, Plus, Trash2, Search, X, AlertTriangle, Copy, Check } from "lucide-react";
 import { Card } from "../components/ui/Card";
+import { SkeletonList } from "../components/ui/Skeleton";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
@@ -245,6 +246,7 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
 
       {/* Volumes List */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
+        {loading && volumes.length === 0 && <SkeletonList rows={4} actions={4} />}
         <AnimatePresence>
           {filteredVolumes.map((vol) => (
             <motion.div
