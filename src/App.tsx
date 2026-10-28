@@ -18,6 +18,7 @@ import { VolumesPage } from "./pages/VolumesPage";
 import { NetworksPage } from "./pages/NetworksPage";
 import { KubernetesPage } from "./pages/KubernetesPage";
 import { ComposePage } from "./pages/ComposePage";
+import { GatewayPage } from "./pages/GatewayPage";
 import { McpPage } from "./pages/McpPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
@@ -111,6 +112,8 @@ const MainLayout: React.FC = () => {
       "networks",
       "kubernetes",
       "compose",
+      "gateway",
+      "mcp",
       "settings",
     ];
     events
@@ -247,6 +250,7 @@ const MainLayout: React.FC = () => {
                 />
               )}
               {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
+              {activeTab === "gateway" && <GatewayPage daemonState={daemonState} />}
               {activeTab === "mcp" && <McpPage />}
               {activeTab === "settings" && <SettingsPage />}
             </motion.div>

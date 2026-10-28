@@ -44,6 +44,9 @@ pub struct ContainerItem {
     /// Primary or active network name(s).
     #[serde(default)]
     pub networks: Vec<String>,
+    /// Broken network names (networks referenced in container settings whose NetworkID does not exist on daemon).
+    #[serde(default)]
+    pub broken_networks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -71,6 +74,9 @@ pub struct VolumeItem {
     /// prune it, because cluster state lives on top of it.
     #[serde(default)]
     pub protected: bool,
+    /// True if currently mounted by at least one container.
+    #[serde(default)]
+    pub in_use: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -449,11 +455,13 @@ pub struct EngineInfo {
     pub containers_stopped: i64,
     pub containers_paused: i64,
     pub images: i64,
+    #[serde(rename = "driver")]
     pub storage_driver: String,
     pub root_dir: String,
     pub cgroup_driver: String,
     #[serde(rename = "cpus")]
     pub n_cpu: i64,
+    #[serde(rename = "memory_total")]
     pub mem_total: i64,
 }
 
@@ -876,6 +884,7 @@ fn is_path_like(source: &str) -> bool {
 
 /// Container restart policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
     #[default]
     No,
@@ -922,6 +931,7 @@ impl RestartPolicy {
 
 /// Memory / CPU constraints for the container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ResourceLimits {
     /// Memory limit in MiB; empty means unlimited.
     pub memory_mb: String,
@@ -935,10 +945,8 @@ pub struct ResourceLimits {
     pub pids_limit: String,
     /// Restart policy override for edits: empty = leave unchanged,
     /// otherwise one of [`RestartPolicy::as_str`].
-    #[serde(default)]
     pub restart_policy: String,
     /// Restart attempts for the `on-failure` policy; empty = engine default.
-    #[serde(default)]
     pub restart_max_retries: String,
 }
 

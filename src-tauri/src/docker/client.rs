@@ -241,6 +241,10 @@ impl DockerClient {
             .all(all)
             .build();
         let list = self.docker.list_containers(Some(opts)).await?;
+        let live_networks = self.list_networks().await.unwrap_or_default();
+        let live_net_ids: std::collections::HashSet<String> = live_networks.iter().map(|n| n.id.clone()).collect();
+        let live_net_names: std::collections::HashSet<String> = live_networks.iter().map(|n| n.name.clone()).collect();
+
         Ok(list
             .into_iter()
             .map(|c| {
@@ -267,6 +271,22 @@ impl DockerClient {
                     .state
                     .map(|s| format!("{:?}", s).to_lowercase())
                     .unwrap_or_default();
+
+                let mut networks = Vec::new();
+                let mut broken_networks = Vec::new();
+                if let Some(ns) = c.network_settings.and_then(|n| n.networks) {
+                    for (net_name, net_cfg) in ns {
+                        let net_id = net_cfg.network_id.unwrap_or_default();
+                        // If NetworkID is non-empty and not present in live networks, or network name is missing
+                        if !net_id.is_empty() && !live_net_ids.contains(&net_id) {
+                            broken_networks.push(net_name.clone());
+                        } else if !live_net_names.contains(&net_name) && net_name != "bridge" && net_name != "host" && net_name != "none" {
+                            broken_networks.push(net_name.clone());
+                        }
+                        networks.push(net_name);
+                    }
+                }
+
                 ContainerItem {
                     short_id: id.chars().take(12).collect(),
                     id,
@@ -289,11 +309,8 @@ impl DockerClient {
                     compose_project,
                     compose_service,
                     kind_cluster,
-                    networks: c
-                        .network_settings
-                        .and_then(|n| n.networks)
-                        .map(|m| m.into_keys().collect())
-                        .unwrap_or_default(),
+                    networks,
+                    broken_networks,
                 }
             })
             .collect())
@@ -619,15 +636,27 @@ impl DockerClient {
         let opts = bollard::query_parameters::ListVolumesOptionsBuilder::default().build();
         let res = self.docker.list_volumes(Some(opts)).await?;
 
-        // Kind node containers mount /var as an anonymous Docker volume without
-        // io.x-k8s.kind* labels. Inspect the nodes to discover every volume they
-        // attach so those can be marked protected as well.
+        // Discover all volumes currently mounted by containers to compute `in_use`,
+        // and identify kind node volumes to mark them protected.
         let mut kind_volume_names = std::collections::HashSet::new();
-        if let Ok(containers) = self.kind_node_containers().await {
+        let mut used_volume_names = std::collections::HashSet::new();
+
+        let all_containers_opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+            .all(true)
+            .build();
+        if let Ok(containers) = self.docker.list_containers(Some(all_containers_opts)).await {
             for c in containers {
+                let is_kind = c
+                    .labels
+                    .as_ref()
+                    .map(|l| l.contains_key(crate::docker::kind::CLUSTER_LABEL))
+                    .unwrap_or(false);
                 for m in c.mounts.into_iter().flatten() {
                     if let Some(name) = m.name.filter(|n| !n.is_empty()) {
-                        kind_volume_names.insert(name);
+                        used_volume_names.insert(name.clone());
+                        if is_kind {
+                            kind_volume_names.insert(name);
+                        }
                     }
                 }
             }
@@ -640,6 +669,7 @@ impl DockerClient {
             .map(|v| {
                 let is_kind_labelled = v.labels.keys().any(|k| k.starts_with("io.x-k8s.kind"));
                 let is_kind_mounted = kind_volume_names.contains(&v.name);
+                let in_use = used_volume_names.contains(&v.name);
                 VolumeItem {
                     protected: is_kind_labelled || is_kind_mounted,
                     name: v.name,
@@ -650,6 +680,7 @@ impl DockerClient {
                     // mountpoint on disk; the raw API list leaves them unknown.
                     size: None,
                     restricted_dirs: 0,
+                    in_use,
                 }
             })
             .collect())
@@ -803,12 +834,109 @@ impl DockerClient {
         Ok(())
     }
 
+    pub async fn connect_container_network(
+        &self,
+        network: &str,
+        container: &str,
+    ) -> anyhow::Result<()> {
+        let config = bollard::models::NetworkConnectRequest {
+            container: container.to_string(),
+            endpoint_config: None,
+        };
+        self.docker.connect_network(network, config).await?;
+        Ok(())
+    }
+
+    pub async fn disconnect_container_network(
+        &self,
+        network: &str,
+        container: &str,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let config = bollard::models::NetworkDisconnectRequest {
+            container: container.to_string(),
+            force: Some(force),
+        };
+        self.docker.disconnect_network(network, config).await?;
+        Ok(())
+    }
+
+    pub async fn repair_container_network(
+        &self,
+        container_id: &str,
+        old_network: &str,
+        target_network: &str,
+        recreate_if_missing: bool,
+    ) -> anyhow::Result<()> {
+        // 1. If target network does not exist and recreate_if_missing is true, create it
+        let current_networks = self.list_networks().await.unwrap_or_default();
+        let target_exists = current_networks.iter().any(|n| n.name == target_network || n.id == target_network);
+        if !target_exists {
+            if recreate_if_missing {
+                self.create_network(
+                    target_network,
+                    "bridge",
+                    "",
+                    "",
+                    false,
+                    true,
+                    std::collections::HashMap::new(),
+                )
+                .await?;
+            } else {
+                anyhow::bail!("Target network '{target_network}' does not exist");
+            }
+        }
+
+        // 2. Disconnect container from old broken network (with force=true)
+        if !old_network.is_empty() {
+            let _ = self.disconnect_container_network(old_network, container_id, true).await;
+        }
+
+        // Also attempt disconnect target_network with force in case stale endpoint left behind
+        let _ = self.disconnect_container_network(target_network, container_id, true).await;
+
+        // 3. Connect container to target network
+        self.connect_container_network(target_network, container_id).await?;
+
+        Ok(())
+    }
+
     pub async fn prune_networks(&self) -> anyhow::Result<u64> {
-        // Skip kind's network and Docker's built-ins; attempt the rest and
-        // ignore "network is in use" failures.
+        // Collect networks referenced by ANY container (running or stopped) so
+        // stopped containers don't have their networks pulled out from under them.
+        let mut referenced_network_names = std::collections::HashSet::new();
+        let mut referenced_network_ids = std::collections::HashSet::new();
+        if let Ok(containers) = self.list_containers(true).await {
+            for c in containers {
+                for net in c.networks {
+                    referenced_network_names.insert(net);
+                }
+            }
+        }
+        if let Ok(raw_containers) = self.docker.list_containers(Some(bollard::query_parameters::ListContainersOptionsBuilder::default().all(true).build())).await {
+            for rc in raw_containers {
+                if let Some(ns) = rc.network_settings.and_then(|n| n.networks) {
+                    for (k, v) in ns {
+                        referenced_network_names.insert(k);
+                        if let Some(id) = v.network_id {
+                            if !id.is_empty() {
+                                referenced_network_ids.insert(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Skip kind's network, Docker's built-ins, and any network referenced by containers;
+        // attempt the rest and ignore "network is in use" failures.
         let mut removed = 0u64;
         for network in self.list_networks().await? {
             if !pruneable_network(&network.name, network.protected) {
+                continue;
+            }
+            if referenced_network_names.contains(&network.name) || referenced_network_ids.contains(&network.id) {
                 continue;
             }
             if self.docker.remove_network(&network.id).await.is_ok() {

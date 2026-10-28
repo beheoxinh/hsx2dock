@@ -16,6 +16,9 @@ import {
   Terminal,
   Trash2,
   Settings2,
+  Globe,
+  Wrench,
+  AlertTriangle,
 } from "lucide-react";
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
@@ -47,6 +50,8 @@ interface ContainerCardProps {
     debug?: boolean
   ) => void;
   onEditContainer?: () => void;
+  onRepairNetwork?: () => void;
+  gatewayDomain?: string | null;
 }
 
 /**
@@ -145,6 +150,8 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   onAction,
   onOpenDetails,
   onEditContainer,
+  onRepairNetwork,
+  gatewayDomain,
 }) => {
   const isRunning = c.state === "running";
   const name = c.name.replace(/^\//, "");
@@ -210,6 +217,24 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             <span className="font-mono text-[11px] text-zinc-400 shrink-0">
               {truncateId(c.id)}
             </span>
+
+            {/* Gateway domain mapped badge */}
+            {gatewayDomain && (
+              <a
+                href={`https://${gatewayDomain}`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => {
+                  e.stopPropagation();
+                }}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-violet-500/15 border border-violet-500/30 text-violet-300 font-mono text-[10px] font-medium hover:bg-violet-500/25 transition shrink-0"
+                title={`Mapped in Gateway: https://${gatewayDomain}`}
+              >
+                <Globe className="w-2.5 h-2.5 text-violet-400" />
+                <span>{gatewayDomain}</span>
+                <ExternalLink className="w-2.5 h-2.5 opacity-60" />
+              </a>
+            )}
           </div>
           <div className="flex items-center text-xs text-zinc-400 pl-4.5">
             <span
@@ -247,8 +272,25 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
 
         {/* Row 2: Network badge at start, followed by published Ports */}
         <div className="flex items-center gap-1.5 flex-wrap min-w-0">
-          {/* Network badge */}
-          {c.networks && c.networks.length > 0 ? (
+          {/* Network badge / Repair Network button if broken */}
+          {c.broken_networks && c.broken_networks.length > 0 ? (
+            c.broken_networks.map((net) => (
+              <button
+                key={`broken-${net}`}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRepairNetwork?.();
+                }}
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition font-mono text-[10px] font-medium animate-pulse cursor-pointer shadow-sm shadow-amber-950/30"
+                title={`Network "${net}" is broken (ID missing from Docker). Click to fix.`}
+              >
+                <AlertTriangle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
+                <span className="font-semibold">Fix Network ({net})</span>
+                <Wrench className="w-2.5 h-2.5 text-amber-300 shrink-0 opacity-80" />
+              </button>
+            ))
+          ) : c.networks && c.networks.length > 0 ? (
             c.networks.map((net) => (
               <span
                 key={net}
@@ -274,11 +316,13 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             <span className="text-[11px] text-zinc-600 font-mono italic">No published ports</span>
           ) : (
             chips.map((chip, i) => (
-              <PortChipBadge
-                key={`${chip.hostPort}-${chip.containerPort}-${chip.protocol}-${i}`}
-                chip={chip}
-                containerName={name}
-              />
+              <div key={`${chip.hostPort}-${chip.containerPort}-${chip.protocol}-${i}`} className="inline-flex items-center gap-1">
+                <PortChipBadge
+                  chip={chip}
+                  containerName={name}
+                />
+
+              </div>
             ))
           )}
         </div>

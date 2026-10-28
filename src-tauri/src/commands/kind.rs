@@ -836,11 +836,37 @@ pub(crate) async fn set_cluster_power(
         if start == is_running {
             continue;
         }
-        let res = if start {
+        let mut res = if start {
             client.start_container(&id).await
         } else {
             client.stop_container(&id).await
         };
+        // Auto-heal stale network endpoint on startup: if Docker daemon was restarted
+        // or killed, kind containers can fail to start with "failed to create endpoint ... on network kind: network ... does not exist"
+        // Reconnecting the container to the kind network resolves the stale endpoint.
+        if start {
+            if let Err(ref e) = res {
+                let err_str = e.to_string();
+                if err_str.contains("failed to create endpoint") && err_str.contains("on network kind") {
+                    tracing::warn!("reconnecting node {id} to kind network due to stale endpoint: {err_str}");
+                    let _ = client.docker().disconnect_network(
+                        "kind",
+                        bollard::models::NetworkDisconnectRequest {
+                            container: id.clone(),
+                            force: Some(true),
+                        },
+                    ).await;
+                    let _ = client.docker().connect_network(
+                        "kind",
+                        bollard::models::NetworkConnectRequest {
+                            container: id.clone(),
+                            endpoint_config: None,
+                        },
+                    ).await;
+                    res = client.start_container(&id).await;
+                }
+            }
+        }
         if let Err(e) = res {
             return Err(format!("{verb} cluster '{name}' failed: {e}"));
         }

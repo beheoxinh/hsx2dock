@@ -19,6 +19,11 @@ import type {
   CliStatus,
   CliUpdateInfo,
   ComposeUpdateInfo,
+  EmbeddedBinaryInfo,
+  CaddyInstallStatus,
+  GatewayRoute,
+  HostsSyncStatus,
+  HostsFileModel,
   EngineDoctorReport,
   RepairReport,
   AppConfig,
@@ -83,6 +88,7 @@ export const api = {
    */
   repairEngine: (checkIds?: string[]) =>
     invoke<RepairReport>("repair_engine", { checkIds: checkIds ?? null }),
+  getEmbeddedBinaries: () => invoke<EmbeddedBinaryInfo[]>("get_embedded_binaries"),
   toggleEngine: () => invoke<DaemonState>("toggle_engine"),
   getEngineInfo: () => invoke<EngineInfo | null>("get_engine_info"),
   getDiskUsage: () => invoke<DfReport>("get_disk_usage"),
@@ -103,6 +109,21 @@ export const api = {
   mcpPrompts: () => invoke<McpPromptInfo[]>("mcp_prompts"),
   getCliBridgeStatus: () => invoke<CliBridgeStatus>("get_cli_bridge_status"),
   toggleCliBridge: (enabled: boolean) => invoke<CliBridgeStatus>("toggle_cli_bridge", { enabled }),
+
+  // Gateway (Caddy reverse proxy & virtual domains)
+  getGatewayStatus: () => invoke<CaddyInstallStatus>("get_gateway_status"),
+  listGatewayRoutes: () => invoke<GatewayRoute[]>("list_gateway_routes"),
+  saveGatewayRoutes: (routes: GatewayRoute[]) =>
+    invoke<void>("save_gateway_routes", { routes }),
+  toggleGateway: (enabled: boolean) => invoke<boolean>("toggle_gateway", { enabled }),
+  trustGatewayCa: () => invoke<void>("trust_gateway_ca"),
+  checkHostsSync: () => invoke<HostsSyncStatus>("check_hosts_sync"),
+  syncHostsFile: () => invoke<void>("sync_hosts_file"),
+  setGatewayAutoStart: (autoStart: boolean) =>
+    invoke<void>("set_gateway_auto_start", { autoStart }),
+  getHostsFileModel: () => invoke<HostsFileModel>("get_hosts_file_model"),
+  saveRawHosts: (newContent: string) => invoke<void>("save_raw_hosts", { newContent }),
+  clearAppHosts: () => invoke<void>("clear_app_hosts"),
 
   // Remote engine endpoints
   listEndpoints: () => invoke<EndpointStatus[]>("list_endpoints"),
@@ -217,6 +238,18 @@ export const api = {
     }),
   removeNetwork: (id: string) => invoke<void>("remove_network", { id }),
   pruneNetworks: () => invoke<number>("prune_networks"),
+  repairContainerNetwork: (
+    containerId: string,
+    oldNetwork: string,
+    targetNetwork: string,
+    recreateIfMissing: boolean
+  ) =>
+    invoke<void>("repair_container_network", {
+      containerId,
+      oldNetwork,
+      targetNetwork,
+      recreateIfMissing,
+    }),
 
   // Compose
   listComposeProjects: () => invoke<ComposeProjectInfo[]>("list_compose_projects"),

@@ -67,12 +67,40 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [historyTarget, setHistoryTarget] = useState<string | null>(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
+  const [autoPrune, setAutoPrune] = useState(false);
+  const [pruningAuto, setPruningAuto] = useState(false);
 
-  const loadImages = async () => {
+  const loadImages = async (checkAutoPrune: boolean = true) => {
     try {
       setLoading(true);
       const list = await api.listImages();
       setImages(list);
+
+      if (checkAutoPrune) {
+        try {
+          const cfg = await api.getAppConfig();
+          const enabled = !!cfg.auto_prune_dangling_images;
+          setAutoPrune(enabled);
+
+          const hasDangling = list.some(
+            (img) => !img.tags || img.tags.length === 0 || img.tags.every((t) => t === "<none>:<none>" || t.startsWith("sha256:"))
+          );
+
+          if (enabled && hasDangling) {
+            setPruningAuto(true);
+            const [count, space] = await api.pruneImages();
+            if (count > 0) {
+              toast.success("Auto-pruned Dangling Images", `Cleaned ${count} images (${formatBytes(space)})`);
+              const updated = await api.listImages();
+              setImages(updated);
+            }
+          }
+        } catch {
+          // ignore background auto-prune check error
+        } finally {
+          setPruningAuto(false);
+        }
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -237,13 +265,35 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     }
   };
 
+  const handleToggleAutoPrune = async () => {
+    const next = !autoPrune;
+    setAutoPrune(next);
+    try {
+      const current = await api.getAppConfig();
+      await api.saveAppConfig({
+        ...current,
+        auto_prune_dangling_images: next,
+      });
+      toast.success(
+        next ? "Auto-prune Dangling Enabled" : "Auto-prune Dangling Disabled",
+        next ? "Dangling/untagged images will be cleaned automatically" : "Automatic cleaning turned off"
+      );
+      if (next) {
+        await loadImages(true);
+      }
+    } catch (e) {
+      setAutoPrune(!next);
+      toast.error("Failed to update Auto-prune setting", String(e));
+    }
+  };
+
   const handlePrune = async () => {
     const confirmed = await modal.showConfirm("Are you sure you want to prune all dangling/unused images?", "Prune Images", "warning");
     if (!confirmed) return;
     try {
       const [count, space] = await api.pruneImages();
       toast.success("Images Pruned", `Removed ${count} images, reclaimed ${formatBytes(space)}`);
-      await loadImages();
+      await loadImages(false);
     } catch (e) {
       toast.error("Prune Error", String(e));
     }
@@ -286,6 +336,44 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
               className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
             />
           </div>
+
+          {/* Auto-prune Dangling Toggle */}
+          <button
+            type="button"
+            onClick={handleToggleAutoPrune}
+            title={
+              autoPrune
+                ? "Auto-clear dangling images is ON (automatically removes untagged images)"
+                : "Auto-clear dangling images is OFF (click to enable)"
+            }
+            className={`flex items-center gap-2 h-9 px-3 rounded-xl border text-xs font-medium transition-all ${
+              autoPrune
+                ? "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20 shadow-sm shadow-amber-500/10"
+                : "bg-zinc-900/90 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full transition-colors ${
+                autoPrune
+                  ? pruningAuto
+                    ? "bg-amber-400 animate-ping"
+                    : "bg-amber-400"
+                  : "bg-zinc-600"
+              }`}
+            />
+            <span className="whitespace-nowrap font-medium">Auto-clean Dangling</span>
+            <div
+              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+                autoPrune ? "bg-amber-500" : "bg-zinc-700"
+              }`}
+            >
+              <span
+                className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                  autoPrune ? "translate-x-3" : "translate-x-0"
+                }`}
+              />
+            </div>
+          </button>
 
           <Button variant="outline" size="sm" onClick={handlePrune} className="gap-2">
             <Trash2 className="w-4 h-4 text-rose-400" />

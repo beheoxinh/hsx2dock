@@ -304,6 +304,12 @@ impl EngineManager {
             bail!("could not prepare containerd snapshotter links: {reason}");
         }
 
+        // Sanitize on-disk container state before dockerd starts:
+        // Ensure containers belonging to groups/projects with auto_start == false
+        // have RestartPolicy: "no" and HasBeenManuallyStopped: true, so dockerd
+        // will NEVER restore or auto-start them on daemon boot.
+        sanitize_containers_on_disk(&paths.data_root);
+
         for d in [
             &paths.data_root,
             &paths.runtime_dir,
@@ -471,6 +477,148 @@ impl EngineManager {
         }
         let _ = fs::remove_file(&paths.pid_file);
         Ok(())
+    }
+}
+
+/// Inspects on-disk container metadata under `<data_root>/containers/<id>/`
+/// and sanitizes containers belonging to groups/projects whose auto-start is OFF.
+/// This runs synchronously BEFORE dockerd is spawned, guaranteeing that dockerd's
+/// internal container restoration phase will NEVER resurrect or start containers
+/// whose auto-start toggle is disabled.
+pub fn sanitize_containers_on_disk(data_root: &Path) {
+    let config_path = match crate::config::AppConfig::config_path() {
+        Some(p) if p.is_file() => p,
+        _ => return,
+    };
+    let Ok(content) = fs::read_to_string(&config_path) else {
+        return;
+    };
+    let Ok(cfg) = toml::from_str::<crate::config::AppConfig>(&content) else {
+        return;
+    };
+
+    let allowed_groups: std::collections::HashSet<String> = cfg
+        .container_groups
+        .iter()
+        .filter(|g| g.auto_start)
+        .map(|g| g.id.clone())
+        .collect();
+
+    let containers_dir = data_root.join("containers");
+    let Ok(entries) = fs::read_dir(&containers_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let config_v2_path = path.join("config.v2.json");
+        let hostconfig_path = path.join("hostconfig.json");
+
+        if !config_v2_path.is_file() || !hostconfig_path.is_file() {
+            continue;
+        }
+
+        let Ok(cfg_data) = fs::read_to_string(&config_v2_path) else {
+            continue;
+        };
+        let Ok(mut cfg_json) = serde_json::from_str::<serde_json::Value>(&cfg_data) else {
+            continue;
+        };
+
+        // Skip Kind cluster nodes (managed separately by kind supervisor)
+        let labels = cfg_json
+            .get("Config")
+            .and_then(|c| c.get("Labels"))
+            .and_then(|l| l.as_object());
+
+        if let Some(lbls) = labels {
+            if lbls.contains_key("io.x-k8s.kind.cluster") {
+                continue;
+            }
+        }
+
+        let cid = entry.file_name().to_string_lossy().to_string();
+        let short_id = if cid.len() >= 12 { &cid[..12] } else { &cid };
+        let name = cfg_json
+            .get("Name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .trim_start_matches('/');
+
+        let compose_project = labels
+            .and_then(|lbls| lbls.get("com.docker.compose.project"))
+            .and_then(|p| p.as_str());
+
+        let is_auto_start_on = if let Some(proj) = compose_project {
+            let group_id = format!("compose:{proj}");
+            allowed_groups.contains(&group_id)
+        } else if let Some(g) = cfg.container_groups.iter().find(|g| {
+            !g.id.starts_with("compose:")
+                && g.id != "__isolated__"
+                && g.container_ids.iter().any(|token| {
+                    token == &cid || token == short_id || token == name
+                })
+        }) {
+            allowed_groups.contains(&g.id)
+        } else {
+            allowed_groups.contains("__isolated__")
+        };
+
+        if !is_auto_start_on {
+            // Read hostconfig.json and set RestartPolicy: { "Name": "no", "MaximumRetryCount": 0 }
+            if let Ok(host_data) = fs::read_to_string(&hostconfig_path) {
+                if let Ok(mut host_json) = serde_json::from_str::<serde_json::Value>(&host_data) {
+                    let mut changed = false;
+                    if let Some(restart_obj) = host_json.get_mut("RestartPolicy") {
+                        if restart_obj.get("Name").and_then(|n| n.as_str()) != Some("no") {
+                            restart_obj["Name"] = serde_json::json!("no");
+                            restart_obj["MaximumRetryCount"] = serde_json::json!(0);
+                            changed = true;
+                        }
+                    } else {
+                        host_json["RestartPolicy"] = serde_json::json!({
+                            "Name": "no",
+                            "MaximumRetryCount": 0
+                        });
+                        changed = true;
+                    }
+                    if changed {
+                        if let Ok(out) = serde_json::to_string(&host_json) {
+                            let _ = fs::write(&hostconfig_path, out);
+                        }
+                    }
+                }
+            }
+
+            // In config.v2.json, set HasBeenManuallyStopped = true and ensure State.Running = false
+            let mut cfg_changed = false;
+            if cfg_json.get("HasBeenManuallyStopped").and_then(|b| b.as_bool()) != Some(true) {
+                cfg_json["HasBeenManuallyStopped"] = serde_json::json!(true);
+                cfg_changed = true;
+            }
+            if let Some(state_obj) = cfg_json.get_mut("State") {
+                if state_obj.get("Running").and_then(|b| b.as_bool()) == Some(true) {
+                    state_obj["Running"] = serde_json::json!(false);
+                    cfg_changed = true;
+                }
+                if state_obj.get("Paused").and_then(|b| b.as_bool()) == Some(true) {
+                    state_obj["Paused"] = serde_json::json!(false);
+                    cfg_changed = true;
+                }
+                if state_obj.get("Restarting").and_then(|b| b.as_bool()) == Some(true) {
+                    state_obj["Restarting"] = serde_json::json!(false);
+                    cfg_changed = true;
+                }
+            }
+            if cfg_changed {
+                if let Ok(out) = serde_json::to_string(&cfg_json) {
+                    let _ = fs::write(&config_v2_path, out);
+                }
+            }
+        }
     }
 }
 
@@ -2900,6 +3048,51 @@ mod tests {
             normalize_version(reported_version("Docker version 28.4.0, build abc")),
             "28.4.0"
         );
+    }
+
+    #[test]
+    fn sanitize_containers_on_disk_marks_disabled_groups_stopped() {
+        let temp = std::env::temp_dir().join(format!("dm-test-sanitize-{}", std::process::id()));
+        let containers_dir = temp.join("containers");
+        let container_a = containers_dir.join("container1234567890ab");
+        fs::create_dir_all(&container_a).unwrap();
+
+        let cfg_v2 = serde_json::json!({
+            "Name": "/test-container",
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "myproject"
+                }
+            },
+            "State": {
+                "Running": true,
+                "Paused": false,
+                "Restarting": false
+            },
+            "HasBeenManuallyStopped": false
+        });
+        fs::write(container_a.join("config.v2.json"), serde_json::to_string(&cfg_v2).unwrap()).unwrap();
+
+        let host_cfg = serde_json::json!({
+            "RestartPolicy": {
+                "Name": "always",
+                "MaximumRetryCount": 0
+            }
+        });
+        fs::write(container_a.join("hostconfig.json"), serde_json::to_string(&host_cfg).unwrap()).unwrap();
+
+        sanitize_containers_on_disk(&temp);
+
+        // Without a config file containing "compose:myproject" with auto_start: true,
+        // sanitize_containers_on_disk will default it to auto_start: false and sanitize it
+        let read_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(container_a.join("config.v2.json")).unwrap()).unwrap();
+        let read_host: serde_json::Value = serde_json::from_str(&fs::read_to_string(container_a.join("hostconfig.json")).unwrap()).unwrap();
+
+        assert_eq!(read_cfg["HasBeenManuallyStopped"], true);
+        assert_eq!(read_cfg["State"]["Running"], false);
+        assert_eq!(read_host["RestartPolicy"]["Name"], "no");
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

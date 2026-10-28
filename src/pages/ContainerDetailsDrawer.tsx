@@ -281,6 +281,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
               <Button variant="ghost" size="icon" onClick={loadAll} title="Reload Data">
                 <RotateCw className="w-4 h-4" />
               </Button>
+
               {onOpenEditConfig && details && (
                 <Button
                   variant="ghost"

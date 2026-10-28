@@ -10,6 +10,8 @@ import { EngineGate } from "../components/ui/EngineGate";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
 import { ContainerGroupsBar } from "../components/ContainerGroupsBar";
+import { GroupGatewayModal } from "../components/groups/GroupGatewayModal";
+import { RepairContainerNetworkModal } from "../components/containers/RepairContainerNetworkModal";
 import {
   ContainerCard,
   type ContainerAction,
@@ -45,7 +47,10 @@ const DraggableContainerCard: React.FC<{
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
   onEditContainer?: () => void;
-}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer }) => {
+  onOpenGatewayMap?: (hostPort: number) => void;
+  onRepairNetwork?: () => void;
+  gatewayDomain?: string | null;
+}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayDomain }) => {
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
@@ -61,6 +66,8 @@ const DraggableContainerCard: React.FC<{
       onAction={onAction}
       onOpenDetails={onOpenDetails}
       onEditContainer={onEditContainer}
+      onRepairNetwork={onRepairNetwork}
+      gatewayDomain={gatewayDomain}
     />
   );
 };
@@ -82,6 +89,16 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   // Groups live here so the flat list can hide containers already placed in
   // one; the group bar edits and persists the same array.
   const [groups, setGroups] = useState<ContainerGroup[]>([]);
+  const [gatewayRoutes, setGatewayRoutes] = useState<Array<{ id: string; domain: string; target: string; container_name?: string | null }>>([]);
+
+  // Gateway Modal states
+  const [groupGatewayTarget, setGroupGatewayTarget] = useState<{
+    name: string;
+    members: ContainerItem[];
+  } | null>(null);
+
+  // Network repair target state
+  const [repairTarget, setRepairTarget] = useState<ContainerItem | null>(null);
 
   const saveGroups = async (next: ContainerGroup[]) => {
     await api.saveContainerGroups(next);
@@ -109,6 +126,11 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     api
       .listContainerGroups()
       .then(setGroups)
+      .catch((e) => console.error(e));
+
+    api
+      .listGatewayRoutes()
+      .then(setGatewayRoutes)
       .catch((e) => console.error(e));
 
     let unlistenStats: (() => void) | undefined;
@@ -216,6 +238,12 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     );
   }
 
+
+
+  const handleMapEntireGroup = (groupName: string, groupContainers: ContainerItem[]) => {
+    setGroupGatewayTarget({ name: groupName, members: groupContainers });
+  };
+
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col">
       {/* Action Bar */}
@@ -258,8 +286,11 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         onChanged={loadContainers}
         onOpenDetails={onOpenDetails}
         onEditContainer={onEditContainer}
+        onRepairNetwork={(container) => setRepairTarget(container)}
         onContainerAction={handleAction}
         busyMap={actionLoading}
+        onMapEntireGroup={handleMapEntireGroup}
+        gatewayRoutes={gatewayRoutes}
       >
         {/* Ungrouped containers — the body of the Isolated bucket. */}
         <div className="space-y-3">
@@ -277,15 +308,29 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
                   exit={{ opacity: 0, scale: 0.98 }}
                   transition={{ duration: 0.2 }}
                 >
-                  <DraggableContainerCard
-                    container={c}
-                    stats={stats}
-                    sizeBytes={sizesMap[c.id]}
-                    busy={isBusy}
-                    onAction={(action) => handleAction(c, action)}
-                    onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                    onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
-                  />
+                  {(() => {
+                    const cleanName = c.name.replace(/^\//, "");
+                    const matchedRoute = gatewayRoutes.find(
+                      (r) =>
+                        r.container_name === cleanName ||
+                        c.published_ports?.some(
+                          (p) => r.target === `127.0.0.1:${p.host_port}` || r.target === `localhost:${p.host_port}`
+                        )
+                    );
+                    return (
+                      <DraggableContainerCard
+                        container={c}
+                        stats={stats}
+                        sizeBytes={sizesMap[c.id]}
+                        busy={isBusy}
+                        onAction={(action) => handleAction(c, action)}
+                        onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                        onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
+                        onRepairNetwork={() => setRepairTarget(c)}
+                        gatewayDomain={matchedRoute?.domain}
+                      />
+                    );
+                  })()}
                 </motion.div>
               );
             })}
@@ -309,6 +354,27 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         </div>
         </ContainerGroupsBar>
       </div>
+
+      {/* Group Gateway Configuration Modal */}
+      {groupGatewayTarget && (
+        <GroupGatewayModal
+          isOpen={!!groupGatewayTarget}
+          groupName={groupGatewayTarget.name}
+          members={groupGatewayTarget.members}
+          onClose={() => setGroupGatewayTarget(null)}
+          onSuccess={() => {
+            api.listGatewayRoutes().then(setGatewayRoutes).catch(console.error);
+          }}
+        />
+      )}
+
+      {/* Repair Container Network Modal */}
+      <RepairContainerNetworkModal
+        isOpen={!!repairTarget}
+        container={repairTarget}
+        onClose={() => setRepairTarget(null)}
+        onSuccess={loadContainers}
+      />
     </div>
   );
 };

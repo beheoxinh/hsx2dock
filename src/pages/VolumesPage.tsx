@@ -2,7 +2,7 @@ import { useModal } from "../components/ui/ModalContext";
 import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { HardDrive, Plus, Trash2, Search, X, AlertTriangle } from "lucide-react";
+import { HardDrive, Plus, Trash2, Search, X, AlertTriangle, Copy, Check } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { api } from "../lib/api";
@@ -29,12 +29,40 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
   const [newVolumeName, setNewVolumeName] = useState("");
   const [newDriver, setNewDriver] = useState("local");
   const [creating, setCreating] = useState(false);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const [autoPrune, setAutoPrune] = useState(false);
+  const [pruningAuto, setPruningAuto] = useState(false);
 
-  const loadVolumes = async () => {
+  const loadVolumes = async (checkAutoPrune: boolean = true) => {
     try {
       setLoading(true);
       const list = await api.listVolumes();
       setVolumes(list);
+
+      if (checkAutoPrune) {
+        try {
+          const cfg = await api.getAppConfig();
+          const enabled = !!cfg.auto_prune_isolated_volumes;
+          setAutoPrune(enabled);
+
+          // An isolated/alone volume is one not protected and not currently mounted by any container
+          const hasIsolated = list.some((v) => !v.protected && !v.in_use);
+
+          if (enabled && hasIsolated) {
+            setPruningAuto(true);
+            const count = await api.pruneVolumes();
+            if (count > 0) {
+              toast.success("Auto-cleared Isolated Volumes", `Cleaned ${count} unused volume${count === 1 ? "" : "s"}`);
+              const updated = await api.listVolumes();
+              setVolumes(updated);
+            }
+          }
+        } catch {
+          // ignore background check errors
+        } finally {
+          setPruningAuto(false);
+        }
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -45,6 +73,37 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
   useEffect(() => {
     loadVolumes();
   }, [refreshKey]);
+
+  const handleCopyPath = (path: string) => {
+    navigator.clipboard.writeText(path);
+    setCopiedPath(path);
+    toast.success("Path Copied", path);
+    setTimeout(() => {
+      setCopiedPath((current) => (current === path ? null : current));
+    }, 2000);
+  };
+
+  const handleToggleAutoPrune = async () => {
+    const next = !autoPrune;
+    setAutoPrune(next);
+    try {
+      const current = await api.getAppConfig();
+      await api.saveAppConfig({
+        ...current,
+        auto_prune_isolated_volumes: next,
+      });
+      toast.success(
+        next ? "Auto-clean Isolated Enabled" : "Auto-clean Isolated Disabled",
+        next ? "Unused/alone volumes will be cleaned automatically" : "Automatic cleaning turned off"
+      );
+      if (next) {
+        await loadVolumes(true);
+      }
+    } catch (e) {
+      setAutoPrune(!next);
+      toast.error("Failed to update setting", String(e));
+    }
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -129,6 +188,44 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
             />
           </div>
 
+          {/* Auto-prune Isolated Volumes Toggle */}
+          <button
+            type="button"
+            onClick={handleToggleAutoPrune}
+            title={
+              autoPrune
+                ? "Auto-clear isolated/unused volumes is ON (automatically removes unattached volumes)"
+                : "Auto-clear isolated/unused volumes is OFF (click to enable)"
+            }
+            className={`flex items-center gap-2 h-9 px-3 rounded-xl border text-xs font-medium transition-all ${
+              autoPrune
+                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20 shadow-sm shadow-emerald-500/10"
+                : "bg-zinc-900/90 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full transition-colors ${
+                autoPrune
+                  ? pruningAuto
+                    ? "bg-emerald-400 animate-ping"
+                    : "bg-emerald-400"
+                  : "bg-zinc-600"
+              }`}
+            />
+            <span className="whitespace-nowrap font-medium">Auto-clean Isolated</span>
+            <div
+              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+                autoPrune ? "bg-emerald-500" : "bg-zinc-700"
+              }`}
+            >
+              <span
+                className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                  autoPrune ? "translate-x-3" : "translate-x-0"
+                }`}
+              />
+            </div>
+          </button>
+
           <Button variant="outline" size="sm" onClick={handlePrune} className="gap-2">
             <Trash2 className="w-4 h-4 text-rose-400" />
             <span>Prune</span>
@@ -158,26 +255,38 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
               exit={{ opacity: 0, scale: 0.98 }}
             >
               <Card className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 hover:border-zinc-700/80 transition-all">
-                <div className="flex items-start gap-4">
-                  <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 shrink-0">
+                <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                  <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 shrink-0 mt-0.5">
                     <HardDrive className="w-5 h-5" />
                   </div>
 
-                  <div>
-                    <span className="font-semibold text-white tracking-tight text-sm">
-                      {vol.name}
-                    </span>
-                    {vol.protected && (
-                      <span className="ml-2 align-middle text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30">
-                        kind
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      {vol.in_use ? (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 shrink-0">
+                          in use
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/60 shrink-0">
+                          isolated
+                        </span>
+                      )}
+                      {vol.protected && (
+                        <span className="text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/30 shrink-0">
+                          kind
+                        </span>
+                      )}
+                      <span className="font-semibold text-white tracking-tight text-sm truncate">
+                        {vol.name}
                       </span>
-                    )}
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 mt-1 font-mono">
-                      <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300">
+                    </div>
+
+                    <div className="flex items-center gap-2 text-xs text-zinc-400 mt-1.5">
+                      <span className="px-1.5 py-0.5 rounded bg-zinc-800/80 text-zinc-300 text-[11px] font-mono shrink-0">
                         {vol.driver}
                       </span>
                       {typeof vol.size === "number" && (
-                        <span className="flex items-center gap-1 font-sans">
+                        <span className="flex items-center gap-1 font-sans text-zinc-300 text-xs shrink-0">
                           {formatBytes(vol.size)}
                           {vol.restricted_dirs && vol.restricted_dirs > 0 ? (
                             <span
@@ -190,31 +299,52 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
                           ) : null}
                         </span>
                       )}
-                      <span className="truncate max-w-[450px]" title={vol.mountpoint}>
-                        {vol.mountpoint}
-                      </span>
+
+                      {/* Mountpoint Path - smaller font, full width towards the right, with copy button in front */}
+                      <div className="flex items-center gap-1.5 min-w-0 flex-1 ml-1 group/path">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyPath(vol.mountpoint)}
+                          title="Copy mountpoint path"
+                          className="p-1 rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-all shrink-0 opacity-70 group-hover/path:opacity-100"
+                        >
+                          {copiedPath === vol.mountpoint ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                        <span
+                          className="font-mono text-[11px] text-zinc-400 truncate flex-1 hover:text-zinc-200 transition-colors"
+                          title={vol.mountpoint}
+                        >
+                          {vol.mountpoint}
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => handleRemove(vol.name)}
-                  disabled={vol.protected}
-                  title={
-                    vol.protected
-                      ? "Managed by kind — remove the cluster in Kubernetes"
-                      : "Remove Volume"
-                  }
-                  className={
-                    vol.protected
-                      ? "text-zinc-600 cursor-not-allowed"
-                      : "text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
-                  }
-                >
-                  <Trash2 className="w-4 h-4" />
-                </Button>
+                <div className="flex items-center gap-1 shrink-0 self-end sm:self-center ml-2">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => handleRemove(vol.name)}
+                    disabled={vol.protected}
+                    title={
+                      vol.protected
+                        ? "Managed by kind — remove the cluster in Kubernetes"
+                        : "Remove Volume"
+                    }
+                    className={
+                      vol.protected
+                        ? "text-zinc-600 cursor-not-allowed"
+                        : "text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
+                    }
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                </div>
               </Card>
             </motion.div>
           ))}

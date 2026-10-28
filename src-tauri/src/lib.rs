@@ -129,6 +129,13 @@ pub fn run() {
     let app_state = std::sync::Arc::new(crate::runtime::runtime().block_on(AppState::new()));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state)
@@ -209,6 +216,29 @@ pub fn run() {
                         if let Err(e) = crate::commands::mcp::apply_mcp_enabled(&state, true).await
                         {
                             tracing::warn!("could not start the MCP HTTP server: {e}");
+                        }
+                    });
+                }
+            }
+
+            // Gateway Caddy auto-start when app launches
+            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
+                let (auto_start, http_port, https_port, routes) = crate::runtime::runtime().block_on(async {
+                    let cfg = state.config.read().await;
+                    (
+                        cfg.gateway_auto_start,
+                        cfg.gateway_http_port,
+                        cfg.gateway_https_port,
+                        cfg.gateway_routes.clone(),
+                    )
+                });
+
+                if auto_start {
+                    let supervisor = state.caddy.clone();
+                    crate::runtime::spawn(async move {
+                        tracing::info!("Auto-starting Caddy HTTPS Gateway...");
+                        if let Err(e) = supervisor.start(http_port, https_port, &routes).await {
+                            tracing::warn!("Could not auto-start Caddy Gateway: {e}");
                         }
                     });
                 }
@@ -374,6 +404,7 @@ pub fn run() {
             networks::create_network,
             networks::remove_network,
             networks::prune_networks,
+            networks::repair_container_network,
             // Compose
             compose::list_compose_projects,
             compose::compose_up,
@@ -416,6 +447,19 @@ pub fn run() {
             system::install_compose_update,
             system::diagnose_engine,
             system::repair_engine,
+            system::get_embedded_binaries,
+            // Gateway (Caddy reverse proxy & hosts manager)
+            commands::gateway::get_gateway_status,
+            commands::gateway::list_gateway_routes,
+            commands::gateway::save_gateway_routes,
+            commands::gateway::toggle_gateway,
+            commands::gateway::trust_gateway_ca,
+            commands::gateway::check_hosts_sync,
+            commands::gateway::sync_hosts_file,
+            commands::gateway::set_gateway_auto_start,
+            commands::gateway::get_hosts_file_model,
+            commands::gateway::save_raw_hosts,
+            commands::gateway::clear_app_hosts,
             endpoints::list_endpoints,
             endpoints::test_endpoint,
             endpoints::save_endpoint,
@@ -424,6 +468,17 @@ pub fn run() {
             endpoints::get_active_endpoint,
             endpoints::active_endpoint_host,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Graceful cleanup: stop Caddy gateway when app exits
+                if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                    let supervisor = state.caddy.clone();
+                    let _ = crate::runtime::runtime().block_on(async move {
+                        let _ = supervisor.stop().await;
+                    });
+                }
+            }
+        });
 }

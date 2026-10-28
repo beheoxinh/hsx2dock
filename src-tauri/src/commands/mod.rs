@@ -2,6 +2,7 @@ pub mod compose;
 pub mod containers;
 pub mod endpoints;
 pub mod exec;
+pub mod gateway;
 pub mod groups;
 pub mod images;
 pub mod kind;

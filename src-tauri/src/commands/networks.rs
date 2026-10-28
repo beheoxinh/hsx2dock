@@ -72,3 +72,28 @@ pub(crate) async fn prune_networks_core(state: &AppState) -> Result<u64, String>
     let client = state.get_client().await?;
     client.prune_networks().await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn repair_container_network(
+    state: State<'_, Arc<AppState>>,
+    container_id: String,
+    old_network: String,
+    target_network: String,
+    recreate_if_missing: bool,
+) -> Result<(), String> {
+    repair_container_network_core(&state, &container_id, &old_network, &target_network, recreate_if_missing).await
+}
+
+pub(crate) async fn repair_container_network_core(
+    state: &AppState,
+    container_id: &str,
+    old_network: &str,
+    target_network: &str,
+    recreate_if_missing: bool,
+) -> Result<(), String> {
+    let client = state.get_client().await?;
+    client
+        .repair_container_network(container_id, old_network, target_network, recreate_if_missing)
+        .await
+        .map_err(|e| e.to_string())
+}

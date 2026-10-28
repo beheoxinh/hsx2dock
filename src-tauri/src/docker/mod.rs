@@ -1,4 +1,5 @@
 pub mod cli_bridge;
+pub mod caddy;
 pub mod client;
 pub mod compose;
 pub mod daemon;

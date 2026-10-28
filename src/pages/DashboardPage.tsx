@@ -6,6 +6,7 @@ import {
   Network,
   Server,
   Trash2,
+  Cpu,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -21,9 +22,11 @@ import type {
   ContainerStats,
   DaemonState,
   DfReport,
+  EmbeddedBinaryInfo,
   EngineInfo,
   ImageItem,
   KindCluster,
+  KindInstallStatus,
   NetworkItem,
   VolumeItem,
 } from "../types";
@@ -72,7 +75,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [volumes, setVolumes] = useState<VolumeItem[]>([]);
   const [networks, setNetworks] = useState<NetworkItem[]>([]);
   const [clusters, setClusters] = useState<KindCluster[]>([]);
-  const [stats, setStats] = useState<Record<string, ContainerStats>>({});
+  const [kindStatus, setKindStatus] = useState<KindInstallStatus | null>(null);
+  const [embeddedBinaries, setEmbeddedBinaries] = useState<EmbeddedBinaryInfo[]>([]);
+  const [, setStats] = useState<Record<string, ContainerStats>>({});
   const [pruning, setPruning] = useState(false);
 
   // Kind node ids, so their CPU/memory never inflates the user's charts.
@@ -122,13 +127,15 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   const loadData = async () => {
     try {
-      const [infoR, dfR, cR, iR, vR, nR] = await Promise.allSettled([
+      const [infoR, dfR, cR, iR, vR, nR, kindR, binR] = await Promise.allSettled([
         api.getEngineInfo(),
         api.getDiskUsage(),
         api.listContainers(true),
         api.listImages(),
         api.listVolumes(),
         api.listNetworks(),
+        api.kindStatus(),
+        api.getEmbeddedBinaries(),
       ]);
       if (infoR.status === "fulfilled") setEngineInfo(infoR.value);
       if (dfR.status === "fulfilled") setDiskUsage(dfR.value);
@@ -136,6 +143,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       if (iR.status === "fulfilled") setImages(iR.value);
       if (vR.status === "fulfilled") setVolumes(vR.value);
       if (nR.status === "fulfilled") setNetworks(nR.value);
+      if (kindR.status === "fulfilled") setKindStatus(kindR.value);
+      if (binR.status === "fulfilled") setEmbeddedBinaries(binR.value);
     } catch (e) {
       toast.error("Failed to load dashboard data", String(e));
     }
@@ -318,8 +327,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     : [];
   const storageTotal = storageSegments.reduce((a, s) => a + s.value, 0);
 
-  const specRows: [string, string][] = [
-    ["Version", engineInfo?.version ?? "—"],
+  const dockerSpecRows: [string, string][] = [
+    ["Docker Engine", engineInfo?.version ?? "—"],
+    ["API Version", engineInfo?.api_version ? `v${engineInfo.api_version}` : "—"],
     ["Storage driver", engineInfo?.driver ?? "—"],
     [
       "Platform",
@@ -327,6 +337,14 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     ],
     ["CPU cores", engineInfo ? String(engineInfo.cpus) : "—"],
     ["Total memory", totalMem ? formatBytes(totalMem) : "—"],
+  ];
+
+  const k8sSpecRows: [string, string][] = [
+    ["Kind Binary", kindStatus?.installed ? (kindStatus.version ? `v${kindStatus.version}` : "installed") : "not installed"],
+    ["Clusters", clusters.length > 0 ? `${runningClusters}/${clusters.length} running` : "none"],
+    ["Kubernetes Node Image", "kindest/node:v1.37.0"],
+    ["Network Driver", "kind bridge (172.18.0.0/16)"],
+    ["Kubeconfig", kindStatus?.installed ? "isolated (hsx2dock)" : "not created"],
   ];
 
   return (
@@ -543,60 +561,109 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
         </Card>
 
+        {/* Engine Specs (Docker + Kubernetes) */}
         <Card className="flex min-h-[150px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[120px]">
           <div className="flex shrink-0 items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-white">Engine</h3>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Server className="w-4 h-4 text-sky-400 shrink-0" />
+              <h3 className="text-sm font-semibold text-white truncate">Engines</h3>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/20">
+                Docker + K8s
+              </span>
+            </div>
           </div>
-          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto text-xs">
-            {specRows.map(([label, value]) => (
-              <div key={label} className="flex items-center justify-between gap-3">
-                <span className="text-zinc-400">{label}</span>
-                <span className="truncate tabular-nums text-zinc-200">{value}</span>
+          <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto text-xs pr-1">
+            {/* Docker Engine info */}
+            <div>
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-zinc-300 uppercase tracking-wider mb-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                Docker Engine
               </div>
-            ))}
+              <div className="space-y-1 pl-3 border-l border-zinc-800">
+                {dockerSpecRows.map(([label, value]) => (
+                  <div key={label} className="flex items-center justify-between gap-3">
+                    <span className="text-zinc-400">{label}</span>
+                    <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Kubernetes Kind info */}
+            <div className="pt-1">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-zinc-300 uppercase tracking-wider mb-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+                Kubernetes (Kind)
+              </div>
+              <div className="space-y-1 pl-3 border-l border-zinc-800">
+                {k8sSpecRows.map(([label, value]) => (
+                  <div key={label} className="flex items-center justify-between gap-3">
+                    <span className="text-zinc-400">{label}</span>
+                    <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </Card>
 
+        {/* Embedded & Bundled Binaries */}
         <Card className="flex min-h-[150px] flex-col gap-2 p-3 lg:col-span-2 xl:col-span-1 [@media(max-height:820px)]:min-h-[120px]">
           <div className="flex shrink-0 items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-white">Containers</h3>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onNavigate("containers")}
-              className="text-[11px] text-zinc-400 hover:text-zinc-100"
-            >
-              View all
-            </Button>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Cpu className="w-4 h-4 text-purple-400 shrink-0" />
+              <h3 className="text-sm font-semibold text-white truncate">Embedded Tools</h3>
+            </div>
+            <span className="text-[10px] text-zinc-500 font-mono">
+              {embeddedBinaries.length} binaries
+            </span>
           </div>
-          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
-            {appContainers.slice(0, 8).map((c) => {
-              const s = stats[c.id];
-              return (
-                <div
-                  key={c.id}
-                  className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5"
-                >
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">
+            {embeddedBinaries.map((bin) => (
+              <div
+                key={bin.name}
+                className="flex items-center justify-between gap-2.5 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5 hover:border-zinc-700/60 transition-colors"
+                title={`${bin.name} (${bin.category})\nPath: ${bin.path || "Not installed"}\n${bin.description}`}
+              >
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <span
+                    className={cn(
+                      "w-1.5 h-1.5 shrink-0 rounded-full",
+                      bin.is_active ? "bg-emerald-400" : "bg-zinc-600"
+                    )}
+                  />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-xs text-zinc-200">
-                      {c.name || c.short_id}
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-semibold text-white font-mono">
+                        {bin.name}
+                      </span>
+                      <span className="text-[9px] px-1 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/40">
+                        {bin.category}
+                      </span>
                     </div>
-                    <div className="truncate text-[10px] text-zinc-500">{c.image}</div>
-                  </div>
-                  <div className="shrink-0 text-right">
-                    <div className="text-[11px] tabular-nums text-zinc-300">
-                      {s
-                        ? `${(s.cpu_percent ?? 0).toFixed(1)}% · ${formatBytes(s.mem_usage ?? 0)}`
-                        : c.state}
+                    <div className="text-[10px] text-zinc-500 truncate mt-0.5">
+                      {bin.description}
                     </div>
-                    <div className="text-[10px] text-zinc-500">{c.status}</div>
                   </div>
                 </div>
-              );
-            })}
-            {appContainers.length === 0 && (
+
+                <div className="shrink-0 text-right">
+                  <span
+                    className={cn(
+                      "text-[11px] font-mono font-medium",
+                      bin.version ? "text-purple-300" : "text-zinc-600"
+                    )}
+                  >
+                    {bin.version || "missing"}
+                  </span>
+                </div>
+              </div>
+            ))}
+            {embeddedBinaries.length === 0 && (
               <div className="py-6 text-center text-xs text-zinc-600">
-                No containers yet — run one from the Containers page.
+                Loading binary tools…
               </div>
             )}
           </div>

@@ -14,6 +14,7 @@ import {
   RotateCw,
   Square,
   FileText,
+  Globe,
 } from "lucide-react";
 import { GroupLogsModal } from "./groups/GroupLogsModal";
 import { Button } from "./ui/Button";
@@ -55,6 +56,9 @@ interface ContainerGroupsBarProps {
     debug?: boolean
   ) => void;
   onEditContainer?: (id: string) => void;
+  onRepairNetwork?: (container: ContainerItem) => void;
+  onMapEntireGroup?: (groupName: string, containers: ContainerItem[]) => void;
+  gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
   /** Runs a lifecycle action on a member card. */
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
   /** Containers with an action in flight, so their buttons disable. */
@@ -119,7 +123,9 @@ const MemberCard: React.FC<{
   onAction: (action: ContainerAction) => void;
   onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
   onEditContainer?: () => void;
-}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer }) => {
+  onRepairNetwork?: () => void;
+  gatewayDomain?: string | null;
+}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayDomain }) => {
   const drag = useDraggable({
     id: c.id,
     label: c.name.replace(/^\//, ""),
@@ -137,6 +143,8 @@ const MemberCard: React.FC<{
       onAction={onAction}
       onOpenDetails={onOpenDetails}
       onEditContainer={onEditContainer}
+      onRepairNetwork={onRepairNetwork}
+      gatewayDomain={gatewayDomain}
     />
   );
 };
@@ -205,8 +213,11 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   onChanged,
   onOpenDetails,
   onEditContainer,
+  onRepairNetwork,
   onContainerAction,
   busyMap,
+  onMapEntireGroup,
+  gatewayRoutes,
   children,
 }) => {
   const toast = useToast();
@@ -766,7 +777,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
+            onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
+            onMapEntireGroup={onMapEntireGroup}
+            gatewayRoutes={gatewayRoutes}
           />
         ))}
 
@@ -794,7 +808,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
+            onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
+            onMapEntireGroup={onMapEntireGroup}
+            gatewayRoutes={gatewayRoutes}
           />
         ))}
 
@@ -853,7 +870,10 @@ interface GroupCardProps {
     debug?: boolean
   ) => void;
   onEditContainer?: (id: string) => void;
+  onRepairNetwork?: (container: ContainerItem) => void;
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
+  onMapEntireGroup?: (groupName: string, containers: ContainerItem[]) => void;
+  gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
 }
 
 const GroupCard: React.FC<GroupCardProps> = ({
@@ -879,7 +899,10 @@ const GroupCard: React.FC<GroupCardProps> = ({
   onOpenLogs,
   onOpenDetails,
   onEditContainer,
+  onRepairNetwork,
   onContainerAction,
+  onMapEntireGroup,
+  gatewayRoutes,
 }) => {
   const drop = useDropTarget(g.id);
   const hasMembers = members.length > 0;
@@ -1050,6 +1073,18 @@ const GroupCard: React.FC<GroupCardProps> = ({
               <FileText className="w-3.5 h-3.5" />
             </Button>
           )}
+          {hasMembers && onMapEntireGroup && (
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Configure HTTPS Gateway routes for group services"
+              aria-label={`Configure Gateway routes for ${g.name}`}
+              onClick={() => onMapEntireGroup(g.name, members)}
+              className="text-violet-400 hover:text-violet-300 hover:bg-violet-500/10"
+            >
+              <Globe className="w-3.5 h-3.5" />
+            </Button>
+          )}
           {!compose && (
             <Button
               variant="ghost"
@@ -1105,16 +1140,30 @@ const GroupCard: React.FC<GroupCardProps> = ({
                   {reorder && !reorder.unchanged && reorder.beforeKey === c.id && (
                     <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
                   )}
-                  <MemberCard
-                    c={c}
-                    stats={statsMap?.[c.id]}
-                    sizeBytes={sizesMap?.[c.id]}
-                    busy={!!busyMap?.[c.id]}
-                    ownGroupId={g.id}
-                    onAction={(action) => onContainerAction(c, action)}
-                    onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                    onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
-                  />
+                  {(() => {
+                    const cleanName = c.name.replace(/^\//, "");
+                    const matchedRoute = gatewayRoutes?.find(
+                      (r) =>
+                        r.container_name === cleanName ||
+                        c.published_ports?.some(
+                          (p) => r.target === `127.0.0.1:${p.host_port}` || r.target === `localhost:${p.host_port}`
+                        )
+                    );
+                    return (
+                      <MemberCard
+                        c={c}
+                        stats={statsMap?.[c.id]}
+                        sizeBytes={sizesMap?.[c.id]}
+                        busy={!!busyMap?.[c.id]}
+                        ownGroupId={g.id}
+                        onAction={(action) => onContainerAction(c, action)}
+                        onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
+                        onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
+                        onRepairNetwork={onRepairNetwork ? () => onRepairNetwork(c) : undefined}
+                        gatewayDomain={matchedRoute?.domain}
+                      />
+                    );
+                  })()}
                 </React.Fragment>
               ))}
               {reorder && !reorder.unchanged && reorder.beforeKey === null && (

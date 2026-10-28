@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -9,6 +9,8 @@ import {
   RotateCw,
   ChevronDown,
   ChevronUp,
+  Globe,
+  ShieldCheck,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { useToast } from "../components/ui/Toast";
@@ -58,9 +60,73 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
   const [command, setCommand] = useState("");
   const [network, setNetwork] = useState("");
 
+  // Gateway routing options
+  const [enableGateway, setEnableGateway] = useState(false);
+  const [gatewayDomain, setGatewayDomain] = useState("");
+  const [gatewayPath, setGatewayPath] = useState("");
+  const [gatewayStripPrefix, setGatewayStripPrefix] = useState(false);
+
   // UI state
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [loading, setLoading] = useState(false);
+
+  // Determine if advanced/recreate-required parameters have changed compared to original inspect details
+  const hasAdvancedChanged = useMemo(() => {
+    if (!isEdit || !editTarget) return false;
+    const d = editTarget.details;
+
+    // Image check
+    if (image.trim() !== (d.image || "").trim()) return true;
+
+    // Command check
+    const origCmd = (d.command || (d.command_vec ? d.command_vec.join(" ") : "")).trim();
+    if (command.trim() !== origCmd) return true;
+
+    // Network check
+    const origNet = (d.network || "").trim();
+    if (network.trim() !== origNet) return true;
+
+    // Ports check
+    const curPorts = ports
+      .filter((p) => p.container_port.trim() !== "")
+      .map((p) => `${p.host_ip || "127.0.0.1"}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
+      .sort();
+    const origPorts = (d.port_mappings || [])
+      .filter((p) => (p.container_port || "").trim() !== "")
+      .map((p) => `${p.host_ip || "127.0.0.1"}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
+      .sort();
+    if (curPorts.length !== origPorts.length || curPorts.some((val, i) => val !== origPorts[i])) {
+      return true;
+    }
+
+    // Env vars check
+    const curEnv = envVars
+      .filter((e) => e.key.trim() !== "")
+      .map((e) => `${e.key}=${e.value}`)
+      .sort();
+    const origEnvRaw = d.env_pairs && d.env_pairs.length > 0
+      ? d.env_pairs.map((e) => `${e.key}=${e.value}`)
+      : (d.env || []).map((line) => line);
+    const origEnv = origEnvRaw.sort();
+    if (curEnv.length !== origEnv.length || curEnv.some((val, i) => val !== origEnv[i])) {
+      return true;
+    }
+
+    // Volumes check
+    const curVols = volumes
+      .filter((v) => v.source.trim() !== "" && v.target.trim() !== "")
+      .map((v) => `${v.kind || "bind"}:${v.source}:${v.target}:${!!v.read_only}`)
+      .sort();
+    const origVols = (d.volume_mounts || [])
+      .filter((v) => (v.source || "").trim() !== "" && (v.target || "").trim() !== "")
+      .map((v) => `${v.kind || "bind"}:${v.source}:${v.target}:${!!v.read_only}`)
+      .sort();
+    if (curVols.length !== origVols.length || curVols.some((val, i) => val !== origVols[i])) {
+      return true;
+    }
+
+    return false;
+  }, [isEdit, editTarget, image, command, network, ports, envVars, volumes]);
 
   // Sync state when dialog opens or editTarget changes
   useEffect(() => {
@@ -124,6 +190,23 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       setCommand(d.command || (d.command_vec ? d.command_vec.join(" ") : ""));
       setNetwork(d.network || "");
 
+      // Load existing gateway route if container has one
+      const cName = d.name.replace(/^\//, "");
+      api.listGatewayRoutes().then((routes) => {
+        const found = routes.find((r) => r.container_name === cName);
+        if (found) {
+          setEnableGateway(true);
+          setGatewayDomain(found.domain);
+          setGatewayPath(found.path || "");
+          setGatewayStripPrefix(!!found.strip_prefix);
+        } else {
+          setEnableGateway(false);
+          setGatewayDomain(`${cName.toLowerCase().replace(/[^a-z0-9-]/g, "-")}.localhost`);
+          setGatewayPath("");
+          setGatewayStripPrefix(false);
+        }
+      }).catch(console.error);
+
       // Default collapsed when opened
       setShowAdvanced(false);
     } else {
@@ -140,6 +223,10 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       setNetwork("");
       setMemoryMb("");
       setCpus("");
+      setEnableGateway(false);
+      setGatewayDomain("");
+      setGatewayPath("");
+      setGatewayStripPrefix(false);
       setShowAdvanced(false);
     }
   }, [isOpen, editTarget]);
@@ -207,21 +294,105 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
         },
       };
 
+      const finalContainerName = (name.trim() || (isEdit && editTarget ? editTarget.details.name : "")).replace(/^\//, "");
+
       if (isEdit && editTarget) {
-        // Recreate the container
-        const newId = await api.recreateContainer(editTarget.id, config);
-        toast.success(
-          "Container Recreated",
-          `Container ${name || editTarget.details.name} updated and started.`
-        );
-        onSuccess(newId);
+        let activeContainerId = editTarget.id;
+
+        if (hasAdvancedChanged) {
+          // Advanced parameters changed -> Recreate the container
+          activeContainerId = await api.recreateContainer(editTarget.id, config);
+          toast.success(
+            "Container Recreated",
+            `Container ${name || editTarget.details.name} updated and recreated.`
+          );
+        } else {
+          // Only hot configurations changed -> In-place update without recreation
+          const currentName = editTarget.details.name.replace(/^\//, "");
+          if (name.trim() && name.trim() !== currentName) {
+            await api.renameContainer(editTarget.id, name.trim());
+          }
+
+          // Update resources & restart policy
+          await api.updateContainerResources(editTarget.id, {
+            memory_mb: memoryMb.trim() || undefined,
+            cpus: cpus.trim() || undefined,
+            restart_policy: restartPolicy,
+          });
+
+          toast.success(
+            "Changes Saved",
+            `Container ${name.trim() || currentName} updated in-place.`
+          );
+        }
+
+        // Sync gateway route if configured
+        const currentPorts = config.ports && config.ports.length > 0 ? config.ports : (editTarget.details.port_mappings || []);
+        const firstPort = currentPorts[0]?.host_port || "80";
+        try {
+          const routes = await api.listGatewayRoutes();
+          const cleanDomain = gatewayDomain.trim().toLowerCase();
+          const updated = routes.filter(
+            (r) => r.container_name !== finalContainerName && r.domain !== cleanDomain
+          );
+
+          if (enableGateway && gatewayDomain.trim()) {
+            const routeId = `route-${Date.now()}`;
+            const target = `127.0.0.1:${firstPort}`;
+            updated.push({
+              id: routeId,
+              domain: cleanDomain,
+              target,
+              path: gatewayPath.trim() ? (gatewayPath.startsWith("/") ? gatewayPath.trim() : `/${gatewayPath.trim()}`) : null,
+              strip_prefix: gatewayStripPrefix,
+              container_name: finalContainerName,
+              group_name: null,
+              enabled: true,
+              auto_detected: true,
+            });
+          }
+
+          await api.saveGatewayRoutes(updated);
+        } catch (gErr) {
+          console.warn("Failed to update gateway route:", gErr);
+        }
+
+        onSuccess(activeContainerId);
       } else {
         // Run fresh container
         const newId = await api.runContainer(config);
+        const effectiveName = finalContainerName || newId.slice(0, 12);
         toast.success(
           "Container Launched",
-          `New container instance created: ${name || newId.slice(0, 12)}`
+          `New container instance created: ${effectiveName}`
         );
+
+        // Sync gateway route if configured
+        if (enableGateway && gatewayDomain.trim()) {
+          const firstPort = config.ports?.[0]?.host_port || "80";
+          try {
+            const routes = await api.listGatewayRoutes();
+            const cleanDomain = gatewayDomain.trim().toLowerCase();
+            const routeId = `route-${Date.now()}`;
+            const target = `127.0.0.1:${firstPort}`;
+            const updated = routes.filter((r) => r.domain !== cleanDomain);
+            updated.push({
+              id: routeId,
+              domain: cleanDomain,
+              target,
+              path: gatewayPath.trim() ? (gatewayPath.startsWith("/") ? gatewayPath.trim() : `/${gatewayPath.trim()}`) : null,
+              strip_prefix: gatewayStripPrefix,
+              container_name: effectiveName,
+              group_name: null,
+              enabled: true,
+              auto_detected: true,
+            });
+            await api.saveGatewayRoutes(updated);
+          } catch (gErr) {
+            console.warn("Failed to create gateway route:", gErr);
+          }
+        }
+
         onSuccess(newId);
       }
       onClose();
@@ -386,6 +557,87 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                   />
                 </div>
               </div>
+
+              {/* HTTPS Gateway Virtual Domain (Always accessible, no recreate required) */}
+              <div className="p-4 rounded-xl border border-violet-500/30 bg-violet-500/5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={enableGateway}
+                      onChange={(e) => {
+                        setEnableGateway(e.target.checked);
+                        if (e.target.checked && !gatewayDomain) {
+                          const safe = (name || "app").toLowerCase().replace(/[^a-z0-9-]/g, "-");
+                          setGatewayDomain(`${safe}.localhost`);
+                        }
+                      }}
+                      className="rounded border-zinc-700 text-violet-600 focus:ring-violet-500 w-4 h-4"
+                    />
+                    <span className="text-xs font-semibold text-violet-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <Globe className="w-3.5 h-3.5 text-violet-400" />
+                      HTTPS Gateway Route
+                    </span>
+                  </label>
+                  <span className="text-[10px] font-mono text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded">
+                    Caddy Native
+                  </span>
+                </div>
+
+                {enableGateway && (
+                  <div className="space-y-3 pt-2 border-t border-violet-500/20">
+                    <div>
+                      <label className="text-[11px] font-medium text-zinc-300 block mb-1">
+                        Virtual Domain Name
+                      </label>
+                      <input
+                        type="text"
+                        value={gatewayDomain}
+                        onChange={(e) => setGatewayDomain(e.target.value)}
+                        placeholder="my-service.localhost or custom.dev"
+                        className="w-full h-8 px-2.5 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white font-mono focus:border-violet-500 focus:outline-none"
+                      />
+                      <p className="text-[10px] text-zinc-500 mt-1">
+                        Use .localhost for automatic resolution without editing hosts, or any custom domain (synced with /etc/hosts).
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[11px] font-medium text-zinc-300 block mb-1">
+                          Path Prefix (Optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={gatewayPath}
+                          onChange={(e) => setGatewayPath(e.target.value)}
+                          placeholder="/api"
+                          className="w-full h-8 px-2.5 rounded-lg bg-zinc-900 border border-zinc-700 text-xs text-white font-mono focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="flex flex-col justify-end">
+                        <label className="flex items-center gap-2 p-1.5 rounded-lg bg-zinc-900/60 border border-zinc-800 cursor-pointer text-xs text-zinc-300 h-8">
+                          <input
+                            type="checkbox"
+                            checked={gatewayStripPrefix}
+                            onChange={(e) => setGatewayStripPrefix(e.target.checked)}
+                            className="rounded border-zinc-700 text-violet-600 focus:ring-violet-500 w-3.5 h-3.5"
+                          />
+                          <span className="text-[11px]">Strip prefix before upstream</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {gatewayDomain && (
+                      <div className="p-2 rounded bg-violet-500/10 border border-violet-500/20 flex items-center justify-between text-[11px] font-mono text-violet-300">
+                        <span>https://{gatewayDomain}{gatewayPath || ""} &rarr; 127.0.0.1:{ports[0]?.host_port || "8080"}</span>
+                        <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Section 2: Recreate Parameters (Ports, ENV, Volumes, Network, Command) */}
@@ -506,6 +758,8 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
                       only when another device must reach it.
                     </p>
                   </div>
+
+
 
                   {/* Environment Variables */}
                   <div>
@@ -698,11 +952,21 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
               </Button>
               <Button
                 type="submit"
-                variant={isEdit ? "primary" : "primary"}
+                variant="primary"
                 isLoading={loading}
-                className={isEdit ? "bg-amber-600 hover:bg-amber-500 text-white" : ""}
+                className={
+                  isEdit
+                    ? hasAdvancedChanged
+                      ? "bg-amber-600 hover:bg-amber-500 text-white"
+                      : "bg-blue-600 hover:bg-blue-500 text-white"
+                    : ""
+                }
               >
-                {isEdit ? "Save & Recreate Container" : "Run Container"}
+                {isEdit
+                  ? hasAdvancedChanged
+                    ? "Recreate"
+                    : "Save Changes"
+                  : "Run Container"}
               </Button>
             </div>
           </form>

@@ -818,3 +818,187 @@ pub async fn install_cli_update(
         }
     }
 }
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EmbeddedBinaryInfo {
+    pub name: String,
+    pub category: String,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub is_active: bool,
+    pub description: String,
+}
+
+/// Lists all bundled and embedded tool binaries (dockerd, docker, containerd, runc, rootlesskit, docker-compose, kind)
+/// along with their active state, version, path, and purpose.
+#[tauri::command]
+pub async fn get_embedded_binaries(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<EmbeddedBinaryInfo>, String> {
+    let engine_paths = state.engine.paths();
+    let bin_dir = engine_paths.bin_dir();
+    let mut list = Vec::new();
+
+    // 1. Docker (dockerd + docker CLI)
+    let dockerd_path = bin_dir.join("dockerd");
+    let docker_path = bin_dir.join("docker");
+    let docker_ver = if dockerd_path.is_file() {
+        crate::docker::engine::installed_engine_version(&engine_paths)
+            .or_else(|| run_cmd_version(&dockerd_path, &["--version"]))
+    } else if docker_path.is_file() {
+        crate::docker::engine::bundled_cli_version(&engine_paths)
+            .or_else(|| run_cmd_version(&docker_path, &["--version"]))
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "docker / dockerd".into(),
+        category: "Engine & CLI".into(),
+        version: docker_ver,
+        path: if dockerd_path.is_file() {
+            Some(dockerd_path.display().to_string())
+        } else if docker_path.is_file() {
+            Some(docker_path.display().to_string())
+        } else {
+            None
+        },
+        is_active: state.daemon_state() == DaemonState::Running,
+        description: "Official Docker daemon & CLI command-line tool suite".into(),
+    });
+
+    // 3. containerd
+    let containerd_path = bin_dir.join("containerd");
+    let containerd_ver = if containerd_path.is_file() {
+        run_cmd_version(&containerd_path, &["--version"])
+            .map(|s| clean_containerd_version(&s))
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "containerd".into(),
+        category: "Container Runtime".into(),
+        version: containerd_ver,
+        path: containerd_path.is_file().then(|| containerd_path.display().to_string()),
+        is_active: state.daemon_state() == DaemonState::Running,
+        description: "Industry-standard core container runtime supervisor".into(),
+    });
+
+    // 4. runc
+    let runc_path = bin_dir.join("runc");
+    let runc_ver = if runc_path.is_file() {
+        run_cmd_version(&runc_path, &["--version"])
+            .map(|s| clean_runc_version(&s))
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "runc".into(),
+        category: "OCI Runtime".into(),
+        version: runc_ver,
+        path: runc_path.is_file().then(|| runc_path.display().to_string()),
+        is_active: runc_path.is_file(),
+        description: "Low-level CLI tool for spawning containers according to OCI specification".into(),
+    });
+
+    // 5. rootlesskit
+    let rootless_path = bin_dir.join("rootlesskit");
+    let rootless_ver = if rootless_path.is_file() {
+        run_cmd_version(&rootless_path, &["--version"])
+            .map(|s| clean_rootless_version(&s))
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "rootlesskit".into(),
+        category: "Rootless Engine".into(),
+        version: rootless_ver,
+        path: rootless_path.is_file().then(|| rootless_path.display().to_string()),
+        is_active: state.daemon_state() == DaemonState::Running,
+        description: "Linux user-namespace supervisor providing unprivileged rootless isolation".into(),
+    });
+
+    // 6. docker-compose
+    let compose_plugin = engine_paths.compose_plugin();
+    let compose_ver = if compose_plugin.is_file() {
+        crate::docker::engine::compose_plugin_version(&compose_plugin)
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "docker-compose".into(),
+        category: "Compose Plugin".into(),
+        version: compose_ver,
+        path: compose_plugin.is_file().then(|| compose_plugin.display().to_string()),
+        is_active: compose_plugin.is_file(),
+        description: "Multi-container Docker orchestration plugin (CLI v2)".into(),
+    });
+
+    // 7. kind (Kubernetes IN Docker)
+    let kind_paths = &state.kind;
+    let kind_status = crate::docker::kind::kind_status(kind_paths);
+    list.push(EmbeddedBinaryInfo {
+        name: "kind".into(),
+        category: "Kubernetes Tool".into(),
+        version: kind_status.version,
+        path: kind_status.path,
+        is_active: kind_status.installed,
+        description: "Kubernetes IN Docker runner and cluster management tool".into(),
+    });
+
+    // 8. caddy (HTTPS Reverse Proxy Gateway)
+    let caddy_paths = &state.caddy.paths;
+    let caddy_installed = caddy_paths.is_installed();
+    let caddy_ver = if caddy_installed {
+        run_cmd_version(&caddy_paths.binary(), &["version"])
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+    } else {
+        None
+    };
+    list.push(EmbeddedBinaryInfo {
+        name: "caddy".into(),
+        category: "Gateway & Proxy".into(),
+        version: caddy_ver,
+        path: caddy_installed.then(|| caddy_paths.binary().display().to_string()),
+        is_active: state.caddy.is_running().await,
+        description: "Zero-config HTTPS reverse proxy gateway with automatic local CA certificate".into(),
+    });
+
+    Ok(list)
+}
+
+fn run_cmd_version(bin: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .args(args)
+        .output()
+        .ok()?;
+    let text = if !out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    text.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn clean_containerd_version(s: &str) -> String {
+    // e.g. "containerd github.com/containerd/containerd/v2 v2.4.2 b7a252..." -> "v2.4.2"
+    for part in s.split_whitespace() {
+        if part.starts_with('v') && part.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) {
+            return part.to_string();
+        }
+    }
+    s.to_string()
+}
+
+fn clean_runc_version(s: &str) -> String {
+    // e.g. "runc version 1.5.2" -> "1.5.2"
+    s.strip_prefix("runc version ")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| s.to_string())
+}
+
+fn clean_rootless_version(s: &str) -> String {
+    // e.g. "rootlesskit version 3.3.0" -> "3.3.0"
+    s.strip_prefix("rootlesskit version ")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| s.to_string())
+}

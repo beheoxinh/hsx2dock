@@ -45,6 +45,8 @@ export interface ContainerItem {
   kind_cluster?: string | null;
   /** Networks this container is connected to. */
   networks?: string[];
+  /** Broken network names whose NetworkID does not exist on the daemon. */
+  broken_networks?: string[];
 }
 
 /** A user-defined container group: bulk start/stop + optional engine-start auto-run. */
@@ -144,6 +146,8 @@ export interface VolumeItem {
   restricted_dirs?: number;
   /** Managed by kind: deleting or pruning it is refused by the backend. */
   protected?: boolean;
+  /** True if currently mounted by at least one container. */
+  in_use?: boolean;
 }
 
 export interface NetworkItem {
@@ -182,6 +186,10 @@ export interface DfReport {
 
 export interface EngineInfo {
   version: string;
+  api_version?: string;
+  kernel?: string;
+  root_dir?: string;
+  cgroup_driver?: string;
   containers: number;
   containers_running: number;
   containers_paused: number;
@@ -241,6 +249,10 @@ export interface AppConfig {
   mcp_enabled?: boolean;
   /** Loopback port for the MCP HTTP transport. */
   mcp_port?: number;
+  /** Automatically prune dangling / untagged images. */
+  auto_prune_dangling_images?: boolean;
+  /** Automatically prune isolated / unused volumes. */
+  auto_prune_isolated_volumes?: boolean;
 }
 
 /**
@@ -687,6 +699,70 @@ export interface KindInstallStatus {
   path: string | null;
   /** False on platforms with no published kind binary. */
   supported: boolean;
+}
+
+export interface EmbeddedBinaryInfo {
+  name: string;
+  category: string;
+  version: string | null;
+  path: string | null;
+  is_active: boolean;
+  description: string;
+}
+
+export interface CaddyInstallStatus {
+  installed: boolean;
+  version: string | null;
+  latest: string;
+  path: string | null;
+  running: boolean;
+  admin_url: string;
+  http_port: number;
+  https_port: number;
+  trusted: boolean;
+  hosts_synced: boolean;
+  auto_start: boolean;
+}
+
+export interface GatewayRoute {
+  id: string;
+  domain: string;
+  target: string;
+  path?: string | null;
+  strip_prefix?: boolean;
+  container_name?: string | null;
+  group_name?: string | null;
+  enabled: boolean;
+  auto_detected: boolean;
+}
+
+export interface HostsSyncStatus {
+  managed_domains: string[];
+  in_hosts_domains: string[];
+  synced: boolean;
+  tampered: boolean;
+  managed_block_present: boolean;
+}
+
+export interface HostsEntryItem {
+  id: string;
+  ip: string;
+  hosts: string[];
+  comment?: string | null;
+  is_enabled: boolean;
+  is_managed_by_app: boolean;
+  is_syntax_valid: boolean;
+  syntax_error?: string | null;
+  raw_line: string;
+}
+
+export interface HostsFileModel {
+  entries: HostsEntryItem[];
+  raw_content: string;
+  can_write_direct: boolean;
+  managed_block_present: boolean;
+  tampered: boolean;
+  total_lines: number;
 }
 
 /** A streamed line from a kind subprocess (`kind-progress` event). */

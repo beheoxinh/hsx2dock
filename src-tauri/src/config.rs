@@ -129,6 +129,31 @@ pub struct AppConfig {
     /// Port for the loopback HTTP transport. `0` = pick a free port on start.
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Automatically prune dangling / untagged images when viewing the Images page or on background tick.
+    #[serde(default)]
+    pub auto_prune_dangling_images: bool,
+    /// Automatically prune isolated / unused volumes when viewing the Volumes page.
+    #[serde(default)]
+    pub auto_prune_isolated_volumes: bool,
+    // ---- Caddy Gateway Preferences ----
+    #[serde(default)]
+    pub gateway_enabled: bool,
+    #[serde(default)]
+    pub gateway_auto_start: bool,
+    #[serde(default = "default_gateway_http_port")]
+    pub gateway_http_port: u16,
+    #[serde(default = "default_gateway_https_port")]
+    pub gateway_https_port: u16,
+    #[serde(default)]
+    pub gateway_routes: Vec<crate::docker::caddy::GatewayRoute>,
+}
+
+fn default_gateway_http_port() -> u16 {
+    80
+}
+
+fn default_gateway_https_port() -> u16 {
+    443
 }
 
 fn default_kind_start_delay() -> u32 {
@@ -329,6 +354,13 @@ impl Default for AppConfig {
             kind_cluster_prefs: Default::default(),
             mcp_enabled: false,
             mcp_port: default_mcp_port(),
+            auto_prune_dangling_images: false,
+            auto_prune_isolated_volumes: false,
+            gateway_enabled: false,
+            gateway_auto_start: false,
+            gateway_http_port: default_gateway_http_port(),
+            gateway_https_port: default_gateway_https_port(),
+            gateway_routes: Vec::new(),
         }
     }
 }
@@ -583,6 +615,13 @@ mod tests {
             kind_cluster_prefs: Default::default(),
             mcp_enabled: false,
             mcp_port: default_mcp_port(),
+            auto_prune_dangling_images: false,
+            auto_prune_isolated_volumes: false,
+            gateway_enabled: false,
+            gateway_auto_start: false,
+            gateway_http_port: default_gateway_http_port(),
+            gateway_https_port: default_gateway_https_port(),
+            gateway_routes: Vec::new(),
         };
         cfg.save_to(&path).await.expect("save works");
         let loaded = AppConfig::load_from(&path).await.expect("load works");

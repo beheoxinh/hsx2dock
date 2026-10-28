@@ -37,6 +37,8 @@ pub struct AppState {
     /// The loopback MCP HTTP server, when Settings has it enabled. Holding the
     /// value is what keeps it alive; setting it to `None` stops it.
     pub mcp_server: Arc<RwLock<Option<crate::mcp::http::RunningServer>>>,
+    /// Caddy Gateway supervisor for routing HTTP/HTTPS requests to local containers
+    pub caddy: Arc<crate::docker::caddy::CaddySupervisor>,
 }
 
 impl AppState {
@@ -54,6 +56,7 @@ impl AppState {
         };
 
         let close_to_tray = config.close_to_tray;
+        let caddy = Arc::new(crate::docker::caddy::CaddySupervisor::new());
 
         Self {
             client: Arc::new(RwLock::new(client)),
@@ -65,6 +68,7 @@ impl AppState {
             kind: KindPaths::for_app(),
             close_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(close_to_tray)),
             mcp_server: Arc::new(RwLock::new(None)),
+            caddy,
         }
     }
 
