@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDashed,
+  Info,
   Loader2,
   RefreshCw,
   Stethoscope,
@@ -238,7 +239,8 @@ export const EngineHealthCard: React.FC = () => {
 
   const repairable = report?.checks.filter((c) => c.repairable) ?? [];
   const needsRepair = repairable.filter((c) => needsFixing(c.health));
-  const failingPlugins = report?.plugins.filter((p) => needsFixing(p.health)) ?? [];
+  const failingPlugins = report?.plugins.filter((p) => p.health === "error") ?? [];
+  const warningPlugins = report?.plugins.filter((p) => p.health === "warning") ?? [];
   const tone = TONE[report?.health ?? "missing"];
   const busy = repairingAll || repairing !== null;
 
@@ -358,19 +360,26 @@ export const EngineHealthCard: React.FC = () => {
                 <span className="text-xs font-normal text-zinc-500">
                   {report.plugins.length === 0
                     ? "no plugin data yet"
-                    : `${report.plugins.length} loaded${
+                    : `${report.plugins.length} probed${
                         failingPlugins.length > 0
-                          ? `, ${failingPlugins.length} failing`
-                          : ""
+                          ? `, ${failingPlugins.length} broken`
+                          : warningPlugins.length > 0
+                            ? `, ${warningPlugins.length} optional skipped`
+                            : ""
                       }`}
                 </span>
               </span>
-              {failingPlugins.length > 0 && (
-                <span className="flex items-center gap-1 text-[11px] text-amber-400 shrink-0">
-                  <AlertTriangle className="w-3.5 h-3.5" />
-                  {failingPlugins.length} failing
+              {failingPlugins.length > 0 ? (
+                <span className="flex items-center gap-1 text-[11px] text-rose-400 shrink-0">
+                  <XCircle className="w-3.5 h-3.5" />
+                  {failingPlugins.length} broken
                 </span>
-              )}
+              ) : warningPlugins.length > 0 ? (
+                <span className="flex items-center gap-1 text-[11px] text-zinc-400 shrink-0" title="Optional platform snapshotters skipped">
+                  <Info className="w-3.5 h-3.5 text-zinc-400" />
+                  {warningPlugins.length} skipped
+                </span>
+              ) : null}
             </button>
 
             {showPlugins && (

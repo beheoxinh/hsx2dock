@@ -437,6 +437,11 @@ fn check_containerd_plugin_failures(plugins: &[ContainerdPlugin]) -> EngineCheck
         .filter(|p| p.health == Health::Error)
         .collect();
 
+    let warnings: Vec<&ContainerdPlugin> = plugins
+        .iter()
+        .filter(|p| p.health == Health::Warning)
+        .collect();
+
     if plugins.is_empty() {
         return EngineCheck {
             id: CHECK_CONTAINERD_PLUGINS.into(),
@@ -450,11 +455,26 @@ fn check_containerd_plugin_failures(plugins: &[ContainerdPlugin]) -> EngineCheck
     }
 
     if failed.is_empty() {
+        let detail = if warnings.is_empty() {
+            format!("All {} plugins loaded cleanly.", plugins.len())
+        } else {
+            format!(
+                "{} plugins active ({} optional skipped: {}).",
+                plugins.len() - warnings.len(),
+                warnings.len(),
+                warnings
+                    .iter()
+                    .map(|p| p.id.replace("io.containerd.snapshotter.v1.", "").replace("io.containerd.internal.v1.", ""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
         return EngineCheck {
             id: CHECK_CONTAINERD_PLUGINS.into(),
             label: "Containerd plugins".into(),
             health: Health::Ok,
-            detail: format!("All {} plugins loaded cleanly.", plugins.len()),
+            detail,
             path: None,
             repairable: false,
             auto: false,
@@ -466,9 +486,9 @@ fn check_containerd_plugin_failures(plugins: &[ContainerdPlugin]) -> EngineCheck
         label: "Containerd plugins".into(),
         health: Health::Error,
         detail: format!(
-            "{} failed to load: {}. Repairing the snapshotter links and restarting the engine \
-             usually clears this.",
+            "{} critical plugin{} failed to load: {}. Running engine repair to restore snapshotter links and restarting usually clears this.",
             failed.len(),
+            if failed.len() == 1 { "" } else { "s" },
             failed
                 .iter()
                 .map(|p| p.id.as_str())
@@ -514,19 +534,36 @@ fn is_optional_plugin(id: &str) -> bool {
             | "io.containerd.server.v1.grpc-tcp"
             | "io.containerd.server.v1.metrics"
     ) || id.starts_with("io.containerd.snapshotter.v1.blockfile")
+        || id.starts_with("io.containerd.snapshotter.v1.btrfs")
         || id.starts_with("io.containerd.snapshotter.v1.erofs")
         || id.starts_with("io.containerd.snapshotter.v1.zfs")
         || id.starts_with("io.containerd.snapshotter.v1.devmapper")
 }
 
-/// A failure that is expected because the engine runs rootless, rather than a
-/// sign of damage.
+/// A failure that is expected because the engine runs rootless or on an
+/// incompatible filesystem/kernel configuration for optional snapshotters,
+/// rather than an engine fault.
 ///
-/// The clearest case is `io.containerd.internal.v1.opt`: it tries to create its
-/// scratch directory under `/opt/containerd`, which a rootless daemon has no
-/// business writing to. containerd logs it at `warning` and carries on.
+/// Cases:
+/// - `io.containerd.internal.v1.opt`: attempts `/opt/containerd` (permission denied in rootless).
+/// - `io.containerd.snapshotter.v1.btrfs`: "not supported on this platform: skip plugin" on ext4/xfs.
+/// - `io.containerd.snapshotter.v1.devmapper`: "devmapper not supported: skip plugin" or "devmapper not configured".
+/// - `io.containerd.snapshotter.v1.zfs` / `erofs`: filesystem missing or kernel module absent.
 fn is_expected_rootless_failure(id: &str, line: &str) -> bool {
-    id == "io.containerd.internal.v1.opt" && line.contains("permission denied")
+    if id == "io.containerd.internal.v1.opt" && line.contains("permission denied") {
+        return true;
+    }
+
+    if is_optional_plugin(id)
+        && (line.contains("not supported")
+            || line.contains("skip plugin")
+            || line.contains("not configured")
+            || line.contains("no such file or directory"))
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Pure form of [`read_containerd_plugins`], so the parsing is unit-testable.
@@ -716,6 +753,26 @@ time="1" level=warning msg="failed to load plugin" error="mkdir /opt/containerd:
         // And it does not roll up into a failing "Containerd plugins" check.
         let check = check_containerd_plugin_failures(&plugins);
         assert_eq!(check.health, Health::Ok);
+    }
+
+    #[test]
+    fn platform_unsupported_snapshotters_are_treated_as_warnings() {
+        // When running on ext4/xfs without btrfs/devmapper support, containerd
+        // skips those snapshotters with "not supported on this platform" or "devmapper not supported".
+        // These are optional plugins and should not fail the engine health check.
+        let log = r#"
+time="1" level=warning msg="failed to load plugin" error="plugin is not supported on this platform: skip plugin" id=io.containerd.snapshotter.v1.btrfs type=io.containerd.snapshotter.v1
+time="2" level=warning msg="failed to load plugin" error="devmapper not supported: skip plugin" id=io.containerd.snapshotter.v1.devmapper type=io.containerd.snapshotter.v1
+"#;
+        let plugins = parse_containerd_plugins(log);
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].health, Health::Warning);
+        assert_eq!(plugins[1].health, Health::Warning);
+
+        let check = check_containerd_plugin_failures(&plugins);
+        assert_eq!(check.health, Health::Ok);
+        assert!(check.detail.contains("btrfs"));
+        assert!(check.detail.contains("devmapper"));
     }
 
     #[test]
