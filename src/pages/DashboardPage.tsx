@@ -8,28 +8,26 @@ import {
   Trash2,
   Cpu,
 } from "lucide-react";
+import { motion } from "framer-motion";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { useToast } from "../components/ui/Toast";
 import { useModal } from "../components/ui/ModalContext";
-import { StatTileSkeleton } from "../components/ui/Skeleton";
+import { StatTileSkeleton, ChartSkeleton, DonutSkeleton, KeyValueSkeleton } from "../components/ui/Skeleton";
 import { api, events } from "../lib/api";
+import { useContainerStore } from "../lib/containerStore";
+import {
+  primeDashboardStore,
+  refreshDashboardClusters,
+  useDashboardStore,
+} from "../lib/dashboardStore";
 import { useSeries } from "../hooks/useSeries";
 import { AreaChart } from "../components/charts/AreaChart";
 import { DonutChart } from "../components/charts/DonutChart";
 import { cn, formatBytes, formatDuration } from "../lib/utils";
 import type {
-  ContainerItem,
   ContainerStats,
   DaemonState,
-  DfReport,
-  EmbeddedBinaryInfo,
-  EngineInfo,
-  ImageItem,
-  KindCluster,
-  KindInstallStatus,
-  NetworkItem,
-  VolumeItem,
 } from "../types";
 
 interface DashboardPageProps {
@@ -69,18 +67,24 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const toast = useToast();
   const modal = useModal();
 
-  const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null);
-  const [diskUsage, setDiskUsage] = useState<DfReport | null>(null);
-  const [containers, setContainers] = useState<ContainerItem[]>([]);
-  const [images, setImages] = useState<ImageItem[]>([]);
-  const [volumes, setVolumes] = useState<VolumeItem[]>([]);
-  const [networks, setNetworks] = useState<NetworkItem[]>([]);
+  // Engine figures come from the app-wide cache primed at startup, and the
+  // container list comes from the cache the Containers screen shares, so this
+  // page paints from memory instead of fetching on every tab switch.
+  const dashboard = useDashboardStore();
+  const {
+    engineInfo,
+    diskUsage,
+    images,
+    volumes,
+    networks,
+    kindStatus,
+    embeddedBinaries,
+    clusters,
+  } = dashboard;
+  const containers = useContainerStore().containers;
   // First-load gate for the summary tiles: placeholders instead of zeros that
   // snap to real figures a moment later.
-  const [loading, setLoading] = useState(true);
-  const [clusters, setClusters] = useState<KindCluster[]>([]);
-  const [kindStatus, setKindStatus] = useState<KindInstallStatus | null>(null);
-  const [embeddedBinaries, setEmbeddedBinaries] = useState<EmbeddedBinaryInfo[]>([]);
+  const loading = !dashboard.ready;
   const [, setStats] = useState<Record<string, ContainerStats>>({});
   const [pruning, setPruning] = useState(false);
 
@@ -106,71 +110,27 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   // Cluster status for the dashboard card. Clusters change slowly, so a gentle
   // poll is enough while the engine is up.
   useEffect(() => {
-    if (!isRunning) {
-      setClusters([]);
-      return;
-    }
-    let disposed = false;
-    const load = () => {
-      api
-        .listKindClusters()
-        .then((list) => {
-          if (!disposed) setClusters(list);
-        })
-        .catch(() => {
-          /* engine went away mid-poll — keep the last known snapshot */
-        });
-    };
-    load();
-    const timer = window.setInterval(load, 10_000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
+    if (!isRunning) return;
+    void refreshDashboardClusters();
+    const timer = window.setInterval(() => {
+      void refreshDashboardClusters();
+    }, 10_000);
+    return () => window.clearInterval(timer);
   }, [isRunning]);
 
   const loadData = async () => {
-    try {
-      const [infoR, dfR, cR, iR, vR, nR, kindR, binR] = await Promise.allSettled([
-        api.getEngineInfo(),
-        api.getDiskUsage(),
-        api.listContainers(true),
-        api.listImages(),
-        api.listVolumes(),
-        api.listNetworks(),
-        api.kindStatus(),
-        api.getEmbeddedBinaries(),
-      ]);
-      if (infoR.status === "fulfilled") setEngineInfo(infoR.value);
-      if (dfR.status === "fulfilled") setDiskUsage(dfR.value);
-      if (cR.status === "fulfilled") setContainers(cR.value);
-      if (iR.status === "fulfilled") setImages(iR.value);
-      if (vR.status === "fulfilled") setVolumes(vR.value);
-      if (nR.status === "fulfilled") setNetworks(nR.value);
-      if (kindR.status === "fulfilled") setKindStatus(kindR.value);
-      if (binR.status === "fulfilled") setEmbeddedBinaries(binR.value);
-    } catch (e) {
-      toast.error("Failed to load dashboard data", String(e));
-    } finally {
-      setLoading(false);
-    }
+    // The shared store handles partial failures itself: a panel whose request
+    // fails keeps its previous value instead of blanking the dashboard.
+    await primeDashboardStore(true);
   };
 
   useEffect(() => {
     loadData();
 
-    let unlistenContainers: (() => void) | undefined;
     let unlistenStats: (() => void) | undefined;
     let disposed = false;
     let prevNet: Record<string, { rx: number; tx: number }> = {};
     let lastTs = Date.now();
-
-    events.onContainersTick((updated) => {
-      setContainers(updated);
-    }).then((u) => {
-      if (disposed) u();
-      else unlistenContainers = u;
-    });
 
     events.onContainerStatsTick((tick: Record<string, ContainerStats>) => {
       const now = Date.now();
@@ -218,7 +178,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
     return () => {
       disposed = true;
-      if (unlistenContainers) unlistenContainers();
       if (unlistenStats) unlistenStats();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -413,13 +372,24 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </span>
           </div>
           <div className="min-h-0 flex-1">
-            <AreaChart
-              series={[{ name: "CPU", color: "#22d3ee", data: cpuSeries }]}
-              formatValue={(v) => `${v.toFixed(0)}%`}
-              yMax={100}
-              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
-              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
-            />
+            {isRunning && samples.length === 0 ? (
+              <ChartSkeleton hint="Collecting samples…" />
+            ) : (
+              <motion.div
+                className="h-full"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.35 }}
+              >
+                <AreaChart
+                  series={[{ name: "CPU", color: "#22d3ee", data: cpuSeries }]}
+                  formatValue={(v) => `${v.toFixed(0)}%`}
+                  yMax={100}
+                  emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+                  timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+                />
+              </motion.div>
+            )}
           </div>
         </Card>
 
@@ -438,13 +408,24 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </span>
           </div>
           <div className="min-h-0 flex-1">
-            <AreaChart
-              series={[{ name: "Memory", color: "#a3e635", data: memSeries }]}
-              formatValue={(v) => formatBytes(v)}
-              yMax={totalMem > 0 ? totalMem : undefined}
-              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
-              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
-            />
+            {isRunning && samples.length === 0 ? (
+              <ChartSkeleton hint="Collecting samples…" />
+            ) : (
+              <motion.div
+                className="h-full"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.35 }}
+              >
+                <AreaChart
+                  series={[{ name: "Memory", color: "#a3e635", data: memSeries }]}
+                  formatValue={(v) => formatBytes(v)}
+                  yMax={totalMem > 0 ? totalMem : undefined}
+                  emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+                  timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+                />
+              </motion.div>
+            )}
           </div>
         </Card>
       </div>
@@ -468,15 +449,26 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </div>
           </div>
           <div className="min-h-0 flex-1">
-            <AreaChart
-              series={[
-                { name: "Download", color: "#38bdf8", data: rxSeries },
-                { name: "Upload", color: "#fb923c", data: txSeries },
-              ]}
-              formatValue={(v) => `${formatBytes(v)}/s`}
-              emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
-              timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
-            />
+            {isRunning && samples.length === 0 ? (
+              <ChartSkeleton hint="Collecting samples…" />
+            ) : (
+              <motion.div
+                className="h-full"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.35 }}
+              >
+                <AreaChart
+                  series={[
+                    { name: "Download", color: "#38bdf8", data: rxSeries },
+                    { name: "Upload", color: "#fb923c", data: txSeries },
+                  ]}
+                  formatValue={(v) => `${formatBytes(v)}/s`}
+                  emptyHint={isRunning ? "Collecting samples…" : "Engine not running"}
+                  timeHint={`last ${MAX_SAMPLES} samples (≈4 min)`}
+                />
+              </motion.div>
+            )}
           </div>
         </Card>
 
@@ -485,11 +477,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white">Kind Clusters</h3>
               <p className="truncate text-[11px] text-zinc-500">
-                {clusters.length === 0
-                  ? isRunning
-                    ? "No clusters yet"
-                    : "Engine not running"
-                  : `${runningClusters} of ${clusters.length} running`}
+                {loading
+                  ? "Loading clusters…"
+                  : clusters.length === 0
+                    ? isRunning
+                      ? "No clusters yet"
+                      : "Engine not running"
+                    : `${runningClusters} of ${clusters.length} running`}
               </p>
             </div>
             <Button
@@ -502,7 +496,10 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </Button>
           </div>
           <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto">
-            {clusters.length === 0 && (
+            {isRunning && loading && (
+              <KeyValueSkeleton rows={3} compact />
+            )}
+            {!loading && clusters.length === 0 && (
               <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
                 <Boxes className="h-7 w-7 text-zinc-600" />
                 <p className="text-[11px] text-zinc-500">
@@ -548,7 +545,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-white">Storage</h3>
               <p className="truncate text-[11px] text-zinc-500">
-                {formatBytes(diskUsage?.total_reclaimable ?? 0)} reclaimable
+                {loading
+                  ? "Reading disk usage…"
+                  : `${formatBytes(diskUsage?.total_reclaimable ?? 0)} reclaimable`}
               </p>
             </div>
             <Button
@@ -563,11 +562,22 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </Button>
           </div>
           <div className="min-h-0 flex-1">
-            <DonutChart
-              segments={storageSegments}
-              total={storageTotal}
-              centerLabel="Total"
-            />
+            {loading ? (
+              <DonutSkeleton />
+            ) : (
+              <motion.div
+                className="h-full"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.35 }}
+              >
+                <DonutChart
+                  segments={storageSegments}
+                  total={storageTotal}
+                  centerLabel="Total"
+                />
+              </motion.div>
+            )}
           </div>
         </Card>
 
@@ -592,12 +602,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 Docker Engine
               </div>
               <div className="space-y-1 pl-3 border-l border-zinc-800">
-                {dockerSpecRows.map(([label, value]) => (
-                  <div key={label} className="flex items-center justify-between gap-3">
-                    <span className="text-zinc-400">{label}</span>
-                    <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
-                  </div>
-                ))}
+                {loading ? (
+                  <KeyValueSkeleton rows={6} />
+                ) : (
+                  dockerSpecRows.map(([label, value]) => (
+                    <div key={label} className="flex items-center justify-between gap-3">
+                      <span className="text-zinc-400">{label}</span>
+                      <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
 
@@ -608,12 +622,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 Kubernetes (Kind)
               </div>
               <div className="space-y-1 pl-3 border-l border-zinc-800">
-                {k8sSpecRows.map(([label, value]) => (
-                  <div key={label} className="flex items-center justify-between gap-3">
-                    <span className="text-zinc-400">{label}</span>
-                    <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
-                  </div>
-                ))}
+                {loading ? (
+                  <KeyValueSkeleton rows={5} />
+                ) : (
+                  k8sSpecRows.map(([label, value]) => (
+                    <div key={label} className="flex items-center justify-between gap-3">
+                      <span className="text-zinc-400">{label}</span>
+                      <span className="truncate tabular-nums text-zinc-200 font-mono text-[11px]">{value}</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -627,7 +645,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               <h3 className="text-sm font-semibold text-white truncate">Embedded Tools</h3>
             </div>
             <span className="text-[10px] text-zinc-500 font-mono">
-              {embeddedBinaries.length} binaries
+              {loading ? "…" : `${embeddedBinaries.length} binaries`}
             </span>
           </div>
           <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">
@@ -671,9 +689,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 </div>
               </div>
             ))}
-            {embeddedBinaries.length === 0 && (
+            {embeddedBinaries.length === 0 && loading && (
+              <KeyValueSkeleton rows={4} compact />
+            )}
+            {embeddedBinaries.length === 0 && !loading && (
               <div className="py-6 text-center text-xs text-zinc-600">
-                Loading binary tools…
+                No bundled tools found
               </div>
             )}
           </div>

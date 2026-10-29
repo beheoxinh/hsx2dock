@@ -23,6 +23,7 @@ import { McpPage } from "./pages/McpPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { api, events } from "./lib/api";
 import { primeContainerStore, startContainerStoreSync } from "./lib/containerStore";
+import { primeDashboardStore, resetDashboardEngineData } from "./lib/dashboardStore";
 import type { DaemonState } from "./types";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
@@ -83,6 +84,9 @@ const MainLayout: React.FC = () => {
     // groups and gateway routes are fetched once here so the tab paints from
     // memory instead of waiting on Docker on first visit.
     startContainerStoreSync();
+    // Warm the Dashboard too: it is the opening screen, so its engine figures,
+    // storage donut and tool list should already be in memory when it paints.
+    void primeDashboardStore();
 
     let unlisten: (() => void) | undefined;
     events.onEngineStateChanged((state) => {
@@ -93,6 +97,11 @@ const MainLayout: React.FC = () => {
       if (state === "Running") {
         // The container cache belongs to the daemon that produced it.
         void primeContainerStore(true);
+        void primeDashboardStore(true);
+      } else {
+        // Stopped: engine-backed dashboard figures no longer describe anything
+        // that is running, so drop them instead of showing stale numbers.
+        resetDashboardEngineData();
       }
       // Engine start/stop is visible in the header and every page gate, so it
       // is not announced with a toast; only failures are.
@@ -106,6 +115,7 @@ const MainLayout: React.FC = () => {
         setRefreshKey((k) => k + 1);
         // A different daemon means a different container list.
         void primeContainerStore(true);
+        void primeDashboardStore(true);
       })
       .then((u) => (unlistenEndpoint = u));
 
@@ -152,7 +162,10 @@ const MainLayout: React.FC = () => {
       // not leave a stale "Running" label on the button.
       const verified = await api.getEngineStatus();
       setDaemonState(verified);
-      if (verified === "Running") void primeContainerStore(true);
+      if (verified === "Running") {
+        void primeContainerStore(true);
+        void primeDashboardStore(true);
+      }
     } catch (e) {
       toast.error("Failed to toggle engine", String(e));
       // The daemon may have died mid-startup; never leave a stale "Running"
