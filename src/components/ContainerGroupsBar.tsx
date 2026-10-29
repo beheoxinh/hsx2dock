@@ -198,6 +198,39 @@ const GroupName: React.FC<{
   );
 
 /**
+ * Which group cards the user left expanded. Purely presentational, so it lives
+ * in localStorage rather than the app config: it must survive a restart without
+ * turning into another field the backend has to validate. Keyed by group id, so
+ * a renamed group keeps its state; a deleted group's entry is dropped with it.
+ */
+const EXPANDED_STORAGE_KEY = "containerGroupsExpanded";
+/** Synthetic id of the "Isolated" bucket. */
+const ISOLATED_GROUP_ID = "__isolated__";
+
+function loadExpandedGroups(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(EXPANDED_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, boolean> = {};
+    for (const [id, open] of Object.entries(parsed)) {
+      if (typeof open === "boolean") out[id] = open;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistExpandedGroups(next: Record<string, boolean>) {
+  try {
+    localStorage.setItem(EXPANDED_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    /* storage disabled — expansion memory is a convenience, not a requirement */
+  }
+}
+
+/**
  * Container groups as full-width folder cards.
  *
  * A container belongs to exactly one group — like a file in one folder — so a
@@ -225,7 +258,8 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const toast = useToast();
   const modal = useModal();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // Restored from the last session: a group the user opened stays open.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(loadExpandedGroups);
   const [localSizes, setSizes] = useState<Record<string, number>>({});
   // The page owns the app-wide size cache (primed at startup); self-polling is
   // only the fallback when no map is supplied.
@@ -235,10 +269,39 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     null
   );
   const [saving, setSaving] = useState(false);
+  const toggleGroupExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = { ...prev, [id]: !prev[id] };
+      persistExpandedGroups(next);
+      return next;
+    });
+  }, []);
+
+  const forgetGroupExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      persistExpandedGroups(next);
+      return next;
+    });
+  }, []);
+
+  /** Force a card open/closed (a drop opens its target) and remember it. */
+  const setGroupExpanded = useCallback((id: string, open: boolean) => {
+    setExpanded((prev) => {
+      if (!!prev[id] === open) return prev;
+      const next = { ...prev, [id]: open };
+      persistExpandedGroups(next);
+      return next;
+    });
+  }, []);
+
   // Isolated starts expanded: its cards are the main list, so collapsing it
-  // should be the deliberate action, not the default.
-  const [isolatedOpen, setIsolatedOpen] = useState(true);
-  const toggleIsolated = () => setIsolatedOpen((v) => !v);
+  // should be the deliberate action, not the default. Like the group cards,
+  // the choice survives a restart.
+  const isolatedOpen = expanded[ISOLATED_GROUP_ID] !== false;
+  const toggleIsolated = () => toggleGroupExpanded(ISOLATED_GROUP_ID);
   const [logsGroup, setLogsGroup] = useState<{ name: string; containers: ContainerItem[] } | null>(null);
 
   const loadSizes = useCallback(async () => {
@@ -400,12 +463,14 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       toast.success("Project deleted", out.trim() ? `${project}: ${out.trim()}` : project);
       // Clean up saved order entry if any
       await saveAll(groups.filter((x) => x.id !== g.id));
+      forgetGroupExpanded(g.id);
       onChanged?.();
     } catch (e) {
       // Fallback: remove containers directly if compose down fails
       try {
         await Promise.allSettled(members.map((c) => api.removeContainer(c.id, true)));
         await saveAll(groups.filter((x) => x.id !== g.id));
+        forgetGroupExpanded(g.id);
         toast.success("Project deleted", project);
         onChanged?.();
       } catch (err) {
@@ -464,6 +529,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         onChanged?.();
       }
       await saveAll(groups.filter((x) => x.id !== g.id));
+      // The group is gone, so its remembered expansion must go too — a future
+      // group that happens to reuse the id would otherwise open by surprise.
+      forgetGroupExpanded(g.id);
       toast.success("Group deleted", g.name);
     } catch (e) {
       toast.error("Could not delete group", String(e));
@@ -677,14 +745,14 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             }
           }
         }
-        if (groupId) setExpanded((e) => ({ ...e, [groupId]: true }));
+        if (groupId) setGroupExpanded(groupId, true);
         return;
       }
       try {
         await saveAll(moveMember(groups, map, target.id, groupId));
         // Show the result of the drop: a collapsed group would otherwise
         // swallow the card with no visible feedback.
-        if (groupId) setExpanded((e) => ({ ...e, [groupId]: true }));
+        if (groupId) setGroupExpanded(groupId, true);
         const label = target.name.replace(/^\//, "");
         const dest = groupId
           ? groups.find((g) => g.id === groupId)?.name ?? "group"
@@ -759,7 +827,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             sizesMap={sizes}
             busyMap={busyMap}
             compose
-            onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
+            onToggle={() => toggleGroupExpanded(g.id)}
             onRenameStart={() => undefined}
             onRenameChange={() => undefined}
             onRenameCommit={() => undefined}
@@ -789,7 +857,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             statsMap={statsMap}
             sizesMap={sizes}
             busyMap={busyMap}
-            onToggle={() => setExpanded((e) => ({ ...e, [g.id]: !e[g.id] }))}
+            onToggle={() => toggleGroupExpanded(g.id)}
             onRenameStart={() => setEditing({ id: g.id, name: g.name })}
             onRenameChange={(name) => setEditing({ id: g.id, name })}
             onRenameCommit={() => void commitRename()}
