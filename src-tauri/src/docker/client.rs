@@ -590,18 +590,98 @@ impl DockerClient {
     }
 
     pub async fn prune_images(&self) -> anyhow::Result<(u64, u64)> {
-        // Dangling-only for two reasons: it matches the UI copy ("unused
-        // images") and it can never touch a tagged kind node image.
-        let filters =
-            std::collections::HashMap::from([("dangling".to_string(), vec!["true".to_string()])]);
-        let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
-            .filters(&filters)
+        self.prune_images_mode(true).await
+    }
+
+    /// Prunes images with mode selection:
+    /// - `dangling_only: true`: removes only untagged/dangling images (`dangling=true`), used by background auto-clean.
+    /// - `dangling_only: false`: removes all unreferenced/unused images not used by any container,
+    ///   while strictly protecting Kubernetes / Kind cluster node images.
+    pub async fn prune_images_mode(&self, dangling_only: bool) -> anyhow::Result<(u64, u64)> {
+        if dangling_only {
+            let filters = std::collections::HashMap::from([("dangling".to_string(), vec!["true".to_string()])]);
+            let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
+                .filters(&filters)
+                .build();
+            let res = self.docker.prune_images(Some(opts)).await?;
+            return Ok((
+                res.images_deleted.map(|v| v.len() as u64).unwrap_or(0),
+                res.space_reclaimed.unwrap_or(0).max(0) as u64,
+            ));
+        }
+
+        // For manual "Prune All Unused Images", identify all images not currently in use by any container,
+        // and delete them safely while ensuring kind cluster images are never touched.
+        let protected_kind_ids = self.kind_node_image_ids().await.unwrap_or_default();
+
+        // Collect all image IDs and tags currently referenced by existing containers (running or stopped)
+        let containers_opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+            .all(true)
             .build();
-        let res = self.docker.prune_images(Some(opts)).await?;
-        Ok((
-            res.images_deleted.map(|v| v.len() as u64).unwrap_or(0),
-            res.space_reclaimed.unwrap_or(0).max(0) as u64,
-        ))
+        let containers = self.docker.list_containers(Some(containers_opts)).await?;
+        let mut used_image_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in containers {
+            if let Some(img_id) = c.image_id {
+                let clean_id = img_id.trim_start_matches("sha256:").to_string();
+                used_image_refs.insert(clean_id.clone());
+                if clean_id.len() >= 12 {
+                    used_image_refs.insert(clean_id[..12].to_string());
+                }
+            }
+            if let Some(img_name) = c.image {
+                used_image_refs.insert(img_name);
+            }
+        }
+
+        let all_images = self.list_images().await?;
+        let mut removed_count = 0u64;
+        let mut reclaimed_space = 0u64;
+
+        for img in all_images {
+            let clean_id = img.id.trim_start_matches("sha256:");
+            let short_id = &img.short_id;
+
+            // Protect kind images (by tag or node container reference)
+            if crate::docker::kind::is_kind_image(&img.tags, None)
+                || protected_kind_ids.contains(clean_id)
+            {
+                continue;
+            }
+
+            // Check if this image is referenced by any container
+            let is_used = used_image_refs.contains(clean_id)
+                || used_image_refs.contains(short_id)
+                || img.tags.iter().any(|t| used_image_refs.contains(t));
+
+            if is_used {
+                continue;
+            }
+
+            // Attempt to remove the unused image
+            let remove_opts = bollard::query_parameters::RemoveImageOptionsBuilder::default()
+                .force(false)
+                .build();
+
+            // Try removing by ID or tags
+            if self.docker.remove_image(&img.id, Some(remove_opts), None).await.is_ok() {
+                removed_count += 1;
+                reclaimed_space += img.size.max(0) as u64;
+            }
+        }
+
+        // Also clean up any lingering untagged layers
+        let dangling_filters = std::collections::HashMap::from([("dangling".to_string(), vec!["true".to_string()])]);
+        let dangling_opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
+            .filters(&dangling_filters)
+            .build();
+        if let Ok(res) = self.docker.prune_images(Some(dangling_opts)).await {
+            let dangling_count = res.images_deleted.map(|v| v.len() as u64).unwrap_or(0);
+            let dangling_space = res.space_reclaimed.unwrap_or(0).max(0) as u64;
+            removed_count += dangling_count;
+            reclaimed_space += dangling_space;
+        }
+
+        Ok((removed_count, reclaimed_space))
     }
 
     pub async fn pull_image<F>(&self, image: &str, mut on_progress: F) -> anyhow::Result<()>

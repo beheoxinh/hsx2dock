@@ -89,7 +89,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
 
           if (enabled && hasDangling) {
             setPruningAuto(true);
-            const [count, space] = await api.pruneImages();
+            const [count, space] = await api.pruneImages(true);
             if (count > 0) {
               toast.success("Auto-pruned Dangling Images", `Cleaned ${count} images (${formatBytes(space)})`);
               const updated = await api.listImages();
@@ -289,11 +289,39 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   };
 
   const handlePrune = async () => {
-    const confirmed = await modal.showConfirm("Are you sure you want to prune all dangling/unused images?", "Prune Images", "warning");
-    if (!confirmed) return;
+    const choice = await modal.showChoice(
+      "Choose which images to prune from the engine.\nKind cluster node images are always protected.",
+      [
+        {
+          value: "all_unused",
+          label: "Prune All Unused Images",
+          hint: "Remove all standalone images not used by any container (frees maximum disk space)",
+          variant: "danger",
+        },
+        {
+          value: "dangling_only",
+          label: "Prune Dangling Only (<none>)",
+          hint: "Remove only untagged build layers",
+          variant: "secondary",
+        },
+      ],
+      "Prune Images",
+      "warning"
+    );
+
+    if (!choice) return;
+
     try {
-      const [count, space] = await api.pruneImages();
-      toast.success("Images Pruned", `Removed ${count} images, reclaimed ${formatBytes(space)}`);
+      const danglingOnly = choice === "dangling_only";
+      const [count, space] = await api.pruneImages(danglingOnly);
+      if (count === 0) {
+        toast.info("Prune Images", "No matching unused images found to remove.");
+      } else {
+        toast.success(
+          danglingOnly ? "Dangling Images Pruned" : "Unused Images Pruned",
+          `Removed ${count} image${count === 1 ? "" : "s"}, reclaimed ${formatBytes(space)}`
+        );
+      }
       await loadImages(false);
     } catch (e) {
       toast.error("Prune Error", String(e));

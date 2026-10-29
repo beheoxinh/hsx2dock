@@ -76,9 +76,15 @@ pub async fn tag_image(
 }
 
 #[tauri::command]
-pub async fn prune_images(state: State<'_, Arc<AppState>>) -> Result<(u64, u64), String> {
+pub async fn prune_images(
+    state: State<'_, Arc<AppState>>,
+    dangling_only: Option<bool>,
+) -> Result<(u64, u64), String> {
     let client = state.get_client().await?;
-    client.prune_images().await.map_err(|e| e.to_string())
+    client
+        .prune_images_mode(dangling_only.unwrap_or(false))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

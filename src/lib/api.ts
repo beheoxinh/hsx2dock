@@ -205,7 +205,8 @@ export const api = {
   listImages: () => invoke<ImageItem[]>("list_images"),
   removeImage: (id: string, force: boolean = false) => invoke<void>("remove_image", { id, force }),
   tagImage: (id: string, repo: string, tag: string) => invoke<void>("tag_image", { id, repo, tag }),
-  pruneImages: () => invoke<[number, number]>("prune_images"),
+  pruneImages: (danglingOnly?: boolean) =>
+    invoke<[number, number]>("prune_images", { danglingOnly }),
   getImageHistory: (name: string) => invoke<ImageHistoryEntry[]>("get_image_history", { name }),
   searchHub: (term: string) => invoke<SearchResult[]>("search_hub", { term }),
   pullImage: (image: string) => invoke<void>("pull_image", { image }),
