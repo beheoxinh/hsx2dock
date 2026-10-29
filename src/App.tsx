@@ -46,6 +46,9 @@ const MainLayout: React.FC = () => {
     try {
       const st = await api.getEngineStatus();
       setDaemonState(st);
+      // A stopped daemon invalidates every cached engine figure — drop the
+      // hydrated dashboard cache instead of showing yesterday's numbers.
+      if (st !== "Running") resetDashboardEngineData();
     } catch (e) {
       console.error("Failed to fetch engine status:", e);
     }

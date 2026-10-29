@@ -55,6 +55,13 @@ interface StatSample {
 const MAX_SAMPLES = 120;
 
 /**
+ * Live chart samples outlive dashboard unmounts. The listener below is
+ * page-owned, so history pauses while another tab is open; on return the chart
+ * is already populated instead of replaying "Collecting samples…" from zero.
+ */
+const seriesCache: StatSample[] = [];
+
+/**
  * The page fills `main` exactly (the app clips overflow rather than scrolling),
  * so every row is sized to share the available height instead of stacking to a
  * fixed total. Rows are `auto-rows-fr` grids: they split the height evenly and
@@ -91,7 +98,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   // Kind node ids, so their CPU/memory never inflates the user's charts.
   const kindIdsRef = useRef<Set<string>>(new Set());
 
-  const { samples, push, reset } = useSeries<StatSample>(MAX_SAMPLES);
+  const { samples, push, reset } = useSeries<StatSample>(MAX_SAMPLES, seriesCache);
 
   // Kind node containers live on the Kubernetes tab — exclude them so the
   // dashboard reflects the user's own containers.
@@ -119,9 +126,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   }, [isRunning]);
 
   const loadData = async () => {
-    // The shared store handles partial failures itself: a panel whose request
-    // fails keeps its previous value instead of blanking the dashboard.
-    await primeDashboardStore(true);
+    // Cached panels stay on screen; the store only revalidates what is stale
+    // and emits when the answer actually differs from the cache.
+    await primeDashboardStore();
   };
 
   useEffect(() => {
@@ -165,12 +172,17 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       prevNet = nextNet;
 
       setStats(tick);
-      push({
+      const sample: StatSample = {
         cpu: counted ? cpuSum / counted : 0,
         mem: memSum,
         rxRate,
         txRate,
-      });
+      };
+      seriesCache.push(sample);
+      if (seriesCache.length > MAX_SAMPLES) {
+        seriesCache.splice(0, seriesCache.length - MAX_SAMPLES);
+      }
+      push(sample);
     }).then((u) => {
       if (disposed) u();
       else unlistenStats = u;
@@ -185,6 +197,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   useEffect(() => {
     if (!isRunning) {
+      seriesCache.length = 0;
       reset();
       setStats({});
     }
@@ -201,7 +214,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setPruning(true);
       await api.pruneSystem();
       toast.success("Prune completed", "Reclaimable space freed");
-      await loadData();
+      // Prune invalidates disk usage and list contents; bypass the TTLs.
+      await primeDashboardStore(true);
     } catch (e) {
       toast.error("Prune error", String(e));
     } finally {

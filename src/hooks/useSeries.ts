@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
-export function useSeries<T>(maxPoints = 90) {
-  const [samples, setSamples] = useState<T[]>([]);
+export function useSeries<T>(maxPoints = 90, initial: T[] = []) {
+  const [samples, setSamples] = useState<T[]>(initial);
   const push = useCallback(
     (s: T) => {
       setSamples((p) => {
