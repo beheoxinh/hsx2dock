@@ -26,7 +26,7 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, events } from "../lib/api";
-import { formatDuration, formatRelativeTime } from "../lib/utils";
+import { formatBytes, formatDuration, formatRelativeTime } from "../lib/utils";
 import type {
   KindCluster,
   KindClusterPrefs,
@@ -766,7 +766,54 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                   <span className="font-mono text-zinc-300">
                     {c.running_nodes}/{c.node_count}
                   </span>
+                  {c.disk_size_bytes != null && c.disk_size_bytes > 0 && (
+                    <>
+                      <span className="mx-2 text-zinc-700">·</span>
+                      Disk{" "}
+                      <span className="font-mono text-zinc-300">
+                        {formatBytes(c.disk_size_bytes)}
+                      </span>
+                    </>
+                  )}
                 </p>
+
+                {/* Forwarded / Published Ports */}
+                {c.published_ports && c.published_ports.length > 0 && (
+                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px]">
+                    <span className="text-zinc-500 font-medium">Forwarded:</span>
+                    {c.published_ports.map((p, idx) => {
+                      const hostPart = p.host_port ? `${p.host_ip ? `${p.host_ip}:` : ""}${p.host_port}` : "—";
+                      const isHttp = p.protocol === "tcp" && (p.host_port === 80 || p.host_port === 443 || p.host_port >= 1024);
+                      const url = isHttp
+                        ? `http://${p.host_ip && p.host_ip !== "0.0.0.0" && p.host_ip !== "::" ? p.host_ip : "localhost"}:${p.host_port}`
+                        : null;
+                      return url ? (
+                        <a
+                          key={idx}
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/25 text-sky-300 font-mono text-[10px] hover:bg-sky-500/20 hover:border-sky-500/40 transition-colors"
+                          title={`Open ${url} in browser (maps to node :${p.container_port}/${p.protocol})`}
+                        >
+                          <span>{hostPart}</span>
+                          <span className="text-sky-400/60">→</span>
+                          <span className="text-zinc-400">{p.container_port}/{p.protocol}</span>
+                        </a>
+                      ) : (
+                        <span
+                          key={idx}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-800/80 border border-zinc-700/60 text-zinc-300 font-mono text-[10px]"
+                          title={`Host port ${hostPart} forwards to node container :${p.container_port}/${p.protocol}`}
+                        >
+                          <span>{hostPart}</span>
+                          <span className="text-zinc-500">→</span>
+                          <span className="text-zinc-400">{p.container_port}/{p.protocol}</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
 
                 {/* Live section — resource charts (left → right) + logs. */}
                 {c.running && (

@@ -14,6 +14,7 @@ use tokio::process::Command;
 use crate::docker::kind::{
     kind_status as read_kind_status, KindInstallStatus, KindPaths, CLUSTER_LABEL,
 };
+use crate::docker::models::PublishedPort;
 use crate::state::AppState;
 
 #[derive(Clone, serde::Serialize)]
@@ -45,11 +46,17 @@ pub struct KindCluster {
     pub cpu_percent: Option<f64>,
     #[serde(default)]
     pub mem_used_mb: Option<f64>,
-    /// Total memory of the host in MiB. The Overview tile uses it as the
+    /// Total host memory in MiB. The Overview tile uses it as the
     /// denominator so "Cluster memory" answers the same question as
     /// "Cluster CPU" (`x% of host`), independent of the node cgroup caps.
     #[serde(default)]
     pub host_mem_total_mb: Option<f64>,
+    /// Total writable layer disk size used across all node containers, in bytes.
+    #[serde(default)]
+    pub disk_size_bytes: Option<u64>,
+    /// Host port bindings exposed by this cluster's nodes.
+    #[serde(default)]
+    pub published_ports: Vec<PublishedPort>,
     /// Node resource caps applied to this cluster (None = uncapped).
     #[serde(default)]
     pub cpu_quota_m: Option<u64>,
@@ -175,6 +182,8 @@ pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<Kind
             cpu_percent: None,
             mem_used_mb: None,
             host_mem_total_mb: None,
+            disk_size_bytes: None,
+            published_ports: Vec::new(),
             cpu_quota_m: None,
             mem_limit_mb: None,
         });
@@ -230,17 +239,51 @@ async fn enrich_cluster_card(
     let mut last_end_times: Vec<i64> = Vec::new();
     let mut cpu_quota_m = 0u64;
     let mut mem_limit_bytes = 0i64;
+    let mut disk_size_bytes = 0u64;
+    let mut published_ports: Vec<PublishedPort> = Vec::new();
     for id in &ids {
         let Ok(details) = client
             .docker()
             .inspect_container(
                 id,
-                None::<bollard::query_parameters::InspectContainerOptions>,
+                Some(bollard::query_parameters::InspectContainerOptions { size: true }),
             )
             .await
         else {
             continue;
         };
+        if let Some(bytes) = details.size_rw.filter(|b| *b > 0) {
+            disk_size_bytes += bytes as u64;
+        }
+        if let Some(ports) = details
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.ports.as_ref())
+        {
+            for (container_spec, bindings) in ports {
+                let Some(bindings) = bindings else { continue };
+                let (c_port, proto) = match container_spec.split_once('/') {
+                    Some((p, pr)) => (p.parse::<u16>().unwrap_or(0), pr.to_string()),
+                    None => (container_spec.parse::<u16>().unwrap_or(0), "tcp".to_string()),
+                };
+                for b in bindings {
+                    let host_port = b
+                        .host_port
+                        .as_deref()
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(0);
+                    let host_ip = b.host_ip.clone().unwrap_or_default();
+                    if host_port > 0 || c_port > 0 {
+                        published_ports.push(PublishedPort {
+                            host_ip,
+                            host_port,
+                            container_port: c_port,
+                            protocol: proto.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let Some(state) = details.state else {
             continue;
         };
@@ -260,6 +303,12 @@ async fn enrich_cluster_card(
             }
         }
     }
+    if disk_size_bytes > 0 {
+        cluster.disk_size_bytes = Some(disk_size_bytes);
+    }
+    published_ports.sort_by_key(|p| (p.host_port, p.container_port, p.protocol.clone()));
+    published_ports.dedup();
+    cluster.published_ports = published_ports;
     if let Some(&oldest) = started_times.iter().min() {
         cluster.last_started_at = Some(oldest);
         cluster.uptime_seconds = Some((now - oldest).max(0));

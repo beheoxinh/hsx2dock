@@ -689,6 +689,10 @@ export interface KindCluster {
   mem_limit_mb: number | null;
   /** Total host memory in MiB; denominator for the Overview "of host" tile. */
   host_mem_total_mb: number | null;
+  /** Total writable layer disk size across all node containers, in bytes. */
+  disk_size_bytes?: number | null;
+  /** Host port bindings exposed by this cluster's nodes. */
+  published_ports?: PublishedPort[];
 }
 
 /** Install state of the app-managed (isolated) kind binary. */

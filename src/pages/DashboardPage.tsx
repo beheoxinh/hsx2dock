@@ -24,7 +24,7 @@ import {
 import { useSeries } from "../hooks/useSeries";
 import { AreaChart } from "../components/charts/AreaChart";
 import { DonutChart } from "../components/charts/DonutChart";
-import { cn, formatBytes, formatDuration } from "../lib/utils";
+import { cn, formatBytes, formatDuration, formatRelativeTime } from "../lib/utils";
 import type {
   ContainerStats,
   DaemonState,
@@ -489,7 +489,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         <Card className="flex min-h-[132px] flex-col gap-2 p-3 [@media(max-height:820px)]:min-h-[104px]">
           <div className="flex shrink-0 items-center justify-between gap-2">
             <div className="min-w-0">
-              <h3 className="text-sm font-semibold text-white">Kind Clusters</h3>
+              <h3 className="text-sm font-semibold text-white">Kubernetes Clusters</h3>
               <p className="truncate text-[11px] text-zinc-500">
                 {loading
                   ? "Loading clusters…"
@@ -523,31 +523,56 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                 </p>
               </div>
             )}
-            {clusters.slice(0, 8).map((c) => (
-              <button
-                key={c.name}
-                type="button"
-                onClick={() => onNavigate("kubernetes")}
-                className="flex w-full items-center gap-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
-              >
-                <span
-                  className={cn(
-                    "h-1.5 w-1.5 shrink-0 rounded-full",
-                    c.running ? "bg-emerald-400" : "bg-zinc-500"
-                  )}
-                />
-                <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-200">
-                  {c.name}
-                </span>
-                <span className="shrink-0 text-[10px] tabular-nums text-zinc-400">
-                  {c.running
-                    ? `${c.running_nodes}/${c.node_count} nodes${
-                        c.uptime_seconds != null ? ` · ${formatDuration(c.uptime_seconds)}` : ""
-                      }`
-                    : "stopped"}
-                </span>
-              </button>
-            ))}
+            {clusters.slice(0, 8).map((c) => {
+              // Resource usage for running clusters; last run for stopped ones.
+              const parts: string[] = [];
+              if (c.running) {
+                if (c.cpu_percent != null) parts.push(`${c.cpu_percent.toFixed(1)}% CPU`);
+                if (c.mem_used_mb != null) parts.push(`${c.mem_used_mb.toFixed(0)} MB RAM`);
+                if (c.disk_size_bytes != null && c.disk_size_bytes > 0) {
+                  parts.push(formatBytes(c.disk_size_bytes));
+                }
+              }
+
+              return (
+                <button
+                  key={c.name}
+                  type="button"
+                  onClick={() => onNavigate("kubernetes")}
+                  className="flex w-full items-center gap-2 rounded-lg border border-zinc-800/60 bg-zinc-900/40 px-2.5 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
+                >
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 shrink-0 rounded-full",
+                      c.running ? "bg-emerald-400" : "bg-zinc-500"
+                    )}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-200">
+                    {c.name}
+                  </span>
+                  <div className="shrink-0 flex items-center gap-2 text-[10px] tabular-nums text-zinc-400">
+                    {c.running ? (
+                      <>
+                        <span className="text-zinc-400">
+                          {c.running_nodes}/{c.node_count} nodes
+                          {c.uptime_seconds != null ? ` · ${formatDuration(c.uptime_seconds)}` : ""}
+                        </span>
+                        {parts.length > 0 && (
+                          <span className="text-zinc-300 font-mono bg-zinc-800/70 px-1.5 py-0.5 rounded border border-zinc-700/50">
+                            {parts.join(" · ")}
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-zinc-500">
+                        stopped
+                        {c.last_started_at ? ` · last run ${formatRelativeTime(c.last_started_at)}` : ""}
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </Card>
       </div>
