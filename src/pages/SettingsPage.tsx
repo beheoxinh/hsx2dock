@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2, Stethoscope } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2, Stethoscope, Globe } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
@@ -22,6 +22,8 @@ import type {
   CliShimStatus,
   CliUpdateInfo,
   ComposeUpdateInfo,
+  CaddyInstallStatus,
+  CaddyUpdateInfo,
 } from "../types";
 
 const humanError = (e: unknown): string => {
@@ -46,6 +48,8 @@ let engineCheckedAt = 0;
 let engineCheckOk = true;
 let cliCheckedAt = 0;
 let cliCheckOk = true;
+let caddyCheckedAt = 0;
+let caddyCheckOk = true;
 
 /** The four configuration domains, in the order the rail presents them. */
 type SettingsTab = "general" | "engine" | "tools" | "registry";
@@ -148,6 +152,17 @@ export const SettingsPage: React.FC = () => {
   const { run: engineRun, reset: resetEngineRun } = useUpdateRun("engine");
   const { run: cliRun, reset: resetCliRun } = useUpdateRun("cli");
   const { run: composeRun, reset: resetComposeRun } = useUpdateRun("compose");
+  const { run: caddyRun, reset: resetCaddyRun } = useUpdateRun("caddy");
+
+  // Caddy Gateway state
+  const [caddyStatus, setCaddyStatus] = useState<CaddyInstallStatus | null>(null);
+  const [caddyUpdate, setCaddyUpdate] = useState<CaddyUpdateInfo | null>(null);
+  const [checkingCaddy, setCheckingCaddy] = useState(false);
+  const [updatingCaddy, setUpdatingCaddy] = useState(false);
+  const [togglingCaddy, setTogglingCaddy] = useState(false);
+  const [caddyHttpPort, setCaddyHttpPort] = useState<number>(80);
+  const [caddyHttpsPort, setCaddyHttpsPort] = useState<number>(443);
+  const [savingPorts, setSavingPorts] = useState(false);
 
   const checkForEngineUpdate = async (announce?: boolean) => {
     if (!announce) {
@@ -334,12 +349,105 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
+  const loadCaddyStatus = async () => {
+    try {
+      const st = await api.getGatewayStatus();
+      setCaddyStatus(st);
+      setCaddyHttpPort(st.http_port);
+      setCaddyHttpsPort(st.https_port);
+    } catch (e) {
+      console.error("Failed to load Caddy status:", e);
+    }
+  };
+
+  const checkCaddy = async (announce?: boolean) => {
+    if (!announce) {
+      const ttl = caddyCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
+      if (Date.now() - caddyCheckedAt < ttl) return;
+    }
+    setCheckingCaddy(true);
+    try {
+      const info = await api.checkCaddyUpdate();
+      caddyCheckedAt = Date.now();
+      caddyCheckOk = true;
+      setCaddyUpdate(info);
+      if (announce) {
+        if (info.update_available) {
+          toast.info("Caddy update available", `${info.latest_version} ready to install`);
+        } else {
+          toast.success("Caddy up to date", `Version: ${info.installed_version ?? "none"}`);
+        }
+      }
+    } catch (e) {
+      caddyCheckedAt = Date.now();
+      caddyCheckOk = false;
+      if (announce) toast.error("Caddy check failed", humanError(e));
+    } finally {
+      setCheckingCaddy(false);
+    }
+  };
+
+  const applyCaddyUpdate = async () => {
+    if (!caddyUpdate?.latest_version) return;
+    setUpdatingCaddy(true);
+    resetCaddyRun();
+    try {
+      const version = caddyUpdate.latest_version;
+      await api.installCaddyUpdate(version);
+      toast.success("Caddy updated", `Caddy binary is now v${version}`);
+      caddyCheckedAt = 0;
+      await checkCaddy();
+      await loadCaddyStatus();
+    } catch (e) {
+      toast.error("Caddy update failed", String(e));
+    } finally {
+      setUpdatingCaddy(false);
+    }
+  };
+
+  const handleToggleCaddy = async () => {
+    if (!caddyStatus) return;
+    setTogglingCaddy(true);
+    try {
+      const next = !caddyStatus.running;
+      const isRunning = await api.toggleGateway(next);
+      setCaddyStatus((prev) => (prev ? { ...prev, running: isRunning } : prev));
+      toast.success(
+        isRunning ? "Caddy Gateway Started" : "Caddy Gateway Stopped",
+        isRunning ? `Listening on :${caddyHttpPort} and :${caddyHttpsPort}` : "Process terminated"
+      );
+    } catch (e) {
+      toast.error("Gateway toggle failed", String(e));
+    } finally {
+      setTogglingCaddy(false);
+    }
+  };
+
+  const handleSavePorts = async () => {
+    if (caddyHttpPort === caddyHttpsPort) {
+      toast.error("Invalid ports", "HTTP and HTTPS ports must be distinct");
+      return;
+    }
+    setSavingPorts(true);
+    try {
+      await api.setGatewayPorts(caddyHttpPort, caddyHttpsPort);
+      toast.success("Gateway ports updated", `HTTP: ${caddyHttpPort} · HTTPS: ${caddyHttpsPort}`);
+      await loadCaddyStatus();
+    } catch (e) {
+      toast.error("Failed to update ports", String(e));
+    } finally {
+      setSavingPorts(false);
+    }
+  };
+
   useEffect(() => {
     loadSettings();
     checkForEngineUpdate().catch(() => {});
     checkDockerCli().catch(() => {});
     checkCompose().catch(() => {});
     checkCliForUpdate().catch(() => {});
+    loadCaddyStatus().catch(() => {});
+    checkCaddy().catch(() => {});
   }, []);
 
   const handleToggleCliBridge = async (enabled: boolean) => {
@@ -1134,6 +1242,175 @@ export const SettingsPage: React.FC = () => {
             {composeRun && (
               <UpdateProgressPanel run={composeRun} onDismiss={resetComposeRun} />
             )}
+          </Card>
+
+          {/* Caddy Gateway Binary & Reverse Proxy */}
+          <Card className="space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-zinc-800/80 border border-zinc-700/50">
+                  <Globe className="w-5 h-5 text-sky-400" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white">Caddy Gateway</h3>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    Embedded reverse proxy and HTTPS domain router for container web apps.
+                  </p>
+                </div>
+              </div>
+
+              {/* Status & Power toggle */}
+              <div className="flex items-center gap-3">
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
+                    caddyStatus?.running
+                      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                      : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                  }`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      caddyStatus?.running ? "bg-emerald-400 animate-pulse" : "bg-zinc-500"
+                    }`}
+                  />
+                  {caddyStatus?.running ? "Running" : "Stopped"}
+                </span>
+
+                <Button
+                  type="button"
+                  variant={caddyStatus?.running ? "danger" : "primary"}
+                  size="sm"
+                  disabled={togglingCaddy || !caddyStatus?.installed}
+                  onClick={handleToggleCaddy}
+                  className="gap-1.5"
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  <span>{togglingCaddy ? "Switching…" : caddyStatus?.running ? "Stop Gateway" : "Start Gateway"}</span>
+                </Button>
+              </div>
+            </div>
+
+            {/* Version & Update row */}
+            <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-zinc-200">
+                    Caddy Binary Version
+                  </span>
+                  <span className="font-mono text-xs text-sky-300 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">
+                    {caddyStatus?.version ? `v${caddyStatus.version}` : "Not installed"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-zinc-500 mt-1 truncate">
+                  {caddyStatus?.path ?? "Location: ~/.local/share/hsx2dock/versions/caddy"}
+                  {caddyUpdate?.update_available && (
+                    <span className="text-amber-400 ml-2 font-medium">
+                      · Update v{caddyUpdate.latest_version} available
+                    </span>
+                  )}
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={checkingCaddy || updatingCaddy}
+                  onClick={() => checkCaddy(true)}
+                >
+                  <RefreshCw
+                    className={`w-4 h-4 ${checkingCaddy ? "animate-spin" : ""}`}
+                  />
+                  <span>Check</span>
+                </Button>
+
+                {(!caddyStatus?.installed || caddyUpdate?.update_available) && (
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    disabled={updatingCaddy}
+                    onClick={applyCaddyUpdate}
+                  >
+                    <DownloadCloud className="w-4 h-4" />
+                    <span>
+                      {updatingCaddy
+                        ? "Installing…"
+                        : caddyStatus?.installed
+                          ? "Update Caddy"
+                          : "Install Caddy"}
+                    </span>
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            {caddyRun && (
+              <UpdateProgressPanel run={caddyRun} onDismiss={resetCaddyRun} />
+            )}
+
+            {/* Port Management */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300 block">
+                  HTTP Port
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={caddyHttpPort}
+                    onChange={(e) => setCaddyHttpPort(parseInt(e.target.value, 10) || 80)}
+                    className="w-full h-9 px-3 rounded-lg bg-zinc-950 border border-zinc-800 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <span className="text-[11px] text-zinc-500 block">
+                  Default: 80. Used for plain HTTP and redirecting to HTTPS.
+                </span>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300 block">
+                  HTTPS Port
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={caddyHttpsPort}
+                    onChange={(e) => setCaddyHttpsPort(parseInt(e.target.value, 10) || 443)}
+                    className="w-full h-9 px-3 rounded-lg bg-zinc-950 border border-zinc-800 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <span className="text-[11px] text-zinc-500 block">
+                  Default: 443. Used for encrypted TLS virtual hosts.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs text-zinc-500">
+                Modifying ports will update Gateway config and reload Caddy if running.
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={
+                  savingPorts ||
+                  (caddyHttpPort === (caddyStatus?.http_port ?? 80) &&
+                    caddyHttpsPort === (caddyStatus?.https_port ?? 443))
+                }
+                onClick={handleSavePorts}
+                className="gap-1.5"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>{savingPorts ? "Saving…" : "Apply Ports"}</span>
+              </Button>
+            </div>
           </Card>
 
           {/* Compose File Path */}

@@ -350,7 +350,7 @@ export interface EngineUpdateInfo {
 }
 
 /** Which binary a progress event belongs to. */
-export type UpdateTarget = "engine" | "cli" | "compose" | "kind";
+export type UpdateTarget = "engine" | "cli" | "compose" | "kind" | "caddy";
 
 /**
  * `engine-install-progress` payload streamed while any bundled binary updates.
@@ -712,6 +712,12 @@ export interface EmbeddedBinaryInfo {
   path: string | null;
   is_active: boolean;
   description: string;
+}
+
+export interface CaddyUpdateInfo {
+  installed_version: string | null;
+  latest_version: string;
+  update_available: boolean;
 }
 
 export interface CaddyInstallStatus {

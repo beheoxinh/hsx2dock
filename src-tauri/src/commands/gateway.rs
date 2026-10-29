@@ -1,10 +1,11 @@
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::docker::caddy::{
-    clear_app_hosts_entries, inspect_hosts_sync, parse_hosts_file, save_raw_hosts_content,
-    update_hosts_file, CaddyInstallStatus, GatewayRoute, HostsFileModel, HostsSyncStatus,
-    CADDY_VERSION,
+    check_caddy_update as check_caddy_update_core, clear_app_hosts_entries,
+    inspect_hosts_sync, install_caddy_version, parse_hosts_file, save_raw_hosts_content,
+    update_hosts_file, CaddyInstallStatus, CaddyUpdateInfo, GatewayRoute, HostsFileModel,
+    HostsSyncStatus, CADDY_UPDATE_STEPS, CADDY_VERSION,
 };
 use crate::state::AppState;
 
@@ -148,6 +149,81 @@ pub async fn get_hosts_file_model(
 ) -> Result<HostsFileModel, String> {
     let config = state.config.read().await;
     Ok(parse_hosts_file(&config.gateway_routes))
+}
+
+#[tauri::command]
+pub async fn check_caddy_update(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CaddyUpdateInfo, String> {
+    check_caddy_update_core(&state.caddy.paths)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn install_caddy_update(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    version: String,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let plan = crate::docker::engine::step_plan(CADDY_UPDATE_STEPS);
+    let step = Arc::new(AtomicUsize::new(0));
+    let handle = app.clone();
+    let seen = step.clone();
+    let paths = &state.caddy.paths;
+    let result = install_caddy_version(paths, &version, move |progress| {
+        if let Some(index) = progress.step {
+            seen.store(index, Ordering::Relaxed);
+        }
+        let _ = handle.emit("engine-install-progress", &progress);
+    })
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let failed = crate::docker::engine::InstallProgress::failed(
+                "caddy",
+                &version,
+                &plan,
+                step.load(Ordering::Relaxed),
+                msg.clone(),
+            );
+            let _ = app.emit("engine-install-progress", &failed);
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn set_gateway_ports(
+    state: State<'_, Arc<AppState>>,
+    http_port: u16,
+    https_port: u16,
+) -> Result<(), String> {
+    if http_port == 0 || https_port == 0 {
+        return Err("Port numbers must be greater than 0".into());
+    }
+    if http_port == https_port {
+        return Err("HTTP and HTTPS ports must be distinct".into());
+    }
+    {
+        let mut config = state.config.write().await;
+        config.gateway_http_port = http_port;
+        config.gateway_https_port = https_port;
+        config.save().await.map_err(|e| e.to_string())?;
+    }
+    let config = state.config.read().await;
+    if config.gateway_enabled && state.caddy.is_running().await {
+        state
+            .caddy
+            .apply_routes(http_port, https_port, &config.gateway_routes)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -1,12 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use crate::docker::engine::{
+    download, normalize_version, step_plan, update_available, verify, InstallProgress,
+};
+
 pub const CADDY_VERSION: &str = "2.11.7";
 pub const CADDY_BASE: &str = "https://github.com/caddyserver/caddy/releases/download";
+
+/// Steps every Caddy install/update follows; the UI renders this checklist.
+pub const CADDY_UPDATE_STEPS: &[&str] = &[
+    "Download Caddy archive",
+    "Verify checksum",
+    "Extract binary",
+    "Verify version",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaddyInstallStatus {
@@ -21,6 +33,13 @@ pub struct CaddyInstallStatus {
     pub trusted: bool,
     pub hosts_synced: bool,
     pub auto_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaddyUpdateInfo {
+    pub installed_version: Option<String>,
+    pub latest_version: String,
+    pub update_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +120,246 @@ impl CaddyPaths {
     pub fn is_installed(&self) -> bool {
         self.binary().is_file()
     }
+
+    pub fn set_active(&self, version: &str) -> Result<()> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let tmp = self.root.join(".current.tmp");
+        std::fs::write(&tmp, format!("{version}\n"))?;
+        std::fs::rename(&tmp, self.root.join("current"))?;
+        Ok(())
+    }
+}
+
+/// Release asset file name for Caddy on this platform
+pub fn caddy_asset_name(version: &str, os: &str, arch: &str) -> Option<String> {
+    let a = match arch {
+        "x86_64" | "amd64" => "amd64",
+        "aarch64" | "arm64" => "arm64",
+        "arm" => "armv7",
+        _ => return None,
+    };
+    match os {
+        "linux" => Some(format!("caddy_{version}_linux_{a}.tar.gz")),
+        "macos" | "darwin" => Some(format!("caddy_{version}_mac_{a}.tar.gz")),
+        "windows" => Some(format!("caddy_{version}_windows_{a}.zip")),
+        _ => None,
+    }
+}
+
+pub fn read_caddy_status(paths: &CaddyPaths) -> (bool, Option<String>) {
+    let installed = paths.is_installed();
+    let version = if installed {
+        std::fs::read_to_string(paths.version_dir(&paths.active_version()).join("VERSION"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .or_else(|| probe_caddy_version(&paths.binary()))
+            .or_else(|| Some(paths.active_version()))
+    } else {
+        None
+    };
+    (installed, version)
+}
+
+pub fn probe_caddy_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // e.g. "v2.11.7 h1:..." -> "2.11.7"
+    let token = stdout.split_whitespace().next()?;
+    Some(token.trim_start_matches('v').to_string())
+}
+
+/// Check available Caddy updates against the GitHub releases API.
+pub async fn check_caddy_update(paths: &CaddyPaths) -> Result<CaddyUpdateInfo> {
+    let (_, installed) = read_caddy_status(paths);
+    let latest = fetch_latest_caddy_release().await.unwrap_or_else(|_| CADDY_VERSION.to_string());
+    let update_available = update_available(&latest, installed.as_deref());
+    Ok(CaddyUpdateInfo {
+        installed_version: installed,
+        latest_version: latest,
+        update_available,
+    })
+}
+
+async fn fetch_latest_caddy_release() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("hsx2dock-caddy-updater")
+        .build()?;
+    let resp = client
+        .get("https://api.github.com/repos/caddyserver/caddy/releases/latest")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {}", resp.status());
+    }
+    let text = resp.text().await?;
+    let body: serde_json::Value = serde_json::from_str(&text)?;
+    let tag = body["tag_name"]
+        .as_str()
+        .context("tag_name not in release json")?;
+    Ok(normalize_version(tag).to_string())
+}
+
+/// Download, verify checksum, extract and install Caddy version.
+pub async fn install_caddy_version<F>(
+    paths: &CaddyPaths,
+    version: &str,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(InstallProgress) + Send,
+{
+    let version = normalize_version(version).to_string();
+    if version.is_empty() {
+        bail!("no caddy version specified");
+    }
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let Some(asset) = caddy_asset_name(&version, os, arch) else {
+        bail!("caddy is not published for {os}-{arch}");
+    };
+
+    let plan = step_plan(CADDY_UPDATE_STEPS);
+    let version_dir = paths.version_dir(&version);
+    std::fs::create_dir_all(&version_dir)
+        .with_context(|| format!("create {}", version_dir.display()))?;
+    let staging_archive = version_dir.join(format!(".{asset}.partial"));
+    let _ = std::fs::remove_file(&staging_archive);
+    let url = format!("{CADDY_BASE}/v{version}/{asset}");
+
+    on_progress(InstallProgress::stage(
+        "caddy",
+        &version,
+        &plan,
+        0,
+        Some(0.05),
+    ));
+
+    let mut last = 0u64;
+    download(&url, &staging_archive, |done, total| {
+        if done.saturating_sub(last) < 256 * 1024 && Some(done) != total {
+            return;
+        }
+        last = done;
+        on_progress(InstallProgress::tick(
+            "caddy",
+            &version,
+            &plan,
+            0,
+            Some(0.05 + 0.5 * crate::docker::engine::fraction_of(done, total)),
+            match total {
+                Some(t) if t > 0 => format!(
+                    "{} / {}",
+                    crate::docker::engine::human_size(done),
+                    crate::docker::engine::human_size(t)
+                ),
+                _ => crate::docker::engine::human_size(done),
+            },
+        ));
+    })
+    .await
+    .with_context(|| format!("download caddy v{version}"))?;
+
+    on_progress(InstallProgress::stage(
+        "caddy",
+        &version,
+        &plan,
+        1,
+        Some(0.6),
+    ));
+
+    let expected = fetch_caddy_checksum(&version, &asset).await?;
+    if let Err(e) = verify(&staging_archive, &expected) {
+        let _ = std::fs::remove_file(&staging_archive);
+        return Err(e).context("caddy checksum verification failed");
+    }
+    on_progress(InstallProgress::note(
+        "caddy",
+        &version,
+        &plan,
+        1,
+        Some(0.65),
+        format!("sha256 {expected}"),
+    ));
+
+    on_progress(InstallProgress::stage(
+        "caddy",
+        &version,
+        &plan,
+        2,
+        Some(0.75),
+    ));
+
+    let dest = version_dir.join(if cfg!(windows) { "caddy.exe" } else { "caddy" });
+    let _ = std::fs::remove_file(&dest);
+
+    // Extract caddy binary from tar.gz
+    let file = std::fs::File::open(&staging_archive)
+        .with_context(|| format!("open {}", staging_archive.display()))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let mut extracted = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.into_owned();
+        let fname = name.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if fname == "caddy" || fname == "caddy.exe" {
+            let mut out = std::fs::File::create(&dest)
+                .with_context(|| format!("create {}", dest.display()))?;
+            std::io::copy(&mut entry, &mut out)?;
+            extracted = true;
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&staging_archive);
+    if !extracted {
+        bail!("caddy binary not found inside downloaded archive");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .context("chmod caddy binary")?;
+    }
+
+    on_progress(InstallProgress::stage(
+        "caddy",
+        &version,
+        &plan,
+        3,
+        Some(0.9),
+    ));
+
+    let reported = probe_caddy_version(&dest)
+        .ok_or_else(|| anyhow::anyhow!("staged caddy {version} failed `caddy version`"))?;
+    if !reported.starts_with(&version) {
+        bail!("staged caddy reported {reported}, but {version} was expected");
+    }
+
+    let _ = std::fs::write(version_dir.join("VERSION"), format!("{version}\n"));
+    paths.set_active(&version)?;
+
+    on_progress(InstallProgress::finished("caddy", &version, &plan));
+    Ok(dest)
+}
+
+async fn fetch_caddy_checksum(version: &str, asset: &str) -> Result<String> {
+    let url = format!("{CADDY_BASE}/v{version}/caddy_{version}_checksums.txt");
+    let text = reqwest::get(&url).await?.text().await?;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[1].trim_start_matches('*').ends_with(asset) {
+            return Ok(parts[0].trim().to_lowercase());
+        }
+    }
+    bail!("checksum for {asset} not found in {url}")
 }
 
 pub struct CaddySupervisor {

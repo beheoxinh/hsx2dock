@@ -21,6 +21,7 @@ import type {
   ComposeUpdateInfo,
   EmbeddedBinaryInfo,
   CaddyInstallStatus,
+  CaddyUpdateInfo,
   GatewayRoute,
   HostsSyncStatus,
   HostsFileModel,
@@ -112,6 +113,11 @@ export const api = {
 
   // Gateway (Caddy reverse proxy & virtual domains)
   getGatewayStatus: () => invoke<CaddyInstallStatus>("get_gateway_status"),
+  checkCaddyUpdate: () => invoke<CaddyUpdateInfo>("check_caddy_update"),
+  installCaddyUpdate: (version: string) =>
+    invoke<void>("install_caddy_update", { version }),
+  setGatewayPorts: (httpPort: number, httpsPort: number) =>
+    invoke<void>("set_gateway_ports", { httpPort, httpsPort }),
   listGatewayRoutes: () => invoke<GatewayRoute[]>("list_gateway_routes"),
   saveGatewayRoutes: (routes: GatewayRoute[]) =>
     invoke<void>("save_gateway_routes", { routes }),
