@@ -300,12 +300,12 @@ pub fn run() {
                 }
             };
 
-            // The window is created hidden (tauri.conf.json) so a login launch
-            // never flashes the full window before dropping into the tray.
-            // Without a tray there is no way back, so always show in that case.
-            if !start_hidden || !tray_ready {
-                if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window("main") {
+                if start_hidden && tray_ready {
+                    let _ = window.hide();
+                } else {
                     let _ = window.show();
+                    let _ = window.unminimize();
                     let _ = window.set_focus();
                 }
             }
