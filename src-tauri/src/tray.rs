@@ -142,16 +142,21 @@ struct MenuParts {
     menu_sig: String,
 }
 
-fn menu_signature(stats: Option<&TrayStats>) -> String {
+fn menu_signature(daemon: &DaemonState, stats: Option<&TrayStats>) -> String {
+    let mut parts = vec![format!("daemon:{:?}", daemon)];
     let Some(s) = stats else {
-        return String::new();
+        return parts.join("|");
     };
-    let mut parts = Vec::new();
     for g in &s.groups {
-        parts.push(format!("g:{}:{}:{}:{:.1}:{:.1}", g.id, g.running, g.total, g.cpu_percent, g.mem_usage_mb));
+        // Bin CPU to integer and RAM to 10MB blocks to avoid rebuilding the GTK menu on minor floating jitter
+        let cpu_bin = g.cpu_percent.round() as i64;
+        let mem_bin = (g.mem_usage_mb / 10.0).round() as i64 * 10;
+        parts.push(format!("g:{}:{}:{}:{}:{}", g.id, g.running, g.total, cpu_bin, mem_bin));
     }
     for c in &s.clusters {
-        parts.push(format!("c:{}:{}:{}:{:.1}:{:.1}", c.name, c.running, c.nodes, c.cpu_percent, c.mem_usage_mb));
+        let cpu_bin = c.cpu_percent.round() as i64;
+        let mem_bin = (c.mem_usage_mb / 10.0).round() as i64 * 10;
+        parts.push(format!("c:{}:{}:{}:{}:{}", c.name, c.running, c.nodes, cpu_bin, mem_bin));
     }
     parts.push(format!("gw:{}:{}", s.gateway_running, s.active_routes.len()));
     for r in &s.active_routes {
@@ -387,7 +392,7 @@ fn build_menu(
         stats_row,
         toggle,
         restart,
-        menu_sig: menu_signature(stats),
+        menu_sig: menu_signature(daemon, stats),
     })
 }
 
@@ -885,7 +890,7 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
         )));
     }
 
-    let sig = menu_signature(stats.as_ref());
+    let sig = menu_signature(&daemon, stats.as_ref());
     // Menu rebuilds whenever dynamic items change (counts, resources, routes, or engine state).
     if parts.menu_sig != sig {
         if let Some(ts) = app.try_state::<TrayState>() {
@@ -944,16 +949,18 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
         .ok()?
         .len();
 
-    // 1. Group stats: measure CPU % and RAM MB for running containers
-    let mut stats_by_id: HashMap<String, (f64, f64)> = HashMap::new();
-    for c in &containers {
-        if c.running {
-            if let Ok(s) = client.container_stats(&c.id).await {
+    // 1. Group stats: read from cached_stats updated by background monitor
+    // so tray refresh is instant and does not bombard the Docker socket with sequential HTTP calls
+    let stats_by_id: HashMap<String, (f64, f64)> = {
+        let guard = state.cached_stats.read().await;
+        guard
+            .iter()
+            .map(|(id, s)| {
                 let mem_mb = s.mem_usage as f64 / (1024.0 * 1024.0);
-                stats_by_id.insert(c.id.clone(), (s.cpu_percent, mem_mb));
-            }
-        }
-    }
+                (id.clone(), (s.cpu_percent, mem_mb))
+            })
+            .collect()
+    };
 
     // Build container groups (compose projects + custom groups + isolated)
     let config = state.config.read().await.clone();
@@ -1333,14 +1340,14 @@ mod tests {
                 container_name: Some("web".into()),
             }],
         };
-        let sig1 = menu_signature(Some(&stats));
+        let sig1 = menu_signature(&DaemonState::Running, Some(&stats));
         assert!(sig1.contains("Web Stack") || sig1.contains("grp1"));
         assert!(sig1.contains("kind-local"));
         assert!(sig1.contains("app.localhost"));
 
         // Changing container count or resource updates the signature
         stats.groups[0].running = 1;
-        let sig2 = menu_signature(Some(&stats));
+        let sig2 = menu_signature(&DaemonState::Running, Some(&stats));
         assert_ne!(sig1, sig2);
     }
 }

@@ -104,13 +104,25 @@ fn start_background_monitoring(app_handle: AppHandle) {
                             .collect();
 
                         if !running_ids.is_empty() {
-                            let mut stats_map = HashMap::new();
-                            for id in running_ids {
-                                if let Ok(stats) = client.container_stats(&id).await {
-                                    stats_map.insert(id, stats);
+                            // Query stats concurrently with futures::future::join_all
+                            let futures = running_ids.iter().map(|id| {
+                                let c = client.clone();
+                                let id_clone = id.clone();
+                                async move {
+                                    c.container_stats(&id_clone).await.ok().map(|s| (id_clone, s))
                                 }
+                            });
+                            let results = futures_util::future::join_all(futures).await;
+                            let mut stats_map = HashMap::new();
+                            for item in results.into_iter().flatten() {
+                                stats_map.insert(item.0, item.1);
                             }
+
+                            // Keep app_state's cached_stats current for tray & background readers
+                            *state.cached_stats.write().await = stats_map.clone();
                             let _ = handle.emit("container-stats-tick", stats_map);
+                        } else {
+                            state.cached_stats.write().await.clear();
                         }
                     }
                 }

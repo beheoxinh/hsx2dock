@@ -39,6 +39,8 @@ pub struct AppState {
     pub mcp_server: Arc<RwLock<Option<crate::mcp::http::RunningServer>>>,
     /// Caddy Gateway supervisor for routing HTTP/HTTPS requests to local containers
     pub caddy: Arc<crate::docker::caddy::CaddySupervisor>,
+    /// Cached live container stats shared across background monitoring and tray
+    pub cached_stats: Arc<RwLock<HashMap<String, crate::docker::models::ContainerStats>>>,
 }
 
 impl AppState {
@@ -69,6 +71,7 @@ impl AppState {
             close_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(close_to_tray)),
             mcp_server: Arc::new(RwLock::new(None)),
             caddy,
+            cached_stats: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
