@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
@@ -24,20 +24,20 @@ use crate::state::AppState;
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(15);
 /// Menu + tooltip refresh cadence when nothing else is happening.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-/// Running clusters shown in the tray; the rest collapse into a "more" row.
-const MAX_CLUSTER_ROWS: usize = 5;
 
 // Menu ids — matched in the tray's `on_menu_event` handler.
 const ID_TOGGLE: &str = "engine-toggle";
 const ID_RESTART: &str = "engine-restart";
-const ID_NAV_DASHBOARD: &str = "nav-dashboard";
-const ID_NAV_CONTAINERS: &str = "nav-containers";
-const ID_NAV_IMAGES: &str = "nav-images";
-const ID_NAV_VOLUMES: &str = "nav-volumes";
-const ID_NAV_CLUSTERS: &str = "nav-kubernetes";
-const ID_NAV_SETTINGS: &str = "nav-settings";
+const ID_OPEN_DASHBOARD: &str = "open-dashboard";
 const ID_QUIT: &str = "quit";
-const CLUSTER_ROW_PREFIX: &str = "cluster-row-";
+
+// Dynamic action prefixes
+const GROUP_START_PREFIX: &str = "grp-start-";
+const GROUP_STOP_PREFIX: &str = "grp-stop-";
+const CLUSTER_NAV_PREFIX: &str = "cls-nav-";
+const CLUSTER_START_PREFIX: &str = "cls-start-";
+const CLUSTER_STOP_PREFIX: &str = "cls-stop-";
+const GATEWAY_ROUTE_PREFIX: &str = "gw-route-";
 
 enum Signal {
     Engine(DaemonState),
@@ -64,17 +64,11 @@ enum Signal {
 #[derive(Clone)]
 struct TrayParts {
     tray: Option<TrayIcon<Wry>>,
-    /// App name + version, mirroring Docker Desktop's title row.
     title_row: MenuItem<Wry>,
-    /// Engine state plus live Docker counts.
     stats_row: MenuItem<Wry>,
-    /// Exactly one row per cluster currently known (capped), so the menu has
-    /// no blank placeholders; it is rebuilt when the cluster set changes.
-    cluster_rows: Vec<MenuItem<Wry>>,
     toggle: MenuItem<Wry>,
     restart: MenuItem<Wry>,
-    /// Names of the clusters this menu was laid out for.
-    cluster_sig: String,
+    menu_sig: String,
     tx: tokio::sync::mpsc::UnboundedSender<Signal>,
 }
 
@@ -142,23 +136,31 @@ struct MenuParts {
     menu: Menu<Wry>,
     title_row: MenuItem<Wry>,
     stats_row: MenuItem<Wry>,
-    cluster_rows: Vec<MenuItem<Wry>>,
     toggle: MenuItem<Wry>,
     restart: MenuItem<Wry>,
-    /// Cluster names this layout was built for; a change triggers a rebuild.
-    cluster_sig: String,
+    /// Signature of dynamic sections (groups, clusters, gateway routes); changes trigger rebuild.
+    menu_sig: String,
 }
 
-fn cluster_signature(clusters: &[ClusterStat]) -> String {
-    clusters
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect::<Vec<_>>()
-        .join("\u{1f}")
+fn menu_signature(stats: Option<&TrayStats>) -> String {
+    let Some(s) = stats else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for g in &s.groups {
+        parts.push(format!("g:{}:{}:{}:{:.1}:{:.1}", g.id, g.running, g.total, g.cpu_percent, g.mem_usage_mb));
+    }
+    for c in &s.clusters {
+        parts.push(format!("c:{}:{}:{}:{:.1}:{:.1}", c.name, c.running, c.nodes, c.cpu_percent, c.mem_usage_mb));
+    }
+    parts.push(format!("gw:{}:{}", s.gateway_running, s.active_routes.len()));
+    for r in &s.active_routes {
+        parts.push(format!("r:{}:{}", r.domain, r.target));
+    }
+    parts.join("|")
 }
 
-/// Status line under the title — the same shape Docker Desktop uses: engine
-/// state first, live Docker counts only while the daemon is up.
+/// Status line under the title — engine state and summary.
 fn format_status_row(daemon: &DaemonState, stats: Option<&TrayStats>) -> String {
     match stats {
         Some(s) => format!(
@@ -172,20 +174,8 @@ fn format_status_row(daemon: &DaemonState, stats: Option<&TrayStats>) -> String 
     }
 }
 
-fn format_cluster_row(c: &ClusterStat) -> String {
-    let phase = if c.running == 0 {
-        "stopped"
-    } else if c.running == c.nodes {
-        "running"
-    } else {
-        "degraded"
-    };
-    format!("{} · {}/{} nodes · {}", c.name, c.running, c.nodes, phase)
-}
-
-/// Lays the menu out for exactly the clusters that exist right now. Rebuilding
-/// instead of keeping placeholder rows is what keeps the tray compact — there
-/// are no empty rows when a cluster disappears or the engine stops.
+/// Lays the menu out cleanly: Container Groups, Kubernetes Clusters, Gateway,
+/// Open Dashboard, Engine controls, and Quit.
 fn build_menu(
     app: &AppHandle,
     daemon: &DaemonState,
@@ -205,22 +195,6 @@ fn build_menu(
         false,
         None::<&str>,
     )?;
-
-    let clusters = stats.map(|s| s.clusters.as_slice()).unwrap_or(&[]);
-    let shown = clusters.len().min(MAX_CLUSTER_ROWS);
-    // Enabled: clicking a row opens that cluster in the Kubernetes page.
-    let cluster_rows = clusters[..shown]
-        .iter()
-        .map(|c| {
-            MenuItem::with_id(
-                app,
-                format!("{CLUSTER_ROW_PREFIX}{}", c.name),
-                format_cluster_row(c),
-                true,
-                None::<&str>,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
 
     let transitioning = matches!(
         daemon,
@@ -244,49 +218,163 @@ fn build_menu(
         *daemon == DaemonState::Running,
         None::<&str>,
     )?;
-    let nav_dashboard = MenuItem::with_id(app, ID_NAV_DASHBOARD, "Dashboard", true, None::<&str>)?;
-    let nav_containers =
-        MenuItem::with_id(app, ID_NAV_CONTAINERS, "Containers", true, None::<&str>)?;
-    let nav_images = MenuItem::with_id(app, ID_NAV_IMAGES, "Images", true, None::<&str>)?;
-    let nav_volumes = MenuItem::with_id(app, ID_NAV_VOLUMES, "Volumes", true, None::<&str>)?;
-    let nav_clusters = MenuItem::with_id(app, ID_NAV_CLUSTERS, "Kubernetes", true, None::<&str>)?;
-    let nav_settings = MenuItem::with_id(app, ID_NAV_SETTINGS, "Settings", true, None::<&str>)?;
+    let open_dashboard = MenuItem::with_id(
+        app,
+        ID_OPEN_DASHBOARD,
+        "Open Hsx2Dock Dashboard",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
     let menu = Menu::new(app)?;
     menu.append(&title_row)?;
     menu.append(&stats_row)?;
-    // The cluster block (and its separator) exists only when there is a
-    // cluster to show — otherwise the menu stays short.
-    if !cluster_rows.is_empty() {
-        menu.append(&PredefinedMenuItem::separator(app)?)?;
-        menu.append(&MenuItem::with_id(
-            app,
-            "clusters-title",
-            "Clusters",
-            false,
-            None::<&str>,
-        )?)?;
-        for row in &cluster_rows {
-            menu.append(row)?;
-        }
-        if clusters.len() > MAX_CLUSTER_ROWS {
-            menu.append(&MenuItem::with_id(
+
+    if let Some(s) = stats {
+        // ================= Container Groups Section =================
+        if !s.groups.is_empty() {
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
+            let groups_header = MenuItem::with_id(
                 app,
-                "clusters-more",
-                format!("…and {} more", clusters.len() - MAX_CLUSTER_ROWS),
+                "header-groups",
+                format!("Container Groups ({})", s.groups.len()),
                 false,
                 None::<&str>,
-            )?)?;
+            )?;
+            menu.append(&groups_header)?;
+
+            for g in &s.groups {
+                let res_str = if g.running > 0 && (g.cpu_percent > 0.0 || g.mem_usage_mb > 0.0) {
+                    format!(" · CPU: {:.1}% | RAM: {:.0} MB", g.cpu_percent, g.mem_usage_mb)
+                } else {
+                    String::new()
+                };
+                let group_title = format!("{} ({}/{} running){}", g.name, g.running, g.total, res_str);
+                let group_sub = Submenu::new(app, &group_title, true)?;
+
+                let start_item = MenuItem::with_id(
+                    app,
+                    format!("{GROUP_START_PREFIX}{}", g.id),
+                    "Start Group",
+                    g.running < g.total,
+                    None::<&str>,
+                )?;
+                let stop_item = MenuItem::with_id(
+                    app,
+                    format!("{GROUP_STOP_PREFIX}{}", g.id),
+                    "Stop Group",
+                    g.running > 0,
+                    None::<&str>,
+                )?;
+
+                group_sub.append(&start_item)?;
+                group_sub.append(&stop_item)?;
+                menu.append(&group_sub)?;
+            }
+        }
+
+        // ================= Kubernetes Clusters Section =================
+        if !s.clusters.is_empty() {
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
+            let active_cls = s.clusters.iter().filter(|c| c.running > 0).count();
+            let cls_header = MenuItem::with_id(
+                app,
+                "header-clusters",
+                format!("Kubernetes Clusters ({}/{} active)", active_cls, s.clusters.len()),
+                false,
+                None::<&str>,
+            )?;
+            menu.append(&cls_header)?;
+
+            for c in &s.clusters {
+                let phase = if c.running == 0 {
+                    "stopped"
+                } else if c.running == c.nodes {
+                    "running"
+                } else {
+                    "degraded"
+                };
+                let res_str = if c.running > 0 && (c.cpu_percent > 0.0 || c.mem_usage_mb > 0.0) {
+                    format!(" · CPU: {:.1}% | RAM: {:.0} MB", c.cpu_percent, c.mem_usage_mb)
+                } else {
+                    String::new()
+                };
+                let cluster_title = format!("{} ({}/{} nodes, {}){}", c.name, c.running, c.nodes, phase, res_str);
+                let cluster_sub = Submenu::new(app, &cluster_title, true)?;
+
+                let nav_item = MenuItem::with_id(
+                    app,
+                    format!("{CLUSTER_NAV_PREFIX}{}", c.name),
+                    "Open in App",
+                    true,
+                    None::<&str>,
+                )?;
+                let start_item = MenuItem::with_id(
+                    app,
+                    format!("{CLUSTER_START_PREFIX}{}", c.name),
+                    "Start Cluster",
+                    c.running < c.nodes,
+                    None::<&str>,
+                )?;
+                let stop_item = MenuItem::with_id(
+                    app,
+                    format!("{CLUSTER_STOP_PREFIX}{}", c.name),
+                    "Stop Cluster",
+                    c.running > 0,
+                    None::<&str>,
+                )?;
+
+                cluster_sub.append(&nav_item)?;
+                cluster_sub.append(&start_item)?;
+                cluster_sub.append(&stop_item)?;
+                menu.append(&cluster_sub)?;
+            }
+        }
+
+        // ================= Gateway Section =================
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        let gw_status_label = if s.gateway_running {
+            format!("Gateway: Online ({} bound routes)", s.active_routes.len())
+        } else {
+            "Gateway: Offline".to_string()
+        };
+        let gw_header = MenuItem::with_id(
+            app,
+            "header-gateway",
+            gw_status_label,
+            false,
+            None::<&str>,
+        )?;
+        menu.append(&gw_header)?;
+
+        if s.gateway_running && !s.active_routes.is_empty() {
+            let routes_sub = Submenu::new(
+                app,
+                format!("Public URLs ({})", s.active_routes.len()),
+                true,
+            )?;
+            for r in &s.active_routes {
+                let container_info = r
+                    .container_name
+                    .as_deref()
+                    .map(|c| format!(" [{}]", c))
+                    .unwrap_or_default();
+                let route_item = MenuItem::with_id(
+                    app,
+                    format!("{GATEWAY_ROUTE_PREFIX}{}", r.public_url),
+                    format!("{} → {}{}", r.public_url, r.target, container_info),
+                    true,
+                    None::<&str>,
+                )?;
+                routes_sub.append(&route_item)?;
+            }
+            menu.append(&routes_sub)?;
         }
     }
+
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&nav_dashboard)?;
-    menu.append(&nav_containers)?;
-    menu.append(&nav_images)?;
-    menu.append(&nav_volumes)?;
-    menu.append(&nav_clusters)?;
-    menu.append(&nav_settings)?;
+    menu.append(&open_dashboard)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&restart)?;
     menu.append(&toggle)?;
@@ -297,10 +385,9 @@ fn build_menu(
         menu,
         title_row,
         stats_row,
-        cluster_rows,
         toggle,
         restart,
-        cluster_sig: cluster_signature(clusters),
+        menu_sig: menu_signature(stats),
     })
 }
 
@@ -336,10 +423,9 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             tray: Some(tray),
             title_row: built.title_row,
             stats_row: built.stats_row,
-            cluster_rows: built.cluster_rows,
             toggle: built.toggle,
             restart: built.restart,
-            cluster_sig: built.cluster_sig,
+            menu_sig: built.menu_sig,
             tx: tx.clone(),
         }),
     });
@@ -553,31 +639,65 @@ async fn handle_menu(app: &AppHandle, id: &str) {
     match id {
         ID_TOGGLE => toggle_engine_from_tray(app).await,
         ID_RESTART => restart_engine_from_tray(app).await,
-        // Page shortcuts mirror the sidebar one-for-one (no duplicate actions).
-        ID_NAV_DASHBOARD | ID_NAV_CONTAINERS | ID_NAV_IMAGES | ID_NAV_VOLUMES | ID_NAV_CLUSTERS
-        | ID_NAV_SETTINGS => {
+        ID_OPEN_DASHBOARD => {
             show_main_window(app);
-            let target = match id {
-                ID_NAV_DASHBOARD => "dashboard",
-                ID_NAV_CONTAINERS => "containers",
-                ID_NAV_IMAGES => "images",
-                ID_NAV_VOLUMES => "volumes",
-                ID_NAV_CLUSTERS => "kubernetes",
-                _ => "settings",
-            };
-            let _ = app.emit("tray-navigate", target);
+            let _ = app.emit("tray-navigate", "dashboard");
         }
         ID_QUIT => app.exit(0),
-        // Clicking a cluster row opens that cluster. Navigation state lives in
-        // the React shell, so the tray only reveals the window and emits the
-        // intent.
-        id if id.starts_with(CLUSTER_ROW_PREFIX) => {
+
+        // Container Group start/stop actions
+        id if id.starts_with(GROUP_START_PREFIX) => {
+            let group_id = &id[GROUP_START_PREFIX.len()..];
+            if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                match crate::commands::groups::start_container_group_core(&state, group_id).await {
+                    Ok(summary) => record_notice(app, "Container Group Started", &summary),
+                    Err(e) => record_notice(app, "Start Group Failed", &e),
+                }
+            }
+        }
+        id if id.starts_with(GROUP_STOP_PREFIX) => {
+            let group_id = &id[GROUP_STOP_PREFIX.len()..];
+            if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                match crate::commands::groups::stop_container_group_core(&state, group_id).await {
+                    Ok(summary) => record_notice(app, "Container Group Stopped", &summary),
+                    Err(e) => record_notice(app, "Stop Group Failed", &e),
+                }
+            }
+        }
+
+        // Kubernetes Cluster actions
+        id if id.starts_with(CLUSTER_NAV_PREFIX) => {
             show_main_window(app);
-            let cluster = &id[CLUSTER_ROW_PREFIX.len()..];
-            // One event carries both the page and the cluster so the shell can
-            // mount the page and open the monitor in the same render pass.
+            let cluster = &id[CLUSTER_NAV_PREFIX.len()..];
             let _ = app.emit("tray-navigate", format!("kubernetes:{cluster}"));
         }
+        id if id.starts_with(CLUSTER_START_PREFIX) => {
+            let cluster = &id[CLUSTER_START_PREFIX.len()..];
+            if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                match crate::commands::kind::set_cluster_power(Some(app), &state, cluster, true).await {
+                    Ok(()) => record_notice(app, "Cluster Started", &format!("Kind cluster '{cluster}' started")),
+                    Err(e) => record_notice(app, "Start Cluster Failed", &e),
+                }
+            }
+        }
+        id if id.starts_with(CLUSTER_STOP_PREFIX) => {
+            let cluster = &id[CLUSTER_STOP_PREFIX.len()..];
+            if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                match crate::commands::kind::set_cluster_power(Some(app), &state, cluster, false).await {
+                    Ok(()) => record_notice(app, "Cluster Stopped", &format!("Kind cluster '{cluster}' stopped")),
+                    Err(e) => record_notice(app, "Stop Cluster Failed", &e),
+                }
+            }
+        }
+
+        // Public Gateway Route item click -> open in default browser
+        id if id.starts_with(GATEWAY_ROUTE_PREFIX) => {
+            let url = &id[GATEWAY_ROUTE_PREFIX.len()..];
+            let _ = std::process::Command::new("xdg-open")
+                .arg(url)
+                .spawn();
+        }
+
         _ => {}
     }
 }
@@ -705,15 +825,38 @@ struct TrayStats {
     running: usize,
     images: usize,
     kinds: usize,
+    groups: Vec<GroupStat>,
     clusters: Vec<ClusterStat>,
+    gateway_running: bool,
+    active_routes: Vec<ActiveRouteStat>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GroupStat {
+    id: String,
+    name: String,
+    total: usize,
+    running: usize,
+    cpu_percent: f64,
+    mem_usage_mb: f64,
 }
 
 /// One kind cluster as the tray menu reports it.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct ClusterStat {
     name: String,
     nodes: usize,
     running: usize,
+    cpu_percent: f64,
+    mem_usage_mb: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ActiveRouteStat {
+    domain: String,
+    public_url: String,
+    target: String,
+    container_name: Option<String>,
 }
 
 async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
@@ -729,10 +872,6 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
     let label = state_label(&daemon);
 
     if let Some(tray) = &parts.tray {
-        // Raw RGBA swapped in place; on Linux StatusNotifier hosts that cache
-        // the pixmap the swap can lag — tooltip and menu stay authoritative.
-        // Only rewrite the pixmap when the colour actually changed: every
-        // set_icon forces a host-side reload, which flickers on some DEs.
         let color = state_color(&daemon);
         if ctx.last_color != Some(color) {
             let _ = tray.set_icon(Some(state_icon(color)));
@@ -746,13 +885,9 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
         )));
     }
 
-    let sig = stats
-        .as_ref()
-        .map(|s| cluster_signature(&s.clusters))
-        .unwrap_or_default();
-    // GTK menu items cannot be hidden once added, so a changed cluster set
-    // rebuilds the menu instead of leaving blank placeholder rows behind.
-    if parts.cluster_sig != sig {
+    let sig = menu_signature(stats.as_ref());
+    // Menu rebuilds whenever dynamic items change (counts, resources, routes, or engine state).
+    if parts.menu_sig != sig {
         if let Some(ts) = app.try_state::<TrayState>() {
             if let Ok(mut guard) = ts.parts.lock() {
                 if let Ok(built) = build_menu(app, &daemon, stats.as_ref()) {
@@ -761,10 +896,9 @@ async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
                     }
                     guard.title_row = built.title_row;
                     guard.stats_row = built.stats_row;
-                    guard.cluster_rows = built.cluster_rows;
                     guard.toggle = built.toggle;
                     guard.restart = built.restart;
-                    guard.cluster_sig = built.cluster_sig;
+                    guard.menu_sig = built.menu_sig;
                     let refreshed = guard.clone();
                     drop(guard);
                     update_rows(&refreshed, &daemon, &label, stats.as_ref());
@@ -792,13 +926,7 @@ fn update_rows(parts: &TrayParts, daemon: &DaemonState, _label: &str, stats: Opt
         "Start Engine"
     });
     let _ = parts.toggle.set_enabled(!transitioning);
-    // Restart only makes sense against a live engine, and must not race a
-    // start/stop that is already in flight.
     let _ = parts.restart.set_enabled(running);
-    let clusters = stats.map(|s| s.clusters.as_slice()).unwrap_or(&[]);
-    for (row, c) in parts.cluster_rows.iter().zip(clusters) {
-        let _ = row.set_text(format_cluster_row(c));
-    }
 }
 
 async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats> {
@@ -815,37 +943,206 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
         .await
         .ok()?
         .len();
-    // Group kind node containers into a compact per-cluster line. The container
-    // list already carries the cluster label, so the tray never shells out to
-    // kubectl just to redraw its menu.
-    let mut grouped: HashMap<String, (usize, usize)> = HashMap::new();
+
+    // 1. Group stats: measure CPU % and RAM MB for running containers
+    let mut stats_by_id: HashMap<String, (f64, f64)> = HashMap::new();
     for c in &containers {
-        if let Some(name) = &c.kind_cluster {
-            let entry = grouped.entry(name.clone()).or_insert((0, 0));
-            entry.0 += 1;
-            if c.running {
-                entry.1 += 1;
+        if c.running {
+            if let Ok(s) = client.container_stats(&c.id).await {
+                let mem_mb = s.mem_usage as f64 / (1024.0 * 1024.0);
+                stats_by_id.insert(c.id.clone(), (s.cpu_percent, mem_mb));
             }
         }
     }
-    let mut clusters: Vec<ClusterStat> = grouped
-        .into_iter()
-        .map(|(name, (nodes, running))| ClusterStat {
-            name,
-            nodes,
-            running,
+
+    // Build container groups (compose projects + custom groups + isolated)
+    let config = state.config.read().await.clone();
+    let mut groups: Vec<GroupStat> = Vec::new();
+
+    // Compose projects
+    let mut compose_map: HashMap<String, Vec<&crate::docker::models::ContainerItem>> = HashMap::new();
+    for c in &containers {
+        if let Some(ref proj) = c.compose_project {
+            compose_map.entry(proj.clone()).or_default().push(c);
+        }
+    }
+    for (proj, members) in compose_map {
+        let mut g_running = 0;
+        let mut g_cpu = 0.0;
+        let mut g_mem = 0.0;
+        for m in &members {
+            if m.running {
+                g_running += 1;
+                if let Some(&(cpu, mem)) = stats_by_id.get(&m.id) {
+                    g_cpu += cpu;
+                    g_mem += mem;
+                }
+            }
+        }
+        groups.push(GroupStat {
+            id: format!("compose:{proj}"),
+            name: format!("compose: {proj}"),
+            total: members.len(),
+            running: g_running,
+            cpu_percent: (g_cpu * 10.0).round() / 10.0,
+            mem_usage_mb: (g_mem * 10.0).round() / 10.0,
+        });
+    }
+
+    // Custom user groups
+    let mut custom_claimed_tokens = std::collections::HashSet::new();
+    for cg in &config.container_groups {
+        if cg.id.starts_with("compose:") || cg.id == "__isolated__" {
+            continue;
+        }
+        for token in &cg.container_ids {
+            custom_claimed_tokens.insert(token.as_str());
+        }
+
+        let mut members = Vec::new();
+        for token in &cg.container_ids {
+            if let Some(c) = containers.iter().find(|c| {
+                c.id == *token || c.short_id == *token || c.name == *token || c.name.trim_start_matches('/') == *token
+            }) {
+                members.push(c);
+            }
+        }
+
+        let mut g_running = 0;
+        let mut g_cpu = 0.0;
+        let mut g_mem = 0.0;
+        for m in &members {
+            if m.running {
+                g_running += 1;
+                if let Some(&(cpu, mem)) = stats_by_id.get(&m.id) {
+                    g_cpu += cpu;
+                    g_mem += mem;
+                }
+            }
+        }
+        groups.push(GroupStat {
+            id: cg.id.clone(),
+            name: cg.name.clone(),
+            total: members.len(),
+            running: g_running,
+            cpu_percent: (g_cpu * 10.0).round() / 10.0,
+            mem_usage_mb: (g_mem * 10.0).round() / 10.0,
+        });
+    }
+
+    // Isolated (standalone) containers not in compose or custom groups, and not kind node containers
+    let isolated: Vec<&crate::docker::models::ContainerItem> = containers
+        .iter()
+        .filter(|c| {
+            c.compose_project.is_none()
+                && c.kind_cluster.is_none()
+                && !custom_claimed_tokens.contains(c.id.as_str())
+                && !custom_claimed_tokens.contains(c.short_id.as_str())
+                && !custom_claimed_tokens.contains(c.name.as_str())
+                && !custom_claimed_tokens.contains(c.name.trim_start_matches('/'))
         })
         .collect();
-    // Alphabetical: the tray rows keep their position across refreshes, so the
-    // menu is only rebuilt when the *set* of clusters changes.
+
+    if !isolated.is_empty() {
+        let mut g_running = 0;
+        let mut g_cpu = 0.0;
+        let mut g_mem = 0.0;
+        for m in &isolated {
+            if m.running {
+                g_running += 1;
+                if let Some(&(cpu, mem)) = stats_by_id.get(&m.id) {
+                    g_cpu += cpu;
+                    g_mem += mem;
+                }
+            }
+        }
+        groups.push(GroupStat {
+            id: "__isolated__".to_string(),
+            name: "Standalone Containers".to_string(),
+            total: isolated.len(),
+            running: g_running,
+            cpu_percent: (g_cpu * 10.0).round() / 10.0,
+            mem_usage_mb: (g_mem * 10.0).round() / 10.0,
+        });
+    }
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // 2. Kind Kubernetes Clusters
+    let mut cluster_map: HashMap<String, Vec<&crate::docker::models::ContainerItem>> = HashMap::new();
+    for c in &containers {
+        if let Some(ref name) = c.kind_cluster {
+            cluster_map.entry(name.clone()).or_default().push(c);
+        }
+    }
+    let mut clusters: Vec<ClusterStat> = Vec::new();
+    for (name, nodes) in cluster_map {
+        let mut c_running = 0;
+        let mut c_cpu = 0.0;
+        let mut c_mem = 0.0;
+        for n in &nodes {
+            if n.running {
+                c_running += 1;
+                if let Some(&(cpu, mem)) = stats_by_id.get(&n.id) {
+                    c_cpu += cpu;
+                    c_mem += mem;
+                }
+            }
+        }
+        clusters.push(ClusterStat {
+            name,
+            nodes: nodes.len(),
+            running: c_running,
+            cpu_percent: (c_cpu * 10.0).round() / 10.0,
+            mem_usage_mb: (c_mem * 10.0).round() / 10.0,
+        });
+    }
     clusters.sort_by(|a, b| a.name.cmp(&b.name));
     let kinds = clusters.len();
+
+    // 3. Gateway status & active bound routes
+    let gateway_running = config.gateway_enabled && state.caddy.is_running().await;
+    let mut active_routes: Vec<ActiveRouteStat> = Vec::new();
+    if gateway_running {
+        let https_port = config.gateway_https_port;
+        for r in &config.gateway_routes {
+            if !r.enabled {
+                continue;
+            }
+            // Check if bound container is actively running
+            if let Some(ref cname) = r.container_name {
+                let is_running = containers.iter().any(|c| {
+                    (c.name == *cname || c.name.trim_start_matches('/') == *cname || c.id == *cname || c.short_id == *cname)
+                        && c.running
+                });
+                if !is_running {
+                    continue;
+                }
+            }
+            let host_port_str = if https_port == 443 {
+                r.domain.clone()
+            } else {
+                format!("{}:{}", r.domain, https_port)
+            };
+            let path_str = r.path.as_deref().unwrap_or("");
+            let public_url = format!("https://{}{}", host_port_str, path_str);
+            active_routes.push(ActiveRouteStat {
+                domain: r.domain.clone(),
+                public_url,
+                target: r.target.clone(),
+                container_name: r.container_name.clone(),
+            });
+        }
+    }
+
     Some(TrayStats {
         containers: total,
         running,
         images,
         kinds,
+        groups,
         clusters,
+        gateway_running,
+        active_routes,
     })
 }
 
@@ -987,7 +1284,10 @@ mod tests {
             running: 2,
             images: 9,
             kinds: 0,
+            groups: vec![],
             clusters: vec![],
+            gateway_running: false,
+            active_routes: vec![],
         };
         assert_eq!(
             format_status_row(&DaemonState::Running, Some(&stats)),
@@ -1004,63 +1304,43 @@ mod tests {
     }
 
     #[test]
-    fn cluster_row_text_names_the_node_phase() {
-        let full = ClusterStat {
-            name: "kind-local".into(),
-            nodes: 3,
-            running: 3,
+    fn menu_signature_tracks_dynamic_changes() {
+        let mut stats = TrayStats {
+            containers: 4,
+            running: 2,
+            images: 9,
+            kinds: 1,
+            groups: vec![GroupStat {
+                id: "grp1".into(),
+                name: "Web Stack".into(),
+                total: 2,
+                running: 2,
+                cpu_percent: 1.5,
+                mem_usage_mb: 120.0,
+            }],
+            clusters: vec![ClusterStat {
+                name: "kind-local".into(),
+                nodes: 3,
+                running: 3,
+                cpu_percent: 4.2,
+                mem_usage_mb: 850.0,
+            }],
+            gateway_running: true,
+            active_routes: vec![ActiveRouteStat {
+                domain: "app.localhost".into(),
+                public_url: "https://app.localhost".into(),
+                target: "127.0.0.1:8080".into(),
+                container_name: Some("web".into()),
+            }],
         };
-        assert_eq!(
-            format_cluster_row(&full),
-            "kind-local · 3/3 nodes · running"
-        );
-        let degraded = ClusterStat {
-            name: "kind-mixed".into(),
-            nodes: 3,
-            running: 1,
-        };
-        assert_eq!(
-            format_cluster_row(&degraded),
-            "kind-mixed · 1/3 nodes · degraded"
-        );
-        let stopped = ClusterStat {
-            name: "kind-off".into(),
-            nodes: 2,
-            running: 0,
-        };
-        assert_eq!(
-            format_cluster_row(&stopped),
-            "kind-off · 0/2 nodes · stopped"
-        );
-    }
+        let sig1 = menu_signature(Some(&stats));
+        assert!(sig1.contains("Web Stack") || sig1.contains("grp1"));
+        assert!(sig1.contains("kind-local"));
+        assert!(sig1.contains("app.localhost"));
 
-    #[test]
-    fn signature_only_changes_when_the_cluster_set_changes() {
-        let a = ClusterStat {
-            name: "a".into(),
-            nodes: 1,
-            running: 1,
-        };
-        let b = ClusterStat {
-            name: "b".into(),
-            nodes: 1,
-            running: 0,
-        };
-        // Node counts are rendered into the row text, not the layout, so they
-        // must not force a rebuild.
-        let a_running = ClusterStat {
-            name: "a".into(),
-            nodes: 4,
-            running: 4,
-        };
-        assert_eq!(
-            cluster_signature(std::slice::from_ref(&a)),
-            cluster_signature(&[a_running])
-        );
-        assert_ne!(
-            cluster_signature(std::slice::from_ref(&a)),
-            cluster_signature(&[a, b])
-        );
-        assert_eq!(cluster_signature(&[]), "");
+        // Changing container count or resource updates the signature
+        stats.groups[0].running = 1;
+        let sig2 = menu_signature(Some(&stats));
+        assert_ne!(sig1, sig2);
     }
 }
