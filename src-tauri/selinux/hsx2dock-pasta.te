@@ -1,0 +1,21 @@
+module hsx2dock-pasta 1.0;
+
+require {
+    type pasta_t;
+    type unconfined_t;
+    type proc_t;
+    type cgroup_t;
+    class dir { getattr search open read };
+    class file { getattr open read map };
+}
+
+# pasta is spawned by rootlesskit inside the (unconfined) hsx2dock app.
+# Its stock policy only lets it attach to namespaces of container domains,
+# so entering the sibling child's /proc/<pid>/ns dies with:
+#   "netns dir open: Permission denied, exiting"
+allow pasta_t unconfined_t:dir { getattr search open read };
+allow pasta_t unconfined_t:file { getattr open read map };
+
+# Diagnostics pasta reads at startup (non-fatal but noisy in the audit log).
+allow pasta_t proc_t:file { getattr open read };
+allow pasta_t cgroup_t:file { getattr open read };

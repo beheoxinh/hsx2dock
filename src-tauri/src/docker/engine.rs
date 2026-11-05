@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 use super::doctor;
 
@@ -266,6 +266,25 @@ impl EngineManager {
     /// engine and signal forwarding is murky. Spawning rootlesskit directly
     /// keeps the process tree shallow and predictable.
     pub fn start(&self) -> Result<()> {
+        match self.start_once() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Self-heal the one environmental failure a fresh install can
+                // hit: on SELinux-enforcing hosts (Fedora), the stock `pasta`
+                // policy refuses to enter the netns rootlesskit created for the
+                // engine — "netns dir open: Permission denied". Ship the
+                // allow-rule module and, once it is in, retry the start.
+                if pasta_selinux_blocked(&self.paths(), &e) && install_pasta_selinux_module() {
+                    tracing::info!("hsx2dock-pasta SELinux module installed; retrying engine start");
+                    self.start_once()
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn start_once(&self) -> Result<()> {
         if self.is_running() {
             return Ok(());
         }
@@ -720,8 +739,17 @@ where
 
 /// Lowercase hex sha256 of a file, read in chunks (never loads it whole).
 pub fn sha256_file(path: &Path) -> Result<String> {
+    hash_file_with::<Sha256>(path)
+}
+
+/// Lowercase hex sha512 of a file, read in chunks (never loads it whole).
+pub fn sha512_file(path: &Path) -> Result<String> {
+    hash_file_with::<Sha512>(path)
+}
+
+fn hash_file_with<D: Digest>(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = D::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
@@ -730,13 +758,30 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
 }
 
 /// Verify a downloaded artifact **before** extracting it. A mismatch is fatal:
 /// we never extract unverified binaries.
+///
+/// The expected digest selects the algorithm by its length: 64 hex chars is
+/// SHA-256 (Docker, compose, kind), 128 hex chars is SHA-512 — Caddy's release
+/// `checksums.txt` switched to SHA-512, so a pinned-sha256-only check rejected
+/// every genuine Caddy archive.
 pub fn verify(path: &Path, expected_hex: &str) -> Result<()> {
-    let actual = sha256_file(path)?;
+    let actual = match expected_hex.len() {
+        64 => sha256_file(path)?,
+        128 => sha512_file(path)?,
+        n => bail!(
+            "unsupported checksum length {n} for {}: expected digest must be 64 (sha256) or 128 (sha512) hex chars",
+            path.display()
+        ),
+    };
     if !actual.eq_ignore_ascii_case(expected_hex) {
         bail!(
             "checksum mismatch for {}: expected {expected_hex}, got {actual}",
@@ -1210,6 +1255,93 @@ fn host_dns_upstreams() -> (Vec<String>, Vec<String>) {
     std::fs::read_to_string("/etc/resolv.conf")
         .map(|t| parse_resolv_conf(&t))
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// SELinux self-heal for the pasta network driver
+// ---------------------------------------------------------------------------
+//
+// Fedora ships `pasta` with a dedicated SELinux domain whose stock policy only
+// lets it attach to namespaces of *container* domains. Spawned by this app (an
+// unconfined GUI process) via rootlesskit, entering the sibling's
+// `/proc/<pid>/ns` is denied and every engine start dies with:
+//
+//   netns dir open: Permission denied, exiting
+//
+// The fix is a tiny local policy module (`selinux/hsx2dock-pasta.te`, compiled
+// to `.pp` and embedded below). On the failure signature we install it through
+// `pkexec` — one password prompt — and retry the start.
+
+/// The log line pasta emits when SELinux refused the netns directory.
+const PASTA_NETNS_DENIED: &str = "netns dir open: Permission denied";
+const PASTA_SELINUX_MODULE: &[u8] = include_bytes!("../../selinux/hsx2dock-pasta.pp");
+const PASTA_SELINUX_MODULE_NAME: &str = "hsx2dock-pasta";
+
+/// Pure matcher, unit-testable: does this engine log show the SELinux pasta
+/// denial?
+fn log_shows_pasta_netns_denial(log: &str) -> bool {
+    log.contains(PASTA_NETNS_DENIED)
+}
+
+/// Whether the engine log plus the host state point at the pasta/SELinux
+/// failure this self-heal addresses.
+fn pasta_selinux_blocked(paths: &EnginePaths, err: &anyhow::Error) -> bool {
+    // Only the "exited during startup" failure can carry the denial; a timeout
+    // or a spawn error is something else entirely.
+    if !err.to_string().contains("exited during startup") {
+        return false;
+    }
+    let Ok(log) = fs::read_to_string(&paths.log_file) else {
+        return false;
+    };
+    // The log accumulates across runs; only the tail is this run's verdict.
+    let tail_start = log.len().saturating_sub(16 * 1024);
+    if !log_shows_pasta_netns_denial(&log[tail_start..]) {
+        return false;
+    }
+    selinux_enforcing() && !pasta_selinux_module_loaded()
+}
+
+fn selinux_enforcing() -> bool {
+    std::fs::read_to_string("/sys/fs/selinux/enforce")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+fn pasta_selinux_module_loaded() -> bool {
+    std::process::Command::new("semodule")
+        .arg("-l")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+            l.split_whitespace().next() == Some(PASTA_SELINUX_MODULE_NAME)
+        }))
+        .unwrap_or(false)
+}
+
+/// Install the embedded policy module via `pkexec` (polkit prompts for the
+/// password). Returns whether the module is loaded afterwards.
+fn install_pasta_selinux_module() -> bool {
+    let pp = std::env::temp_dir().join(format!(
+        "{}.pp",
+        PASTA_SELINUX_MODULE_NAME
+    ));
+    if let Err(e) = fs::write(&pp, PASTA_SELINUX_MODULE) {
+        tracing::warn!("cannot stage SELinux module: {e}");
+        return false;
+    }
+    let ok = std::process::Command::new("pkexec")
+        .args(["semodule", "-i", pp.to_str().unwrap_or_default()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = fs::remove_file(&pp);
+    if ok {
+        pasta_selinux_module_loaded()
+    } else {
+        tracing::warn!("pkexec semodule -i did not succeed; SELinux fix not applied");
+        false
+    }
 }
 
 /// Runs inside the rootlesskit netns (as the command before dockerd): rewrites
@@ -1838,13 +1970,49 @@ pub fn human_size(bytes: u64) -> String {
 
 /// Atomically repoint `current` → `versions/<version>`. A plain rename over the
 /// symlink is atomic on the same filesystem, so a reader never sees it missing.
+///
+/// Trees installed by older builds kept `current` as a *real directory* (the
+/// pre-`versions/` layout). `rename(2)` refuses to replace a directory with a
+/// non-directory (EISDIR), which made every install die right after the
+/// self-check with a stray `.current-tmp` left behind. Such a directory is
+/// unreferenced once `current` becomes a symlink, so move it aside first —
+/// renamed, never deleted.
 pub fn swap_current(paths: &EnginePaths, version: &str) -> Result<()> {
     let target = paths.versions_dir.join(version);
     let tmp_link = paths.versions_dir.join(".current-tmp");
     let _ = fs::remove_file(&tmp_link);
+
+    if let Ok(md) = fs::symlink_metadata(&paths.current_dir) {
+        if !md.file_type().is_symlink() {
+            let backup = next_free_path(&paths.versions_dir.join(".legacy-current"));
+            fs::rename(&paths.current_dir, &backup).with_context(|| {
+                format!(
+                    "move legacy {} out of the way to {}",
+                    paths.current_dir.display(),
+                    backup.display()
+                )
+            })?;
+        }
+    }
+
     std::os::unix::fs::symlink(&target, &tmp_link)?;
     fs::rename(&tmp_link, &paths.current_dir)?;
     Ok(())
+}
+
+/// First unused `base`, `base-1`, `base-2`, … path so repeated legacy moves
+/// never clobber each other.
+fn next_free_path(base: &Path) -> PathBuf {
+    let mut candidate = base.to_path_buf();
+    let mut n = 0u32;
+    while fs::symlink_metadata(&candidate).is_ok() {
+        n += 1;
+        candidate = base.with_file_name(format!(
+            "{}-{n}",
+            base.file_name().and_then(|f| f.to_str()).unwrap_or(".legacy-current")
+        ));
+    }
+    candidate
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,11 +2961,21 @@ where
     if version.is_empty() {
         bail!("no compose version given");
     }
+    // The plugin lives inside the engine tree (`current/docker-config/...`).
+    // Installing it without an engine would materialize `current` as a real
+    // directory, and the engine installer's atomic `current` symlink swap can
+    // never replace a directory (EISDIR) — a first-run "install compose before
+    // the engine" used to permanently break every later engine install.
+    let bin_dir = paths.bin_dir();
+    if !bin_dir.is_dir() {
+        bail!("no bundled engine installed yet — install the engine first");
+    }
 
     let dir = compose_plugin_dir(paths);
-    fs::create_dir_all(&dir)?;
     let dest = dir.join("docker-compose");
-    let staging = dir.join(format!(".compose-{version}.staging"));
+    // Stage under versions/ — creating the plugin dir up front would
+    // materialize `current` before the engine ever installed it (see above).
+    let staging = paths.versions_dir.join(format!(".compose-{version}.staging"));
     if staging.exists() {
         fs::remove_file(&staging).ok();
     }
@@ -2883,6 +3061,9 @@ where
         3,
         Some(0.9),
     ));
+    // Only now — with a verified, self-checking binary in hand — may the
+    // plugin dir come into existence.
+    fs::create_dir_all(&dir)?;
     fs::rename(&staging, &dest)
         .with_context(|| format!("install compose {version} to {}", dest.display()))?;
 
@@ -3035,6 +3216,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasta_selinux_denial_signature_is_matched_from_log_tail() {
+        let log = "time=... level=info msg=\"Starting up\"\n\
+                   [rootlesskit:parent] error: failed to setup network ...: \
+                   pasta failed with exit code 1:\nnetns dir open: Permission denied, exiting\n";
+        assert!(log_shows_pasta_netns_denial(log));
+        assert!(!log_shows_pasta_netns_denial(
+            "pasta failed with exit code 1: some other network error\n"
+        ));
+        assert!(!log_shows_pasta_netns_denial(""));
+    }
+
+    #[test]
+    fn pasta_selinux_blocked_requires_the_startup_exit_error() {
+        let dir = std::env::temp_dir().join(format!("dm-selinux-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("engine.log");
+        std::fs::write(&log, format!("x\n{PASTA_NETNS_DENIED}\n")).unwrap();
+        let paths = EnginePaths {
+            log_file: log.clone(),
+            ..EnginePaths::new()
+        };
+        // The denial alone is not enough — the surfaced error must be the
+        // "exited during startup" one. (Enforcing + module-absent are
+        // host-dependent and can't be asserted portably.)
+        let wrong_shape = anyhow::anyhow!("engine did not open its API socket within 30s");
+        assert!(!pasta_selinux_blocked(&paths, &wrong_shape));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn version_prefix_is_ignored_when_comparing() {
@@ -3781,6 +3992,56 @@ mod tests {
             std::fs::canonicalize(&current).unwrap(),
             versions.join("v1").canonicalize().unwrap()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn swap_current_moves_a_legacy_real_directory_aside() {
+        let dir = std::env::temp_dir().join(format!("dm-swap-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let versions = dir.join("versions");
+        let v1 = versions.join("v1");
+        std::fs::create_dir_all(&v1).unwrap();
+        // The old layout: `current` is a real directory, not a symlink.
+        let current = dir.join("current");
+        std::fs::create_dir_all(current.join("docker-config/cli-plugins")).unwrap();
+        std::fs::write(current.join("docker-config/cli-plugins/docker-compose"), b"x").unwrap();
+        let paths = EnginePaths {
+            versions_dir: versions.clone(),
+            current_dir: current.clone(),
+            ..EnginePaths::new()
+        };
+        swap_current(&paths, "v1").unwrap();
+        // `current` is now a proper symlink and the legacy tree survives.
+        assert!(current.is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(&current).unwrap(),
+            versions.join("v1").canonicalize().unwrap()
+        );
+        let backup = versions.join(".legacy-current");
+        assert!(backup.is_dir());
+        assert!(backup.join("docker-config/cli-plugins/docker-compose").is_file());
+        // No staging symlink left behind.
+        assert!(!versions.join(".current-tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_accepts_sha512_digests() {
+        let dir = std::env::temp_dir().join(format!("dm-verify-512-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("f");
+        std::fs::write(&f, b"hello caddy").unwrap();
+        let sha512 = sha512_file(&f).unwrap();
+        assert_eq!(sha512.len(), 128);
+        assert!(verify(&f, &sha512).is_ok());
+        // A sha256 digest still verifies as before.
+        let sha256 = sha256_file(&f).unwrap();
+        assert!(verify(&f, &sha256).is_ok());
+        // Wrong sha512 must be rejected.
+        assert!(verify(&f, &"0".repeat(128)).is_err());
+        // Nonsense digest length is rejected, not silently accepted.
+        assert!(verify(&f, "abcd").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
