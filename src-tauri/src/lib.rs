@@ -131,8 +131,61 @@ fn start_background_monitoring(app_handle: AppHandle) {
     });
 }
 
+/// Where the GUI's own log lives. The engine has `log/engine.log`; the app
+/// process itself — tray, gateway auto-start, self-repair, MCP — logs here.
+fn app_log_file() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("hsx2dock").join("log").join("app.log"))
+}
+
+/// Install a tracing subscriber for the GUI process.
+///
+/// Without this every `tracing::info!/warn!` in the app (gateway auto-start
+/// failures, self-repair, MCP) goes nowhere — stdout is discarded when the app
+/// is launched from a launcher, which made production failures undebuggable.
+/// Logs append to `~/.local/share/hsx2dock/log/app.log`, rotated at 10 MiB to
+/// `app.log.1`. Falls back silently to stderr when the log dir is unwritable.
+fn init_app_logging() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let file = app_log_file().and_then(|path| {
+        let dir = path.parent()?;
+        std::fs::create_dir_all(dir).ok()?;
+        // Rotate: a runaway warn-loop must not grow the file without bound.
+        const MAX_BYTES: u64 = 10 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_BYTES {
+                let _ = std::fs::rename(&path, dir.join("app.log.1"));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false);
+
+    match file {
+        Some(f) => {
+            let _ = subscriber
+                .with_writer(std::sync::Mutex::new(f))
+                .try_init();
+        }
+        None => {
+            let _ = subscriber.with_writer(std::io::stderr).try_init();
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_app_logging();
     // Rename any pre-rebrand (`docker-manager`) tree before anything reads a
     // path, so `AppState`/`EnginePaths` only ever see the new identity.
     crate::migrate::migrate_legacy_identity();

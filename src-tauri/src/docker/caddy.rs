@@ -405,7 +405,22 @@ impl CaddySupervisor {
             bail!("Caddy binary not installed yet at {}", bin.display());
         }
 
-        let initial_json = generate_caddy_json(http_port, https_port, routes)?;
+        // The default ports (80/443) are privileged: a rootless caddy cannot
+        // bind them without CAP_NET_BIND_SERVICE and dies with "bind:
+        // permission denied" before the admin API ever comes up. Grant the
+        // capability to the binary once (one pkexec prompt); a declined grant
+        // surfaces as caddy's own bind error below.
+        if (http_port < 1024 || https_port < 1024) && !has_net_bind_service(&bin) {
+            grant_net_bind_service(&bin).with_context(|| {
+                format!(
+                    "ports {http_port}/{https_port} are privileged (<1024) — accept the \
+                     capability prompt, or pick ports above 1023 in the Gateway settings"
+                )
+            })?;
+        }
+
+        let http_bindable = http_port_bindable(&bin, http_port);
+        let initial_json = generate_caddy_json(http_port, https_port, http_bindable, routes)?;
 
         let mut cmd = Command::new(&bin);
         cmd.args(["run", "--config", "-", "--adapter", ""]);
@@ -463,7 +478,9 @@ impl CaddySupervisor {
         https_port: u16,
         routes: &[GatewayRoute],
     ) -> Result<()> {
-        let json_body = generate_caddy_json(http_port, https_port, routes)?;
+        let bin = self.paths.binary();
+        let http_bindable = http_port_bindable(&bin, http_port);
+        let json_body = generate_caddy_json(http_port, https_port, http_bindable, routes)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
@@ -519,8 +536,49 @@ pub fn is_port_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+/// Whether the binary may bind privileged ports (<1024).
+fn has_net_bind_service(bin: &Path) -> bool {
+    std::process::Command::new("getcap")
+        .arg(bin)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("cap_net_bind_service"))
+        .unwrap_or(false)
+}
+
+/// Grant `cap_net_bind_service` to the binary via `pkexec` (polkit prompts for
+/// the password). Idempotent — a re-grant on an already-capable binary is a
+/// no-op, and a caddy update replaces the binary, dropping the capability,
+/// which the next start re-grants.
+fn grant_net_bind_service(bin: &Path) -> Result<()> {
+    let status = std::process::Command::new("pkexec")
+        .args(["setcap", "cap_net_bind_service=+ep"])
+        .arg(bin)
+        .status()
+        .context("invoke pkexec setcap")?;
+    if !status.success() {
+        bail!("pkexec setcap exited with {:?}", status.code());
+    }
+    Ok(())
+}
+
 /// Builds dynamic Caddy JSON configuration
-pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRoute]) -> Result<String> {
+/// Whether caddy can actually bind the HTTP port.
+///
+/// A plain `TcpListener::bind` probe from *this* process answers nothing for
+/// privileged ports (<1024): the app itself has no `CAP_NET_BIND_SERVICE`, so
+/// the probe fails even when the caddy binary — which carries the capability —
+/// binds the port fine. Treat a privileged port as bindable when the binary
+/// has the capability granted.
+fn http_port_bindable(bin: &Path, port: u16) -> bool {
+    is_port_available(port) || (port < 1024 && has_net_bind_service(bin))
+}
+
+pub fn generate_caddy_json(
+    http_port: u16,
+    https_port: u16,
+    http_bindable: bool,
+    routes: &[GatewayRoute],
+) -> Result<String> {
     let mut server_routes = Vec::new();
     let mut tls_subjects = Vec::new();
 
@@ -617,7 +675,7 @@ pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRou
     };
 
     let mut listen_addrs = Vec::new();
-    let can_bind_http = is_port_available(http_port);
+    let can_bind_http = http_bindable;
     if can_bind_http {
         listen_addrs.push(format!(":{http_port}"));
     }
@@ -944,5 +1002,17 @@ pub fn update_hosts_file(routes: &[GatewayRoute]) -> Result<()> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => bail!("Failed to update /etc/hosts with pkexec (exit code {:?})", s.code()),
         Err(e) => bail!("Failed to invoke pkexec: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_bind_service_probe_is_false_without_the_capability() {
+        // A missing binary has no file capabilities; getcap exits non-zero
+        // (or prints nothing) and the probe must read that as "not granted".
+        assert!(!has_net_bind_service(Path::new("/nonexistent/hsx2dock-caddy")));
     }
 }

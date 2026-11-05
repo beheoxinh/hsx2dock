@@ -296,6 +296,18 @@ impl EngineManager {
 
         let paths = self.paths();
 
+        // Rootless networking needs a user-space net helper. Without one,
+        // rootlesskit dies with an opaque "no such file or directory" long
+        // before anything explains itself — bail here, where the cause is
+        // still nameable, and tell the user exactly what to install.
+        if missing_net_helper(&paths) {
+            bail!(
+                "no rootless network helper found: install `pasta` (preferred, \
+                 e.g. `sudo dnf install passt` on Fedora) or `slirp4netns`, \
+                 then start the engine again"
+            );
+        }
+
         // Pre-flight self-repair, before anything is spawned. Every fix here is
         // idempotent and never deletes user data, so a data root that was moved,
         // replaced with an empty directory, or whose compat links were left

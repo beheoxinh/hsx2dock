@@ -34,6 +34,7 @@ pub const CHECK_COMPOSE_PLUGIN: &str = "compose-plugin";
 pub const CHECK_CONTAINERD_STATE: &str = "containerd-state";
 pub const CHECK_CONTAINERD_PLUGINS: &str = "containerd-plugins";
 pub const CHECK_SOCKET: &str = "engine-socket";
+pub const CHECK_NET_HELPER: &str = "net-helper";
 
 /// How a check (or a containerd plugin) is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -123,6 +124,7 @@ pub fn diagnose(paths: &EnginePaths) -> EngineDoctorReport {
         check_compose_plugin(paths),
         check_containerd_state(paths),
         check_socket(paths),
+        check_net_helper(paths),
     ];
 
     let plugins = read_containerd_plugins(&paths.log_file);
@@ -140,6 +142,41 @@ pub fn diagnose(paths: &EnginePaths) -> EngineDoctorReport {
         plugins,
         data_root: paths.data_root.display().to_string(),
         engine_running: engine::is_usable_socket(&paths.socket),
+    }
+}
+
+/// Rootless networking needs a user-space net helper (`pasta` preferred, else
+/// `slirp4netns`). Without one the engine cannot start at all — flag it here so
+/// the Doctor card names the fix instead of the start button failing with a
+/// rootlesskit error.
+fn check_net_helper(paths: &EnginePaths) -> EngineCheck {
+    let engine_installed = paths.current_dir.join(".complete").is_file();
+    let (health, detail) = if !engine::missing_net_helper(paths) {
+        (Health::Ok, "A rootless network helper (pasta or slirp4netns) is available.".into())
+    } else if engine_installed {
+        (
+            Health::Error,
+            "No rootless network helper found. Install `pasta` (preferred, \
+             e.g. `sudo dnf install passt`) or `slirp4netns`, then start the engine."
+                .into(),
+        )
+    } else {
+        (
+            Health::Missing,
+            "No rootless network helper yet. Install `pasta` (preferred, \
+             e.g. `sudo dnf install passt`) or `slirp4netns` before starting the engine."
+                .into(),
+        )
+    };
+    EngineCheck {
+        id: CHECK_NET_HELPER.into(),
+        label: "Rootless network helper".into(),
+        health,
+        detail,
+        path: None,
+        // Installing a system package is the user's call; nothing on disk to fix.
+        repairable: false,
+        auto: false,
     }
 }
 
