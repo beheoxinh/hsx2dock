@@ -1185,28 +1185,67 @@ fn state_color(state: &DaemonState) -> [u8; 3] {
     }
 }
 
-/// The container glyph the app is branded with. It ships white, so tinting is
-/// a flat RGB swap: the alpha channel is the shape (anti-aliased edges
-/// included) and keeps the menu-bar silhouette.
+/// The container glyph the app is branded with. It ships white, so its alpha
+/// channel is the shape (anti-aliased edges included).
 const TRAY_GLYPH_PNG: &[u8] = include_bytes!("../icons/tray-glyph.png");
 
 fn state_icon(rgb: [u8; 3]) -> Image<'static> {
-    tinted_glyph(rgb).unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
+    badge_icon(rgb).unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
 }
 
-/// RGBA buffer of the glyph painted in `rgb`; `None` only if the bundled PNG
-/// fails to decode (a corrupt asset, i.e. a build error rather than a runtime
-/// condition) — the caller falls back to a blank icon instead of panicking.
-fn tinted_glyph(rgb: [u8; 3]) -> Option<Image<'static>> {
+/// A solid disc in the state colour with the container glyph knocked out in
+/// white.
+///
+/// The bare tinted glyph is a thin outline that vanishes on panels close to
+/// its colour — the stopped grey on a light GNOME bar reads as "no icon at
+/// all". A filled badge keeps the state colour as the signal and stays
+/// visible on light and dark panels alike.
+fn badge_icon(rgb: [u8; 3]) -> Option<Image<'static>> {
+    const SIZE: usize = 32;
+    const CENTER: f32 = (SIZE - 1) as f32 / 2.0;
+    // The glyph is shrunk a touch so its outline never sits on the disc's
+    // anti-aliased rim, where white on half-coverage would wash out.
+    const GLYPH_SCALE: f32 = 30.0 / 32.0;
+
     let glyph = Image::from_bytes(TRAY_GLYPH_PNG).ok()?;
-    let (width, height) = (glyph.width(), glyph.height());
-    let mut rgba = glyph.rgba().to_vec();
-    for px in rgba.chunks_exact_mut(4) {
-        px[0] = rgb[0];
-        px[1] = rgb[1];
-        px[2] = rgb[2];
+    let src = glyph.rgba().to_vec();
+    if src.len() != SIZE * SIZE * 4 {
+        return None;
     }
-    Some(Image::new_owned(rgba, width, height))
+
+    let mut out = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let i = (y * SIZE + x) * 4;
+            // Disc coverage with a 1px anti-aliased edge.
+            let d = ((x as f32 - CENTER).powi(2) + (y as f32 - CENTER).powi(2)).sqrt();
+            let disc = (15.5 - d).clamp(0.0, 1.0);
+            if disc <= 0.0 {
+                continue;
+            }
+
+            // Nearest-neighbour sample of the glyph, shrunk about the centre.
+            let sx = ((x as f32 - CENTER) / GLYPH_SCALE + CENTER).round()
+                .clamp(0.0, (SIZE - 1) as f32) as usize;
+            let sy = ((y as f32 - CENTER) / GLYPH_SCALE + CENTER).round()
+                .clamp(0.0, (SIZE - 1) as f32) as usize;
+            let glyph_a = src[(sy * SIZE + sx) * 4 + 3];
+
+            // "White glyph over coloured disc", straight-alpha compositing.
+            let a_g = glyph_a as f32 / 255.0;
+            let a_d = disc;
+            let a_out = a_g + a_d * (1.0 - a_g);
+            if a_out <= 0.0 {
+                continue;
+            }
+            let mix = |g: f32, d: f32| ((g * a_g + d * a_d * (1.0 - a_g)) / a_out).round() as u8;
+            out[i] = mix(255.0, rgb[0] as f32);
+            out[i + 1] = mix(255.0, rgb[1] as f32);
+            out[i + 2] = mix(255.0, rgb[2] as f32);
+            out[i + 3] = (a_out * 255.0).round() as u8;
+        }
+    }
+    Some(Image::new_owned(out, SIZE as u32, SIZE as u32))
 }
 
 /// Tooltip shown on hover (and, on Linux, whatever the host honours — many
@@ -1252,6 +1291,30 @@ mod tests {
         assert!(two.ends_with("2 kind clusters"), "got: {two}");
     }
 
+ #[test]
+    fn badge_icon_is_visible_on_any_panel() {
+        let img = badge_icon([113, 113, 122]).expect("bundled glyph must decode");
+        let rgba = img.rgba();
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        let mut opaque = 0usize;
+        let mut disc_colored = 0usize;
+        let mut glyph_white = 0usize;
+        for px in rgba.chunks_exact(4) {
+            if px[3] > 200 {
+                opaque += 1;
+                if px[0] == 255 && px[1] == 255 && px[2] == 255 {
+                    glyph_white += 1;
+                } else if px[0] == 113 && px[1] == 113 && px[2] == 122 {
+                    disc_colored += 1;
+                }
+            }
+        }
+        // A solid badge, not a thin outline: most of the disc is filled.
+        assert!(opaque > 500, "badge must be a filled disc, got {opaque}");
+        assert!(disc_colored > 150, "disc must carry the state colour");
+        assert!(glyph_white > 150, "glyph must be knocked out in white");
+    }
+
     #[test]
     fn state_colors_distinguish_running_stopped_transition() {
         assert_ne!(
@@ -1269,19 +1332,17 @@ mod tests {
     }
 
     #[test]
-    fn tray_glyph_keeps_its_silhouette_and_takes_the_state_colour() {
-        let img = tinted_glyph([36, 150, 237]).expect("bundled glyph decodes");
-        let (w, h) = (img.width() as usize, img.height() as usize);
+    fn tray_badge_keeps_the_glyph_silhouette_inside_the_disc() {
+        let img = badge_icon([36, 150, 237]).expect("bundled glyph decodes");
         let rgba = img.rgba();
-        let px = |x: usize, y: usize| &rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        let px = |x: usize, y: usize| &rgba[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
 
         assert_eq!(px(0, 0)[3], 0, "corner stays transparent");
-
-        let solid = (0..h)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .find(|&(x, y)| px(x, y)[3] == 255)
-            .expect("glyph has opaque pixels");
-        assert_eq!(&px(solid.0, solid.1)[..3], &[36, 150, 237], "tinted");
+        // The glyph silhouette survives: white pixels inside the blue disc.
+        let white = rgba.chunks_exact(4).filter(|p| p[3] == 255 && p[..3] == [255, 255, 255]).count();
+        assert!(white > 50, "glyph must be visible in white, got {white}");
+        let blue = rgba.chunks_exact(4).filter(|p| p[3] == 255 && p[..3] == [36, 150, 237]).count();
+        assert!(blue > 150, "disc must be filled with the state colour");
     }
 
     #[test]
