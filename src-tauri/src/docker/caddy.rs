@@ -666,13 +666,28 @@ fn grant_net_bind_service(bin: &Path) -> Result<()> {
 
 /// Whether caddy can actually bind the HTTP port.
 ///
-/// A plain `TcpListener::bind` probe from *this* process answers nothing for
+/// A plain `TcpListener::bind` probe from *this* process cannot answer for
 /// privileged ports (<1024): the app itself has no `CAP_NET_BIND_SERVICE`, so
-/// the probe fails even when the caddy binary — which carries the capability —
-/// binds the port fine. Treat a privileged port as bindable when the binary
-/// has the capability granted.
+/// the probe is refused even when the caddy binary — which carries the
+/// capability — binds the port fine. Only that refusal is excused by the
+/// capability: a port that is already taken stays unbindable. Treating every
+/// failure on a privileged port as "permission" made Caddy try `:80` while
+/// another listener held it, and the whole gateway failed to start.
 fn http_port_bindable(bin: &Path, port: u16) -> bool {
-    is_port_available(port) || (port < 1024 && has_net_bind_service(bin))
+    bind_probe_allows(probe_bind(port), port < 1024 && has_net_bind_service(bin))
+}
+
+/// Bind the wildcard address, as Caddy's `:<port>` listener does.
+fn probe_bind(port: u16) -> std::io::Result<()> {
+    std::net::TcpListener::bind(("0.0.0.0", port)).map(drop)
+}
+
+fn bind_probe_allows(probe: std::io::Result<()>, caddy_has_capability: bool) -> bool {
+    match probe {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => caddy_has_capability,
+        Err(_) => false,
+    }
 }
 
 /// Builds dynamic Caddy JSON configuration
@@ -1253,6 +1268,15 @@ mod tests {
         ])
         .is_err());
         assert!(validate_routes(&[route("1", "app.test", Some("/api"), "localhost:8080")]).is_ok());
+    }
+
+    #[test]
+    fn a_taken_port_is_never_bindable_even_with_the_capability() {
+        use std::io::{Error, ErrorKind};
+        assert!(bind_probe_allows(Ok(()), false));
+        assert!(bind_probe_allows(Err(Error::from(ErrorKind::PermissionDenied)), true));
+        assert!(!bind_probe_allows(Err(Error::from(ErrorKind::PermissionDenied)), false));
+        assert!(!bind_probe_allows(Err(Error::from(ErrorKind::AddrInUse)), true));
     }
 
     #[test]
