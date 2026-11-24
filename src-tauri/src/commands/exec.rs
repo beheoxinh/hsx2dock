@@ -6,10 +6,9 @@
 //! boundary intact, including multi-byte characters split across chunks).
 
 use base64::Engine as _;
-use bollard::container::LogOutput;
 use bollard::exec::{ResizeExecOptions, StartExecResults};
 use bollard::models::{ContainerStateStatusEnum, ExecConfig};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
@@ -27,6 +26,8 @@ const DEBUG_POLL_INTERVAL_MS: u64 = 200;
 /// Terminal size sanity bounds; absurd values would just confuse the pty.
 const MIN_DIM: i32 = 1;
 const MAX_DIM: i32 = 500;
+/// Upper bound for one coalesced `exec-output` event.
+const EXEC_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Serialize)]
 pub struct ExecOutputPayload {
@@ -41,7 +42,8 @@ fn clamp_dim(value: i32) -> u16 {
     value.clamp(MIN_DIM, MAX_DIM) as u16
 }
 
-fn encode_output(log: &LogOutput) -> String {
+#[cfg(test)]
+fn encode_output(log: &bollard::container::LogOutput) -> String {
     base64::engine::general_purpose::STANDARD.encode(log.as_ref())
 }
 
@@ -133,23 +135,34 @@ async fn open_session(
     let emit_app = app.clone();
     let task = tokio::spawn(async move {
         let mut output = output;
-        while let Some(chunk) = output.next().await {
-            let payload = match chunk {
-                Ok(log) => ExecOutputPayload {
+        let emit = |data: String| {
+            emit_app.emit(
+                "exec-output",
+                ExecOutputPayload {
                     session_id: sid.clone(),
-                    data: Some(encode_output(&log)),
+                    data: Some(data),
                     eof: false,
                 },
-                Err(e) => ExecOutputPayload {
-                    session_id: sid.clone(),
-                    data: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(format!("exec stream error: {e}\n")),
-                    ),
-                    eof: false,
-                },
-            };
-            if emit_app.emit("exec-output", payload).is_err() {
+            )
+        };
+        while let Some(first) = output.next().await {
+            // A burst (`cat` of a big file, `yes`, a build log) arrived as
+            // thousands of tiny chunks, one IPC event each, which froze the
+            // webview. Coalesce whatever is already buffered into one event;
+            // interactive echo still goes out immediately.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut pending = Some(first);
+            while let Some(chunk) = pending.take() {
+                match chunk {
+                    Ok(log) => buf.extend_from_slice(log.as_ref()),
+                    Err(e) => buf.extend_from_slice(format!("exec stream error: {e}\n").as_bytes()),
+                }
+                if buf.len() >= EXEC_BATCH_BYTES {
+                    break;
+                }
+                pending = output.next().now_or_never().flatten();
+            }
+            if emit(base64::engine::general_purpose::STANDARD.encode(&buf)).is_err() {
                 break;
             }
         }
@@ -326,14 +339,23 @@ pub async fn resize_exec_session(
         .map_err(|e| e.to_string())
 }
 
-/// Tears a session down: closes stdin (letting the shell exit) and aborts the
-/// output pump. Idempotent — a session that already ended is a no-op.
+/// Tears a session down: interrupts whatever runs in the foreground, ends the
+/// shell, closes stdin and aborts the output pump. Idempotent — a session that
+/// already ended is a no-op.
+///
+/// The engine has no "kill exec" call, and closing stdin alone only ends an
+/// idle shell: a `top` or `tail -f` left in the foreground kept running in the
+/// container after the terminal tab was closed. Over the pty, Ctrl-C stops
+/// the foreground job and Ctrl-D on the then-empty prompt exits the shell.
 #[tauri::command]
 pub async fn stop_exec_session(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<(), String> {
     if let Some(session) = state.exec_sessions.write().await.remove(&session_id) {
+        // The input pump drains queued bytes before it sees the channel close.
+        let _ = session.stdin_tx.send(b"\x03\x04".to_vec());
+        drop(session.stdin_tx);
         session.task.abort();
     }
     Ok(())
@@ -342,6 +364,7 @@ pub async fn stop_exec_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bollard::container::LogOutput;
 
     #[test]
     fn clamp_dim_keeps_terminal_sizes_sane() {

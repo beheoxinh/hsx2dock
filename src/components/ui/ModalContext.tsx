@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from "react";
+import React, { createContext, useCallback, useContext, useMemo, useRef, useState, ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle, Info, HelpCircle, CheckCircle2, X } from "lucide-react";
 import { Button } from "./Button";
@@ -60,55 +60,66 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   } | null>(null);
 
   const [promptInput, setPromptInput] = useState("");
+  // The resolver of the dialog on screen, and what dismissing it means. A new
+  // dialog that replaces an unanswered one settles the old promise as
+  // dismissed, so its caller does not wait forever.
+  const pending = useRef<{ resolve: (value: any) => void; dismissed: unknown } | null>(null);
 
-  const showAlert = (message: string, title: string = "Notice", type: ModalType = "info"): Promise<void> => {
+  const open = useCallback((options: ModalOptions, resolve: (value: any) => void, dismissed: unknown) => {
+    const prev = pending.current;
+    pending.current = { resolve, dismissed };
+    prev?.resolve(prev.dismissed);
+    setModalState({ isOpen: true, options, resolve });
+  }, []);
+
+  const showAlert = useCallback((message: string, title: string = "Notice", type: ModalType = "info"): Promise<void> => {
     return new Promise((resolve) => {
-      setModalState({
-        isOpen: true,
-        options: { message, title, type, confirmText: "OK" },
-        resolve,
-      });
+      open({ message, title, type, confirmText: "OK" }, resolve, undefined);
     });
-  };
+  }, [open]);
 
-  const showConfirm = (message: string, title: string = "Confirmation", type: ModalType = "warning"): Promise<boolean> => {
+  const showConfirm = useCallback((message: string, title: string = "Confirmation", type: ModalType = "warning"): Promise<boolean> => {
     return new Promise((resolve) => {
-      setModalState({
-        isOpen: true,
-        options: { message, title, type, confirmText: "Confirm", cancelText: "Cancel" },
-        resolve,
-      });
+      open({ message, title, type, confirmText: "Confirm", cancelText: "Cancel" }, resolve, false);
     });
-  };
+  }, [open]);
 
-  const showPrompt = (message: string, defaultValue: string = "", title: string = "Input Required"): Promise<string | null> => {
+  const showPrompt = useCallback((message: string, defaultValue: string = "", title: string = "Input Required"): Promise<string | null> => {
     setPromptInput(defaultValue);
     return new Promise((resolve) => {
-      setModalState({
-        isOpen: true,
-        options: { message, title, type: "prompt", confirmText: "Submit", cancelText: "Cancel", defaultValue },
+      open(
+        { message, title, type: "prompt", confirmText: "Submit", cancelText: "Cancel", defaultValue },
         resolve,
-      });
+        null
+      );
     });
-  };
+  }, [open]);
 
-  const showChoice = (
+  const showChoice = useCallback((
     message: string,
     choices: ModalChoice[],
     title: string = "Choose an action",
     type: ModalType = "warning"
   ): Promise<string | null> => {
     return new Promise((resolve) => {
-      setModalState({ isOpen: true, options: { message, title, type, choices }, resolve });
+      open({ message, title, type, choices }, resolve, null);
     });
-  };
+  }, [open]);
 
   const handleClose = (value: any) => {
     if (modalState) {
+      if (pending.current?.resolve === modalState.resolve) pending.current = null;
       modalState.resolve(value);
       setModalState(null);
     }
   };
+
+  // Stable value: every `useModal()` consumer used to re-render with the
+  // provider, and callbacks depending on `modal` were rebuilt each time.
+  const value = useMemo(
+    () => ({ showAlert, showConfirm, showPrompt, showChoice }),
+    [showAlert, showConfirm, showPrompt, showChoice]
+  );
 
   const currentOptions = modalState?.options;
 
@@ -133,7 +144,7 @@ export const ModalProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   };
 
   return (
-    <ModalContext.Provider value={{ showAlert, showConfirm, showPrompt, showChoice }}>
+    <ModalContext.Provider value={value}>
       {children}
       <AnimatePresence>
         {modalState?.isOpen && (

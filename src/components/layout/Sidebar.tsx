@@ -129,13 +129,13 @@ const SECTIONS: NavSection[] = [
   },
 ];
 
-export const Sidebar: React.FC<SidebarProps> = ({
+export const Sidebar = React.memo<SidebarProps>(function Sidebar({
   activeTab,
   setActiveTab,
   runningContainersCount = 0,
-}) => {
+}) {
   return (
-    <aside className="w-80 shrink-0 bg-zinc-950/90 backdrop-blur-2xl border-r border-zinc-800/80 flex flex-col h-full select-none">
+    <aside className="w-80 shrink-0 bg-zinc-950 border-r border-zinc-800/80 flex flex-col h-full select-none">
       {/* Brand / Logo */}
       <div className="h-[4.5rem] flex items-center px-5 gap-3.5 border-b border-zinc-800/70 bg-zinc-900/20">
         <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-blue-600 via-indigo-600 to-indigo-500 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 ring-1 ring-white/15">
@@ -243,7 +243,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Footer status */}
       <div className="p-3.5 border-t border-zinc-800/70 bg-zinc-950/60">
         <div className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-zinc-900/50 border border-zinc-800/80 text-xs text-zinc-300 shadow-inner">
-          <Activity className="w-4 h-4 text-emerald-400 animate-pulse shrink-0" />
+          <Activity className="w-4 h-4 text-emerald-400 shrink-0" />
           <div className="min-w-0 flex-1 flex flex-col">
             <span className="text-[12px] font-medium text-zinc-200 truncate leading-tight">Rootless Docker</span>
             <span className="text-[10px] text-zinc-400 truncate">Daemon online &amp; healthy</span>
@@ -252,4 +252,4 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
     </aside>
   );
-};
+});

@@ -64,24 +64,31 @@ pub async fn save_gateway_routes(
     state: State<'_, Arc<AppState>>,
     routes: Vec<GatewayRoute>,
 ) -> Result<(), String> {
-    {
+    crate::docker::caddy::validate_routes(&routes).map_err(|e| e.to_string())?;
+    let (http_port, https_port) = {
         let mut config = state.config.write().await;
         config.gateway_routes = routes.clone();
         config.save().await.map_err(|e| e.to_string())?;
+        (config.gateway_http_port, config.gateway_https_port)
+    };
+
+    // The hosts sync goes first and off the async workers: it may wait on the
+    // pkexec password dialog, which used to run with the config lock held and
+    // stall every other command, and a reload failure skipped it entirely.
+    // It only prompts when the managed block actually changes.
+    let hosts_routes = routes.clone();
+    match tokio::task::spawn_blocking(move || update_hosts_file(&hosts_routes)).await {
+        Ok(Err(e)) => tracing::warn!("Auto-syncing /etc/hosts failed: {e}"),
+        Err(e) => tracing::warn!("Auto-syncing /etc/hosts panicked: {e}"),
+        Ok(Ok(())) => {}
     }
 
-    let config = state.config.read().await;
-    if config.gateway_enabled && state.caddy.is_running().await {
+    if state.caddy.is_running().await {
         state
             .caddy
-            .apply_routes(config.gateway_http_port, config.gateway_https_port, &routes)
+            .apply_routes(http_port, https_port, &routes)
             .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Auto-sync /etc/hosts with new routes whenever routes are updated
-    if let Err(e) = update_hosts_file(&routes) {
-        tracing::warn!("Auto-syncing /etc/hosts encountered warning: {e}");
+            .map_err(|e| format!("Routes saved, but reloading the gateway failed: {e}"))?;
     }
 
     Ok(())
@@ -92,28 +99,40 @@ pub async fn toggle_gateway(
     state: State<'_, Arc<AppState>>,
     enabled: bool,
 ) -> Result<bool, String> {
-    {
-        let mut config = state.config.write().await;
-        config.gateway_enabled = enabled;
-        config.save().await.map_err(|e| e.to_string())?;
-    }
-
-    let config = state.config.read().await;
+    // Copy what Caddy needs and release the lock: start polls for up to 3s,
+    // and a held read lock stalls every config writer (and, behind it, every
+    // reader) for that long.
+    let (http_port, https_port, routes) = {
+        let config = state.config.read().await;
+        (
+            config.gateway_http_port,
+            config.gateway_https_port,
+            config.gateway_routes.clone(),
+        )
+    };
     if enabled {
         state
             .caddy
-            .start(
-                config.gateway_http_port,
-                config.gateway_https_port,
-                &config.gateway_routes,
-            )
+            .start(http_port, https_port, &routes)
             .await
             .map_err(|e| e.to_string())?;
     } else {
         state.caddy.stop().await.map_err(|e| e.to_string())?;
     }
 
-    Ok(state.caddy.is_running().await)
+    // Persist only what actually happened: saving `enabled` before a start
+    // that then failed left the switch on for a gateway that never ran.
+    let running = state.caddy.is_running().await;
+    {
+        // Save a copy first: a failed write must not leave memory and disk
+        // disagreeing about whether the gateway is on.
+        let mut config = state.config.write().await;
+        let mut next = config.clone();
+        next.gateway_enabled = running;
+        next.save().await.map_err(|e| e.to_string())?;
+        *config = next;
+    }
+    Ok(running)
 }
 
 #[tauri::command]
@@ -129,8 +148,14 @@ pub async fn check_hosts_sync(state: State<'_, Arc<AppState>>) -> Result<HostsSy
 
 #[tauri::command]
 pub async fn sync_hosts_file(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let config = state.config.read().await;
-    update_hosts_file(&config.gateway_routes).map_err(|e| e.to_string())
+    // `update_hosts_file` runs pkexec synchronously; the password dialog can
+    // stay open for minutes. Run it off the async workers and without the
+    // config lock held.
+    let routes = state.config.read().await.gateway_routes.clone();
+    tokio::task::spawn_blocking(move || update_hosts_file(&routes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -181,7 +206,32 @@ pub async fn install_caddy_update(
     .await;
 
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // A running gateway keeps executing the old binary until it is
+            // restarted, while the UI already reports the new version as
+            // active. Restart it on the new one with the saved routes.
+            if state.caddy.is_running().await {
+                let (http_port, https_port, routes) = {
+                    let config = state.config.read().await;
+                    (
+                        config.gateway_http_port,
+                        config.gateway_https_port,
+                        config.gateway_routes.clone(),
+                    )
+                };
+                state.caddy.stop().await.map_err(|e| {
+                    format!("Caddy {version} installed, but stopping the old gateway failed: {e}")
+                })?;
+                state
+                    .caddy
+                    .start(http_port, https_port, &routes)
+                    .await
+                    .map_err(|e| {
+                        format!("Caddy {version} installed, but restarting the gateway failed: {e}")
+                    })?;
+            }
+            Ok(())
+        }
         Err(e) => {
             let msg = format!("{e:#}");
             let failed = crate::docker::engine::InstallProgress::failed(
@@ -209,30 +259,39 @@ pub async fn set_gateway_ports(
     if http_port == https_port {
         return Err("HTTP and HTTPS ports must be distinct".into());
     }
-    {
+    let routes = {
         let mut config = state.config.write().await;
-        config.gateway_http_port = http_port;
-        config.gateway_https_port = https_port;
-        config.save().await.map_err(|e| e.to_string())?;
-    }
-    let config = state.config.read().await;
-    if config.gateway_enabled && state.caddy.is_running().await {
+        let mut next = config.clone();
+        next.gateway_http_port = http_port;
+        next.gateway_https_port = https_port;
+        next.save().await.map_err(|e| e.to_string())?;
+        *config = next;
+        config.gateway_routes.clone()
+    };
+    if state.caddy.is_running().await {
         state
             .caddy
-            .apply_routes(http_port, https_port, &config.gateway_routes)
+            .apply_routes(http_port, https_port, &routes)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Ports saved, but reloading the gateway failed: {e}"))?;
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn save_raw_hosts(new_content: String) -> Result<(), String> {
-    save_raw_hosts_content(&new_content).map_err(|e| e.to_string())
+    // pkexec blocks on the password dialog — keep it off the async workers.
+    tokio::task::spawn_blocking(move || save_raw_hosts_content(&new_content))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn clear_app_hosts(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let _ = state;
-    clear_app_hosts_entries().map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(clear_app_hosts_entries)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }

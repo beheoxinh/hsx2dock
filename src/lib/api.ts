@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ContainerOp,
+  ContainerOpsSnapshot,
+  GroupOp,
   ContainerItem,
   ContainerStats,
   ContainerDetails,
@@ -362,14 +365,54 @@ export const api = {
     invoke<void>("save_container_groups", { groups }),
   startContainerGroup: (id: string) => invoke<string>("start_container_group", { id }),
   stopContainerGroup: (id: string) => invoke<string>("stop_container_group", { id }),
+  /** Container/group lifecycle operations currently in flight (spinners). */
+  listContainerOps: () => invoke<ContainerOpsSnapshot>("list_container_ops"),
 
   // Compose project lifecycle addressed by project name (no compose file)
   composeProjectAction: (project: string, action: "start" | "stop" | "restart" | "down") =>
     invoke<string>("compose_project_action", { project, action }),
 };
 
+/**
+ * Turns a pending `listen()` into a synchronous disposer.
+ *
+ * `listen()` resolves asynchronously, so the common
+ * `.then((u) => (unlisten = u))` + cleanup pattern leaks the listener when the
+ * component unmounts before the promise settles (fast tab switches, StrictMode).
+ * The disposer returned here also unsubscribes a listener that resolves late.
+ */
+export function disposeListener(pending: Promise<UnlistenFn>): () => void {
+  let disposed = false;
+  let unlisten: UnlistenFn | undefined;
+  pending
+    .then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    })
+    .catch(() => {
+      /* no Tauri bridge (tests, plain browser) */
+    });
+  return () => {
+    disposed = true;
+    unlisten?.();
+    unlisten = undefined;
+  };
+}
+
 // Event Listeners helper
 export const events = {
+  /** One container moved through queued → running → done/failed. */
+  onContainerOp: (cb: (op: ContainerOp) => void): Promise<UnlistenFn> =>
+    listen<ContainerOp>("container-op", (event) => cb(event.payload)),
+
+  /** A group start/stop pass progressed or finished. */
+  onGroupOp: (cb: (op: GroupOp) => void): Promise<UnlistenFn> =>
+    listen<GroupOp>("group-op", (event) => cb(event.payload)),
+
+  /** The saved group list changed (this window, another one, or MCP). */
+  onContainerGroupsChanged: (cb: (groups: ContainerGroup[]) => void): Promise<UnlistenFn> =>
+    listen<ContainerGroup[]>("container-groups-changed", (event) => cb(event.payload)),
+
   onEngineStateChanged: (cb: (state: DaemonState) => void): Promise<UnlistenFn> =>
     listen<DaemonState>("engine-state-changed", (event) => cb(event.payload)),
 

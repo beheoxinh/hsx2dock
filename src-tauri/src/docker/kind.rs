@@ -336,12 +336,9 @@ fn parse_sha256sum(text: &str) -> Option<String> {
 /// `kind version` prints `kind v0.33.0 go1.24.6 linux/amd64` — note it has no
 /// `version` keyword, so the docker parser cannot be reused.
 fn probe_kind_version(bin: &Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("version");
+    let out = crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, "kind version").ok()?;
     if !out.status.success() {
         return None;
     }

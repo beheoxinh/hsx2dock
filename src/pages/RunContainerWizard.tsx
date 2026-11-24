@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
+import { setGatewayRoutes } from "../lib/containerStore";
+import { joinArgs, splitArgs } from "../lib/shellArgs";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -92,8 +94,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
     if (image.trim() !== (d.image || "").trim()) return true;
 
     // Command check
-    const origCmd = (d.command || (d.command_vec ? d.command_vec.join(" ") : "")).trim();
-    if (command.trim() !== origCmd) return true;
+    const origCmd = d.command_vec ? d.command_vec : [];
+    const curCmd = command.trim() ? splitArgs(command.trim()) : [];
+    if (curCmd.length !== origCmd.length || curCmd.some((a, i) => a !== origCmd[i])) return true;
 
     // Network check
     const origNet = (d.network || "").trim();
@@ -102,11 +105,11 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
     // Ports check
     const curPorts = ports
       .filter((p) => p.container_port.trim() !== "")
-      .map((p) => `${p.host_ip || "127.0.0.1"}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
+      .map((p) => `${p.host_ip ?? ""}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
       .sort();
     const origPorts = (d.port_mappings || [])
       .filter((p) => (p.container_port || "").trim() !== "")
-      .map((p) => `${p.host_ip || "127.0.0.1"}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
+      .map((p) => `${p.host_ip ?? ""}:${p.host_port || ""}:${p.container_port}/${p.protocol || "tcp"}`)
       .sort();
     if (curPorts.length !== origPorts.length || curPorts.some((val, i) => val !== origPorts[i])) {
       return true;
@@ -159,7 +162,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       if (d.port_mappings && d.port_mappings.length > 0) {
         setPorts(
           d.port_mappings.map((p) => ({
-            host_ip: p.host_ip || "127.0.0.1",
+            // Empty means "all interfaces"; turning it into 127.0.0.1 made
+            // a LAN-reachable service localhost-only after any edit.
+            host_ip: p.host_ip ?? "",
             host_port: p.host_port || "",
             container_port: p.container_port || "",
             protocol: p.protocol || "tcp",
@@ -200,7 +205,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
       }
 
       // Command & Network
-      setCommand(d.command || (d.command_vec ? d.command_vec.join(" ") : ""));
+      // `command_vec` is the container's CMD. `command` is Path+Args, i.e.
+      // the entrypoint too — sent back as CMD it ran the entrypoint twice.
+      setCommand(d.command_vec ? joinArgs(d.command_vec) : "");
       setNetwork(d.network || "");
 
       // Load existing gateway route if container has one
@@ -307,9 +314,8 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
     try {
       setLoading(true);
 
-      const parsedCommand = command.trim()
-        ? command.trim().split(/\s+/)
-        : undefined;
+      // Shell-style split: `nginx -g "daemon off;"` is three arguments.
+      const parsedCommand = command.trim() ? splitArgs(command.trim()) : undefined;
 
       const config: RunConfig = {
         image: image.trim(),
@@ -387,6 +393,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
           }
 
           await api.saveGatewayRoutes(updated);
+          setGatewayRoutes(updated);
         } catch (gErr) {
           console.warn("Failed to update gateway route:", gErr);
         }
@@ -422,6 +429,7 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
               auto_detected: true,
             });
             await api.saveGatewayRoutes(updated);
+            setGatewayRoutes(updated);
           } catch (gErr) {
             console.warn("Failed to create gateway route:", gErr);
           }

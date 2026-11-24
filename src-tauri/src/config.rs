@@ -392,7 +392,25 @@ impl AppConfig {
     pub async fn load() -> anyhow::Result<Self> {
         if let Some(path) = Self::config_path() {
             if path.exists() {
-                let (cfg, stale) = Self::load_and_migrate(&path).await?;
+                let (cfg, stale) = match Self::load_and_migrate(&path).await {
+                    Ok(loaded) => loaded,
+                    Err(e) => {
+                        // Falling back to defaults is fine, but the next save
+                        // would overwrite the only copy of the user's groups,
+                        // endpoints and tokens. Keep the unreadable file aside.
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let backup = path.with_extension(format!("toml.corrupt-{stamp}"));
+                        let _ = tokio::fs::rename(&path, &backup).await;
+                        tracing::error!(
+                            "Config file {} could not be read ({e:#}); kept it as {} and started with defaults",
+                            path.display(),
+                            backup.display()
+                        );
+                        return Ok(Self::default());
+                    }
+                };
                 // Persist a one-time migration so it does not re-run and so
                 // the file is not misleadingly still showing the old values.
                 if stale {
@@ -472,9 +490,41 @@ impl AppConfig {
             }
         }
         let content = toml::to_string_pretty(self)?;
-        tokio::fs::write(path, content).await?;
-        Ok(())
+        write_atomic(path, content.into_bytes()).await
     }
+}
+
+/// Serialises config writes: two saves racing on the same temp file would
+/// interleave.
+static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Writes `bytes` to a temp file next to `path`, fsyncs it and renames it over
+/// `path`. A plain write truncates first, so a crash mid-save left a partial
+/// TOML that the next launch replaced with defaults. The file holds registry
+/// secrets and the MCP token, so it is created owner-only.
+async fn write_atomic(path: &std::path::Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let _guard = SAVE_LOCK.lock().await;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("toml.tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)?;
+        // An existing file keeps its old mode through `mode()`; tighten it.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]

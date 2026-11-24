@@ -25,7 +25,7 @@ import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
-import { api, events } from "../lib/api";
+import { api, disposeListener, events } from "../lib/api";
 import { formatBytes, formatDuration, formatRelativeTime } from "../lib/utils";
 import type {
   KindCluster,
@@ -249,13 +249,19 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   }, [refreshKey]);
 
   // Silent cluster refresh (no loading spinner) for the background card poll.
+  const refreshInflight = useRef(false);
   const refreshClusters = async () => {
+    // A slow kind/docker answer must not stack polls on top of each other.
+    if (refreshInflight.current) return;
+    refreshInflight.current = true;
     try {
       const list = await api.listKindClusters();
       setClusters(list);
       setLoadError(null);
     } catch {
       /* keep last-known list; cards simply stop updating until the next poll */
+    } finally {
+      refreshInflight.current = false;
     }
   };
 
@@ -265,6 +271,8 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   useEffect(() => {
     if (!hasRunning) return;
     const t = window.setInterval(() => {
+      // Nobody is looking at a hidden window: skip the docker round-trips.
+      if (document.hidden) return;
       refreshClusters();
     }, 10_000);
     return () => window.clearInterval(t);
@@ -274,7 +282,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   // Track per-cluster samples for the card sparklines (capped ring buffer).
   useEffect(() => {
     setHistory((prev) => {
-      const next: typeof prev = { ...prev };
+      // Rebuilt from the live list, so a deleted cluster's samples are dropped
+      // instead of accumulating for the lifetime of the page.
+      const next: typeof prev = {};
+      for (const c of clusters) {
+        if (prev[c.name]) next[c.name] = prev[c.name];
+      }
       for (const c of clusters) {
         if (!c.running || c.pod_count == null) continue;
         const cur = next[c.name] ?? { pods: [], cpu: [], mem: [] };
@@ -305,14 +318,11 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   }, []);
 
   useEffect(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenInstall: (() => void) | undefined;
-
-    events.onKindProgress((payload) => {
+    const unlistenProgress = disposeListener(events.onKindProgress((payload) => {
       setLogLines((prev) => [...prev.slice(-199), payload]);
-    }).then((u) => (unlistenProgress = u));
+    }));
 
-    events.onKindInstallProgress((payload) => {
+    const unlistenInstall = disposeListener(events.onKindInstallProgress((payload) => {
       if (payload.error) {
         setInstalling(false);
         setInstallPct(null);
@@ -332,11 +342,11 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
         toast.success("kind installed", "The isolated kind binary is ready.");
         api.kindStatus().then(setStatus).catch(() => {});
       }
-    }).then((u) => (unlistenInstall = u));
+    }));
 
     return () => {
-      unlistenProgress?.();
-      unlistenInstall?.();
+      unlistenProgress();
+      unlistenInstall();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

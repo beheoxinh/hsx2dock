@@ -137,8 +137,50 @@ pub async fn list_kind_clusters(
     list_kind_clusters_core(&state).await
 }
 
+type KindCache = Option<(std::time::Instant, u64, Vec<KindCluster>)>;
+
+static KIND_CLUSTERS_CACHE: std::sync::OnceLock<tokio::sync::Mutex<KindCache>> =
+    std::sync::OnceLock::new();
+/// Bumped by every mutation. A cached list, or a pass that was already running
+/// when the mutation landed, is only trusted while its generation matches.
+static KIND_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn kind_clusters_cache() -> &'static tokio::sync::Mutex<KindCache> {
+    KIND_CLUSTERS_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+/// Lock-free: create/delete/power flows used to wait here behind a running
+/// list pass (one `kubectl` exec per cluster) before they could report done.
+pub(crate) async fn invalidate_kind_clusters_cache() {
+    KIND_CACHE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// App-free core of [`list_kind_clusters`], shared with the MCP server.
+/// Cached behind a mutex so concurrent pollers (Header, Dashboard,
+/// KubernetesPage) share one `docker exec kubectl` pass instead of spawning
+/// duplicate processes.
 pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<KindCluster>, String> {
+    let mut guard = kind_clusters_cache().lock().await;
+    let gen = KIND_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if let Some((ts, cached_gen, ref cached)) = *guard {
+        // Header, Dashboard and the Kubernetes page each poll every 10s; a
+        // 9s window lets them share one pass instead of each missing.
+        if cached_gen == gen && ts.elapsed() < std::time::Duration::from_secs(9) {
+            return Ok(cached.clone());
+        }
+    }
+    let list = list_kind_clusters_uncached(state).await?;
+    // A mutation during the pass may have made this list stale: hand it to
+    // this caller but don't let it serve the next one.
+    if KIND_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire) == gen {
+        *guard = Some((std::time::Instant::now(), gen, list.clone()));
+    } else {
+        *guard = None;
+    }
+    Ok(list)
+}
+
+async fn list_kind_clusters_uncached(state: &AppState) -> Result<Vec<KindCluster>, String> {
     // kind targets the bundled engine even when a remote endpoint is active.
     let client = local_client(state).await?;
     // Docker's filter grammar: {"label": ["key"]} = "has this label key".
@@ -201,10 +243,20 @@ pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<Kind
     }
 
     let mut list: Vec<KindCluster> = map.into_values().collect();
-    for cluster in list.iter_mut() {
-        cluster.has_kubeconfig = kubeconfig_has_context(&state.kind, &cluster.name).await;
-        enrich_cluster_card(&client, cluster).await;
-    }
+    // Clusters are enriched concurrently: each one does inspects plus two
+    // kubectl execs, and one booting cluster must not delay the others.
+    let stats = state.cached_stats.read().await.clone();
+    let sizes = client.container_sizes().await.unwrap_or_default();
+    futures_util::future::join_all(list.iter_mut().map(|cluster| {
+        let client = &client;
+        let stats = &stats;
+        let sizes = &sizes;
+        async move {
+            cluster.has_kubeconfig = kubeconfig_has_context(&state.kind, &cluster.name).await;
+            enrich_cluster_card(client, cluster, stats, sizes).await;
+        }
+    }))
+    .await;
     list.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(list)
 }
@@ -216,6 +268,8 @@ pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<Kind
 async fn enrich_cluster_card(
     client: &crate::docker::client::DockerClient,
     cluster: &mut KindCluster,
+    cached_stats: &HashMap<String, crate::docker::models::ContainerStats>,
+    sizes: &HashMap<String, u64>,
 ) {
     // The Overview tile reports memory as a share of the host, mirroring the
     // CPU tile's `% of host`; read it even when the cluster is stopped so the
@@ -246,14 +300,19 @@ async fn enrich_cluster_card(
             .docker()
             .inspect_container(
                 id,
-                Some(bollard::query_parameters::InspectContainerOptions { size: true }),
+                None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
         else {
             continue;
         };
-        if let Some(bytes) = details.size_rw.filter(|b| *b > 0) {
-            disk_size_bytes += bytes as u64;
+        // Inspect without `size=true` never carries SizeRw; the 60s-cached
+        // size pass does, without walking the node's layer on every poll.
+        let full_id = details.id.clone().unwrap_or_else(|| id.clone());
+        if let Some(bytes) = sizes.get(&full_id).copied().or_else(|| {
+            sizes.iter().find(|(k, _)| k.starts_with(id.as_str())).map(|(_, v)| *v)
+        }) {
+            disk_size_bytes += bytes;
         }
         if let Some(ports) = details
             .network_settings
@@ -332,7 +391,18 @@ async fn enrich_cluster_card(
     let mut mem_mb = 0.0f64;
     let mut any_stats = false;
     for id in &ids {
-        if let Ok(s) = client.container_stats(id).await {
+        // The background monitor already samples every running container
+        // (with a correct CPU delta); only fall back to a fresh sample when
+        // it has not caught up with a node yet.
+        let cached = cached_stats
+            .get(id.as_str())
+            .or_else(|| cached_stats.iter().find(|(k, _)| k.starts_with(id.as_str())).map(|(_, v)| v))
+            .cloned();
+        let sample = match cached {
+            Some(s) => Ok(s),
+            None => client.container_stats(id).await,
+        };
+        if let Ok(s) = sample {
             cpu_pct += s.cpu_percent;
             mem_mb += s.mem_usage as f64 / (1024.0 * 1024.0);
             any_stats = true;
@@ -522,21 +592,30 @@ pub(crate) async fn run_kind_streaming(
         pipe: R,
         app: Option<AppHandle>,
         event: String,
-    ) -> tokio::task::JoinHandle<()>
+    ) -> tokio::task::JoinHandle<Vec<String>>
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut tail: std::collections::VecDeque<String> = Default::default();
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Some(line) = clean_kind_line(&raw) else {
+                    continue;
+                };
                 if let Some(app) = &app {
                     let _ = app.emit(&event, serde_json::json!({ "line": line }));
                 }
+                if tail.len() == KIND_ERROR_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
             }
+            tail.into()
         })
     }
 
-    let mut readers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut readers: Vec<tokio::task::JoinHandle<Vec<String>>> = Vec::new();
     if let Some(out) = stdout {
         readers.push(spawn_line_reader(out, app.cloned(), event.to_string()));
     }
@@ -544,20 +623,79 @@ pub(crate) async fn run_kind_streaming(
         readers.push(spawn_line_reader(err, app.cloned(), event.to_string()));
     }
 
-    let status = child.wait().await.map_err(|e| format!("wait kind: {e}"))?;
+    // A hung kind (stuck image pull, wedged daemon) used to hold the create /
+    // delete flow, and its per-cluster busy state, forever. Cluster creation
+    // pulls a ~1 GB node image, so the budget is generous.
+    const KIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    let status = match tokio::time::timeout(KIND_TIMEOUT, child.wait()).await {
+        Ok(r) => r.map_err(|e| format!("wait kind: {e}"))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            for r in readers {
+                r.abort();
+            }
+            return Err(format!(
+                "kind {} did not finish within {} minutes and was stopped",
+                args.first().copied().unwrap_or(""),
+                KIND_TIMEOUT.as_secs() / 60
+            ));
+        }
+    };
+    let mut output_tail = Vec::new();
     for r in readers {
-        let _ = r.await;
+        if let Ok(lines) = r.await {
+            output_tail.extend(lines);
+        }
     }
 
     if status.success() {
         Ok(())
     } else {
+        // "exited with 1" alone told the user nothing; kind prints the cause
+        // (port in use, image pull failure…) as its last lines.
+        let detail = output_tail
+            .iter()
+            .rev()
+            .find(|l| l.contains("ERROR") || l.contains("error") || l.contains("failed"))
+            .or_else(|| output_tail.last())
+            .map(|l| format!(": {l}"))
+            .unwrap_or_default();
         Err(format!(
-            "kind {} exited with {}",
+            "kind {} exited with {}{detail}",
             args.first().copied().unwrap_or(""),
             status.code().unwrap_or(-1)
         ))
     }
+}
+
+/// Lines of kind output kept for the error message of a failed run.
+const KIND_ERROR_TAIL: usize = 20;
+
+/// One kind output line as the UI should show it: spinner redraws (`\r`)
+/// collapsed to their final frame, ANSI colour codes removed, blank lines
+/// dropped. kind uses a TTY-style spinner when it thinks it may, and the raw
+/// frames showed up as garbled duplicates in the progress log.
+pub(crate) fn clean_kind_line(raw: &str) -> Option<String> {
+    let last = raw.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or("");
+    let mut out = String::with_capacity(last.len());
+    let mut chars = last.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // CSI: parameters/intermediates until a final byte @..~
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end().to_string();
+    (!out.trim().is_empty()).then_some(out)
 }
 
 /// kind always rides this app's bundled engine (kubeconfig points at the
@@ -598,16 +736,18 @@ pub(crate) async fn create_kind_cluster_core(
     if name.is_empty() {
         return Err("Cluster name is required".into());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-    {
-        return Err("Cluster name may only contain letters, digits, '-' and '.'".into());
-    }
+    check_cluster_name(&name)?;
     let host = docker_host_for(state);
     let paths = &state.kind;
     if !paths.is_installed() {
         return Err("kind is not installed yet".into());
+    }
+
+    let _busy = ClusterBusy::claim(&name)?;
+    // A failed create cleans up after itself below; that must never touch a
+    // cluster that already existed under this name.
+    if count_cluster_nodes(state, &name).await.unwrap_or(0) > 0 {
+        return Err(format!("A cluster named '{name}' already exists"));
     }
 
     let n = nodes.unwrap_or(1).clamp(1, 10);
@@ -655,10 +795,7 @@ pub(crate) async fn create_kind_cluster_core(
     }
     let config_yaml =
         format!("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n{nodes_yaml}");
-    let config_path = paths
-        .kubeconfig
-        .parent()
-        .map(|d| d.join(format!("cluster-config-{name}.yaml")))
+    let config_path = cluster_config_path(paths, &name)
         .ok_or_else(|| "kind data directory is unavailable".to_string())?;
     std::fs::write(&config_path, config_yaml)
         .map_err(|e| format!("failed to write kind cluster config: {e}"))?;
@@ -693,8 +830,70 @@ pub(crate) async fn create_kind_cluster_core(
         // kind ships nodes with on-failure:1 — pin them so a later engine
         // start cannot resurrect a cluster the user stopped.
         let _ = enforce_kind_restart_policy(state).await;
+    } else {
+        // kind removes its nodes on a clean failure, but not when it was
+        // killed on timeout, and never the node state dirs (image layers,
+        // often gigabytes) or the config file written above.
+        let _ = delete_cluster_containers(state, &name).await;
+        cleanup_cluster_state(&name);
+        let _ = std::fs::remove_file(&config_path);
     }
+    invalidate_kind_clusters_cache().await;
     result
+}
+
+/// Number of node containers carrying this cluster's label.
+async fn count_cluster_nodes(state: &AppState, name: &str) -> Result<usize, String> {
+    let client = local_client(state).await?;
+    let mut filters = HashMap::new();
+    filters.insert("label".to_string(), vec![format!("{CLUSTER_LABEL}={name}")]);
+    let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    client
+        .docker()
+        .list_containers(Some(opts))
+        .await
+        .map(|v| v.len())
+        .map_err(|e| e.to_string())
+}
+
+/// Per-cluster single flight: a create and a delete (or two creates) of one
+/// name used to interleave, and the failure cleanup of one could wipe the
+/// state of the other.
+struct ClusterBusy(String);
+
+fn busy_clusters() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static BUSY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    BUSY.get_or_init(Default::default)
+}
+
+impl ClusterBusy {
+    fn claim(name: &str) -> Result<Self, String> {
+        let mut set = busy_clusters().lock().map_err(|_| "kind state lock poisoned".to_string())?;
+        if !set.insert(name.to_string()) {
+            return Err(format!("Another operation on cluster '{name}' is still running"));
+        }
+        Ok(Self(name.to_string()))
+    }
+}
+
+impl Drop for ClusterBusy {
+    fn drop(&mut self) {
+        if let Ok(mut set) = busy_clusters().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Path of the generated per-cluster kind config.
+fn cluster_config_path(paths: &KindPaths, name: &str) -> Option<std::path::PathBuf> {
+    paths
+        .kubeconfig
+        .parent()
+        .map(|d| d.join(format!("cluster-config-{name}.yaml")))
 }
 
 /// Emits a `kind-progress` line when there is a window to emit to; the MCP
@@ -721,11 +920,13 @@ pub(crate) async fn delete_kind_cluster_core(
     name: String,
 ) -> Result<(), String> {
     let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("Cluster name is required".into());
-    }
+    check_cluster_name(&name)?;
+    let _busy = ClusterBusy::claim(&name)?;
     let host = docker_host_for(state);
     let paths = &state.kind;
+    if let Some(cfg) = cluster_config_path(paths, &name) {
+        let _ = std::fs::remove_file(cfg);
+    }
     if !paths.is_installed() {
         // Fall back to removing the node containers directly so a stale
         // cluster can still be cleaned up without the binary.
@@ -735,6 +936,7 @@ pub(crate) async fn delete_kind_cluster_core(
                 crate::tray::notify_kind_event(app, false, &name);
             }
             cleanup_cluster_state(&name);
+            invalidate_kind_clusters_cache().await;
         }
         return result;
     }
@@ -749,14 +951,40 @@ pub(crate) async fn delete_kind_cluster_core(
             crate::tray::notify_kind_event(app, false, &name);
         }
         cleanup_cluster_state(&name);
+        invalidate_kind_clusters_cache().await;
     }
     result
+}
+
+/// Cluster names reach `kind` arguments and filesystem paths, so they are
+/// held to kind's own shape: lowercase letters, digits, '-' and '.', starting
+/// with a letter or digit, never `..`.
+pub(crate) fn check_cluster_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Cluster name is required".into());
+    }
+    let first_ok = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let chars_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+    if !first_ok || !chars_ok || name.contains("..") || name.len() > 50 {
+        return Err(
+            "Cluster name must start with a letter or digit and contain only lowercase letters, digits, '-' and '.'"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Removes the d_type-compat bind-mount dirs a created cluster left behind.
 /// Best-effort: image layers can be gigabytes, and a failure here must not
 /// fail the delete itself (the containers are already gone).
 pub(crate) fn cleanup_cluster_state(name: &str) {
+    // The name becomes a path component of a recursive delete: `..` or `.`
+    // would have wiped the engine's compat root or every cluster's state.
+    if check_cluster_name(name).is_err() {
+        return;
+    }
     if let Some(root) = crate::docker::engine::dtype_compat_root() {
         let dir = root.join("kind-nodes").join(name);
         if dir.is_dir() {
@@ -827,9 +1055,8 @@ pub(crate) async fn set_cluster_power(
     start: bool,
 ) -> Result<(), String> {
     let name = name.trim();
-    if name.is_empty() {
-        return Err("Cluster name is required".into());
-    }
+    check_cluster_name(name)?;
+    let _busy = ClusterBusy::claim(name)?;
     if start {
         // Re-apply the cluster's per-node caps so a resumed cluster starts
         // under the same limits (docker keeps them across stop/start, but a
@@ -855,13 +1082,28 @@ pub(crate) async fn set_cluster_power(
         .all(true)
         .filters(&filters)
         .build();
-    let containers = client
+    let mut containers = client
         .docker()
         .list_containers(Some(opts))
         .await
         .map_err(|e| e.to_string())?;
     if containers.is_empty() {
         return Err(format!("No node containers found for cluster '{name}'"));
+    }
+    // Docker listed nodes in arbitrary order, so workers often booted before
+    // the API server they join and sat in back-off. Start the load balancer
+    // and control plane first; stop in reverse so workers drain first.
+    containers.sort_by_key(|c| {
+        let role = c
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("io.x-k8s.kind.role"))
+            .map(String::as_str)
+            .unwrap_or("worker");
+        node_start_rank(role)
+    });
+    if !start {
+        containers.reverse();
     }
 
     let action = if start { "start" } else { "stop" };
@@ -938,7 +1180,17 @@ pub(crate) async fn set_cluster_power(
         app,
         serde_json::json!({ "action": action, "name": name, "line": summary }),
     );
+    invalidate_kind_clusters_cache().await;
     Ok(())
+}
+
+/// Boot order of a kind node role: lower starts first.
+fn node_start_rank(role: &str) -> u8 {
+    match role {
+        "external-load-balancer" => 0,
+        "control-plane" => 1,
+        _ => 2,
+    }
 }
 
 /// Ensures the cluster's context is present in the app-managed kubeconfig and
@@ -976,9 +1228,9 @@ pub(crate) async fn get_kind_kubeconfig_core(
     let host = docker_host_for(state);
     let mut cmd = kind_command(paths, &host);
     cmd.args(["export", "kubeconfig", "--name", &name]);
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
         .await
+        .map_err(|_| "kind export kubeconfig timed out".to_string())?
         .map_err(|e| format!("run kind export kubeconfig: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -1000,7 +1252,16 @@ async fn kubeconfig_has_context(paths: &KindPaths, name: &str) -> bool {
         let needle = format!("kind-{name}");
         move || {
             std::fs::read_to_string(&p)
-                .map(|s| s.contains(&needle))
+                // Whole-value match: `contains("kind-dev")` also matched
+                // `kind-dev2` and skipped exporting dev's context.
+                .map(|s| {
+                    s.lines().any(|l| {
+                        let l = l.trim().trim_start_matches("- ").trim();
+                        l.strip_prefix("name:")
+                            .map(|v| v.trim().trim_matches('"') == needle)
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false)
         }
     })
@@ -1487,11 +1748,24 @@ pub(crate) fn parse_events(json: &serde_json::Value) -> Vec<K8sEventInfo> {
         .filter_map(|e| {
             let meta = e.get("metadata")?;
             let obj = e.get("involvedObject")?;
-            let last_ts = e
-                .get("lastTimestamp")
-                .or_else(|| e.get("eventTime"))
-                .and_then(|t| t.as_str())
-                .and_then(rfc3339_to_epoch);
+            // Events written through events.k8s.io/v1 (the scheduler, kubelet
+            // on newer releases) carry `lastTimestamp: null` and keep the time
+            // in `series.lastObservedTime` / `eventTime`. `.get()` returned
+            // that JSON null, so the fallbacks never ran and those events
+            // showed no time and sorted first.
+            let ts_at = |v: Option<&serde_json::Value>| {
+                v.and_then(|t| t.as_str()).and_then(rfc3339_to_epoch)
+            };
+            let last_ts = ts_at(e.get("lastTimestamp"))
+                .or_else(|| ts_at(e.get("series").and_then(|s| s.get("lastObservedTime"))))
+                .or_else(|| ts_at(e.get("eventTime")))
+                .or_else(|| ts_at(e.get("firstTimestamp")))
+                .or_else(|| ts_at(meta.get("creationTimestamp")));
+            let count = e
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .or_else(|| e.get("series").and_then(|s| s.get("count")).and_then(|v| v.as_u64()))
+                .unwrap_or(1) as u32;
             Some(K8sEventInfo {
                 kind: e
                     .get("type")
@@ -1520,7 +1794,7 @@ pub(crate) fn parse_events(json: &serde_json::Value) -> Vec<K8sEventInfo> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                count: e.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                count,
                 last_timestamp: last_ts,
             })
         })
@@ -1907,7 +2181,9 @@ pub(crate) async fn get_cluster_events_core(
     )
     .await?;
     let mut events = parse_events(&v);
-    events.reverse(); // newest last → newest first for the UI
+    // kubectl's `--sort-by=.lastTimestamp` puts events with a null
+    // lastTimestamp (events.k8s.io writers) first; sort on the resolved time.
+    events.sort_by_key(|e| std::cmp::Reverse(e.last_timestamp.unwrap_or(0)));
     Ok(events)
 }
 
@@ -2188,15 +2464,21 @@ fn parse_metrics_pods(json: &serde_json::Value) -> Vec<MetricsPodStatus> {
                         .unwrap_or(0);
                     // A stuck pod explains itself in waiting/terminated.reason
                     // (ImagePullBackOff, CrashLoopBackOff, ...).
-                    let reason = cs
-                        .and_then(|list| list.first())
-                        .and_then(|c| c.get("state"))
-                        .and_then(|s| {
-                            s.pointer("/waiting/reason")
-                                .or_else(|| s.pointer("/terminated/reason"))
+                    // Only the first container was read, so a sidecar in
+                    // CrashLoopBackOff showed as a healthy-looking pod. A
+                    // waiting reason anywhere wins over a terminated one.
+                    let reason_at = |ptr: &str| {
+                        cs.and_then(|list| {
+                            list.iter().find_map(|c| {
+                                c.get("state")
+                                    .and_then(|s| s.pointer(ptr))
+                                    .and_then(|r| r.as_str())
+                                    .map(str::to_string)
+                            })
                         })
-                        .and_then(|r| r.as_str())
-                        .map(|s| s.to_string());
+                    };
+                    let reason = reason_at("/waiting/reason")
+                        .or_else(|| reason_at("/terminated/reason"));
                     MetricsPodStatus {
                         name: p
                             .pointer("/metadata/name")
@@ -2750,6 +3032,26 @@ mod metrics_status_tests {
     }
 
     #[test]
+    fn pod_reason_comes_from_any_stuck_container() {
+        let json = serde_json::json!({
+            "items": [{
+                "metadata": { "name": "web" },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [
+                        { "ready": true, "restartCount": 0, "state": { "running": {} } },
+                        { "ready": false, "restartCount": 7,
+                          "state": { "waiting": { "reason": "CrashLoopBackOff" } } }
+                    ]
+                }
+            }]
+        });
+        let parsed = parse_metrics_pods(&json);
+        assert_eq!(parsed[0].reason.as_deref(), Some("CrashLoopBackOff"));
+        assert_eq!(parsed[0].restarts, 7);
+    }
+
+    #[test]
     fn pod_status_captures_ready_state_restarts_and_reason() {
         let pods = json!({ "items": [
             { "metadata": { "name": "ms-1" },
@@ -3128,12 +3430,25 @@ pub async fn reconcile_kind_auto_start(
 
 // ==================== Pod & resource management ====================
 
+/// Kubernetes object names (DNS-1123 subdomain: lowercase alphanumerics, `-`
+/// and `.`, alphanumeric at both ends, at most 253 chars).
+///
+/// The old check only rejected whitespace, so a "name" such as
+/// `--kubeconfig=/other` or `-A` reached kubectl as a flag. Names are passed
+/// on untrimmed, so surrounding whitespace is rejected too rather than trimmed.
 pub(crate) fn k8s_name_check(s: &str) -> Result<(), String> {
-    let s = s.trim();
-    if s.is_empty() || s.contains(char::is_whitespace) {
-        return Err("invalid name".into());
+    let b = s.as_bytes();
+    let alnum = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let ok = !b.is_empty()
+        && b.len() <= 253
+        && b.first().is_some_and(alnum)
+        && b.last().is_some_and(alnum)
+        && b.iter().all(|c| alnum(c) || *c == b'-' || *c == b'.');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid Kubernetes name '{s}'"))
     }
-    Ok(())
 }
 
 /// Container logs of a pod (its first container). `tail` lines, default 200.
@@ -3308,7 +3623,9 @@ pub(crate) async fn get_resource_events_core(
             all
         }
     };
-    Ok(parse_events(&v))
+    let mut events = parse_events(&v);
+    events.sort_by_key(|e| e.last_timestamp.unwrap_or(0));
+    Ok(events)
 }
 
 /// Aggregated logs of a workload (`kubectl logs deployment/name` picks one of
@@ -3476,6 +3793,8 @@ pub(crate) async fn scale_workload_core(
     replicas: u32,
 ) -> Result<(), String> {
     k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    let kind = kind.trim().to_lowercase();
     if !["deployment", "statefulset"].contains(&kind.as_str()) {
         return Err("only deployments and statefulsets are scalable".into());
     }
@@ -3516,6 +3835,13 @@ pub(crate) async fn restart_workload_core(
     name: String,
 ) -> Result<(), String> {
     k8s_name_check(&name)?;
+    k8s_name_check(&namespace)?;
+    // `kind` went to kubectl unchecked, so any string (a flag included) was
+    // accepted. Only workloads support `rollout restart`.
+    let kind = kind.trim().to_lowercase();
+    if !["deployment", "statefulset", "daemonset"].contains(&kind.as_str()) {
+        return Err(format!("'{kind}' cannot be restarted — select a workload"));
+    }
     kubectl_raw(
         state,
         &cluster,
@@ -4194,6 +4520,45 @@ mod monitor_tests {
         assert_eq!(pods[1].phase, "Pending");
         assert_eq!(pods[1].reason.as_deref(), Some("Unschedulable"));
         assert_eq!(pods[1].total_containers, 1);
+    }
+
+    #[test]
+    fn kind_output_lines_are_cleaned() {
+        assert_eq!(
+            clean_kind_line(" \u{1b}[32m✓\u{1b}[0m Ensuring node image 🖼").as_deref(),
+            Some(" ✓ Ensuring node image 🖼")
+        );
+        assert_eq!(
+            clean_kind_line(" • Preparing nodes ⠈\r • Preparing nodes ⠐\r ✓ Preparing nodes").as_deref(),
+            Some(" ✓ Preparing nodes")
+        );
+        assert_eq!(clean_kind_line("   "), None);
+        assert_eq!(clean_kind_line("\u{1b}[2K\r"), None);
+    }
+
+    #[test]
+    fn k8s_names_reject_flags_and_bad_chars() {
+        for ok in ["web", "web-0", "kube-system", "a.b-c", "x1"] {
+            assert!(k8s_name_check(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-A", "--kubeconfig=/x", "Web", "a b", " web", "web-", "a/b", "a_b"] {
+            assert!(k8s_name_check(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn events_fall_back_when_last_timestamp_is_null() {
+        let v = serde_json::json!({"items": [{
+            "metadata": {"namespace": "default", "creationTimestamp": "2025-10-19T07:00:00Z"},
+            "involvedObject": {"kind": "Pod", "name": "web"},
+            "type": "Normal", "reason": "Scheduled", "message": "ok",
+            "lastTimestamp": null,
+            "eventTime": "2025-10-19T07:05:00.000000Z",
+            "series": {"count": 4, "lastObservedTime": "2025-10-19T07:10:00.000000Z"}
+        }]});
+        let ev = parse_events(&v);
+        assert_eq!(ev[0].count, 4);
+        assert_eq!(ev[0].last_timestamp, rfc3339_to_epoch("2025-10-19T07:10:00Z"));
     }
 
     #[test]

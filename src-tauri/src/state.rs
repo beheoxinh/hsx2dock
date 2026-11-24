@@ -41,7 +41,29 @@ pub struct AppState {
     pub caddy: Arc<crate::docker::caddy::CaddySupervisor>,
     /// Cached live container stats shared across background monitoring and tray
     pub cached_stats: Arc<RwLock<HashMap<String, crate::docker::models::ContainerStats>>>,
+    /// In-flight container/group lifecycle operations (pending spinners).
+    pub ops: Arc<crate::ops::OpsRegistry>,
+    /// When the cached client last answered a ping. Every command used to
+    /// ping before doing its real work; a fresh check is reused for a few
+    /// seconds instead, which halves the round trips of a bulk action.
+    client_checked: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Bumped by `invalidate_client`. A client is only stored (and a cached
+    /// one only trusted) when it was built in the current generation, so an
+    /// endpoint switch cannot be undone by a connect that was already in
+    /// flight against the old endpoint.
+    client_gen: std::sync::atomic::AtomicU64,
+    cached_gen: std::sync::atomic::AtomicU64,
+    /// Serialises background restart-policy reconciliation passes.
+    pub restart_policy_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A reconciliation pass is already queued; further saves just ride it.
+    pub restart_policy_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Restart policy last seen/applied per container id, so a group edit
+    /// does not inspect every container on the engine again.
+    pub restart_policy_seen: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
+
+/// How long a successful ping vouches for the cached client.
+const CLIENT_HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl AppState {
     pub async fn new() -> Self {
@@ -72,6 +94,13 @@ impl AppState {
             mcp_server: Arc::new(RwLock::new(None)),
             caddy,
             cached_stats: Arc::new(RwLock::new(HashMap::new())),
+            ops: Arc::new(crate::ops::OpsRegistry::default()),
+            client_checked: std::sync::Mutex::new(None),
+            restart_policy_lock: Arc::new(tokio::sync::Mutex::new(())),
+            restart_policy_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restart_policy_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            client_gen: std::sync::atomic::AtomicU64::new(0),
+            cached_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -89,13 +118,32 @@ impl AppState {
     }
 
     pub async fn get_client(&self) -> Result<DockerClient, String> {
-        let read_guard = self.client.read().await;
-        if let Some(ref c) = *read_guard {
+        use std::sync::atomic::Ordering;
+        let gen = self.client_gen.load(Ordering::Acquire);
+        let cached = self
+            .client
+            .read()
+            .await
+            .clone()
+            .filter(|_| self.cached_gen.load(Ordering::Acquire) == gen);
+        if let Some(c) = cached {
+            let fresh = self
+                .client_checked
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .is_some_and(|t| t.elapsed() < CLIENT_HEALTH_TTL);
+            if fresh {
+                return Ok(c);
+            }
             if c.is_healthy().await {
-                return Ok(c.clone());
+                self.mark_client_checked();
+                return Ok(c);
             }
         }
-        drop(read_guard);
+        if let Ok(mut g) = self.client_checked.lock() {
+            *g = None;
+        }
 
         let active = { self.config.read().await.active_endpoint.clone() };
         let remote = match active.as_deref() {
@@ -106,7 +154,8 @@ impl AppState {
             }
         };
 
-        let mut write_guard = self.client.write().await;
+        // Connect and ping without the write lock: a dead endpoint used to
+        // hold it for the whole ping and stall every command behind it.
         let client = match remote {
             Some(ep) => {
                 DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, Some(&self.engine.socket()))
@@ -122,8 +171,41 @@ impl AppState {
             Ok(_) => client,
             Err(e) => return Err(format!("Docker daemon not reachable: {e}")),
         };
-        *write_guard = Some(client.clone());
+        let mut write_guard = self.client.write().await;
+        if self.client_gen.load(Ordering::Acquire) == gen {
+            *write_guard = Some(client.clone());
+            self.cached_gen.store(gen, Ordering::Release);
+            drop(write_guard);
+            self.mark_client_checked();
+        }
         Ok(client)
+    }
+
+    fn mark_client_checked(&self) {
+        if let Ok(mut g) = self.client_checked.lock() {
+            *g = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Stats for one container: the background monitor's sample when it has
+    /// one (already correct and free), otherwise a fresh two-cycle sample.
+    pub async fn container_stats(
+        &self,
+        client: &DockerClient,
+        id: &str,
+    ) -> anyhow::Result<crate::docker::models::ContainerStats> {
+        {
+            let cache = self.cached_stats.read().await;
+            if let Some(s) = cache.get(id) {
+                return Ok(s.clone());
+            }
+            if id.len() >= 12 {
+                if let Some((_, s)) = cache.iter().find(|(k, _)| k.starts_with(id)) {
+                    return Ok(s.clone());
+                }
+            }
+        }
+        client.container_stats(id).await
     }
 
     /// Engine lifecycle commands talk to the daemon this app owns, so they
@@ -151,6 +233,11 @@ impl AppState {
     /// Drops the cached client so the next `get_client` reconnects to whatever
     /// the active endpoint is now.
     pub fn invalidate_client(&self) {
+        self.client_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Ok(mut g) = self.client_checked.lock() {
+            *g = None;
+        }
         if let Ok(mut guard) = self.client.try_write() {
             *guard = None;
         }

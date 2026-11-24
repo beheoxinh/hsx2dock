@@ -1,5 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   Plus,
@@ -17,12 +16,18 @@ import {
   type ContainerAction,
 } from "../components/ContainerCard";
 import { useDraggable } from "../components/ContainerDragLayer";
-import { canonicalContainerIds, groupOf } from "../lib/containerGroups";
-import { api, events } from "../lib/api";
+import {
+  canonicalContainerIds,
+  reconcileStats,
+  routesByContainer,
+} from "../lib/containerGroups";
+import { api, disposeListener, events } from "../lib/api";
+import { isContainerBusy, trackContainerOp } from "../lib/containerOps";
+import { useStableCallback } from "../hooks/useStableCallback";
 import {
   primeContainerStore,
   refreshContainers,
-  setContainerGroups,
+  saveContainerGroups,
   useContainerStore,
 } from "../lib/containerStore";
 import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
@@ -40,29 +45,56 @@ interface ContainersPageProps {
   daemonState?: DaemonState;
 }
 
+type DetailsTab = "logs" | "inspect" | "stats" | "terminal";
+type GatewayRouteLike = { domain: string; target: string; path?: string | null; container_name?: string | null };
+
 /**
  * A flat-list card that can be dragged into a group. The drag handle has to
  * come from a hook, so the card is wrapped rather than built inline in the
  * list's map callback.
+ *
+ * Every handler it receives is page-stable and takes the container, so the
+ * memo holds across stats ticks; the per-card bindings are made here.
  */
-const DraggableContainerCard: React.FC<{
+const DraggableContainerCard = React.memo<{
   container: ContainerItem;
   stats?: ContainerStats;
   sizeBytes?: number;
   busy: boolean;
-  onAction: (action: ContainerAction) => void;
-  onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
-  onEditContainer?: () => void;
-  onOpenGatewayMap?: (hostPort: number) => void;
-  onRepairNetwork?: () => void;
-  gatewayRoutes?: Array<{ domain: string; path?: string | null }> | null;
-  gatewayDomain?: string | null;
-}> = ({ container, stats, sizeBytes, busy, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayRoutes, gatewayDomain }) => {
+  onAction: (c: ContainerItem, action: ContainerAction) => void;
+  onOpenDetails: (id: string, tab?: DetailsTab, debug?: boolean) => void;
+  onEditContainer?: (id: string) => void;
+  onRepairNetwork?: (c: ContainerItem) => void;
+  gatewayRoutes?: GatewayRouteLike[];
+}>(function DraggableContainerCard({
+  container,
+  stats,
+  sizeBytes,
+  busy,
+  onAction,
+  onOpenDetails,
+  onEditContainer,
+  onRepairNetwork,
+  gatewayRoutes,
+}) {
   const dragHandle = useDraggable({
     id: container.id,
     label: container.name.replace(/^\//, ""),
     composeOwned: !!container.compose_project,
   });
+  const action = useCallback((a: ContainerAction) => onAction(container, a), [onAction, container]);
+  const details = useCallback(
+    (tab?: DetailsTab, debug?: boolean) => onOpenDetails(container.id, tab, debug),
+    [onOpenDetails, container.id]
+  );
+  const edit = useMemo(
+    () => (onEditContainer ? () => onEditContainer(container.id) : undefined),
+    [onEditContainer, container.id]
+  );
+  const repair = useMemo(
+    () => (onRepairNetwork ? () => onRepairNetwork(container) : undefined),
+    [onRepairNetwork, container]
+  );
   return (
     <ContainerCard
       container={container}
@@ -70,15 +102,16 @@ const DraggableContainerCard: React.FC<{
       sizeBytes={sizeBytes}
       busy={busy}
       dragHandle={dragHandle}
-      onAction={onAction}
-      onOpenDetails={onOpenDetails}
-      onEditContainer={onEditContainer}
-      onRepairNetwork={onRepairNetwork}
+      onAction={action}
+      onOpenDetails={details}
+      onEditContainer={edit}
+      onRepairNetwork={repair}
       gatewayRoutes={gatewayRoutes}
-      gatewayDomain={gatewayDomain}
     />
   );
-};
+});
+
+const NO_ROUTES = new Map<string, never[]>();
 
 export const ContainersPage: React.FC<ContainersPageProps> = ({
   onOpenDetails,
@@ -97,7 +130,6 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const loading = !store.ready;
   const [statsMap, setStatsMap] = useState<Record<string, ContainerStats>>({});
   const [search, setSearch] = useState("");
-  const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const toast = useToast();
   const modal = useModal();
   // Groups live in the shared store so the flat list can hide containers
@@ -105,15 +137,14 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
 
   const [repairTarget, setRepairTarget] = useState<ContainerItem | null>(null);
 
-  const saveGroups = async (next: ContainerGroup[]) => {
-    await api.saveContainerGroups(next);
-    setContainerGroups(next);
-  };
+  const saveGroups = useStableCallback(async (next: ContainerGroup[]) => {
+    await saveContainerGroups(next);
+  });
 
-  const loadContainers = async () => {
+  const loadContainers = useStableCallback(async () => {
     // Refreshes the shared cache; every mounted view of it re-renders.
     await refreshContainers();
-  };
+  });
 
   useEffect(() => {
     // Usually a no-op: the app primed this cache on startup. It still covers a
@@ -121,73 +152,86 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     // when the app opened.
     void primeContainerStore();
 
-    let unlistenStats: (() => void) | undefined;
-
-    events.onContainerStatsTick((stats) => {
-      setStatsMap((prev) => ({ ...prev, ...stats }));
-    }).then((u) => (unlistenStats = u));
-
-    return () => {
-      if (unlistenStats) unlistenStats();
-    };
+    // Each tick carries every running container, so the map is replaced (a
+    // removed container drops out) while unchanged entries keep their
+    // identity and their cards stay memoised.
+    return disposeListener(
+      events.onContainerStatsTick((stats) => {
+        setStatsMap((prev) => reconcileStats(prev, stats ?? {}));
+      })
+    );
   }, []);
 
-  const handleAction = async (
-    c: ContainerItem,
-    action: "start" | "stop" | "restart" | "pause" | "unpause" | "clone" | "remove"
-  ) => {
+  const handleAction = useStableCallback(async (c: ContainerItem, action: ContainerAction) => {
     const cName = c.name.replace(/^\//, "");
+    if (isContainerBusy(c.id)) return;
     try {
-      setActionLoading((prev) => ({ ...prev, [c.id]: true }));
-      if (action === "start") {
-        await api.startContainer(c.id);
-        // Status dot and action buttons switch instantly — no toast needed.
-      } else if (action === "stop") {
-        await api.stopContainer(c.id);
-      } else if (action === "restart") {
-        await api.restartContainer(c.id);
-      } else if (action === "pause") {
-        await api.pauseContainer(c.id);
-      } else if (action === "unpause") {
-        await api.unpauseContainer(c.id);
-      } else if (action === "clone") {
-        const details = await api.inspectContainer(c.id);
-        const newName = `${cName}-clone-${Math.floor(Math.random() * 1000)}`;
-        const envVars = (details.env || []).map((e) => {
-          const idx = e.indexOf("=");
-          return idx !== -1
-            ? { key: e.slice(0, idx), value: e.slice(idx + 1) }
-            : { key: e, value: "" };
-        });
-        await api.runContainer({
-          image: details.image,
-          name: newName,
-          env: envVars,
-          command: details.command ? details.command.split(" ") : undefined,
-          restart_policy: "unless-stopped",
-        });
-        // New container appears after refresh — no toast needed.
-      } else if (action === "remove") {
-        const confirmed = await modal.showConfirm(`Are you sure you want to remove container '${cName}'?\n\nThis action cannot be undone.`, "Remove Container", "danger");
+      if (action === "remove") {
+        const confirmed = await modal.showConfirm(
+          `Are you sure you want to remove container '${cName}'?\n\nThis action cannot be undone.`,
+          "Remove Container",
+          "danger"
+        );
         if (!confirmed) return;
-        await api.removeContainer(c.id, true);
       }
-      await loadContainers();
+      // The card swaps its buttons for a spinner while this runs and until
+      // the live list shows the new state.
+      await trackContainerOp(c.id, action, async () => {
+        switch (action) {
+          case "start":
+            // `docker start` refuses a paused container; resume it instead.
+            return c.state === "paused"
+              ? api.unpauseContainer(c.id)
+              : api.startContainer(c.id);
+          case "stop":
+            return api.stopContainer(c.id);
+          case "restart":
+            return api.restartContainer(c.id);
+          case "pause":
+            return api.pauseContainer(c.id);
+          case "remove":
+            return api.removeContainer(c.id, true);
+        }
+      });
     } catch (e) {
       toast.error("Operation failed", String(e));
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [c.id]: false }));
     }
-  };
+  });
+
+  const openRepair = useStableCallback((c: ContainerItem) => setRepairTarget(c));
+  const openDetails = useStableCallback(
+    (id: string, tab?: DetailsTab, debug?: boolean) => onOpenDetails(id, tab, debug)
+  );
+  const editContainer = useStableCallback((id: string) => onEditContainer?.(id));
+
+  // Matching routes per container, computed once per list/route change rather
+  // than once per card on every render.
+  const routesRef = useRef<Map<string, GatewayRouteLike[]>>(NO_ROUTES);
+  const routesById = useMemo(() => {
+    const next = routesByContainer(
+      containers,
+      // A disabled route is not served; its chip would link to nothing.
+      (gatewayRoutes as GatewayRouteLike[]).filter((r) => (r as { enabled?: boolean }).enabled !== false),
+      routesRef.current
+    );
+    routesRef.current = next;
+    return next;
+  }, [containers, gatewayRoutes]);
 
   // Kind node containers are managed entirely on the Kubernetes tab, so they
   // are hidden from this generic container list.
-  const searchMatches = containers.filter(
-    (c) =>
-      !c.kind_cluster &&
-      (c.name.toLowerCase().includes(search.toLowerCase()) ||
-        c.image.toLowerCase().includes(search.toLowerCase()) ||
-        c.id.toLowerCase().includes(search.toLowerCase()))
+  const query = search.trim().toLowerCase();
+  const searchMatches = useMemo(
+    () =>
+      containers.filter(
+        (c) =>
+          !c.kind_cluster &&
+          (!query ||
+            c.name.toLowerCase().includes(query) ||
+            c.image.toLowerCase().includes(query) ||
+            c.id.toLowerCase().includes(query))
+      ),
+    [containers, query]
   );
 
   // Containers placed in a user group live inside that group's card above, and
@@ -196,12 +240,17 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   // removes it from here, like a file leaving a folder.
   // Membership is resolved against the full list so a search cannot make a
   // grouped container look ungrouped.
-  const groupsMap = useMemo(
-    () => canonicalContainerIds(containers.filter((c) => !c.kind_cluster)),
-    [containers]
-  );
-  const filteredContainers = searchMatches.filter(
-    (c) => !c.compose_project && !groupOf(groups, groupsMap, c.id)
+  const grouped = useMemo(() => {
+    const map = canonicalContainerIds(containers.filter((c) => !c.kind_cluster));
+    const ids = new Set<string>();
+    for (const g of groups) {
+      for (const token of g.container_ids) ids.add(map.get(token) ?? token);
+    }
+    return ids;
+  }, [containers, groups]);
+  const filteredContainers = useMemo(
+    () => searchMatches.filter((c) => !c.compose_project && !grouped.has(c.id)),
+    [searchMatches, grouped]
   );
   const allGrouped = searchMatches.length > 0 && filteredContainers.length === 0;
 
@@ -260,56 +309,30 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         statsMap={statsMap}
         sizesMap={sizesMap}
         onChanged={loadContainers}
-        onOpenDetails={onOpenDetails}
-        onEditContainer={onEditContainer}
-        onRepairNetwork={(container) => setRepairTarget(container)}
+        onOpenDetails={openDetails}
+        onEditContainer={onEditContainer ? editContainer : undefined}
+        onRepairNetwork={openRepair}
         onContainerAction={handleAction}
-        busyMap={actionLoading}
-        gatewayRoutes={gatewayRoutes}
+        routesById={routesById}
       >
         {/* Ungrouped containers — the body of the Isolated bucket. */}
         <div className="space-y-3">
-          <AnimatePresence>
-            {filteredContainers.map((c) => {
-              const stats = statsMap[c.id];
-              const isBusy = !!actionLoading[c.id];
-
-              return (
-                <motion.div
-                  key={c.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.98 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  {(() => {
-                    const cleanName = c.name.replace(/^\//, "");
-                    const matchedRoutes = gatewayRoutes.filter(
-                      (r) =>
-                        r.container_name === cleanName ||
-                        c.published_ports?.some(
-                          (p) => r.target === `127.0.0.1:${p.host_port}` || r.target === `localhost:${p.host_port}`
-                        )
-                    );
-                    return (
-                      <DraggableContainerCard
-                        container={c}
-                        stats={stats}
-                        sizeBytes={sizesMap[c.id]}
-                        busy={isBusy}
-                        onAction={(action) => handleAction(c, action)}
-                        onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                        onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
-                        onRepairNetwork={() => setRepairTarget(c)}
-                        gatewayRoutes={matchedRoutes}
-                      />
-                    );
-                  })()}
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
+          {/* Plain rows: a motion wrapper per card cost a layout animation
+              for every container on every list change. */}
+          {filteredContainers.map((c) => (
+            <DraggableContainerCard
+              key={c.id}
+              container={c}
+              stats={statsMap[c.id]}
+              sizeBytes={sizesMap[c.id]}
+              busy={false}
+              onAction={handleAction}
+              onOpenDetails={openDetails}
+              onEditContainer={onEditContainer ? editContainer : undefined}
+              onRepairNetwork={openRepair}
+              gatewayRoutes={routesById.get(c.id)}
+            />
+          ))}
 
           {!loading && filteredContainers.length === 0 && (
             <div className="py-16 text-center text-zinc-400">

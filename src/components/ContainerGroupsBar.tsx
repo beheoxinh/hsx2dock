@@ -14,6 +14,7 @@ import {
   RotateCw,
   Square,
   FileText,
+  Loader2,
 } from "lucide-react";
 import { GroupLogsModal } from "./groups/GroupLogsModal";
 import { Button } from "./ui/Button";
@@ -28,6 +29,17 @@ import {
   useReorderTarget,
 } from "./ContainerDragLayer";
 import { api } from "../lib/api";
+import {
+  clearGroup,
+  isContainerBusy,
+  isGroupBusy,
+  markQueued,
+  releaseGroup,
+  requestGroup,
+  settleGroup,
+  useGroupOp,
+} from "../lib/containerOps";
+import { useStableCallback } from "../hooks/useStableCallback";
 import { formatBytes } from "../lib/utils";
 import {
   canonicalContainerIds,
@@ -35,7 +47,10 @@ import {
   moveMember,
   reorderMember,
 } from "../lib/containerGroups";
-import type { ContainerGroup, ContainerItem, ContainerStats } from "../types";
+import type { ContainerGroup, ContainerItem, ContainerStats, GroupOp } from "../types";
+
+type DetailsTab = "logs" | "inspect" | "stats" | "terminal";
+type RouteLike = { domain: string; path?: string | null };
 
 interface ContainerGroupsBarProps {
   /** Current container list — drives member resolution and the Isolated bucket. */
@@ -58,11 +73,10 @@ interface ContainerGroupsBarProps {
   ) => void;
   onEditContainer?: (id: string) => void;
   onRepairNetwork?: (container: ContainerItem) => void;
-  gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
-  /** Runs a lifecycle action on a member card. */
+  /** Gateway routes per container id, precomputed by the page. */
+  routesById?: Map<string, RouteLike[]>;
+  /** Runs a lifecycle action on a member card. Must be stable. */
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
-  /** Containers with an action in flight, so their buttons disable. */
-  busyMap?: Record<string, boolean>;
   /**
    * The ungrouped container cards, rendered inside the Isolated bucket so they
    * are visibly *in* that group rather than floating below it. The page owns
@@ -70,6 +84,9 @@ interface ContainerGroupsBarProps {
    */
   children?: React.ReactNode;
 }
+
+const EMPTY_MEMBERS: ContainerItem[] = [];
+const noop = () => undefined;
 
 const newId = () =>
   `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -112,42 +129,133 @@ const persistedComposeGroup = (
 /** True for a saved entry that only carries a compose project's card order. */
 const isComposeOrderEntry = (g: ContainerGroup) => g.id.startsWith("compose:");
 
-/** A card inside a group: identical to a list card, but compact and draggable. */
-const MemberCard: React.FC<{
+/**
+ * A card inside a group: identical to a list card, but compact and draggable.
+ * Its handlers are bar-stable and take the container; the per-card bindings
+ * are made here so the memo survives the parent's stats ticks.
+ */
+const MemberCard = React.memo<{
   c: ContainerItem;
   stats?: ContainerStats;
   sizeBytes?: number;
-  busy: boolean;
   /** Groups this card is rendered in — enables the in-place reorder preview. */
   ownGroupId: string;
-  onAction: (action: ContainerAction) => void;
-  onOpenDetails: (tab?: "logs" | "inspect" | "stats" | "terminal", debug?: boolean) => void;
-  onEditContainer?: () => void;
-  onRepairNetwork?: () => void;
-  gatewayRoutes?: Array<{ domain: string; path?: string | null }> | null;
-  gatewayDomain?: string | null;
-}> = ({ c, stats, sizeBytes, busy, ownGroupId, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayRoutes, gatewayDomain }) => {
+  onAction: (c: ContainerItem, action: ContainerAction) => void;
+  onOpenDetails: (id: string, tab?: DetailsTab, debug?: boolean) => void;
+  onEditContainer?: (id: string) => void;
+  onRepairNetwork?: (c: ContainerItem) => void;
+  gatewayRoutes?: RouteLike[];
+}>(function MemberCard({ c, stats, sizeBytes, ownGroupId, onAction, onOpenDetails, onEditContainer, onRepairNetwork, gatewayRoutes }) {
   const drag = useDraggable({
     id: c.id,
     label: c.name.replace(/^\//, ""),
     ownGroupId,
     composeOwned: !!c.compose_project,
   });
+  const action = React.useCallback((a: ContainerAction) => onAction(c, a), [onAction, c]);
+  const details = React.useCallback(
+    (tab?: DetailsTab, debug?: boolean) => onOpenDetails(c.id, tab, debug),
+    [onOpenDetails, c.id]
+  );
+  const edit = React.useMemo(
+    () => (onEditContainer ? () => onEditContainer(c.id) : undefined),
+    [onEditContainer, c.id]
+  );
+  const repair = React.useMemo(
+    () => (onRepairNetwork ? () => onRepairNetwork(c) : undefined),
+    [onRepairNetwork, c]
+  );
   return (
     <ContainerCard
       container={c}
       stats={stats}
       sizeBytes={sizeBytes}
-      busy={busy}
       dragHandle={drag}
       compact
-      onAction={onAction}
-      onOpenDetails={onOpenDetails}
-      onEditContainer={onEditContainer}
-      onRepairNetwork={onRepairNetwork}
+      onAction={action}
+      onOpenDetails={details}
+      onEditContainer={edit}
+      onRepairNetwork={repair}
       gatewayRoutes={gatewayRoutes}
-      gatewayDomain={gatewayDomain}
     />
+  );
+});
+
+/**
+ * Start/stop/restart buttons of a group. While a pass runs, the clicked verb
+ * becomes a spinner with live progress and the others are disabled, so a
+ * 30-container start is visibly working instead of looking frozen.
+ */
+const GroupPowerButtons: React.FC<{
+  name: string;
+  op: GroupOp | undefined;
+  busy: boolean;
+  restart?: boolean;
+  onBulk: (action: "start" | "stop" | "restart") => void;
+}> = ({ name, op, busy, restart, onBulk }) => {
+  const progress =
+    op && op.total > 0 ? `${Math.min(op.completed, op.total)}/${op.total}` : null;
+  const verbLabel: Record<string, string> = {
+    start: "Starting",
+    stop: "Stopping",
+    restart: "Restarting",
+  };
+  if (op) {
+    return (
+      <span
+        role="status"
+        aria-live="polite"
+        title={`${verbLabel[op.op] ?? "Working"} ${name}${progress ? ` — ${progress} done` : ""}`}
+        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-blue-500/40 bg-blue-500/10 px-2.5 text-[11px] font-medium text-blue-300"
+      >
+        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        <span className="whitespace-nowrap">
+          {verbLabel[op.op] ?? "Working"}
+          {progress ? ` ${progress}` : "…"}
+        </span>
+      </span>
+    );
+  }
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="icon"
+        title="Start group"
+        aria-label={`Start group ${name}`}
+        disabled={busy}
+        onClick={() => onBulk("start")}
+        className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
+      >
+        <Play className="w-3.5 h-3.5 fill-current" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        title="Stop group"
+        aria-label={`Stop group ${name}`}
+        disabled={busy}
+        onClick={() => onBulk("stop")}
+        className="text-rose-400 hover:text-rose-300 hover:bg-rose-500/10"
+      >
+        <Square className="w-3.5 h-3.5 fill-current" />
+      </Button>
+      {/* Compose projects have a restart verb of their own; plain groups get
+          it per container from the card's own action. */}
+      {restart && (
+        <Button
+          variant="ghost"
+          size="icon"
+          title="Restart project"
+          aria-label={`Restart project ${name}`}
+          disabled={busy}
+          onClick={() => onBulk("restart")}
+          className="text-blue-400 hover:text-blue-300 hover:bg-blue-500/10"
+        >
+          <RotateCw className="w-3.5 h-3.5" />
+        </Button>
+      )}
+    </>
   );
 };
 
@@ -251,13 +359,11 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   onEditContainer,
   onRepairNetwork,
   onContainerAction,
-  busyMap,
-  gatewayRoutes,
+  routesById,
   children,
 }) => {
   const toast = useToast();
   const modal = useModal();
-  const [busy, setBusy] = useState<Record<string, boolean>>({});
   // Restored from the last session: a group the user opened stays open.
   const [expanded, setExpanded] = useState<Record<string, boolean>>(loadExpandedGroups);
   const [localSizes, setSizes] = useState<Record<string, number>>({});
@@ -315,7 +421,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   useEffect(() => {
     if (sizesMap) return;
     loadSizes();
-    const t = setInterval(loadSizes, 30_000);
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      void loadSizes();
+    }, 30_000);
     return () => clearInterval(t);
   }, [loadSizes, sizesMap]);
 
@@ -405,45 +514,50 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     }
   };
 
-  const runBulk = async (g: ContainerGroup, action: "start" | "stop") => {
-    setBusy((b) => ({ ...b, [g.id]: true }));
-    try {
-      const msg =
-        action === "start"
-          ? await api.startContainerGroup(g.id)
-          : await api.stopContainerGroup(g.id);
-      // Visual state updates via onChanged() — group/container states change visibly; no toast needed.
-      void msg;
-      onChanged?.();
-    } catch (e) {
-      toast.error(`Could not ${action} group`, String(e));
-    } finally {
-      setBusy((b) => ({ ...b, [g.id]: false }));
+  /**
+   * Starts/stops a group — saved, Isolated, or a compose project
+   * (`compose:<project>`, which the backend runs through the compose CLI so
+   * compose's own state stays in sync).
+   *
+   * The backend only schedules the pass and returns at once; per-container
+   * progress arrives as `container-op` events (each card shows its own
+   * queued/starting spinner) and the group's as `group-op` events.
+   */
+  const runBulk = useStableCallback(
+    async (g: ContainerGroup, action: "start" | "stop" | "restart") => {
+      if (action === "restart") return runComposeRestart(g);
+      if (!requestGroup(g.id, action)) return;
+      try {
+        if (action === "start") await api.startContainerGroup(g.id);
+        else await api.stopContainerGroup(g.id);
+      } catch (e) {
+        releaseGroup(g.id);
+        toast.error(`Could not ${action} group`, String(e));
+      }
     }
-  };
+  );
 
   /**
-   * Starts/stops a compose project.
-   *
-   * A project group is derived, not saved, so the group command cannot address
-   * it. It goes through the compose CLI instead, which is the only thing that
-   * knows a project's services — stopping the containers directly would leave
-   * compose's own state out of sync.
+   * Compose restart has no group pass in the backend: it is one compose CLI
+   * call. Its members are marked queued here so their cards spin until the
+   * call returns and the list shows them running again.
    */
-  const runComposeBulk = async (
-    g: ContainerGroup,
-    action: "start" | "stop" | "restart"
-  ) => {
+  const runComposeRestart = async (g: ContainerGroup) => {
     const project = g.id.slice("compose:".length);
-    setBusy((b) => ({ ...b, [g.id]: true }));
+    if (!requestGroup(g.id, "restart")) return;
+    const ids = (membersByGroupId.get(g.id) ?? [])
+      .map((c) => c.id)
+      .filter((id) => !isContainerBusy(id));
+    markQueued(ids, "restart", g.id);
     try {
-      await api.composeProjectAction(project, action);
-      // Visual feedback via onChanged() directly reflects in container status — no toast needed.
-      onChanged?.();
+      await api.composeProjectAction(project, "restart");
+      settleGroup(g.id);
     } catch (e) {
-      toast.error(`Could not ${action} project`, String(e));
+      clearGroup(g.id);
+      toast.error("Could not restart project", String(e));
     } finally {
-      setBusy((b) => ({ ...b, [g.id]: false }));
+      releaseGroup(g.id);
+      onChanged?.();
     }
   };
 
@@ -456,8 +570,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       "danger"
     );
     if (!confirmed) return;
-
-    setBusy((b) => ({ ...b, [g.id]: true }));
+    if (!requestGroup(g.id, "remove")) return;
+    markQueued(
+      members.map((c) => c.id).filter((id) => !isContainerBusy(id)),
+      "remove",
+      g.id
+    );
     try {
       const out = await api.composeProjectAction(project, "down");
       toast.success("Project deleted", out.trim() ? `${project}: ${out.trim()}` : project);
@@ -477,7 +595,8 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         toast.error("Could not delete compose project", String(e || err));
       }
     } finally {
-      setBusy((b) => ({ ...b, [g.id]: false }));
+      settleGroup(g.id);
+      releaseGroup(g.id);
     }
   };
 
@@ -509,11 +628,21 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       "danger"
     );
     if (!choice) return;
+    if (isGroupBusy(g.id)) return;
     try {
       if (choice === "delete") {
+        requestGroup(g.id, "remove");
+        markQueued(
+          members.map((c) => c.id).filter((id) => !isContainerBusy(id)),
+          "remove",
+          g.id
+        );
         const results = await Promise.allSettled(
           members.map((c) => api.removeContainer(c.id, true))
-        );
+        ).finally(() => {
+          settleGroup(g.id);
+          releaseGroup(g.id);
+        });
         const failed = results.filter((r) => r.status === "rejected").length;
         if (failed > 0) {
           toast.error(
@@ -578,13 +707,17 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     }
   };
 
-  const resolveMember = useCallback(
-    (id: string) =>
-      containers.find(
-        (x) => x.id === id || x.short_id === id || x.name === id
-      ),
-    [containers]
-  );
+  /** Token → container, built once per list instead of a scan per member. */
+  const byToken = useMemo(() => {
+    const m = new Map<string, ContainerItem>();
+    for (const c of containers) {
+      m.set(c.id, c);
+      m.set(c.short_id, c);
+      m.set(c.name, c);
+    }
+    return m;
+  }, [containers]);
+  const resolveMember = useCallback((id: string) => byToken.get(id), [byToken]);
 
   // kind node containers belong to the Kubernetes tab; they must never be
   // offered as group members or counted here.
@@ -598,20 +731,23 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   );
 
   /** Resolved, de-duplicated members of a group (stale tokens are dropped). */
-  const membersOf = (g: ContainerGroup): ContainerItem[] => {
-    const seen = new Set<string>();
-    const out: ContainerItem[] = [];
-    for (const token of g.container_ids) {
-      const c = resolveMember(token);
-      if (!c || seen.has(c.id)) continue;
-      // A compose container belongs to its project card, even if an older
-      // saved group still lists it — otherwise it would render twice.
-      if (!isComposeOrderEntry(g) && c.compose_project) continue;
-      seen.add(c.id);
-      out.push(c);
-    }
-    return out;
-  };
+  const membersOf = useCallback(
+    (g: ContainerGroup): ContainerItem[] => {
+      const seen = new Set<string>();
+      const out: ContainerItem[] = [];
+      for (const token of g.container_ids) {
+        const c = resolveMember(token);
+        if (!c || seen.has(c.id)) continue;
+        // A compose container belongs to its project card, even if an older
+        // saved group still lists it — otherwise it would render twice.
+        if (!isComposeOrderEntry(g) && c.compose_project) continue;
+        seen.add(c.id);
+        out.push(c);
+      }
+      return out;
+    },
+    [resolveMember]
+  );
 
   /**
    * Compose projects shown as locked groups.
@@ -648,19 +784,49 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   // Everything not claimed by a user group or a compose project is "Isolated".
   // Compose containers are excluded explicitly: their project group is derived,
   // not saved, so `groupOf` cannot see it.
-  const isolated = visibleContainers.filter(
-    (c) => !c.compose_project && !groupOf(groups, canonicalMap, c.id)
+  const isolated = useMemo(() => {
+    const claimed = new Set<string>();
+    for (const g of groups) {
+      for (const token of g.container_ids) claimed.add(canonicalMap.get(token) ?? token);
+    }
+    return visibleContainers.filter((c) => !c.compose_project && !claimed.has(c.id));
+  }, [visibleContainers, groups, canonicalMap]);
+
+  /**
+   * Groups the user owns — compose order entries and the Isolated policy entry
+   * are not rendered as cards.
+   */
+  const userGroups = useMemo(
+    () => groups.filter((g) => !isComposeOrderEntry(g) && g.id !== ISOLATED_GROUP_ID),
+    [groups]
   );
 
-  /** Groups the user owns — compose order entries are not rendered as cards. */
-  const userGroups = groups.filter((g) => !isComposeOrderEntry(g));
+  /** Precomputed member map ensuring stable array identities per group across re-renders */
+  // A group whose members did not change keeps its previous array, so its
+  // memoised card is not re-rendered because some other container changed.
+  const membersCache = React.useRef(new Map<string, ContainerItem[]>());
+  const membersByGroupId = useMemo(() => {
+    const map = new Map<string, ContainerItem[]>();
+    for (const g of [...composeGroups, ...userGroups]) {
+      const next = membersOf(g);
+      const prev = membersCache.current.get(g.id);
+      map.set(
+        g.id,
+        prev && prev.length === next.length && prev.every((c, i) => c === next[i])
+          ? prev
+          : next
+      );
+    }
+    membersCache.current = map;
+    return map;
+  }, [composeGroups, userGroups, membersOf]);
 
   /**
    * Moves a container into `groupId`, or out of every group when `groupId` is
    * null. A container lives in one group only, so this is a move, not an
    * append.
    */
-  const moveInto = useCallback(
+  const moveInto = useStableCallback(
     async (
       groupId: string | null,
       payload: { id: string; label: string; lockedToGroupId?: string },
@@ -761,29 +927,31 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       } catch (err) {
         toast.error("Could not move container", String(err));
       }
-    },
-    [containers, groups, composeGroups, onSaveGroups, toast]
+    }
   );
 
   // The drag layer reports where the drop landed; this component owns the move.
   useDropHandler(moveInto);
 
-  /** Aggregated live stats across the group's members. */
-  const aggregate = (g: ContainerGroup) => {
-    let mem = 0;
-    let cpu = 0;
-    let disk = 0;
-    for (const id of g.container_ids) {
-      const cid = resolveMember(id)?.id ?? id;
-      const s = statsMap?.[cid];
-      if (s) {
-        mem += s.mem_usage ?? 0;
-        cpu += s.cpu_percent ?? 0;
-      }
-      disk += sizes[cid] ?? 0;
-    }
-    return { mem, cpu, disk };
-  };
+  // Card handlers take the group, so one stable function serves every card
+  // and the memoised GroupCards only re-render when their own data changes.
+  const onComposeAutoStart = useStableCallback((g: ContainerGroup) => void toggleComposeAutoStart(g));
+  const onUserAutoStart = useStableCallback((g: ContainerGroup) => void toggleAutoStart(g));
+  const onRemoveCompose = useStableCallback((g: ContainerGroup) => void removeComposeProject(g));
+  const onRemoveGroup = useStableCallback((g: ContainerGroup) => void removeGroup(g));
+  const openLogs = useStableCallback((g: ContainerGroup) =>
+    setLogsGroup({ name: g.name, containers: membersByGroupId.get(g.id) ?? [] })
+  );
+  const onRenameStart = useStableCallback((g: ContainerGroup) => setEditing({ id: g.id, name: g.name }));
+  const onRenameChange = useStableCallback((g: ContainerGroup, name: string) => setEditing({ id: g.id, name }));
+  const onRenameCommit = useStableCallback(() => void commitRename());
+  const onRenameCancel = useStableCallback(() => setEditing(null));
+  const runIsolatedBulk = useStableCallback((action: "start" | "stop") =>
+    void runBulk(
+      { id: ISOLATED_GROUP_ID, name: "Isolated", container_ids: [], auto_start: false },
+      action
+    )
+  );
 
   return (
     <div className="space-y-3">
@@ -818,30 +986,26 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           <GroupCard
             key={g.id}
             group={g}
-            members={membersOf(g)}
-            aggregate={aggregate(g)}
-            busy={!!busy[g.id]}
+            members={membersByGroupId.get(g.id) ?? EMPTY_MEMBERS}
             isOpen={!!expanded[g.id]}
             editing={null}
             statsMap={statsMap}
             sizesMap={sizes}
-            busyMap={busyMap}
             compose
-            onToggle={() => toggleGroupExpanded(g.id)}
-            onRenameStart={() => undefined}
-            onRenameChange={() => undefined}
-            onRenameCommit={() => undefined}
-            onRenameCancel={() => undefined}
-            onAutoStart={() => void toggleComposeAutoStart(g)}
-            onBulk={(action) => void runComposeBulk(g, action)}
-            onRestart={() => void runComposeBulk(g, "restart")}
-            onDelete={() => void removeComposeProject(g)}
-            onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
+            onToggle={toggleGroupExpanded}
+            onRenameStart={noop}
+            onRenameChange={noop}
+            onRenameCommit={noop}
+            onRenameCancel={noop}
+            onAutoStart={onComposeAutoStart}
+            onBulk={runBulk}
+            onDelete={onRemoveCompose}
+            onOpenLogs={openLogs}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
             onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
-            gatewayRoutes={gatewayRoutes}
+            routesById={routesById}
           />
         ))}
 
@@ -849,29 +1013,25 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           <GroupCard
             key={g.id}
             group={g}
-            members={membersOf(g)}
-            aggregate={aggregate(g)}
-            busy={!!busy[g.id]}
+            members={membersByGroupId.get(g.id) ?? EMPTY_MEMBERS}
             isOpen={!!expanded[g.id]}
             editing={editing?.id === g.id ? editing.name : null}
             statsMap={statsMap}
             sizesMap={sizes}
-            busyMap={busyMap}
-            onToggle={() => toggleGroupExpanded(g.id)}
-            onRenameStart={() => setEditing({ id: g.id, name: g.name })}
-            onRenameChange={(name) => setEditing({ id: g.id, name })}
-            onRenameCommit={() => void commitRename()}
-            onRenameCancel={() => setEditing(null)}
-            onAutoStart={() => void toggleAutoStart(g)}
-            onBulk={(action) => void runBulk(g, action)}
-            onRestart={() => undefined}
-            onDelete={() => void removeGroup(g)}
-            onOpenLogs={() => setLogsGroup({ name: g.name, containers: membersOf(g) })}
+            onToggle={toggleGroupExpanded}
+            onRenameStart={onRenameStart}
+            onRenameChange={onRenameChange}
+            onRenameCommit={onRenameCommit}
+            onRenameCancel={onRenameCancel}
+            onAutoStart={onUserAutoStart}
+            onBulk={runBulk}
+            onDelete={onRemoveGroup}
+            onOpenLogs={openLogs}
             onOpenDetails={onOpenDetails}
             onEditContainer={onEditContainer}
             onRepairNetwork={onRepairNetwork}
             onContainerAction={onContainerAction}
-            gatewayRoutes={gatewayRoutes}
+            routesById={routesById}
           />
         ))}
 
@@ -881,6 +1041,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           autoStart={isolatedAutoStart}
           onToggle={toggleIsolated}
           onAutoStart={toggleIsolatedAutoStart}
+          onBulk={runIsolatedBulk}
         >
           {children}
         </IsolatedCard>
@@ -901,67 +1062,82 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
 interface GroupCardProps {
   group: ContainerGroup;
   members: ContainerItem[];
-  aggregate: { mem: number; cpu: number; disk: number };
-  busy: boolean;
+  aggregate?: { mem: number; cpu: number; disk: number };
   isOpen: boolean;
   editing: string | null;
   statsMap?: Record<string, ContainerStats>;
   sizesMap?: Record<string, number>;
-  busyMap?: Record<string, boolean>;
   /**
    * A compose project group: its membership is owned by the project, so it
    * cannot be renamed, deleted, auto-started, or have cards dragged out.
    */
   compose?: boolean;
-  onToggle: () => void;
-  onRenameStart: () => void;
-  onRenameChange: (name: string) => void;
+  // Every handler is bar-stable and receives the group, so the memo holds.
+  onToggle: (id: string) => void;
+  onRenameStart: (g: ContainerGroup) => void;
+  onRenameChange: (g: ContainerGroup, name: string) => void;
   onRenameCommit: () => void;
   onRenameCancel: () => void;
-  onAutoStart: () => void;
-  onBulk: (action: "start" | "stop") => void;
-  /** Only used by compose project cards, which have a restart verb. */
-  onRestart: () => void;
-  onDelete: () => void;
-  onOpenLogs?: () => void;
-  onOpenDetails: (
-    id: string,
-    tab?: "logs" | "inspect" | "stats" | "terminal",
-    debug?: boolean
-  ) => void;
+  onAutoStart: (g: ContainerGroup) => void;
+  onBulk: (g: ContainerGroup, action: "start" | "stop" | "restart") => void;
+  onDelete: (g: ContainerGroup) => void;
+  onOpenLogs?: (g: ContainerGroup) => void;
+  onOpenDetails: (id: string, tab?: DetailsTab, debug?: boolean) => void;
   onEditContainer?: (id: string) => void;
   onRepairNetwork?: (container: ContainerItem) => void;
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
-  gatewayRoutes?: Array<{ domain: string; target: string; container_name?: string | null }>;
+  routesById?: Map<string, RouteLike[]>;
 }
 
-const GroupCard: React.FC<GroupCardProps> = ({
+const GroupCard = React.memo<GroupCardProps>(function GroupCard({
   group: g,
   members,
-  aggregate,
-  busy,
+  aggregate: propAggregate,
   isOpen,
   editing,
   statsMap,
   sizesMap,
-  busyMap,
   compose = false,
-  onToggle,
-  onRenameStart,
-  onRenameChange,
+  onToggle: onToggleId,
+  onRenameStart: onRenameStartG,
+  onRenameChange: onRenameChangeG,
   onRenameCommit,
   onRenameCancel,
-  onAutoStart,
-  onBulk,
-  onRestart,
-  onDelete,
-  onOpenLogs,
+  onAutoStart: onAutoStartG,
+  onBulk: onBulkG,
+  onDelete: onDeleteG,
+  onOpenLogs: onOpenLogsG,
   onOpenDetails,
   onEditContainer,
   onRepairNetwork,
   onContainerAction,
-  gatewayRoutes,
-}) => {
+  routesById,
+}) {
+  const onToggle = () => onToggleId(g.id);
+  const onRenameStart = () => onRenameStartG(g);
+  const onRenameChange = (name: string) => onRenameChangeG(g, name);
+  const onAutoStart = () => onAutoStartG(g);
+  const onBulk = (action: "start" | "stop" | "restart") => onBulkG(g, action);
+  const onDelete = () => onDeleteG(g);
+  const onOpenLogs = onOpenLogsG ? () => onOpenLogsG(g) : undefined;
+  // Live progress of a start/stop pass on this group (backend events).
+  const groupOp = useGroupOp(g.id);
+  const busy = !!groupOp;
+  const aggregate = React.useMemo(() => {
+    if (propAggregate) return propAggregate;
+    let mem = 0;
+    let cpu = 0;
+    let disk = 0;
+    for (const c of members) {
+      const s = statsMap?.[c.id];
+      if (s) {
+        mem += s.mem_usage ?? 0;
+        cpu += s.cpu_percent ?? 0;
+      }
+      disk += sizesMap?.[c.id] ?? 0;
+    }
+    return { mem, cpu, disk };
+  }, [propAggregate, members, statsMap, sizesMap]);
   const drop = useDropTarget(g.id);
   const hasMembers = members.length > 0;
   const running = members.filter((c) => c.state === "running").length;
@@ -996,7 +1172,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
     <div
       ref={drop.ref}
       data-group-card={g.id}
-      className={`rounded-2xl border bg-zinc-900/60 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
+      className={`rounded-2xl border bg-zinc-900/90 shadow-lg transition-colors duration-150 ${
         isOver
           ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
           : compose
@@ -1079,45 +1255,13 @@ const GroupCard: React.FC<GroupCardProps> = ({
             className="mr-1.5"
           />
           {hasMembers && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon"
-                title="Start group"
-                aria-label={`Start group ${g.name}`}
-                disabled={busy}
-                onClick={() => onBulk("start")}
-                className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
-              >
-                <Play className="w-3.5 h-3.5 fill-current" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                title="Stop group"
-                aria-label={`Stop group ${g.name}`}
-                disabled={busy}
-                onClick={() => onBulk("stop")}
-                className="text-rose-400 hover:text-rose-300 hover:bg-rose-500/10"
-              >
-                <Square className="w-3.5 h-3.5 fill-current" />
-              </Button>
-              {/* Compose projects have a restart verb of their own; plain
-                  groups get it per container from the card's own action. */}
-              {compose && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  title="Restart project"
-                  aria-label={`Restart project ${g.name}`}
-                  disabled={busy}
-                  onClick={() => onRestart()}
-                  className="text-blue-400 hover:text-blue-300 hover:bg-blue-500/10"
-                >
-                  <RotateCw className="w-3.5 h-3.5" />
-                </Button>
-              )}
-            </>
+            <GroupPowerButtons
+              name={g.name}
+              op={groupOp}
+              busy={busy}
+              restart={compose}
+              onBulk={onBulk}
+            />
           )}
           {hasMembers && onOpenLogs && (
             <Button
@@ -1186,30 +1330,17 @@ const GroupCard: React.FC<GroupCardProps> = ({
                   {reorder && !reorder.unchanged && reorder.beforeKey === c.id && (
                     <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
                   )}
-                  {(() => {
-                    const cleanName = c.name.replace(/^\//, "");
-                    const matchedRoutes = gatewayRoutes?.filter(
-                      (r) =>
-                        r.container_name === cleanName ||
-                        c.published_ports?.some(
-                          (p) => r.target === `127.0.0.1:${p.host_port}` || r.target === `localhost:${p.host_port}`
-                        )
-                    );
-                    return (
-                      <MemberCard
-                        c={c}
-                        stats={statsMap?.[c.id]}
-                        sizeBytes={sizesMap?.[c.id]}
-                        busy={!!busyMap?.[c.id]}
-                        ownGroupId={g.id}
-                        onAction={(action) => onContainerAction(c, action)}
-                        onOpenDetails={(tab, debug) => onOpenDetails(c.id, tab, debug)}
-                        onEditContainer={onEditContainer ? () => onEditContainer(c.id) : undefined}
-                        onRepairNetwork={onRepairNetwork ? () => onRepairNetwork(c) : undefined}
-                        gatewayRoutes={matchedRoutes}
-                      />
-                    );
-                  })()}
+                  <MemberCard
+                    c={c}
+                    stats={statsMap?.[c.id]}
+                    sizeBytes={sizesMap?.[c.id]}
+                    ownGroupId={g.id}
+                    onAction={onContainerAction}
+                    onOpenDetails={onOpenDetails}
+                    onEditContainer={onEditContainer}
+                    onRepairNetwork={onRepairNetwork}
+                    gatewayRoutes={routesById?.get(c.id)}
+                  />
                 </React.Fragment>
               ))}
               {reorder && !reorder.unchanged && reorder.beforeKey === null && (
@@ -1246,7 +1377,7 @@ const GroupCard: React.FC<GroupCardProps> = ({
       </div>
     </div>
   );
-};
+});
 
 interface IsolatedCardProps {
   isolated: ContainerItem[];
@@ -1254,6 +1385,7 @@ interface IsolatedCardProps {
   autoStart: boolean;
   onToggle: () => void;
   onAutoStart: () => void;
+  onBulk: (action: "start" | "stop") => void;
   /** The ungrouped container cards, rendered inside this bucket. */
   children?: React.ReactNode;
 }
@@ -1273,9 +1405,11 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
   autoStart,
   onToggle,
   onAutoStart,
+  onBulk,
   children,
 }) => {
   const drop = useDropTarget(null);
+  const groupOp = useGroupOp(ISOLATED_GROUP_ID);
   const hasMembers = isolated.length > 0;
   const running = isolated.filter((c) => c.state === "running").length;
 
@@ -1283,7 +1417,7 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
     <div
       ref={drop.ref}
       data-group-card="__isolated__"
-      className={`rounded-2xl border bg-zinc-900/40 backdrop-blur-xl shadow-xl transition-colors duration-150 ${
+      className={`rounded-2xl border bg-zinc-900/60 shadow-lg transition-colors duration-150 ${
         drop.isOver && drop.payload?.composeOwned !== true
           ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
           : "border-zinc-800/80"
@@ -1324,7 +1458,16 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
                 ? "Auto-start on — starts with the engine"
                 : "Auto-start off — manual start only"
             }
+            className="mr-1.5"
           />
+          {hasMembers && (
+            <GroupPowerButtons
+              name="Isolated"
+              op={groupOp}
+              busy={!!groupOp}
+              onBulk={(action) => action !== "restart" && onBulk(action)}
+            />
+          )}
         </div>
       </div>
 

@@ -28,12 +28,12 @@ const TONES: Record<HealthTone, { color: string; dot: string }> = {
   info: { color: "bg-blue-500/10 text-blue-400 border-blue-500/30", dot: "bg-blue-400" },
 };
 
-export const StatusBadge: React.FC<StatusBadgeProps> = ({
+export const StatusBadge = React.memo<StatusBadgeProps>(function StatusBadge({
   status,
   pulse = false,
   className,
   tone,
-}) => {
+}) {
   const s = status.toLowerCase();
 
   let colorClasses = TONES.neutral.color;
@@ -65,23 +65,21 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border backdrop-blur-sm",
+        "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border",
         colorClasses,
         className
       )}
     >
       <span className="relative flex h-2 w-2">
-        {shouldPulse && (
-          <span
-            className={cn(
-              "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75",
-              dotColor
-            )}
-          />
-        )}
-        <span className={cn("relative inline-flex rounded-full h-2 w-2", dotColor)} />
+        <span
+          className={cn(
+            "relative inline-flex rounded-full h-2 w-2",
+            dotColor,
+            shouldPulse && (dotColor.includes("emerald") ? "shadow-[0_0_8px_rgba(52,211,153,0.7)]" : "shadow-[0_0_6px_rgba(96,165,250,0.7)]")
+          )}
+        />
       </span>
       <span className="capitalize">{status}</span>
     </span>
   );
-};
+});

@@ -7,7 +7,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { events } from "../../lib/api";
+import { disposeListener, events } from "../../lib/api";
 import type { EngineInstallProgress, UpdateTarget } from "../../types";
 
 export type RunStatus = "running" | "done" | "error";
@@ -48,9 +48,8 @@ export function useUpdateRun(target: UpdateTarget) {
 
   useEffect(() => {
     setRun(null);
-    let dispose: (() => void) | undefined;
-    events
-      .onInstallProgress((progress: EngineInstallProgress) => {
+    const dispose = disposeListener(
+      events.onInstallProgress((progress: EngineInstallProgress) => {
         if (progress.target !== target) return;
         setRun((prev) => {
           // A new version (or a run that already finished) starts a fresh log
@@ -80,8 +79,8 @@ export function useUpdateRun(target: UpdateTarget) {
           };
         });
       })
-      .then((unlisten) => (dispose = unlisten));
-    return () => dispose?.();
+    );
+    return dispose;
   }, [target]);
 
   return { run, reset: () => setRun(null) };

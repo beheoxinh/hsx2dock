@@ -129,9 +129,13 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
     return map;
   }, [containers]);
 
-  // Fetch logs for all containers in the group
+  // Fetch logs for all containers in the group. One pass at a time: with many
+  // members a pass can outlast the 4s refresh, and overlapping passes would
+  // race each other's results.
+  const fetchInflight = useRef(false);
   const fetchAllLogs = useCallback(async () => {
-    if (containers.length === 0) return;
+    if (containers.length === 0 || fetchInflight.current) return;
+    fetchInflight.current = true;
     try {
       setLoading(true);
       const results = await Promise.allSettled(
@@ -146,10 +150,19 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
           next[c.id] = `[Error loading logs: ${String(res.reason)}]`;
         }
       });
-      setLogsByContainer(next);
+      // Unchanged logs keep the old object so the parsed/aggregated view is
+      // not rebuilt every 4s for nothing.
+      setLogsByContainer((prev) => {
+        const keys = Object.keys(next);
+        const same =
+          keys.length === Object.keys(prev).length &&
+          keys.every((k) => prev[k] === next[k]);
+        return same ? prev : next;
+      });
     } catch (err) {
       console.error("Failed to load group logs", err);
     } finally {
+      fetchInflight.current = false;
       setLoading(false);
     }
   }, [containers, tail]);

@@ -254,7 +254,12 @@ impl McpServer {
             "engine_get_status" => ok(json!({ "state": state.daemon_state() })),
             "engine_get_info" => done(self.engine_info().await),
             "engine_get_disk_usage" => done(self.disk_usage().await),
-            "engine_start" | "engine_stop" | "engine_toggle" => done(self.toggle_engine().await),
+            // `engine_start` on a running engine used to *stop* it (and the
+            // reverse): all three shared the toggle. Start/stop are now
+            // idempotent and only act when the engine is in the other state.
+            "engine_start" => done(self.set_engine_running(Some(true)).await),
+            "engine_stop" => done(self.set_engine_running(Some(false)).await),
+            "engine_toggle" => done(self.set_engine_running(None).await),
             "engine_diagnose" => ok(json!(self.diagnose())),
             "engine_repair" => {
                 let ids = args
@@ -299,7 +304,7 @@ impl McpServer {
             "container_stats" => {
                 self.with_id(args, |id| async move {
                     let client = state.get_client().await?;
-                    client.container_stats(&id).await.map_err(|e| e.to_string())
+                    state.container_stats(&client, &id).await.map_err(|e| e.to_string())
                 })
                 .await
             }
@@ -862,15 +867,23 @@ impl McpServer {
 
     /// Mirrors `commands::system::toggle_engine`, including the resource-limit
     /// pass after a start so an agent-started engine obeys the saved caps.
-    async fn toggle_engine(&self) -> Result<DaemonState, String> {
+    /// `want`: `Some(true)` start, `Some(false)` stop, `None` toggle.
+    async fn set_engine_running(&self, want: Option<bool>) -> Result<DaemonState, String> {
         let state = &self.state;
-        match state.daemon_state() {
+        state.engine_control_guard().await?;
+        let _lifecycle = crate::runtime::claim_engine_lifecycle()?;
+        let current = state.daemon_state();
+        let running = current == DaemonState::Running;
+        if want == Some(running) {
+            return Ok(current);
+        }
+        match current {
             DaemonState::Running => {
                 let engine = state.engine.clone();
                 crate::runtime::engine_op(move || engine.stop())
                     .await?
                     .map_err(|e| e.to_string())?;
-                *state.client.write().await = None;
+                state.invalidate_client();
                 Ok(state.daemon_state())
             }
             DaemonState::Stopped | DaemonState::NotInstalled => {
@@ -1035,15 +1048,8 @@ impl McpServer {
             (Ok(id), Ok(name)) => (id, name),
             (Err(e), _) | (_, Err(e)) => return fail(e.to_string()),
         };
-        let client = match self.state.get_client().await {
-            Ok(c) => c,
-            Err(e) => return fail(e),
-        };
         done_unit(
-            client
-                .rename_container(&id, &new_name)
-                .await
-                .map_err(|e| e.to_string()),
+            crate::commands::containers::rename_container_core(&self.state, &id, &new_name).await,
         )
     }
 
@@ -1239,11 +1245,11 @@ impl McpServer {
     }
 
     async fn save_endpoint(&self, ep: EndpointInput) -> Result<(), String> {
-        crate::commands::endpoints::save_endpoint_core(&self.state, ep).await
+        crate::commands::endpoints::save_endpoint_core(&self.state, ep).await.map(|_| ())
     }
 
     async fn remove_endpoint(&self, id: &str) -> Result<(), String> {
-        crate::commands::endpoints::remove_endpoint_core(&self.state, id).await
+        crate::commands::endpoints::remove_endpoint_core(&self.state, id).await.map(|_| ())
     }
 
     /// Mirrors `commands::endpoints::set_active_endpoint`: probe the new target

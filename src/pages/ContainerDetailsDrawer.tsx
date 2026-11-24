@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -18,6 +18,7 @@ import { InteractiveTerminal } from "../components/terminal/InteractiveTerminal"
 import { useTerminalFontSize } from "../lib/terminalSettings";
 import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
+import { primeContainerStore } from "../lib/containerStore";
 import { formatBytes } from "../lib/utils";
 import type { ContainerDetails, ContainerStats, ResourceLimits } from "../types";
 
@@ -142,6 +143,8 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     try {
       setSavingName(true);
       await api.renameContainer(containerId, next);
+      // Routes and group members follow the new name on the backend.
+      void primeContainerStore(true);
       toast.success("Container renamed", `Now named ${next}`);
       setRenaming(false);
       await loadAll();
@@ -156,8 +159,13 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     setActiveTab(initialTab);
   }, [initialTab]);
 
+  // Only the latest load may apply its results: switching containers (or a
+  // reload click) while an older load is in flight must not let the slower
+  // answer overwrite the drawer with another container's data.
+  const loadSeq = useRef(0);
   const loadAll = async () => {
     if (!containerId) return;
+    const seq = ++loadSeq.current;
     try {
       setLoading(true);
       const [det, log, st] = await Promise.allSettled([
@@ -165,6 +173,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
         api.getContainerLogs(containerId, "400"),
         api.getContainerStats(containerId),
       ]);
+      if (seq !== loadSeq.current) return;
 
       if (det.status === "fulfilled") setDetails(det.value);
       if (log.status === "fulfilled") setLogs(log.value);
@@ -172,7 +181,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     } catch (e) {
       console.error(e);
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   };
 

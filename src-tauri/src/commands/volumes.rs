@@ -20,6 +20,17 @@ pub(crate) async fn list_volumes_core(state: &AppState) -> Result<Vec<VolumeItem
     let client = state.get_client().await?;
     let mut volumes = client.list_volumes().await.map_err(|e| e.to_string())?;
 
+    // A remote daemon's mountpoints are paths on *its* host. Walking them here
+    // read whatever happened to sit at the same path locally (often the
+    // system Docker's own volumes) and reported that as the remote size.
+    if state.engine_control_guard().await.is_err() {
+        for v in volumes.iter_mut() {
+            v.size = None;
+            v.restricted_dirs = 0;
+        }
+        return Ok(volumes);
+    }
+
     // Size calculation walks the filesystem; keep it off the async runtime.
     let sized = tokio::task::spawn_blocking(move || {
         for v in volumes.iter_mut() {
