@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { setGatewayRoutes } from "../lib/containerStore";
 import {
   Globe,
   ShieldCheck,
@@ -188,6 +189,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
     );
     try {
       await api.saveGatewayRoutes(updated);
+      setGatewayRoutes(updated);
       setRoutes(updated);
       toast.info("Route Updated", "Gateway route toggle saved.");
     } catch (err) {
@@ -199,6 +201,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
     const updated = routes.filter((r) => r.id !== routeId);
     try {
       await api.saveGatewayRoutes(updated);
+      setGatewayRoutes(updated);
       setRoutes(updated);
       toast.success("Route Deleted", "Virtual domain mapping removed.");
       // Auto check hosts sync after deletion
@@ -246,6 +249,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
 
     try {
       await api.saveGatewayRoutes(updated);
+      setGatewayRoutes(updated);
       setRoutes(updated);
       setIsModalOpen(false);
       setEditingRoute(null);

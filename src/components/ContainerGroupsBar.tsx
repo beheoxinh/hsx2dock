@@ -421,7 +421,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   useEffect(() => {
     if (sizesMap) return;
     loadSizes();
-    const t = setInterval(loadSizes, 30_000);
+    const t = setInterval(() => {
+      if (document.hidden) return;
+      void loadSizes();
+    }, 30_000);
     return () => clearInterval(t);
   }, [loadSizes, sizesMap]);
 

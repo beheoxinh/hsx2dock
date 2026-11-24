@@ -29,6 +29,8 @@ export interface PendingOp {
   group?: string | null;
   /** Deadline (ms epoch) for the settling phase. */
   until?: number;
+  /** When the entry entered queued/running (ms epoch), for the watchdog. */
+  since?: number;
 }
 
 export interface OpNotice {
@@ -71,6 +73,9 @@ export function subscribeOpNotices(cb: (n: OpNotice) => void): () => void {
 
 function setContainerOp(id: string, next: PendingOp | null) {
   const prev = containerOps[id];
+  if (next && next.phase !== "settling" && next.since === undefined) {
+    next = { ...next, since: prev?.phase === next.phase ? prev.since : Date.now() };
+  }
   if (!next && !prev) return;
   const copy = { ...containerOps };
   if (next) copy[id] = next;
@@ -169,6 +174,10 @@ function applyContainerOp(ev: ContainerOp) {
 }
 
 function applyGroupOp(ev: GroupOp) {
+  if (ev.group === AUTOSTART_PASS && ev.phase !== "done" && ev.phase !== "failed") {
+    // The boot stop pass has no card; only its summary matters.
+    return;
+  }
   const t = requestTimers.get(ev.group);
   if (t) {
     clearTimeout(t);
@@ -181,6 +190,9 @@ function applyGroupOp(ev: GroupOp) {
       groupOps = copy;
       notify();
     }
+    // Members whose own "done" event was lost (webview reload, a pass the
+    // backend summarised) must not keep spinning.
+    settleGroup(ev.group);
     scheduleRefresh();
     const failed = ev.phase === "failed" || (ev.summary ?? "").includes("failed:");
     if (failed) {
@@ -202,10 +214,26 @@ function applyGroupOp(ev: GroupOp) {
 export function startContainerOpsSync() {
   if (attached) return;
   attached = true;
-  events.onContainerOp(applyContainerOp).catch(() => {
-    attached = false;
-  });
-  events.onGroupOp(applyGroupOp).catch(() => undefined);
+  // The snapshot below answers after the listeners are live; an id that
+  // already got an event is newer than the snapshot and must not be
+  // overwritten by it (a "done" followed by a stale "running" stuck the
+  // spinner forever).
+  const fresh = new Set<string>();
+  events
+    .onContainerOp((ev) => {
+      fresh.add(ev.id);
+      applyContainerOp(ev);
+    })
+    .catch(() => {
+      attached = false;
+    });
+  events
+    .onGroupOp((ev) => {
+      fresh.add(`group:${ev.group}`);
+      applyGroupOp(ev);
+    })
+    .catch(() => undefined);
+  if (!watchdogTimer) watchdogTimer = setInterval(watchdog, WATCHDOG_EVERY_MS);
   // Settling entries clear as soon as the list shows the new state.
   subscribeContainerStore(() => {
     if (Object.values(containerOps).some((e) => e.phase === "settling")) sweep();
@@ -213,8 +241,35 @@ export function startContainerOpsSync() {
   api
     .listContainerOps()
     .then((snap) => {
-      for (const op of snap.containers) applyContainerOp(op);
-      for (const g of snap.groups) applyGroupOp(g);
+      for (const op of snap.containers) if (!fresh.has(op.id)) applyContainerOp(op);
+      for (const g of snap.groups) if (!fresh.has(`group:${g.group}`)) applyGroupOp(g);
+    })
+    .catch(() => undefined);
+}
+
+const AUTOSTART_PASS = "__autostart__";
+const STUCK_AFTER_MS = 120_000;
+const WATCHDOG_EVERY_MS = 30_000;
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Entries queued/running for minutes are re-checked against the backend: an
+ * op it no longer reports finished while its event was lost, so the entry
+ * settles (and clears once the list agrees) instead of spinning forever.
+ */
+function watchdog() {
+  const now = Date.now();
+  const stale = Object.entries(containerOps).filter(
+    ([, e]) => e.phase !== "settling" && now - (e.since ?? now) > STUCK_AFTER_MS
+  );
+  if (stale.length === 0) return;
+  api
+    .listContainerOps()
+    .then((snap) => {
+      const live = new Set(snap.containers.map((c) => c.id));
+      for (const [id, e] of stale) {
+        if (!live.has(id) && containerOps[id] === e) settle(id, e.op, e.group);
+      }
     })
     .catch(() => undefined);
 }
@@ -358,6 +413,8 @@ export function __resetContainerOpsForTests() {
   containerOps = {};
   groupOps = {};
   for (const t of requestTimers.values()) clearTimeout(t);
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  watchdogTimer = null;
   requestTimers.clear();
   listeners.clear();
   noticeListeners.clear();

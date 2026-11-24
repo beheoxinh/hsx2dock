@@ -87,11 +87,65 @@ pub async fn rename_container(
     id: String,
     new_name: String,
 ) -> Result<(), String> {
+    rename_container_core(&state, &id, &new_name).await
+}
+
+/// Renames a container and carries its name-based references along.
+///
+/// Gateway routes map to containers by name, and group members may be stored
+/// by name too, so a rename silently orphaned both: the route showed as
+/// unmapped and the container fell out of its group.
+pub(crate) async fn rename_container_core(
+    state: &AppState,
+    id: &str,
+    new_name: &str,
+) -> Result<(), String> {
     let client = state.get_client().await?;
+    let old = client.inspect_container(id).await.ok();
     client
-        .rename_container(&id, &new_name)
+        .rename_container(id, new_name)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let Some(old) = old else { return Ok(()) };
+    let old_name = old.name.trim_start_matches('/').to_string();
+    let new_name = new_name.trim_start_matches('/');
+    if old_name.is_empty() || old_name == new_name {
+        return Ok(());
+    }
+
+    let mut cfg = state.config.write().await;
+    let mut next = cfg.clone();
+    let mut routes_changed = false;
+    for r in next.gateway_routes.iter_mut() {
+        if r.container_name.as_deref().map(|n| n.trim_start_matches('/')) == Some(old_name.as_str()) {
+            r.container_name = Some(new_name.to_string());
+            routes_changed = true;
+        }
+    }
+    let mut groups_changed = false;
+    for g in next.container_groups.iter_mut() {
+        for m in g.container_ids.iter_mut() {
+            if m.trim_start_matches('/') == old_name {
+                *m = new_name.to_string();
+                groups_changed = true;
+            }
+        }
+    }
+    if !routes_changed && !groups_changed {
+        return Ok(());
+    }
+    // The rename itself succeeded; a failed bookkeeping save is reported so
+    // the user knows the routes/groups still use the old name.
+    next.save()
+        .await
+        .map_err(|e| format!("Renamed, but updating routes/groups failed: {e}"))?;
+    *cfg = next;
+    if groups_changed {
+        state
+            .ops
+            .emit("container-groups-changed", &cfg.container_groups);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -184,6 +238,47 @@ pub async fn recreate_container(
     recreate_container_core(&state, &id, config).await
 }
 
+/// Fills the settings the edit form does not show from the container being
+/// replaced. The form only sends image, name, command, ports, env, mounts,
+/// network, restart and limits; everything else used to be dropped on
+/// recreate — compose labels (the container left its project), entrypoint,
+/// user, workdir, healthcheck, privileged/tty.
+fn inherit_unmanaged_settings(config: &mut RunConfig, details: &crate::docker::models::ContainerDetails) {
+    if config.entrypoint.is_empty() {
+        config.entrypoint = details.entrypoint.clone();
+    }
+    if config.labels.is_empty() {
+        config.labels = details.labels.clone();
+    }
+    // Docker defaults the hostname to the short id; carrying that over would
+    // name the new container after the old one.
+    if config.hostname.trim().is_empty()
+        && !details.hostname.is_empty()
+        && !details.id.starts_with(&details.hostname)
+    {
+        config.hostname = details.hostname.clone();
+    }
+    if config.workdir.trim().is_empty() {
+        config.workdir = details.workdir.clone();
+    }
+    if config.user.trim().is_empty() {
+        config.user = details.user.clone();
+    }
+    if !config.healthcheck.is_enabled() {
+        config.healthcheck = details.healthcheck.clone();
+    }
+    if config.restart_max_retries.trim().is_empty()
+        && config.restart_policy == crate::docker::models::RestartPolicy::OnFailure
+        && details.restart_max_retries.trim().parse::<u32>().is_ok_and(|n| n > 0)
+    {
+        config.restart_max_retries = details.restart_max_retries.clone();
+    }
+    config.privileged |= details.privileged;
+    config.tty |= details.tty;
+    config.stdin_open |= details.stdin_open;
+    config.read_only_rootfs |= details.read_only_rootfs;
+}
+
 /// Core function that recreates a container from an updated [`RunConfig`].
 ///
 /// Workflow:
@@ -191,8 +286,10 @@ pub async fn recreate_container(
 /// 2. If the config has no name, retains the original container's name.
 /// 3. Validates the updated configuration.
 /// 4. Finds which container group the original container belonged to, if any.
-/// 5. Removes the original container (forced, so running ones stop cleanly first).
-/// 6. Creates and starts the new container with the updated configuration.
+/// 5. Stops the original and renames it aside.
+/// 6. Creates and starts the new container; on failure removes it and puts
+///    the original back (name and running state). Only on success is the
+///    original removed, keeping its anonymous volumes on disk.
 /// 7. Re-attaches the new container ID to the original group if applicable.
 pub(crate) async fn recreate_container_core(
     state: &AppState,
@@ -220,6 +317,7 @@ pub(crate) async fn recreate_container_core(
     if config.name.trim().is_empty() {
         config.name = details.name.clone();
     }
+    inherit_unmanaged_settings(&mut config, &details);
 
     config.validate().map_err(|e| e.to_string())?;
 
@@ -234,22 +332,72 @@ pub(crate) async fn recreate_container_core(
         })
     };
 
-    // Remove the old container cleanly with force = true
-    client
-        .remove_container(id, true)
-        .await
-        .map_err(|e| format!("Failed to stop and remove previous container: {e}"))?;
+    // The old container is kept (renamed aside) until the new one runs. It
+    // used to be force-removed first — with its anonymous volumes — so a bad
+    // image or a port clash left the user with no container at all.
+    let was_running = matches!(details.state.as_str(), "running" | "restarting" | "paused");
+    let original_name = details.name.trim_start_matches('/').to_string();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let parked_name = format!("{original_name}-old-{stamp}");
+    if was_running {
+        client
+            .stop_container(&details.id)
+            .await
+            .map_err(|e| format!("Could not stop the container before recreating it: {e}"))?;
+    }
+    if let Err(e) = client.rename_container(&details.id, &parked_name).await {
+        if was_running {
+            let _ = client.start_container(&details.id).await;
+        }
+        return Err(format!("Could not set the old container aside: {e}"));
+    }
 
-    // Create and start the new container with the modified config
-    let new_id = match client.create_container(&config, true).await {
-        Ok(nid) => nid,
-        Err(e) => {
-            return Err(format!(
-                "Old container was removed, but creating new container failed: {e}. \
-                 Check image availability and port conflicts."
-            ));
+    // Puts the original back the way it was after a failed attempt.
+    let restore = |reason: String| {
+        let client = client.clone();
+        let old_id = details.id.clone();
+        let original_name = original_name.clone();
+        async move {
+            let mut msg = reason;
+            if let Err(e) = client.rename_container(&old_id, &original_name).await {
+                msg.push_str(&format!(" Restoring the original name also failed: {e}."));
+            }
+            if was_running {
+                if let Err(e) = client.start_container(&old_id).await {
+                    msg.push_str(&format!(" Restarting the original container failed: {e}."));
+                }
+            }
+            msg
         }
     };
+
+    // Created stopped (even for `detach`) so a start failure leaves us the
+    // id to clean up.
+    let mut create_cfg = config.clone();
+    create_cfg.detach = false;
+    let new_id = match client.create_container(&create_cfg, false).await {
+        Ok(nid) => nid,
+        Err(e) => {
+            return Err(restore(format!(
+                "Creating the new container failed: {e}. The original container was kept."
+            ))
+            .await);
+        }
+    };
+    if let Err(e) = client.start_container(&new_id).await {
+        let _ = client.remove_container(&new_id, true).await;
+        return Err(restore(format!(
+            "The new container failed to start: {e}. The original container was kept."
+        ))
+        .await);
+    }
+    // Anonymous volumes of the old container stay on disk (unused) rather
+    // than being deleted with it.
+    if let Err(e) = client.remove_container_with(&details.id, true, false).await {
+        tracing::warn!("recreate: could not remove the old container {parked_name}: {e}");
+    }
 
     // If the old container belonged to a group, update that group's container_ids
     if let Some((group_id, pos)) = old_group_info {

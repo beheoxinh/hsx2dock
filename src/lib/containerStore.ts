@@ -77,6 +77,14 @@ function attachTicks() {
       // No Tauri bridge (tests, plain browser) — polling still works.
       ticksAttached = false;
     });
+  events
+    .onContainerGroupsChanged((groups) => {
+      // While our own saves are queued the optimistic list is newer than any
+      // echo; the last save's echo lands once the queue drains.
+      if (pendingGroupSaves > 0) return;
+      emit({ groups });
+    })
+    .catch(() => {});
 }
 
 /** Read the cache outside React (event handlers, imperative refreshes). */
@@ -93,9 +101,22 @@ export const subscribeContainerStore = subscribe;
  * Idempotent: a call while a fetch is already running returns that promise,
  * and a call after the cache is warm is a no-op unless `force` is set.
  */
+let forcedAfter: Promise<void> | null = null;
+
 export function primeContainerStore(force = false): Promise<void> {
   attachTicks();
-  if (inflight) return inflight;
+  if (inflight) {
+    // A forced refresh (engine start, endpoint switch, recreate) must not be
+    // satisfied by a fetch that began before the change.
+    if (!force) return inflight;
+    if (!forcedAfter) {
+      forcedAfter = inflight.then(() => {
+        forcedAfter = null;
+        return primeContainerStore(true);
+      });
+    }
+    return forcedAfter;
+  }
   if (snapshot.ready && !force) return Promise.resolve();
 
   emit({ loading: true, error: null });
@@ -191,6 +212,36 @@ export function setContainerGroups(groups: ContainerGroup[]) {
   emit({ groups });
 }
 
+let pendingGroupSaves = 0;
+let groupSaveChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Show the edit at once and persist saves strictly in order. Concurrent saves
+ * (fast drags, a rename while a drop is saving) used to race: an older save
+ * finishing last put its stale list back on screen. A failed save reloads the
+ * list from the backend and rethrows so the caller can report it.
+ */
+export function saveContainerGroups(groups: ContainerGroup[]): Promise<void> {
+  emit({ groups });
+  pendingGroupSaves += 1;
+  const run = groupSaveChain.then(() => api.saveContainerGroups(groups));
+  groupSaveChain = run.catch(() => {});
+  return run.then(
+    () => {
+      pendingGroupSaves -= 1;
+    },
+    async (err) => {
+      pendingGroupSaves -= 1;
+      try {
+        emit({ groups: await api.listContainerGroups() });
+      } catch {
+        // keep the optimistic list; the next prime corrects it
+      }
+      throw err;
+    }
+  );
+}
+
 export function setGatewayRoutes(routes: GatewayRoute[]) {
   emit({ gatewayRoutes: routes });
 }
@@ -204,6 +255,7 @@ export function startContainerStoreSync() {
   void primeContainerStore();
   if (pollTimer) return;
   pollTimer = setInterval(() => {
+    if (typeof document !== "undefined" && document.hidden) return;
     void refreshContainerSizes();
   }, 120_000);
 }

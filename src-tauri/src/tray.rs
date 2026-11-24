@@ -56,6 +56,8 @@ enum Signal {
         name: String,
     },
     Menu(String),
+    /// A spawned menu action finished; only triggers a refresh.
+    Refresh,
 }
 
 /// Everything needed to mutate the tray in place. Menu items are `Clone`
@@ -77,6 +79,10 @@ struct TrayParts {
     last_status_text: Option<String>,
     last_toggle_state: Option<(bool, bool)>,
     last_restart_enabled: Option<bool>,
+    /// Last text written to each group/cluster submenu, keyed `g:<id>` /
+    /// `c:<name>`. Every tick rewrote all of them, and each write bumps the
+    /// DBusMenu revision, so the panel re-read the whole menu every few seconds.
+    item_texts: HashMap<String, String>,
     tx: tokio::sync::mpsc::UnboundedSender<Signal>,
 }
 
@@ -487,6 +493,7 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             last_status_text: None,
             last_toggle_state: None,
             last_restart_enabled: None,
+            item_texts: HashMap::new(),
             tx: tx.clone(),
         }),
     });
@@ -545,6 +552,7 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     });
 
     let handle = app.clone();
+    let tx_loop = tx.clone();
     crate::runtime::spawn(async move {
         let mut ctx = MonitorCtx {
             notified: HashMap::new(),
@@ -559,6 +567,19 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             tokio::select! {
                 sig = rx.recv() => {
                     let Some(sig) = sig else { break };
+                    if let Signal::Menu(id) = sig {
+                        // Group/cluster power and engine toggles take minutes;
+                        // awaited here they froze the tray's refresh and
+                        // queued every other click (Quit included) behind
+                        // them. They run on their own and ask for a refresh.
+                        let app = handle.clone();
+                        let tx = tx_loop.clone();
+                        crate::runtime::spawn(async move {
+                            handle_menu(&app, &id).await;
+                            let _ = tx.send(Signal::Refresh);
+                        });
+                        continue;
+                    }
                     handle_signal(&handle, &mut ctx, sig).await;
                     refresh(&handle, &mut ctx).await;
                 }
@@ -707,6 +728,7 @@ async fn handle_signal(app: &AppHandle, ctx: &mut MonitorCtx, signal: Signal) {
             }
         }
         Signal::Menu(id) => handle_menu(app, &id).await,
+        Signal::Refresh => {}
     }
 }
 
@@ -768,9 +790,12 @@ async fn handle_menu(app: &AppHandle, id: &str) {
         // Public Gateway Route item click -> open in default browser
         id if id.starts_with(GATEWAY_ROUTE_PREFIX) => {
             let url = &id[GATEWAY_ROUTE_PREFIX.len()..];
-            let _ = std::process::Command::new("xdg-open")
-                .arg(url)
-                .spawn();
+            // Reaped on a helper thread so each click does not leave a zombie.
+            if let Ok(mut child) = std::process::Command::new("xdg-open").arg(url).spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
         }
 
         _ => {}
@@ -798,12 +823,16 @@ async fn toggle_engine_from_tray(app: &AppHandle) {
         record_notice(app, "Engine controls unavailable", &e);
         return;
     }
+    let _lifecycle = match crate::runtime::claim_engine_lifecycle() {
+        Ok(g) => g,
+        Err(e) => return record_notice(app, "Engine busy", &e),
+    };
     match state.daemon_state() {
         DaemonState::Running => {
             let engine = state.engine.clone();
             match crate::runtime::engine_op(move || engine.stop()).await {
                 Ok(Ok(())) => {
-                    *state.client.write().await = None;
+                    state.invalidate_client();
                 }
                 Ok(Err(e)) => record_notice(app, "Engine stop failed", &e.to_string()),
                 Err(e) => record_notice(app, "Engine stop failed", &e),
@@ -834,13 +863,17 @@ async fn restart_engine_from_tray(app: &AppHandle) {
         record_notice(app, "Engine controls unavailable", &e);
         return;
     }
+    let _lifecycle = match crate::runtime::claim_engine_lifecycle() {
+        Ok(g) => g,
+        Err(e) => return record_notice(app, "Engine busy", &e),
+    };
     if state.daemon_state() != DaemonState::Running {
         return;
     }
     let engine = state.engine.clone();
     match crate::runtime::engine_op(move || engine.stop()).await {
         Ok(Ok(())) => {
-            *state.client.write().await = None;
+            state.invalidate_client();
         }
         Ok(Err(e)) => {
             record_notice(app, "Engine restart failed", &e.to_string());
@@ -862,9 +895,12 @@ async fn restart_engine_from_tray(app: &AppHandle) {
 }
 
 async fn notification_prefs(app: &AppHandle) -> crate::config::NotificationPrefs {
-    app.try_state::<std::sync::Arc<AppState>>()
-        .and_then(|s| s.config.try_read().ok().map(|c| c.notifications.clone()))
-        .unwrap_or_default()
+    // `try_read` fell back to the defaults whenever a writer held the lock,
+    // so a notification the user turned off could still fire.
+    match app.try_state::<std::sync::Arc<AppState>>() {
+        Some(s) => s.config.read().await.notifications.clone(),
+        None => Default::default(),
+    }
 }
 
 /// Shows a desktop notification. Callers check the Settings prefs first;
@@ -996,6 +1032,7 @@ fn apply_tray_update(app: &AppHandle, daemon: &DaemonState, stats: Option<&TrayS
             );
             guard.last_toggle_state = Some((running, !transitioning));
             guard.last_restart_enabled = Some(running);
+            guard.item_texts.clear();
             return;
         }
     }
@@ -1037,15 +1074,48 @@ fn update_rows(parts: &mut TrayParts, daemon: &DaemonState, _label: &str, stats:
     if let Some(s) = stats {
         for (id, sub) in &parts.group_items {
             if let Some(g) = s.groups.iter().find(|g| &g.id == id) {
-                let _ = sub.set_text(format_group_title(g));
+                let text = format_group_title(g);
+                let key = format!("g:{id}");
+                if parts.item_texts.get(&key) != Some(&text) {
+                    let _ = sub.set_text(&text);
+                    parts.item_texts.insert(key, text);
+                }
             }
         }
         for (name, sub) in &parts.cluster_items {
             if let Some(c) = s.clusters.iter().find(|c| &c.name == name) {
-                let _ = sub.set_text(format_cluster_title(c));
+                let text = format_cluster_title(c);
+                let key = format!("c:{name}");
+                if parts.item_texts.get(&key) != Some(&text) {
+                    let _ = sub.set_text(&text);
+                    parts.item_texts.insert(key, text);
+                }
             }
         }
     }
+}
+
+/// Image count for the status row. Listing images walks every layer on the
+/// daemon side; the count rarely changes, so a minute-old figure is fine and
+/// saves three of every four list calls.
+async fn cached_image_count(
+    client: &crate::docker::client::DockerClient,
+    configured: &str,
+) -> Option<usize> {
+    static CACHE: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(60);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((at, n)) = *guard {
+            if at.elapsed() < TTL {
+                return Some(n);
+            }
+        }
+    }
+    let n = client.list_images_visible(Some(configured)).await.ok()?.len();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), n));
+    }
+    Some(n)
 }
 
 async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats> {
@@ -1056,12 +1126,18 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
     let containers = client.list_containers(true).await.ok()?;
     let total = containers.len();
     let running = containers.iter().filter(|c| c.running).count();
-    let configured = state.config.read().await.kind_default_image.clone();
-    let images = client
-        .list_images_visible(Some(configured.as_str()))
-        .await
-        .ok()?
-        .len();
+    // Only the pieces of config the tray reads, in one lock: cloning the whole
+    // config (endpoints, registries, kind prefs…) every tick was wasted work.
+    let (configured, container_groups, gateway_routes, https_port) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.kind_default_image.clone(),
+            cfg.container_groups.clone(),
+            cfg.gateway_routes.clone(),
+            cfg.gateway_https_port,
+        )
+    };
+    let images = cached_image_count(&client, &configured).await?;
 
     // 1. Group stats: read from cached_stats updated by background monitor
     // so tray refresh is instant and does not bombard the Docker socket with sequential HTTP calls
@@ -1077,7 +1153,6 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
     };
 
     // Build container groups (compose projects + custom groups + isolated)
-    let config = state.config.read().await.clone();
     let mut groups: Vec<GroupStat> = Vec::new();
 
     // Compose projects
@@ -1112,7 +1187,7 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
 
     // Custom user groups
     let mut custom_claimed_tokens = std::collections::HashSet::new();
-    for cg in &config.container_groups {
+    for cg in &container_groups {
         if cg.id.starts_with("compose:") || cg.id == "__isolated__" {
             continue;
         }
@@ -1221,11 +1296,10 @@ async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats
     let kinds = clusters.len();
 
     // 3. Gateway status & active bound routes
-    let gateway_running = config.gateway_enabled && state.caddy.is_running().await;
+    let gateway_running = state.caddy.is_running().await;
     let mut active_routes: Vec<ActiveRouteStat> = Vec::new();
     if gateway_running {
-        let https_port = config.gateway_https_port;
-        for r in &config.gateway_routes {
+        for r in &gateway_routes {
             if !r.enabled {
                 continue;
             }

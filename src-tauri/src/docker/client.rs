@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::Path;
 
 use bollard::Docker;
@@ -25,6 +24,37 @@ fn pruneable_container(state: &str, kind_cluster: Option<&str>) -> bool {
 }
 
 /// kind's network and Docker's built-ins are never prune candidates.
+const EXEC_OUTPUT_CAP: usize = 32 * 1024 * 1024;
+
+/// Time allowed for one captured exec (see [`DockerClient::exec_capture`]).
+fn exec_budget(cmd: &[String]) -> std::time::Duration {
+    use std::time::Duration;
+    let mutating = cmd.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "drain" | "rollout" | "apply" | "wait" | "delete" | "create" | "replace" | "cordon"
+                | "uncordon" | "scale" | "patch"
+        )
+    });
+    let asked = cmd.iter().find_map(|a| {
+        let v = a.strip_prefix("--timeout=")?;
+        let (num, unit) = v.split_at(v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len()));
+        let n: u64 = num.parse().ok()?;
+        Some(match unit {
+            "m" => n * 60,
+            "h" => n * 3600,
+            _ => n,
+        })
+    });
+    let base = if mutating { 180 } else { 30 };
+    Duration::from_secs(asked.map_or(base, |t| base.max(t + 30)))
+}
+
+/// Docker names anonymous volumes with a random 64-hex id.
+fn is_anonymous_volume(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn pruneable_network(name: &str, protected: bool) -> bool {
     !protected && !matches!(name, "bridge" | "host" | "none")
 }
@@ -159,16 +189,14 @@ impl DockerClient {
     /// One-shot exec: runs `cmd` inside `container`, returns combined stdout+stderr.
     /// Errors on non-zero exit. Used for kubectl queries inside kind nodes.
     pub async fn exec_capture(&self, container: &str, cmd: Vec<String>) -> anyhow::Result<String> {
-        // A kubectl against a dead API server can block for minutes; every
-        // caller polls, so a bounded failure is always the better answer.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.exec_capture_unbounded(container, cmd),
-        )
-        .await
-        {
+        // A kubectl against a dead API server can block for minutes, so every
+        // exec is bounded. Queries get 30s; mutating kubectl verbs get the
+        // time they asked for (`--timeout=`) plus a margin, or 3 minutes — a
+        // flat 30s failed a 45s drain while kubectl kept running in the node.
+        let limit = exec_budget(&cmd);
+        match tokio::time::timeout(limit, self.exec_capture_unbounded(container, cmd)).await {
             Ok(r) => r,
-            Err(_) => anyhow::bail!("exec in {container} timed out after 30s"),
+            Err(_) => anyhow::bail!("exec in {container} timed out after {}s", limit.as_secs()),
         }
     }
 
@@ -205,7 +233,13 @@ impl DockerClient {
             match frame {
                 Ok(LogOutput::StdOut { message })
                 | Ok(LogOutput::StdErr { message })
-                | Ok(LogOutput::Console { message }) => out.extend_from_slice(&message),
+                | Ok(LogOutput::Console { message }) => {
+                    // Bounded: a runaway command must not grow app memory
+                    // without limit.
+                    if out.len() < EXEC_OUTPUT_CAP {
+                        out.extend_from_slice(&message);
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => anyhow::bail!("exec stream error: {e}"),
             }
@@ -276,7 +310,19 @@ impl DockerClient {
             .all(all)
             .build();
         let list = self.docker.list_containers(Some(opts)).await?;
-        let live_networks = self.cached_networks(std::time::Duration::from_secs(15)).await.unwrap_or_default();
+        // When the network list cannot be read, no network is called broken:
+        // an empty set flagged every container (bridge included) for repair.
+        let networks_known;
+        let live_networks = match self.cached_networks(std::time::Duration::from_secs(15)).await {
+            Ok(n) => {
+                networks_known = true;
+                n
+            }
+            Err(_) => {
+                networks_known = false;
+                Vec::new()
+            }
+        };
         let live_net_ids: std::collections::HashSet<String> = live_networks.iter().map(|n| n.id.clone()).collect();
         let live_net_names: std::collections::HashSet<String> = live_networks.iter().map(|n| n.name.clone()).collect();
 
@@ -313,7 +359,9 @@ impl DockerClient {
                     for (net_name, net_cfg) in ns {
                         let net_id = net_cfg.network_id.unwrap_or_default();
                         // If NetworkID is non-empty and not present in live networks, or network name is missing
-                        if !net_id.is_empty() && !live_net_ids.contains(&net_id) {
+                        if !networks_known {
+                            // Unknown, not broken.
+                        } else if !net_id.is_empty() && !live_net_ids.contains(&net_id) {
                             broken_networks.push(net_name.clone());
                         } else if !live_net_names.contains(&net_name) && net_name != "bridge" && net_name != "host" && net_name != "none" {
                             broken_networks.push(net_name.clone());
@@ -413,9 +461,15 @@ impl DockerClient {
     }
 
     pub async fn remove_container(&self, id: &str, force: bool) -> anyhow::Result<()> {
+        self.remove_container_with(id, force, true).await
+    }
+
+    /// `remove_container` with control over the container's anonymous
+    /// volumes (`volumes=false` leaves them on disk).
+    pub async fn remove_container_with(&self, id: &str, force: bool, volumes: bool) -> anyhow::Result<()> {
         let opts = bollard::query_parameters::RemoveContainerOptionsBuilder::default()
             .force(force)
-            .v(true)
+            .v(volumes)
             .build();
         self.docker.remove_container(id, Some(opts)).await?;
         Ok(())
@@ -657,14 +711,22 @@ impl DockerClient {
     }
 
     pub async fn prune_images(&self) -> anyhow::Result<(u64, u64)> {
-        self.prune_images_mode(true).await
+        self.prune_images_mode(true, None).await
     }
 
     /// Prunes images with mode selection:
     /// - `dangling_only: true`: removes only untagged/dangling images (`dangling=true`), used by background auto-clean.
     /// - `dangling_only: false`: removes all unreferenced/unused images not used by any container,
     ///   while strictly protecting Kubernetes / Kind cluster node images.
-    pub async fn prune_images_mode(&self, dangling_only: bool) -> anyhow::Result<(u64, u64)> {
+    ///
+    /// `configured_kind_image` is the node image set in Settings; a custom one
+    /// (a mirror, a pinned digest) has no `kindest/` tag, so without it the
+    /// image the next cluster create needs was removed as "unused".
+    pub async fn prune_images_mode(
+        &self,
+        dangling_only: bool,
+        configured_kind_image: Option<&str>,
+    ) -> anyhow::Result<(u64, u64)> {
         if dangling_only {
             let filters = std::collections::HashMap::from([("dangling".to_string(), vec!["true".to_string()])]);
             let opts = bollard::query_parameters::PruneImagesOptionsBuilder::default()
@@ -709,7 +771,7 @@ impl DockerClient {
             let short_id = &img.short_id;
 
             // Protect kind images (by tag or node container reference)
-            if crate::docker::kind::is_kind_image(&img.tags, None)
+            if crate::docker::kind::is_kind_image(&img.tags, configured_kind_image)
                 || protected_kind_ids.contains(clean_id)
             {
                 continue;
@@ -874,10 +936,11 @@ impl DockerClient {
     pub async fn prune_volumes(&self) -> anyhow::Result<u64> {
         // Hand-rolled rather than the API call so protected (kind-managed)
         // volumes can never be selected. In-use volumes fail to remove and are
-        // skipped, which matches Docker's "unused volumes" semantics.
+        // skipped. Like `docker volume prune`, only anonymous volumes go: a
+        // named volume (a stopped database's data) is never "unused" junk.
         let mut removed = 0u64;
         for volume in self.list_volumes().await? {
-            if volume.protected {
+            if volume.protected || !is_anonymous_volume(&volume.name) {
                 continue;
             }
             if self.remove_volume(&volume.name, false).await.is_ok() {
@@ -1188,13 +1251,25 @@ impl DockerClient {
         &self,
         options: &BuildOptions,
         cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        registry_auth: Option<std::collections::HashMap<String, bollard::auth::DockerCredentials>>,
         mut on_step: F,
     ) -> anyhow::Result<Option<String>>
     where
         F: FnMut(BuildStep) + Send,
     {
         let (context, dockerfile) = options.validate().map_err(anyhow::Error::msg)?;
-        let tarball = build_context_tarball(&context)?;
+        // Walking and gzipping a big context is blocking work; on the async
+        // runtime it stalled every other command until it finished.
+        let tarball = {
+            let context = context.clone();
+            let dockerfile = dockerfile.clone();
+            tokio::task::spawn_blocking(move || build_context_tarball(&context, &dockerfile))
+                .await
+                .map_err(|e| anyhow::anyhow!("packing the build context failed: {e}"))??
+        };
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
 
         let mut builder = bollard::query_parameters::BuildImageOptionsBuilder::default()
             .dockerfile(&dockerfile)
@@ -1229,10 +1304,26 @@ impl DockerClient {
 
         let opts = builder.build();
         let body = bollard::body_full(bytes::Bytes::from(tarball));
-        let mut stream = self.docker.build_image(opts, None, Some(body));
+        let mut stream = self.docker.build_image(opts, registry_auth, Some(body));
         let mut image_id: Option<String> = None;
 
-        while let Some(chunk) = stream.next().await {
+        // Cancel was only seen when the daemon sent output, so a long silent
+        // step (a quiet RUN, a big layer export) could not be stopped. Dropping
+        // the stream closes the connection, which makes the daemon abort.
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            let chunk = tokio::select! {
+                c = stream.next() => match c {
+                    Some(c) => c,
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(image_id);
+                    }
+                    continue;
+                }
+            };
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(image_id);
             }
@@ -1565,13 +1656,19 @@ impl DockerClient {
         };
         let res = self.docker.create_container(opts, body).await?;
         if start || cfg.detach {
-            let _ = self
+            // A failed start (port already taken, bad mount) used to be
+            // dropped, so the UI said "launched" for a container stuck in
+            // `created`.
+            if let Err(e) = self
                 .docker
                 .start_container(
                     &res.id,
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
-                .await;
+                .await
+            {
+                anyhow::bail!("Container was created but failed to start: {e}");
+            }
         }
         Ok(res.id)
     }
@@ -1837,11 +1934,24 @@ fn container_details_from_inspect(
 fn port_mappings_from_inspect(
     info: &bollard::models::ContainerInspectResponse,
 ) -> Vec<PortMapping> {
-    let Some(net) = info.network_settings.as_ref() else {
-        return Vec::new();
+    // The configured bindings live in HostConfig and survive a stop;
+    // NetworkSettings.Ports is empty for a stopped container (an edit then
+    // recreated it with no published ports) and lists each binding twice
+    // (IPv4 and IPv6) for a running one. It is only the fallback.
+    let configured = info
+        .host_config
+        .as_ref()
+        .and_then(|h| h.port_bindings.clone())
+        .filter(|m| !m.is_empty());
+    let ports = match configured {
+        Some(m) => m,
+        None => match info.network_settings.as_ref().and_then(|n| n.ports.clone()) {
+            Some(m) => m,
+            None => return Vec::new(),
+        },
     };
     let mut out = Vec::new();
-    for (spec, binding) in net.ports.clone().unwrap_or_default().iter() {
+    for (spec, binding) in ports.iter() {
         // `spec` is `"80/tcp"`.
         let (container_port, proto) = spec
             .split_once('/')
@@ -1922,43 +2032,188 @@ fn ns_to_duration(ns: i64) -> String {
 
 /// Pack `dir` (recursively) into a gzipped tarball for the `/build` endpoint.
 ///
-/// Symlinks are skipped, hidden `.dockerignore` semantics are out of scope:
-/// everything under the directory is included. Fails when `dir` is not a
-/// readable directory.
-fn build_context_tarball(dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+/// Honours `.dockerignore` like the docker CLI: without it every
+/// `node_modules`, `.git` and `target` dir was uploaded, which made builds of
+/// ordinary projects send gigabytes and could exhaust memory. The Dockerfile
+/// and `.dockerignore` are always sent. Symlinks are skipped.
+fn build_context_tarball(dir: &std::path::Path, dockerfile: &str) -> anyhow::Result<Vec<u8>> {
     if !dir.is_dir() {
         anyhow::bail!("build context is not a directory: {}", dir.display());
     }
-    let mut tar_data = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_data);
-        append_dir_all(&mut builder, dir, dir)?;
-        builder.into_inner()?;
-    }
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(&tar_data)?;
-    Ok(gz.finish()?)
+    let ignore = std::fs::read_to_string(dir.join(".dockerignore"))
+        .map(|t| DockerIgnore::parse(&t))
+        .unwrap_or_default();
+    let keep: Vec<String> = vec![
+        dockerfile.trim_start_matches("./").replace('\\', "/"),
+        ".dockerignore".to_string(),
+    ];
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    append_dir_all(&mut builder, dir, dir, &ignore, &keep)?;
+    Ok(builder.into_inner()?.finish()?)
 }
 
-fn append_dir_all(
-    builder: &mut tar::Builder<&mut Vec<u8>>,
+fn append_dir_all<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
     root: &std::path::Path,
     dir: &std::path::Path,
+    ignore: &DockerIgnore,
+    keep: &[String],
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let rel = path.strip_prefix(root).unwrap_or(&path);
-        if path.is_symlink() {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
             continue;
-        } else if path.is_dir() {
-            builder.append_dir(rel, &path)?;
-            append_dir_all(builder, root, &path)?;
-        } else if path.is_file() {
+        }
+        let excluded = ignore.excludes(&rel_str) && !keep.iter().any(|k| k == &rel_str);
+        if ft.is_dir() {
+            let prefix = format!("{rel_str}/");
+            let holds_kept = keep.iter().any(|k| k.starts_with(&prefix));
+            if excluded && !holds_kept && !ignore.may_reinclude_under(&rel_str) {
+                continue;
+            }
+            if !excluded {
+                builder.append_dir(rel, &path)?;
+            }
+            append_dir_all(builder, root, &path, ignore, keep)?;
+        } else if ft.is_file() && !excluded {
             builder.append_path_with_name(&path, rel)?;
         }
     }
     Ok(())
+}
+
+/// `.dockerignore` rules: Go-style globs (`*`, `?`, `**`), `!` re-includes,
+/// last matching rule wins, and a rule matching a directory covers
+/// everything beneath it.
+#[derive(Default, Debug)]
+pub(crate) struct DockerIgnore {
+    rules: Vec<(bool, Vec<String>)>,
+}
+
+impl DockerIgnore {
+    pub(crate) fn parse(text: &str) -> Self {
+        let rules = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let (negate, pat) = match l.strip_prefix('!') {
+                    Some(rest) => (true, rest.trim()),
+                    None => (false, l),
+                };
+                let pat = pat
+                    .trim_start_matches("./")
+                    .trim_start_matches('/')
+                    .trim_end_matches('/');
+                if pat.is_empty() || pat == "." {
+                    return None;
+                }
+                let segs = pat
+                    .split('/')
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                (!segs.is_empty()).then_some((negate, segs))
+            })
+            .collect();
+        Self { rules }
+    }
+
+    pub(crate) fn excludes(&self, rel: &str) -> bool {
+        let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        let mut excluded = false;
+        for (negate, pat) in &self.rules {
+            // The path itself or any parent directory matching counts.
+            let hit = (1..=segs.len()).any(|n| match_segs(pat, &segs[..n]));
+            if hit {
+                excluded = !negate;
+            }
+        }
+        excluded
+    }
+
+    /// True when some `!` rule could re-include a path below `dir`, so an
+    /// excluded directory still has to be walked.
+    fn may_reinclude_under(&self, dir: &str) -> bool {
+        let depth = dir.split('/').filter(|s| !s.is_empty()).count();
+        self.rules.iter().any(|(negate, pat)| {
+            *negate && (pat.iter().any(|s| s.contains("**")) || pat.len() > depth)
+        })
+    }
+}
+
+fn match_segs(pat: &[String], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((first, rest)) if first == "**" => {
+            (0..=path.len()).any(|skip| match_segs(rest, &path[skip..]))
+        }
+        Some((first, rest)) => match path.split_first() {
+            Some((p, prest)) => {
+                glob_seg(first.as_bytes(), p.as_bytes()) && match_segs(rest, prest)
+            }
+            None => false,
+        },
+    }
+}
+
+/// One path segment against `*` / `?` wildcards (no `/` crossing).
+fn glob_seg(pat: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if let Some(s) = star {
+            p = s + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+#[cfg(test)]
+mod dockerignore_tests {
+    use super::DockerIgnore;
+
+    #[test]
+    fn excludes_dirs_globs_and_reincludes() {
+        let ig = DockerIgnore::parse(
+            "# deps\nnode_modules\n.git/\n*.log\n**/target\ndocs/*\n!docs/keep.md\n",
+        );
+        assert!(ig.excludes("node_modules"));
+        assert!(ig.excludes("node_modules/a/b.js"));
+        assert!(ig.excludes(".git/HEAD"));
+        assert!(ig.excludes("app.log"));
+        assert!(!ig.excludes("logs/app.log"), "*.log is anchored at the root");
+        assert!(ig.excludes("crates/x/target/debug/bin"));
+        assert!(ig.excludes("docs/a.md"));
+        assert!(!ig.excludes("docs/keep.md"));
+        assert!(!ig.excludes("src/main.rs"));
+        assert!(!ig.excludes("Dockerfile"));
+    }
+
+    #[test]
+    fn empty_ignore_keeps_everything() {
+        let ig = DockerIgnore::parse("");
+        assert!(!ig.excludes("anything/at/all"));
+    }
 }
 
 fn normalize_tcp_uri(uri: &str) -> anyhow::Result<String> {

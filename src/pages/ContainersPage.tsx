@@ -27,7 +27,7 @@ import { useStableCallback } from "../hooks/useStableCallback";
 import {
   primeContainerStore,
   refreshContainers,
-  setContainerGroups,
+  saveContainerGroups,
   useContainerStore,
 } from "../lib/containerStore";
 import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
@@ -138,8 +138,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   const [repairTarget, setRepairTarget] = useState<ContainerItem | null>(null);
 
   const saveGroups = useStableCallback(async (next: ContainerGroup[]) => {
-    await api.saveContainerGroups(next);
-    setContainerGroups(next);
+    await saveContainerGroups(next);
   });
 
   const loadContainers = useStableCallback(async () => {
@@ -209,7 +208,12 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
   // than once per card on every render.
   const routesRef = useRef<Map<string, GatewayRouteLike[]>>(NO_ROUTES);
   const routesById = useMemo(() => {
-    const next = routesByContainer(containers, gatewayRoutes as GatewayRouteLike[], routesRef.current);
+    const next = routesByContainer(
+      containers,
+      // A disabled route is not served; its chip would link to nothing.
+      (gatewayRoutes as GatewayRouteLike[]).filter((r) => (r as { enabled?: boolean }).enabled !== false),
+      routesRef.current
+    );
     routesRef.current = next;
     return next;
   }, [containers, gatewayRoutes]);

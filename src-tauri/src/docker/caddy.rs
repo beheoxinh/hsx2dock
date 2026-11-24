@@ -162,10 +162,9 @@ pub fn read_caddy_status(paths: &CaddyPaths) -> (bool, Option<String>) {
 }
 
 pub fn probe_caddy_version(bin: &Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("version");
+    let out = crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, "caddy version").ok()?;
     if !out.status.success() {
         return None;
     }
@@ -190,6 +189,8 @@ pub async fn check_caddy_update(paths: &CaddyPaths) -> Result<CaddyUpdateInfo> {
 async fn fetch_latest_caddy_release() -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent("hsx2dock-caddy-updater")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()?;
     let resp = client
         .get("https://api.github.com/repos/caddyserver/caddy/releases/latest")
@@ -297,36 +298,23 @@ where
     ));
 
     let dest = version_dir.join(if cfg!(windows) { "caddy.exe" } else { "caddy" });
-    let _ = std::fs::remove_file(&dest);
-
-    // Extract caddy binary from tar.gz
-    let file = std::fs::File::open(&staging_archive)
-        .with_context(|| format!("open {}", staging_archive.display()))?;
-    let gz = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
-    let mut extracted = false;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let name = entry.path()?.into_owned();
-        let fname = name.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if fname == "caddy" || fname == "caddy.exe" {
-            let mut out = std::fs::File::create(&dest)
-                .with_context(|| format!("create {}", dest.display()))?;
-            std::io::copy(&mut entry, &mut out)?;
-            extracted = true;
-            break;
-        }
-    }
+    // Extract next to the destination and rename into place only once the
+    // binary checks out. Deleting `dest` first meant a failed reinstall of the
+    // active version left the gateway with no binary at all.
+    let staged = version_dir.join(if cfg!(windows) { ".caddy.exe.partial" } else { ".caddy.partial" });
+    let extract = {
+        let archive_path = staging_archive.clone();
+        let staged = staged.clone();
+        tokio::task::spawn_blocking(move || extract_caddy_binary(&archive_path, &staged))
+    };
+    let extracted = extract
+        .await
+        .map_err(|e| anyhow::anyhow!("extracting caddy failed: {e}"))
+        .and_then(|r| r);
     let _ = std::fs::remove_file(&staging_archive);
-    if !extracted {
-        bail!("caddy binary not found inside downloaded archive");
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-            .context("chmod caddy binary")?;
+    if let Err(e) = extracted {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
     }
 
     on_progress(InstallProgress::stage(
@@ -337,11 +325,19 @@ where
         Some(0.9),
     ));
 
-    let reported = probe_caddy_version(&dest)
-        .ok_or_else(|| anyhow::anyhow!("staged caddy {version} failed `caddy version`"))?;
-    if !reported.starts_with(&version) {
-        bail!("staged caddy reported {reported}, but {version} was expected");
+    match probe_caddy_version(&staged) {
+        Some(r) if r.starts_with(&version) => {}
+        Some(r) => {
+            let _ = std::fs::remove_file(&staged);
+            bail!("staged caddy reported {r}, but {version} was expected");
+        }
+        None => {
+            let _ = std::fs::remove_file(&staged);
+            bail!("staged caddy {version} failed `caddy version`");
+        }
     }
+    std::fs::rename(&staged, &dest)
+        .with_context(|| format!("move caddy into {}", dest.display()))?;
 
     let _ = std::fs::write(version_dir.join("VERSION"), format!("{version}\n"));
     paths.set_active(&version)?;
@@ -350,9 +346,45 @@ where
     Ok(dest)
 }
 
+/// Pulls the `caddy` binary out of a release tarball into `dest` (0755).
+fn extract_caddy_binary(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let _ = std::fs::remove_file(dest);
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("open {}", archive_path.display()))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.into_owned();
+        let fname = name.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if fname == "caddy" || fname == "caddy.exe" {
+            let mut out = std::fs::File::create(dest)
+                .with_context(|| format!("create {}", dest.display()))?;
+            std::io::copy(&mut entry, &mut out)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+                    .context("chmod caddy binary")?;
+            }
+            return Ok(());
+        }
+    }
+    bail!("caddy binary not found inside downloaded archive")
+}
+
 async fn fetch_caddy_checksum(version: &str, asset: &str) -> Result<String> {
     let url = format!("{CADDY_BASE}/v{version}/caddy_{version}_checksums.txt");
-    let text = reqwest::get(&url).await?.text().await?;
+    let text = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 && parts[1].trim_start_matches('*').ends_with(asset) {
@@ -365,13 +397,36 @@ async fn fetch_caddy_checksum(version: &str, asset: &str) -> Result<String> {
 pub struct CaddySupervisor {
     pub child: Arc<Mutex<Option<tokio::process::Child>>>,
     pub paths: CaddyPaths,
+    /// Whether the plain-HTTP listener is served, decided once per HTTP port.
+    /// It cannot be re-probed on reload: the running Caddy holds the port, so
+    /// the probe failed and every reload silently dropped `:80`.
+    http_listener: std::sync::Mutex<Option<(u16, bool)>>,
 }
+
+/// `@id` stamped on the gateway server so the app only adopts a Caddy it
+/// configured itself, never a system Caddy that happens to use :2019.
+const GATEWAY_ID: &str = "hsx2dock_gateway";
 
 impl CaddySupervisor {
     pub fn new() -> Self {
         Self {
             child: Arc::new(Mutex::new(None)),
             paths: CaddyPaths::for_app(),
+            http_listener: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Serve `http_port` only when it is free. Probed when the port is first
+    /// used (before our Caddy binds it) and remembered for later reloads.
+    fn bind_http(&self, http_port: u16, owns_port: bool) -> bool {
+        let mut guard = self.http_listener.lock().unwrap_or_else(|e| e.into_inner());
+        match *guard {
+            Some((port, bind)) if port == http_port && owns_port => bind,
+            _ => {
+                let bind = is_port_available(http_port);
+                *guard = Some((http_port, bind));
+                bind
+            }
         }
     }
 
@@ -385,8 +440,9 @@ impl CaddySupervisor {
                 }
             }
         }
-        // Also probe admin API on port 2019 in case process was started externally
-        is_admin_api_live().await
+        // A Caddy this app configured in an earlier session (e.g. after a
+        // crash) is adopted; any other Caddy on :2019 is not ours.
+        is_gateway_live().await
     }
 
     pub async fn start(
@@ -405,7 +461,12 @@ impl CaddySupervisor {
             bail!("Caddy binary not installed yet at {}", bin.display());
         }
 
-        let initial_json = generate_caddy_json(http_port, https_port, routes)?;
+        if is_admin_api_live().await {
+            bail!("Another program is already using the Caddy admin port 127.0.0.1:2019; stop it before starting the gateway");
+        }
+
+        let bind_http = self.bind_http(http_port, false);
+        let initial_json = generate_caddy_json(http_port, https_port, routes, bind_http)?;
 
         let mut cmd = Command::new(&bin);
         cmd.args(["run", "--config", "-", "--adapter", ""]);
@@ -426,7 +487,7 @@ impl CaddySupervisor {
         let mut ready = false;
         for _ in 0..30 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if is_admin_api_live().await {
+            if is_gateway_live().await {
                 ready = true;
                 break;
             }
@@ -480,7 +541,8 @@ impl CaddySupervisor {
         https_port: u16,
         routes: &[GatewayRoute],
     ) -> Result<()> {
-        let json_body = generate_caddy_json(http_port, https_port, routes)?;
+        let bind_http = self.bind_http(http_port, true);
+        let json_body = generate_caddy_json(http_port, https_port, routes, bind_http)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
@@ -506,10 +568,22 @@ impl CaddySupervisor {
         if !bin.is_file() {
             bail!("Caddy is not installed");
         }
-        let output = Command::new(&bin)
-            .arg("trust")
-            .output()
+        // `caddy trust` escalates through sudo to write the system store. With
+        // no terminal, sudo waited on a password prompt nobody could answer
+        // and the call never returned. stdin is closed so sudo fails fast
+        // (pkexec/polkit dialogs still work), and the whole run is bounded.
+        let mut cmd = Command::new(&bin);
+        cmd.arg("trust")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "caddy trust did not finish within 2 minutes (it may be waiting for an \
+                     administrator password); run `caddy trust` in a terminal instead"
+                )
+            })?
             .context("Failed to run 'caddy trust'")?;
 
         if !output.status.success() {
@@ -531,17 +605,47 @@ pub async fn is_admin_api_live() -> bool {
     }
 }
 
+/// True when the Caddy on :2019 carries this app's gateway config.
+pub async fn is_gateway_live() -> bool {
+    let Ok(c) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    else {
+        return false;
+    };
+    c.get(format!("http://127.0.0.1:2019/id/{GATEWAY_ID}"))
+        .send()
+        .await
+        .map_or(false, |r| r.status().is_success())
+}
+
 pub fn is_port_available(port: u16) -> bool {
     use std::net::TcpListener;
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 /// Builds dynamic Caddy JSON configuration
-pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRoute]) -> Result<String> {
+pub fn generate_caddy_json(
+    http_port: u16,
+    https_port: u16,
+    routes: &[GatewayRoute],
+    can_bind_http: bool,
+) -> Result<String> {
     let mut server_routes = Vec::new();
     let mut tls_subjects = Vec::new();
 
-    for r in routes {
+    // Routes are terminal, so the first match wins: the most specific path of
+    // a host must come first, or `app.test` (no path) would swallow
+    // `app.test/api` whenever it was listed earlier.
+    let mut ordered: Vec<&GatewayRoute> = routes.iter().collect();
+    ordered.sort_by(|a, b| {
+        let (ha, pa) = route_host_path(a);
+        let (hb, pb) = route_host_path(b);
+        ha.cmp(&hb)
+            .then_with(|| pb.as_deref().map_or(0, str::len).cmp(&pa.as_deref().map_or(0, str::len)))
+    });
+
+    for r in ordered {
         if !r.enabled {
             continue;
         }
@@ -572,9 +676,10 @@ pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRou
         });
 
         if let Some(ref p) = effective_path {
+            // `/api*` would also match `/apiv2`; match the segment exactly.
             match_rules.as_object_mut().unwrap().insert(
                 "path".to_string(),
-                serde_json::json!([format!("{p}*")]),
+                serde_json::json!([p, format!("{p}/*")]),
             );
         }
 
@@ -634,13 +739,13 @@ pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRou
     };
 
     let mut listen_addrs = Vec::new();
-    let can_bind_http = is_port_available(http_port);
     if can_bind_http {
         listen_addrs.push(format!(":{http_port}"));
     }
     listen_addrs.push(format!(":{https_port}"));
 
     let mut gateway_server = serde_json::json!({
+        "@id": GATEWAY_ID,
         "listen": listen_addrs,
         "routes": server_routes
     });
@@ -675,6 +780,82 @@ pub fn generate_caddy_json(http_port: u16, https_port: u16, routes: &[GatewayRou
     });
 
     Ok(serde_json::to_string(&config)?)
+}
+
+/// Host and normalised path of a route, as the matcher sees them.
+fn route_host_path(r: &GatewayRoute) -> (String, Option<String>) {
+    let clean = r
+        .domain
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let (host, domain_path) = match clean.split_once('/') {
+        Some((h, p)) => (h.trim().to_string(), Some(format!("/{}", p.trim()))),
+        None => (clean.to_string(), None),
+    };
+    let path = match (&r.path, domain_path) {
+        (Some(p), _) if !p.trim().is_empty() => {
+            let t = p.trim().trim_end_matches('/');
+            Some(if t.starts_with('/') { t.to_string() } else { format!("/{t}") })
+        }
+        (_, dp) => dp,
+    };
+    (host.to_lowercase(), path.filter(|p| p != "/"))
+}
+
+fn valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// Rejects routes Caddy or the hosts file cannot represent, before they are
+/// saved: a host with spaces became two hostnames in /etc/hosts, a target
+/// without a port never dialled, and duplicates shadowed each other.
+pub fn validate_routes(routes: &[GatewayRoute]) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    let mut keys = std::collections::HashSet::new();
+    for r in routes {
+        if r.id.trim().is_empty() || !ids.insert(r.id.trim().to_string()) {
+            bail!("Duplicate or empty route id '{}'", r.id);
+        }
+        let (host, path) = route_host_path(r);
+        if !valid_hostname(&host) {
+            bail!("'{}' is not a valid domain (letters, digits, '-' and '.' only)", r.domain.trim());
+        }
+        if let Some(p) = &path {
+            if p.chars().any(|c| c.is_whitespace() || c == '*' || c == '?' || c == '#') {
+                bail!("Path '{p}' of {host} contains characters a path prefix cannot have");
+            }
+        }
+        let target = r
+            .target
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        let port_ok = target
+            .rsplit_once(':')
+            .map(|(h, p)| !h.is_empty() && p.parse::<u16>().map_or(false, |n| n > 0))
+            .unwrap_or(false);
+        if !port_ok || target.contains('/') || target.chars().any(char::is_whitespace) {
+            bail!("Target '{}' of {host} must be host:port, e.g. 127.0.0.1:8080", r.target.trim());
+        }
+        if r.enabled && !keys.insert((host.clone(), path.clone())) {
+            bail!(
+                "Two enabled routes use {host}{}; only the first would ever match",
+                path.as_deref().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------- /etc/hosts helpers ----------------
@@ -868,98 +1049,158 @@ pub fn save_raw_hosts_content(new_content: &str) -> Result<()> {
         }
     }
 
+    let original = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+    write_hosts(new_content, &original)
+}
+
+/// The hosts file without the app's managed block.
+///
+/// Only a complete BEGIN…END pair is removed. A BEGIN whose END the user
+/// deleted used to swallow every following line — the user's own entries —
+/// on the next save; now only the stray marker line goes.
+fn without_managed_block(original: &str) -> Vec<String> {
+    let lines: Vec<&str> = original.lines().collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == HOSTS_MARKER_BEGIN {
+            if let Some(end) = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == HOSTS_MARKER_END)
+            {
+                i += end + 2;
+                continue;
+            }
+            i += 1; // stray BEGIN: drop the marker, keep what follows
+            continue;
+        }
+        if lines[i].trim() == HOSTS_MARKER_END {
+            i += 1; // stray END
+            continue;
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    out
+}
+
+/// Writes /etc/hosts, skipping the write (and the password prompt) when the
+/// content is unchanged. Elevation pipes the content to `pkexec tee` instead
+/// of copying a predictably named temp file another user could swap.
+fn write_hosts(new_content: &str, original: &str) -> Result<()> {
+    if new_content == original {
+        return Ok(());
+    }
     if std::fs::write("/etc/hosts", new_content).is_ok() {
         return Ok(());
     }
-
-    let tmp_file = std::env::temp_dir().join(format!("hsx2dock-raw-hosts-{}", std::process::id()));
-    std::fs::write(&tmp_file, new_content).context("Failed to write temporary hosts file")?;
-
-    let status = std::process::Command::new("pkexec")
-        .args(["cp", tmp_file.to_str().unwrap(), "/etc/hosts"])
-        .status();
-
-    let _ = std::fs::remove_file(&tmp_file);
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => bail!("Failed to save /etc/hosts (pkexec exit code {:?})", s.code()),
-        Err(e) => bail!("Failed to invoke pkexec: {e}"),
+    use std::io::Write;
+    let mut child = std::process::Command::new("pkexec")
+        .args(["tee", "/etc/hosts"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to invoke pkexec")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(new_content.as_bytes())
+            .context("Failed to pass the hosts content to pkexec")?;
+    }
+    let out = child.wait_with_output().context("pkexec did not finish")?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        // 126: the user dismissed the authentication dialog.
+        Some(126) => bail!("Updating /etc/hosts was cancelled at the password prompt"),
+        code => bail!(
+            "Failed to update /etc/hosts (pkexec exit code {code:?}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
     }
 }
 
 pub fn clear_app_hosts_entries() -> Result<()> {
     let original = std::fs::read_to_string("/etc/hosts").context("Cannot read /etc/hosts")?;
-    let mut lines = Vec::new();
-    let mut inside = false;
-
-    for line in original.lines() {
-        if line.trim() == HOSTS_MARKER_BEGIN {
-            inside = true;
-            continue;
-        }
-        if line.trim() == HOSTS_MARKER_END {
-            inside = false;
-            continue;
-        }
-        if !inside {
-            lines.push(line.to_string());
-        }
-    }
-
-    let cleaned = lines.join("\n") + "\n";
-    save_raw_hosts_content(&cleaned)
+    let cleaned = without_managed_block(&original).join("\n") + "\n";
+    write_hosts(&cleaned, &original)
 }
 
 pub fn update_hosts_file(routes: &[GatewayRoute]) -> Result<()> {
     let status = inspect_hosts_sync(routes);
     let original = std::fs::read_to_string("/etc/hosts").context("Cannot read /etc/hosts")?;
+    let new_content = hosts_with_managed_block(&original, &status.managed_domains);
+    write_hosts(&new_content, &original)
+}
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut inside_block = false;
-
-    for line in original.lines() {
-        if line.trim() == HOSTS_MARKER_BEGIN {
-            inside_block = true;
-            continue;
-        }
-        if line.trim() == HOSTS_MARKER_END {
-            inside_block = false;
-            continue;
-        }
-        if !inside_block {
-            lines.push(line.to_string());
-        }
-    }
-
-    if !status.managed_domains.is_empty() {
+/// `original` with the managed block replaced by one for `domains`.
+fn hosts_with_managed_block(original: &str, domains: &[String]) -> String {
+    let mut lines = without_managed_block(original);
+    if !domains.is_empty() {
         lines.push(HOSTS_MARKER_BEGIN.to_string());
-        for domain in &status.managed_domains {
+        for domain in domains {
             lines.push(format!("127.0.0.1\t{domain}"));
         }
         lines.push(HOSTS_MARKER_END.to_string());
     }
+    lines.join("\n") + "\n"
+}
 
-    let new_content = lines.join("\n") + "\n";
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Try direct write first (if running as root / permissive permissions)
-    if std::fs::write("/etc/hosts", &new_content).is_ok() {
-        return Ok(());
+    fn route(id: &str, domain: &str, path: Option<&str>, target: &str) -> GatewayRoute {
+        GatewayRoute {
+            id: id.into(),
+            domain: domain.into(),
+            target: target.into(),
+            path: path.map(Into::into),
+            strip_prefix: None,
+            container_name: None,
+            group_name: None,
+            enabled: true,
+            auto_detected: false,
+        }
     }
 
-    // Write to a temporary file, then use pkexec or tee
-    let tmp_file = std::env::temp_dir().join(format!("hsx2dock-hosts-{}", std::process::id()));
-    std::fs::write(&tmp_file, &new_content).context("Failed to write temporary hosts file")?;
+    #[test]
+    fn a_missing_end_marker_keeps_the_users_lines() {
+        let hosts = format!("127.0.0.1 localhost\n{HOSTS_MARKER_BEGIN}\n127.0.0.1\told.test\n10.0.0.5 nas.lan\n");
+        let out = without_managed_block(&hosts);
+        assert!(out.iter().any(|l| l == "10.0.0.5 nas.lan"));
+        assert!(!out.iter().any(|l| l.trim() == HOSTS_MARKER_BEGIN));
+    }
 
-    let status = std::process::Command::new("pkexec")
-        .args(["cp", tmp_file.to_str().unwrap(), "/etc/hosts"])
-        .status();
+    #[test]
+    fn a_complete_block_is_replaced_and_unchanged_content_is_stable() {
+        let domains = vec!["app.test".to_string()];
+        let first = hosts_with_managed_block("127.0.0.1 localhost\n", &domains);
+        assert_eq!(hosts_with_managed_block(&first, &domains), first);
+        assert!(first.contains("127.0.0.1\tapp.test"));
+    }
 
-    let _ = std::fs::remove_file(&tmp_file);
+    #[test]
+    fn specific_paths_come_first_and_match_whole_segments() {
+        let routes = vec![
+            route("1", "app.test", None, "127.0.0.1:3000"),
+            route("2", "app.test", Some("/api"), "127.0.0.1:4000"),
+        ];
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_caddy_json(80, 443, &routes, true).unwrap()).unwrap();
+        let first = &json["apps"]["http"]["servers"]["gateway"]["routes"][0]["match"][0];
+        assert_eq!(first["path"], serde_json::json!(["/api", "/api/*"]));
+        assert_eq!(json["apps"]["http"]["servers"]["gateway"]["listen"][0], ":80");
+    }
 
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => bail!("Failed to update /etc/hosts with pkexec (exit code {:?})", s.code()),
-        Err(e) => bail!("Failed to invoke pkexec: {e}"),
+    #[test]
+    fn invalid_routes_are_rejected() {
+        assert!(validate_routes(&[route("1", "my app.test", None, "127.0.0.1:80")]).is_err());
+        assert!(validate_routes(&[route("1", "app.test", None, "127.0.0.1")]).is_err());
+        assert!(validate_routes(&[
+            route("1", "app.test", Some("/x"), "127.0.0.1:80"),
+            route("2", "app.test", Some("/x/"), "127.0.0.1:81"),
+        ])
+        .is_err());
+        assert!(validate_routes(&[route("1", "app.test", Some("/api"), "localhost:8080")]).is_ok());
     }
 }

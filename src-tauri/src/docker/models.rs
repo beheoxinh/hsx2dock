@@ -254,7 +254,7 @@ pub fn registry_host_for_image(image: &str) -> String {
     // forms; when no registry is explicit, the engine treats it as docker.io.
     // Names without a `.` or `:` in the first component are usually Docker Hub
     // namespaces (e.g. "library", "username"), not registry hosts.
-    if !first.contains('.') && !first.contains(':') {
+    if first != "localhost" && !first.contains('.') && !first.contains(':') {
         return "docker.io".to_string();
     }
     first.to_string()

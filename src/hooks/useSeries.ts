@@ -1,7 +1,9 @@
 import { useCallback, useState } from "react";
 
 export function useSeries<T>(maxPoints = 90, initial: T[] = []) {
-  const [samples, setSamples] = useState<T[]>(initial);
+  // Copied: callers seed from a module-level cache they keep appending to,
+  // and sharing the array made the first push after a remount land twice.
+  const [samples, setSamples] = useState<T[]>(() => initial.slice(-maxPoints));
   const push = useCallback(
     (s: T) => {
       setSamples((p) => {

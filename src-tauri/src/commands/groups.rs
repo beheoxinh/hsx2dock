@@ -66,8 +66,18 @@ pub(crate) async fn save_container_groups_core(
     validate_groups(&groups)?;
     {
         let mut cfg = state.config.write().await;
-        cfg.container_groups = groups;
-        cfg.save().await.map_err(|e| e.to_string())?;
+        // Save a copy first: on a write error memory must keep the old
+        // groups, or the next unrelated save would persist the rejected ones.
+        let mut next = cfg.clone();
+        next.container_groups = groups;
+        next.save().await.map_err(|e| e.to_string())?;
+        *cfg = next;
+        // Emitted under the write lock so listeners see saves in commit order.
+        // MCP edits reach the open window through this too; before, the UI
+        // kept its stale copy and its next save silently undid them.
+        state
+            .ops
+            .emit("container-groups-changed", &cfg.container_groups);
     }
     schedule_restart_policy_sync(state.clone());
     Ok(())
@@ -168,8 +178,9 @@ pub async fn enforce_groups_restart_policy(
                     Ok(d) => d.restart_policy,
                     Err(_) => return (id, None),
                 };
-                if current == target {
-                    return (id, Some(current));
+                if policy_satisfies(&current, target) {
+                    // Remembered as the target so the next pass skips it.
+                    return (id, Some(target.to_string()));
                 }
                 match client.update_restart_policy(&id, target).await {
                     Ok(()) => (id, Some(target.to_string())),
@@ -192,6 +203,21 @@ pub async fn enforce_groups_restart_policy(
         }
     }
     Ok(())
+}
+
+/// Whether a container's current restart policy already does what the group
+/// switch asks. Only the resurrect-on-boot policies are the app's to change:
+/// `on-failure[:N]` is a crash-recovery choice the user made (the boot pass
+/// stops it if the engine brings it back), and `always` already resurrects.
+fn policy_satisfies(current: &str, target: &str) -> bool {
+    let current = current.trim();
+    if current.starts_with("on-failure") {
+        return true;
+    }
+    match target {
+        "unless-stopped" => matches!(current, "unless-stopped" | "always"),
+        _ => matches!(current, "" | "no"),
+    }
 }
 
 /// Starts every stopped member of a group.
@@ -424,7 +450,9 @@ pub(crate) async fn set_group_power(
                 .collect(),
             Err(_) => Vec::new(),
         };
-        if !state.ops.begin_group(id, op, members.len().max(1)) {
+        // The CLI reports no per-container progress: total 0 makes the UI
+        // show "Starting…" instead of a counter stuck at 0/N.
+        if !state.ops.begin_group(id, op, 0) {
             return Err("This project is already being started or stopped".to_string());
         }
         let claimed: Vec<String> = members
@@ -457,7 +485,9 @@ pub(crate) async fn set_group_power(
             .map_err(|e| e.to_string())?;
         let members = resolve_members(state, &live, id).await?;
         if members.is_empty() {
-            return Err("The group has no containers".to_string());
+            // Not a failure: an empty group (or Isolated with everything
+            // grouped) with auto-start on used to toast an error every boot.
+            return Ok("nothing to do: the group has no containers".to_string());
         }
         let total = members.len();
         let targets: Vec<ContainerItem> = members
@@ -499,7 +529,7 @@ pub(crate) async fn set_group_power(
 ///
 /// Both passes run with bounded concurrency and report through the ops
 /// registry, so a large engine no longer takes one container at a time.
-pub async fn auto_start_groups(state: &AppState, _restored_since: i64) {
+pub async fn auto_start_groups(state: &AppState, restored_since: i64) {
     // Give dockerd a brief moment to finish its internal container restore pass
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -520,18 +550,53 @@ pub async fn auto_start_groups(state: &AppState, _restored_since: i64) {
         let _ = enforce_groups_restart_policy(state, &groups).await;
     }
 
+    let mut live_projects: HashSet<String> = HashSet::new();
     if let Ok(client) = state.get_client().await {
         if let Ok(containers) = client.list_containers(true).await {
-            let to_stop: Vec<ContainerItem> = containers
+            live_projects = containers
+                .iter()
+                .filter_map(|c| c.compose_project.clone())
+                .collect();
+            let candidates: Vec<ContainerItem> = containers
                 .into_iter()
                 .filter(|c| c.state == "running")
                 .filter(|c| auto_start_for(&groups, &allowed, c) == Some(false))
                 .collect();
+            // Only what Docker restored during this engine start is undone.
+            // A container already running before the app opened (the engine
+            // outlived the app, or belongs to another owner) was started on
+            // purpose and is left alone.
+            let to_stop: Vec<ContainerItem> = if restored_since > 0 {
+                let checks: Vec<_> = candidates
+                    .into_iter()
+                    .map(|c| {
+                        let client = client.clone();
+                        async move {
+                            let started = client.container_started_at(&c.id).await.unwrap_or(0);
+                            (started >= restored_since).then_some(c)
+                        }
+                    })
+                    .collect();
+                stream::iter(checks)
+                    .buffer_unordered(BULK_CONCURRENCY)
+                    .filter_map(|c| async move { c })
+                    .collect()
+                    .await
+            } else {
+                candidates
+            };
             if !to_stop.is_empty() {
                 tracing::info!("auto-start: stopping {} containers whose group is off", to_stop.len());
-                let (_, _, errors) = power_many(state, &client, None, to_stop, false).await;
-                for e in errors {
-                    tracing::warn!("auto-start stop failed: {e}");
+                // One summarised failure instead of a toast per container.
+                const PASS_ID: &str = "__autostart__";
+                if state.ops.begin_group(PASS_ID, "stop", to_stop.len()) {
+                    let (done, busy, errors) =
+                        power_many(state, &client, Some(PASS_ID), to_stop, false).await;
+                    let mut summary = format!("{done} stopped, {busy} skipped");
+                    if !errors.is_empty() {
+                        summary.push_str(&format!("; failed: {}", errors.join("; ")));
+                    }
+                    state.ops.end_group(PASS_ID, &Ok(summary));
                 }
             }
         }
@@ -539,7 +604,16 @@ pub async fn auto_start_groups(state: &AppState, _restored_since: i64) {
 
     // Isolated first is arbitrary; groups run one after another so the
     // overall concurrency stays at BULK_CONCURRENCY.
-    let mut ids: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+    let mut ids: Vec<String> = allowed
+        .iter()
+        .filter(|id| match id.strip_prefix("compose:") {
+            // A saved switch for a project that no longer exists would fail
+            // (and toast) on every boot.
+            Some(project) => live_projects.contains(project),
+            None => true,
+        })
+        .map(|s| s.to_string())
+        .collect();
     ids.sort();
     for id in ids {
         match set_group_power(state, &id, true).await {
@@ -552,6 +626,16 @@ pub async fn auto_start_groups(state: &AppState, _restored_since: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_restart_policies_are_kept() {
+        assert!(policy_satisfies("on-failure", "no"));
+        assert!(policy_satisfies("on-failure", "unless-stopped"));
+        assert!(policy_satisfies("always", "unless-stopped"));
+        assert!(!policy_satisfies("always", "no"));
+        assert!(!policy_satisfies("no", "unless-stopped"));
+        assert!(policy_satisfies("", "no"));
+    }
 
     fn group(id: &str, name: &str, members: &[&str]) -> ContainerGroup {
         ContainerGroup {

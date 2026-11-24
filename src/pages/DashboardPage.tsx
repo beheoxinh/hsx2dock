@@ -93,6 +93,21 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   // snap to real figures a moment later.
   const loading = !dashboard.ready;
   const [pruning, setPruning] = useState(false);
+  // The node image is a setting (Settings → Kubernetes), not a constant.
+  const [nodeImage, setNodeImage] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .getAppConfig()
+      .then((cfg) => {
+        if (alive) setNodeImage(cfg.kind_default_image || null);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const kindNetwork = networks.find((n) => n.name === "kind");
 
   // Kind node ids, so their CPU/memory never inflates the user's charts.
   const kindIdsRef = useRef<Set<string>>(new Set());
@@ -119,6 +134,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     if (!isRunning) return;
     void refreshDashboardClusters();
     const timer = window.setInterval(() => {
+      // A window hidden to the tray polls nothing; the next visible tick catches up.
+      if (document.hidden) return;
       void refreshDashboardClusters();
     }, 10_000);
     return () => window.clearInterval(timer);
@@ -318,8 +335,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const k8sSpecRows: [string, string][] = [
     ["Kind Binary", kindStatus?.installed ? (kindStatus.version ? `v${kindStatus.version}` : "installed") : "not installed"],
     ["Clusters", clusters.length > 0 ? `${runningClusters}/${clusters.length} running` : "none"],
-    ["Kubernetes Node Image", "kindest/node:v1.37.0"],
-    ["Network Driver", "kind bridge (172.18.0.0/16)"],
+    ["Kubernetes Node Image", nodeImage ?? "kind default"],
+    [
+      "Network Driver",
+      kindNetwork
+        ? `kind ${kindNetwork.driver}${kindNetwork.subnet ? ` (${kindNetwork.subnet})` : ""}`
+        : "not created",
+    ],
     ["Kubeconfig", kindStatus?.installed ? "isolated (hsx2dock)" : "not created"],
   ];
 

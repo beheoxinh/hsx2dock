@@ -23,7 +23,9 @@ pub enum Access {
     Read,
     /// Creates or starts something. Safe to repeat; nothing is lost.
     Write,
-    /// Removes data. The only class that carries `destructiveHint`.
+    /// Removes data, or can (an arbitrary `container_exec` command, a manifest
+    /// that replaces live objects). The only class that carries
+    /// `destructiveHint`.
     Destructive,
 }
 
@@ -477,7 +479,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             description: "Run a command inside a container and return its combined stdout and \
                           stderr. Fails if the command exits non-zero. Best for short, \
                           non-interactive commands (`ls`, `cat`, `env`, `ps`).",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: false,
             input_schema: obj(&[
                 id_arg(),
@@ -1274,7 +1276,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             title: "Apply YAML to cluster",
             description: "Apply a Kubernetes manifest (YAML or JSON, possibly with several \
                           documents) to a kind cluster.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: false,
             input_schema: obj(&[
                 ("cluster", string(), true, "Cluster name"),

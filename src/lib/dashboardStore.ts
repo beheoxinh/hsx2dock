@@ -67,11 +67,21 @@ const cached = parseCachedDashboard(readStorage());
 let snapshot: DashboardStoreSnapshot = cached
   ? { ...EMPTY, ...cached.data, ready: true }
   : EMPTY;
-let statusFetchedAt = cached?.statusFetchedAt ?? 0;
-let listsFetchedAt = cached?.listsFetchedAt ?? 0;
+// The hydrated figures only paint the first frame. They may come from another
+// endpoint or an engine that has since changed, so the first prime always
+// revalidates instead of trusting stamps written by a previous run.
+let statusFetchedAt = 0;
+let listsFetchedAt = 0;
 
 const listeners = new Set<() => void>();
 let inflight: Promise<void> | null = null;
+/** A forced refresh requested while another fetch was running. */
+let forcedAfter: Promise<void> | null = null;
+/**
+ * Bumped by `resetDashboardEngineData`: a fetch that started before the
+ * engine stopped must not write the old engine's figures back afterwards.
+ */
+let epoch = 0;
 let clustersInflight: Promise<void> | null = null;
 
 /** Serialized form last written, and when — to skip redundant writes. */
@@ -83,19 +93,37 @@ let lastPersistAt = 0;
  * stamp up to this old is just as good for the next cold start.
  */
 const STAMP_PERSIST_INTERVAL_MS = 60_000;
+/** Above this the resource lists are left out of the persisted cache. */
+const MAX_PERSISTED_CHARS = 512 * 1024;
 
 function persist(stampsOnly = false) {
   try {
     if (typeof localStorage === "undefined") return;
     const now = Date.now();
     if (stampsOnly && now - lastPersistAt < STAMP_PERSIST_INTERVAL_MS) return;
-    const value = serializeDashboardCache(snapshot, statusFetchedAt, listsFetchedAt);
+    let value = serializeDashboardCache(snapshot, statusFetchedAt, listsFetchedAt);
+    if (value.length > MAX_PERSISTED_CHARS) {
+      // Hosts with thousands of images made this payload several MB, rewritten
+      // on every change and parsed on every cold start. Keep the small
+      // engine figures and let the lists be fetched again.
+      value = serializeDashboardCache(
+        { ...snapshot, images: [], volumes: [], networks: [] },
+        statusFetchedAt,
+        0
+      );
+    }
     if (value === lastPersisted) return;
     localStorage.setItem(STORAGE_KEY, value);
     lastPersisted = value;
     lastPersistAt = now;
   } catch {
-    /* storage disabled or full — the cache is a convenience, not a requirement */
+    // Storage disabled or full — the cache is a convenience, not a
+    // requirement. Drop the old payload so a stale one is not painted forever.
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -150,7 +178,20 @@ function getSnapshot(): DashboardStoreSnapshot {
  * and a call on a fresh cache is a no-op.
  */
 export function primeDashboardStore(force = false): Promise<void> {
-  if (inflight) return inflight;
+  if (inflight) {
+    // Returning the running fetch dropped `force`: an engine start or
+    // endpoint switch landing mid-fetch kept that fetch's stale lists for up
+    // to LISTS_TTL. Run once more after it instead.
+    if (!force) return inflight;
+    if (!forcedAfter) {
+      forcedAfter = inflight.then(() => {
+        forcedAfter = null;
+        return primeDashboardStore(true);
+      });
+    }
+    return forcedAfter;
+  }
+  const startedEpoch = epoch;
 
   const now = Date.now();
   const cold = !snapshot.ready;
@@ -197,6 +238,7 @@ export function primeDashboardStore(force = false): Promise<void> {
       if (networksR.status === "fulfilled") patch.networks = networksR.value;
     }
 
+    if (startedEpoch !== epoch) return;
     applyData(patch, { status: statusDue, lists: listsDue });
   })();
   inflight = run.finally(() => {
@@ -232,6 +274,7 @@ export function refreshDashboardClusters(): Promise<void> {
 
 /** Clear engine-specific figures when the daemon stops. */
 export function resetDashboardEngineData() {
+  epoch++;
   statusFetchedAt = 0;
   listsFetchedAt = 0;
   commit({

@@ -121,9 +121,25 @@ pub async fn write_token(path: &std::path::Path, token: &str) -> Result<(), Stri
         token: token.to_string(),
     })
     .map_err(|e| e.to_string())?;
-    tokio::fs::write(path, body)
+    // Created owner-only: writing first and chmod-ing after left the token
+    // world-readable for a moment.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let p = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&p)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+        })
         .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

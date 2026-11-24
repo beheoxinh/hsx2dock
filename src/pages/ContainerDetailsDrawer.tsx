@@ -18,6 +18,7 @@ import { InteractiveTerminal } from "../components/terminal/InteractiveTerminal"
 import { useTerminalFontSize } from "../lib/terminalSettings";
 import { useToast } from "../components/ui/Toast";
 import { api } from "../lib/api";
+import { primeContainerStore } from "../lib/containerStore";
 import { formatBytes } from "../lib/utils";
 import type { ContainerDetails, ContainerStats, ResourceLimits } from "../types";
 
@@ -142,6 +143,8 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     try {
       setSavingName(true);
       await api.renameContainer(containerId, next);
+      // Routes and group members follow the new name on the backend.
+      void primeContainerStore(true);
       toast.success("Container renamed", `Now named ${next}`);
       setRenaming(false);
       await loadAll();

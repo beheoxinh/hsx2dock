@@ -72,7 +72,7 @@ impl OpsRegistry {
         let _ = self.app.set(app);
     }
 
-    fn emit<T: serde::Serialize + Clone>(&self, event: &str, payload: &T) {
+    pub(crate) fn emit<T: serde::Serialize + Clone>(&self, event: &str, payload: &T) {
         if let Some(app) = self.app.get() {
             let _ = app.emit(event, payload.clone());
         }

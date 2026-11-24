@@ -47,6 +47,12 @@ pub struct AppState {
     /// ping before doing its real work; a fresh check is reused for a few
     /// seconds instead, which halves the round trips of a bulk action.
     client_checked: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Bumped by `invalidate_client`. A client is only stored (and a cached
+    /// one only trusted) when it was built in the current generation, so an
+    /// endpoint switch cannot be undone by a connect that was already in
+    /// flight against the old endpoint.
+    client_gen: std::sync::atomic::AtomicU64,
+    cached_gen: std::sync::atomic::AtomicU64,
     /// Serialises background restart-policy reconciliation passes.
     pub restart_policy_lock: Arc<tokio::sync::Mutex<()>>,
     /// A reconciliation pass is already queued; further saves just ride it.
@@ -93,6 +99,8 @@ impl AppState {
             restart_policy_lock: Arc::new(tokio::sync::Mutex::new(())),
             restart_policy_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             restart_policy_seen: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            client_gen: std::sync::atomic::AtomicU64::new(0),
+            cached_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -110,7 +118,14 @@ impl AppState {
     }
 
     pub async fn get_client(&self) -> Result<DockerClient, String> {
-        let cached = self.client.read().await.clone();
+        use std::sync::atomic::Ordering;
+        let gen = self.client_gen.load(Ordering::Acquire);
+        let cached = self
+            .client
+            .read()
+            .await
+            .clone()
+            .filter(|_| self.cached_gen.load(Ordering::Acquire) == gen);
         if let Some(c) = cached {
             let fresh = self
                 .client_checked
@@ -139,7 +154,8 @@ impl AppState {
             }
         };
 
-        let mut write_guard = self.client.write().await;
+        // Connect and ping without the write lock: a dead endpoint used to
+        // hold it for the whole ping and stall every command behind it.
         let client = match remote {
             Some(ep) => {
                 DockerClient::connect_for_endpoint(&ep.kind, &ep.uri, Some(&self.engine.socket()))
@@ -155,9 +171,13 @@ impl AppState {
             Ok(_) => client,
             Err(e) => return Err(format!("Docker daemon not reachable: {e}")),
         };
-        *write_guard = Some(client.clone());
-        drop(write_guard);
-        self.mark_client_checked();
+        let mut write_guard = self.client.write().await;
+        if self.client_gen.load(Ordering::Acquire) == gen {
+            *write_guard = Some(client.clone());
+            self.cached_gen.store(gen, Ordering::Release);
+            drop(write_guard);
+            self.mark_client_checked();
+        }
         Ok(client)
     }
 
@@ -213,6 +233,8 @@ impl AppState {
     /// Drops the cached client so the next `get_client` reconnects to whatever
     /// the active endpoint is now.
     pub fn invalidate_client(&self) {
+        self.client_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Ok(mut g) = self.client_checked.lock() {
             *g = None;
         }

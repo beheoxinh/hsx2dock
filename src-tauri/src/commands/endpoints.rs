@@ -98,15 +98,42 @@ pub async fn test_endpoint(ep: EndpointInput) -> Result<EndpointStatus, String> 
 
 #[tauri::command]
 pub async fn save_endpoint(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     ep: EndpointInput,
 ) -> Result<(), String> {
-    save_endpoint_core(&state, ep).await
+    if save_endpoint_core(&state, ep).await? {
+        let _ = app.emit("endpoint-changed", active_id(&state).await);
+    }
+    Ok(())
 }
 
-/// App-free core of [`save_endpoint`].
-pub(crate) async fn save_endpoint_core(state: &AppState, ep: EndpointInput) -> Result<(), String> {
+async fn active_id(state: &AppState) -> String {
+    state
+        .config
+        .read()
+        .await
+        .active_endpoint
+        .clone()
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Point the client, the CLI shim and the CLI bridge at whatever the config
+/// now says is active. Editing or removing the active endpoint used to leave
+/// all three talking to the old target until the next restart.
+async fn retarget(state: &AppState) {
+    state.invalidate_client();
+    crate::commands::system::refresh_shim(state, &*state.config.read().await);
+    let _ = crate::commands::system::apply_cli_bridge(state).await;
+}
+
+/// App-free core of [`save_endpoint`]. Returns true when the saved endpoint
+/// is the active one, so the connection was retargeted.
+pub(crate) async fn save_endpoint_core(state: &AppState, ep: EndpointInput) -> Result<bool, String> {
     validate_endpoint(&ep.kind, &ep.uri)?;
+    if ep.id.as_deref() == Some("local") {
+        return Err("The bundled engine cannot be edited".to_string());
+    }
     // Verify reachability before saving (the UI will have tested it too; this
     // guards against TOCTOU while still keeping the form simple).
     let socket = None;
@@ -123,28 +150,41 @@ pub(crate) async fn save_endpoint_core(state: &AppState, ep: EndpointInput) -> R
         kind: ep.kind.clone(),
         uri: ep.uri.clone(),
     };
-    {
+    let is_active = {
         let mut config = state.config.write().await;
-        let mut next: Vec<EndpointConfig> = config.endpoints.clone();
-        next.retain(|x| x.id != id);
-        next.push(cfg);
-        config.endpoints = next;
-    }
+        // Edit in place so the list keeps its order.
+        match config.endpoints.iter_mut().find(|x| x.id == id) {
+            Some(slot) => *slot = cfg,
+            None => config.endpoints.push(cfg),
+        }
+        config.active_endpoint.as_deref() == Some(id.as_str())
+    };
     state.save_config().await?;
-    Ok(())
+    if is_active {
+        retarget(state).await;
+    }
+    Ok(is_active)
 }
 
 #[tauri::command]
-pub async fn remove_endpoint(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    remove_endpoint_core(&state, &id).await
+pub async fn remove_endpoint(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    if remove_endpoint_core(&state, &id).await? {
+        let _ = app.emit("endpoint-changed", "local");
+    }
+    Ok(())
 }
 
-/// App-free core of [`remove_endpoint`].
-pub(crate) async fn remove_endpoint_core(state: &AppState, id: &str) -> Result<(), String> {
+/// App-free core of [`remove_endpoint`]. Returns true when the removed
+/// endpoint was active and the app fell back to the bundled engine.
+pub(crate) async fn remove_endpoint_core(state: &AppState, id: &str) -> Result<bool, String> {
     if id == "local" {
         return Err("Cannot remove the bundled engine".to_string());
     }
-    {
+    let was_active = {
         let mut config = state.config.write().await;
         let before = config.endpoints.len();
         config.endpoints.retain(|x| x.id != id);
@@ -152,12 +192,17 @@ pub(crate) async fn remove_endpoint_core(state: &AppState, id: &str) -> Result<(
             // Nothing removed: return a non-destructive error to the UI.
             return Err("Unknown endpoint".to_string());
         }
-        if config.active_endpoint.as_deref() == Some(id) {
+        let was_active = config.active_endpoint.as_deref() == Some(id);
+        if was_active {
             config.active_endpoint = None;
         }
-    }
+        was_active
+    };
     state.save_config().await?;
-    Ok(())
+    if was_active {
+        retarget(state).await;
+    }
+    Ok(was_active)
 }
 
 #[tauri::command]
@@ -198,8 +243,8 @@ pub async fn set_active_endpoint(
         config.active_endpoint = Some(id.clone());
     }
     state.save_config().await?;
-    state.invalidate_client();
-    crate::commands::system::refresh_shim(&state, &*state.config.read().await);
+    // Same retarget as the local branch, which also re-pointed the CLI bridge.
+    retarget(&state).await;
     let _ = app.emit("endpoint-changed", id);
     Ok(())
 }

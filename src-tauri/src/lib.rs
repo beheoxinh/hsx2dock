@@ -10,6 +10,7 @@ pub mod fsutil;
 pub mod mcp;
 pub mod migrate;
 pub mod ops;
+pub mod procutil;
 pub mod runtime;
 pub mod state;
 pub mod tray;
@@ -121,7 +122,17 @@ fn start_background_monitoring(app_handle: AppHandle) {
                 // the config on with nothing linked. Re-apply on every
                 // transition; reconcile is a no-op when the bridge is off.
                 if is_live {
-                    let _ = crate::commands::system::apply_cli_bridge(&state).await;
+                    // Bounded: this runs on the monitor loop, and a hung
+                    // bridge apply used to stall every tick behind it.
+                    if tokio::time::timeout(
+                        Duration::from_secs(10),
+                        crate::commands::system::apply_cli_bridge(&state),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!("applying the CLI bridge timed out");
+                    }
                     // Every path that brings the engine up (app open with
                     // auto-start, manual start, restart after crash) gets
                     // the configured caps + group auto-start. Off the
@@ -139,7 +150,13 @@ fn start_background_monitoring(app_handle: AppHandle) {
                         }
                         // Groups are this engine's lifecycle — never
                         // auto-start them into a remote endpoint.
-                        if st.config.read().await.active_endpoint.is_none() {
+                        // An engine this app does not own (socket from an
+                        // earlier session or another owner) was not just
+                        // booted: its containers are where the user left them.
+                        let owns_engine = st.engine.is_running();
+                        if st.config.read().await.active_endpoint.is_none()
+                            && (had_previous_state || owns_engine)
+                        {
                             let restored_since = if had_previous_state { 0 } else { app_started };
                             crate::commands::groups::auto_start_groups(&st, restored_since).await;
                         }
@@ -385,7 +402,11 @@ pub fn run() {
                         win.primary_monitor().or_else(|_| win.current_monitor())
                     {
                         let scale_factor = monitor.scale_factor();
-                        let screen_size = monitor.size();
+                        // The work area excludes panels/docks, so 95% of the
+                        // height never slides under a bottom bar. This is the
+                        // only startup resize: the frontend used to apply a
+                        // second one, so the window visibly jumped twice.
+                        let screen_size = monitor.work_area().size;
                         let target_width = (screen_size.width as f64 * 0.90) as u32;
                         let target_height = (screen_size.height as f64 * 0.95) as u32;
                         tracing::info!(

@@ -773,6 +773,17 @@ fn hash_file_with<D: Digest>(path: &Path) -> Result<String> {
 /// SHA-256 (Docker, compose, kind), 128 hex chars is SHA-512 — Caddy's release
 /// `checksums.txt` switched to SHA-512, so a pinned-sha256-only check rejected
 /// every genuine Caddy archive.
+/// The `docker` tarball digest an engine install of this version recorded in
+/// its `CHECKSUMS` file (`<sha256>  docker` lines).
+fn recorded_docker_sha(version_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(version_dir.join("CHECKSUMS")).ok()?;
+    text.lines().find_map(|l| {
+        let mut parts = l.split_whitespace();
+        let sha = parts.next()?;
+        (parts.next()? == "docker" && sha.len() == 64).then(|| sha.to_string())
+    })
+}
+
 pub fn verify(path: &Path, expected_hex: &str) -> Result<()> {
     let actual = match expected_hex.len() {
         64 => sha256_file(path)?,
@@ -1309,9 +1320,9 @@ fn selinux_enforcing() -> bool {
 }
 
 fn pasta_selinux_module_loaded() -> bool {
-    std::process::Command::new("semodule")
-        .arg("-l")
-        .output()
+    let mut cmd = std::process::Command::new("semodule");
+    cmd.arg("-l");
+    crate::procutil::output_with_timeout(cmd, Duration::from_secs(30), "semodule -l")
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| {
             l.split_whitespace().next() == Some(PASTA_SELINUX_MODULE_NAME)
@@ -1892,12 +1903,12 @@ where
         4,
         Some(0.85),
     ));
-    let probe = Command::new(bin_dir.join("docker"))
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("run the staged docker --version")?;
+    let probe = {
+        let mut cmd = Command::new(bin_dir.join("docker"));
+        cmd.arg("--version");
+        crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, "docker --version")
+            .context("run the staged docker --version")?
+    };
     let probe_out = format!(
         "{}{}",
         String::from_utf8_lossy(&probe.stdout),
@@ -1928,11 +1939,7 @@ where
     //    installed; `is_installed()` is checked via the `current` symlink only.
     fs::write(staging.join(".complete"), "")?;
     let _ = fs::remove_dir_all(&tmp);
-    let final_dir = paths.versions_dir.join(release.version);
-    let _ = fs::remove_dir_all(&final_dir);
-    fs::rename(&staging, &final_dir)
-        .with_context(|| format!("move staged engine to {}", final_dir.display()))?;
-    swap_current(paths, release.version)?;
+    activate_staged(paths, &staging, release.version)?;
 
     on_progress(InstallProgress::note(
         "engine",
@@ -1943,6 +1950,80 @@ where
         format!("Docker Engine {version} activated"),
     ));
     Ok(())
+}
+
+/// Move a fully staged tree to `versions/<version>` and point `current` at it.
+///
+/// Reinstalling the version already in place used to delete that tree before
+/// the rename, so a failed rename left `current` dangling and no engine at
+/// all. The old tree is now moved aside and only removed once the new one is
+/// live; any failure before that puts it back.
+fn activate_staged(paths: &EnginePaths, staging: &Path, version: &str) -> Result<()> {
+    let final_dir = paths.versions_dir.join(version);
+    let aside = paths.versions_dir.join(format!(
+        ".replaced-{version}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let moved_aside = if fs::symlink_metadata(&final_dir).is_ok() {
+        fs::rename(&final_dir, &aside)
+            .with_context(|| format!("move the existing {} aside", final_dir.display()))?;
+        true
+    } else {
+        false
+    };
+    let restore = || {
+        if moved_aside {
+            let _ = fs::remove_dir_all(&final_dir);
+            let _ = fs::rename(&aside, &final_dir);
+        }
+    };
+    if let Err(e) = fs::rename(staging, &final_dir) {
+        restore();
+        return Err(e).with_context(|| format!("move staged engine to {}", final_dir.display()));
+    }
+    let previous = fs::read_link(&paths.current_dir)
+        .ok()
+        .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()));
+    if let Err(e) = swap_current(paths, version) {
+        restore();
+        return Err(e);
+    }
+    if moved_aside {
+        let _ = fs::remove_dir_all(&aside);
+    }
+    prune_old_versions(&paths.versions_dir, version, previous.as_deref());
+    Ok(())
+}
+
+/// Drop engine trees nothing points at any more. Each update left a full
+/// engine (~250 MB) behind forever. The new version and the one it replaced
+/// are kept, the latter so a bad update can still be put back by hand; only
+/// directories that are recognisably ours (a `VERSION` or `.complete` marker,
+/// or a leftover `.staging-` / `.replaced-` dir) are touched.
+fn prune_old_versions(versions_dir: &Path, current: &str, previous: Option<&str>) {
+    let Ok(entries) = fs::read_dir(versions_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current || Some(name.as_str()) == previous {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let leftover = name.starts_with(".staging-") || name.starts_with(".replaced-");
+        let engine_tree = !name.starts_with('.')
+            && (path.join("VERSION").is_file() || path.join(".complete").is_file());
+        if leftover || engine_tree {
+            if let Err(e) = fs::remove_dir_all(&path) {
+                tracing::warn!("could not remove old engine tree {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 pub fn fraction_of(done: u64, total: Option<u64>) -> f64 {
@@ -2287,12 +2368,12 @@ where
         4,
         Some(0.85),
     ));
-    let probe = Command::new(bin_dir.join("docker"))
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("run the staged docker --version")?;
+    let probe = {
+        let mut cmd = Command::new(bin_dir.join("docker"));
+        cmd.arg("--version");
+        crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, "docker --version")
+            .context("run the staged docker --version")?
+    };
     let probe_out = format!(
         "{}{}",
         String::from_utf8_lossy(&probe.stdout),
@@ -2327,11 +2408,7 @@ where
     fs::write(staging.join("VERSION"), version)?;
     let _ = fs::remove_dir_all(&tmp);
     fs::write(staging.join(".complete"), "")?;
-    let final_dir = paths.versions_dir.join(version);
-    let _ = fs::remove_dir_all(&final_dir);
-    fs::rename(&staging, &final_dir)
-        .with_context(|| format!("move staged engine to {}", final_dir.display()))?;
-    swap_current(paths, version)?;
+    activate_staged(paths, &staging, version)?;
 
     on_progress(InstallProgress::note(
         "engine",
@@ -2847,11 +2924,9 @@ fn parse_checksums(text: &str, file_name: &str) -> Option<String> {
 
 /// Version token of `docker-compose version`, or `None` when it will not run.
 pub fn compose_plugin_version(bin: &Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("version")
-        .arg("--short")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["version", "--short"]);
+    let out = crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, "docker-compose version").ok()?;
     if !out.status.success() {
         return None;
     }
@@ -3169,21 +3244,32 @@ where
         1,
         Some(0.55),
     ));
-    // The pinned release has a maintainer-checked digest; any other version is
-    // fetched over TLS, and we record the digest we actually received.
-    let expected = if version == DEFAULT_RELEASE.version {
-        DEFAULT_RELEASE.docker_sha256.to_string()
-    } else {
-        sha256_file(&tarball)?
+    // Hashing the download and then "verifying" it against that same hash
+    // checked nothing, while the progress line read as a verified install.
+    // The tarball is the one the engine install fetches, so a digest recorded
+    // by an engine install of this version is a real cross-check; without one
+    // the download is only as trusted as TLS, and the note says so.
+    let pinned = (version == DEFAULT_RELEASE.version).then(|| DEFAULT_RELEASE.docker_sha256.to_string());
+    let recorded = pinned.or_else(|| recorded_docker_sha(&paths.versions_dir.join(&version)));
+    let (expected, note) = match recorded {
+        Some(sha) => {
+            verify(&tarball, &sha).context("verifying docker CLI tarball")?;
+            let note = format!("sha256 verified: {sha}");
+            (sha, note)
+        }
+        None => {
+            let sha = sha256_file(&tarball)?;
+            let note = format!("No published checksum for {version}; fetched over TLS, sha256 {sha}");
+            (sha, note)
+        }
     };
-    verify(&tarball, &expected).context("verifying docker CLI tarball")?;
     on_progress(InstallProgress::note(
         "cli",
         &version,
         &plan,
         1,
         Some(0.6),
-        format!("sha256 {expected}"),
+        note,
     ));
 
     on_progress(InstallProgress::stage("cli", &version, &plan, 2, Some(0.7)));
@@ -3975,6 +4061,35 @@ mod tests {
         assert!(cfg.1.ends_with("docker-config"));
         let path = envs.iter().find(|(k, _)| k == "PATH").expect("PATH set");
         assert!(path.1.starts_with(&p.bin_dir().display().to_string()));
+    }
+
+    #[test]
+    fn prune_keeps_current_previous_and_foreign_dirs() {
+        let root = std::env::temp_dir().join(format!("dm-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (name, marker) in [
+            ("27.0.0", Some("VERSION")),
+            ("28.0.0", Some("VERSION")),
+            ("29.0.0", Some(".complete")),
+            (".staging-26.0.0", None),
+            (".replaced-29.0.0-1", None),
+            ("notes", None),
+            (".legacy-current", None),
+        ] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            if let Some(m) = marker {
+                fs::write(root.join(name).join(m), "").unwrap();
+            }
+        }
+        prune_old_versions(&root, "29.0.0", Some("28.0.0"));
+        let mut left: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![".legacy-current", "28.0.0", "29.0.0", "notes"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

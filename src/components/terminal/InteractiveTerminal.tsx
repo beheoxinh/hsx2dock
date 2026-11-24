@@ -55,6 +55,8 @@ export const InteractiveTerminal: React.FC<InteractiveTerminalProps> = ({
   // Keeps the latest callback without re-running the session effect.
   const liveCallbackRef = useRef(onSessionLive);
   liveCallbackRef.current = onSessionLive;
+  const fontSizeRef = useRef(fontSize);
+  fontSizeRef.current = fontSize;
   const endedCallbackRef = useRef(onSessionEnded);
   endedCallbackRef.current = onSessionEnded;
 
@@ -79,7 +81,7 @@ export const InteractiveTerminal: React.FC<InteractiveTerminalProps> = ({
     const term = new Terminal({
       cursorBlink: true,
       disableStdin: true, // enabled once the session is live
-      fontSize,
+      fontSize: fontSizeRef.current,
       fontFamily: FONT_FAMILY,
       theme: {
         background: "#09090b",
@@ -240,7 +242,24 @@ export const InteractiveTerminal: React.FC<InteractiveTerminalProps> = ({
       fitAddonRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [containerId, debug, cmd?.join("\u0000"), fontSize]);
+  }, [containerId, debug, cmd?.join("\u0000")]);
+
+  // Font size changes restyle the live terminal; re-running the session effect
+  // for them used to kill the shell and everything running in it.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || term.options.fontSize === fontSize) return;
+    term.options.fontSize = fontSize;
+    try {
+      fitAddonRef.current?.fit();
+    } catch {
+      return;
+    }
+    const sessionId = sessionRef.current;
+    if (sessionId) {
+      void api.resizeExecSession(sessionId, term.cols, term.rows).catch(() => {});
+    }
+  }, [fontSize]);
 
   if (status === "error" && error) {
     return (

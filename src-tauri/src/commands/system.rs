@@ -13,6 +13,11 @@ pub async fn get_engine_status(state: State<'_, Arc<AppState>>) -> Result<Daemon
 
 #[tauri::command]
 pub async fn toggle_engine(state: State<'_, Arc<AppState>>) -> Result<DaemonState, String> {
+    // Same gate as the tray, MCP and doctor paths: with a remote endpoint
+    // active this would start/stop the local engine (and drop the shared
+    // client the remote is using).
+    state.engine_control_guard().await?;
+    let _lifecycle = crate::runtime::claim_engine_lifecycle()?;
     let current = state.daemon_state();
     match current {
         DaemonState::Running => {
@@ -21,7 +26,7 @@ pub async fn toggle_engine(state: State<'_, Arc<AppState>>) -> Result<DaemonStat
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
-            *state.client.write().await = None;
+            state.invalidate_client();
             Ok(state.daemon_state())
         }
         DaemonState::Stopped | DaemonState::NotInstalled => {
@@ -111,6 +116,13 @@ pub(crate) async fn save_app_config_core(
     // written, fail the save rather than pretend the toggle took effect.
     crate::autostart::apply(config.auto_start_on_boot, config.start_minimized)
         .map_err(|e| format!("Could not update the autostart entry: {e}"))?;
+    // Settings, Images, Volumes and Kubernetes each save the whole config
+    // from a copy they fetched earlier. Anything another command owns and may
+    // have changed since (groups, routes, endpoints, registries, ...) is taken
+    // from the live config under the write lock, so a stale copy cannot undo
+    // it. The merge, save and swap happen as one step.
+    let mut live = state.config.write().await;
+    preserve_owned_fields(&mut config, &live);
     config.save().await.map_err(|e| e.to_string())?;
     // Sync data_root immediately to engine paths so subsequent daemon restarts take effect without restarting the app
     state.engine.set_data_root(Some(&config.data_root));
@@ -126,13 +138,30 @@ pub(crate) async fn save_app_config_core(
     // The close handler reads a lock-free mirror; update it before the config
     // is moved so the very next window close honours the new setting.
     state.set_close_to_tray(config.close_to_tray);
-    *state.config.write().await = config;
+    *live = config;
+    drop(live);
     // Caps changed on a running engine apply immediately; never reject the
     // save over it (the next engine start re-applies them anyway).
     if let Err(e) = apply_engine_limits_now(state).await {
         tracing::warn!("could not apply engine resource limits after save: {e}");
     }
     Ok(())
+}
+
+/// Copies the fields that dedicated commands own from `live` into `incoming`.
+fn preserve_owned_fields(incoming: &mut AppConfig, live: &AppConfig) {
+    incoming.schema_version = live.schema_version;
+    incoming.data_root = live.data_root.clone(); // migrate_data_root
+    incoming.endpoints = live.endpoints.clone(); // endpoint commands
+    incoming.active_endpoint = live.active_endpoint.clone();
+    incoming.registries = live.registries.clone(); // registry commands
+    incoming.default_registry = live.default_registry.clone();
+    incoming.container_groups = live.container_groups.clone(); // group saves
+    incoming.kind_cluster_prefs = live.kind_cluster_prefs.clone(); // per-cluster prefs
+    incoming.gateway_routes = live.gateway_routes.clone(); // gateway commands
+    incoming.gateway_enabled = live.gateway_enabled;
+    incoming.gateway_http_port = live.gateway_http_port;
+    incoming.gateway_https_port = live.gateway_https_port;
 }
 
 /// Reads the configured engine caps and, when our engine is running, pushes
@@ -299,6 +328,7 @@ pub(crate) async fn migrate_data_root_core(
     clear_old: bool,
 ) -> Result<(), String> {
     state.engine_control_guard().await?;
+    let _lifecycle = crate::runtime::claim_engine_lifecycle()?;
     let target = std::path::PathBuf::from(target_path.trim());
     if target.as_os_str().is_empty() {
         return Err("Target data root path cannot be empty".to_string());
@@ -336,59 +366,95 @@ pub(crate) async fn migrate_data_root_core(
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-        *state.client.write().await = None;
+        state.invalidate_client();
     }
 
-    // 2. Ensure target directory exists
-    tokio::fs::create_dir_all(&target)
-        .await
-        .map_err(|e| format!("Failed to create target directory: {e}"))?;
-
-    // 3. Move/Copy data if requested and old directory exists
-    if move_data && old_data_root.exists() && old_data_root != target {
-        tracing::info!("Copying data from {:?} to {:?}", old_data_root, target);
-        // Use cp -a via std::process::Command for rootless layer preserving permissions and symlinks
-        let status = std::process::Command::new("cp")
-            .arg("-a")
-            .arg(format!("{}/.", old_data_root.display()))
-            .arg(format!("{}/", target.display()))
-            .status()
-            .map_err(|e| format!("Failed to copy data root content: {e}"))?;
-
-        if !status.success() {
-            return Err("Failed to copy existing data to new path".to_string());
+    // Every step from here can fail. The engine used to stay stopped when one
+    // did, which looked like the migration had broken Docker. On failure it is
+    // brought back up on the old data root.
+    let moved = move_data_root(state, &old_data_root, &target, move_data).await;
+    if let Err(e) = moved {
+        if was_running {
+            state.engine.set_data_root(Some(&old_data_root.to_string_lossy()));
+            let engine = state.engine.clone();
+            if let Ok(Err(err)) = crate::runtime::engine_op(move || engine.start()).await {
+                tracing::warn!("could not restart the engine on the old data root: {err}");
+            }
+            let _ = state.get_client().await;
         }
+        return Err(e);
     }
 
-    // 3b. After the copy, make containerd's snapshotter dirs d_type-compatible
-    // if the new root's filesystem needs it. Idempotent, and no-op when the
-    // filesystem already reports real entry types.
-    crate::docker::engine::ensure_snapshotter_compat(&target).map_err(|e| e.to_string())?;
-
-    // 4. Clear old data if requested
-    if clear_old && old_data_root.exists() && old_data_root != target {
-        tracing::info!("Clearing old data root directory: {:?}", old_data_root);
-        let _ = tokio::fs::remove_dir_all(&old_data_root).await;
-    }
-
-    // 5. Update engine paths immediately
-    state.engine.set_data_root(Some(&target.to_string_lossy()));
-
-    // 6. Save updated path into AppConfig
-    let mut config = state.config.write().await;
-    config.data_root = target.to_string_lossy().to_string();
-    config.save().await.map_err(|e| e.to_string())?;
-
-    // 7. Restart engine if it was running before
+    // Restart engine if it was running before. The config lock must not be
+    // held here: `get_client` reads the config too.
     if was_running {
         let engine = state.engine.clone();
         crate::runtime::engine_op(move || engine.start())
             .await
             .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Data root moved, but the engine did not start on it: {e}"))?;
         let _ = state.get_client().await;
     }
 
+    // Only now, with the new root saved (and running, when it was), is the old
+    // copy expendable. Clearing it first lost the data whenever a later step failed.
+    if clear_old && old_data_root.exists() && old_data_root != target {
+        tracing::info!("Clearing old data root directory: {:?}", old_data_root);
+        if let Err(e) = tokio::fs::remove_dir_all(&old_data_root).await {
+            tracing::warn!("could not clear the old data root: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy (when asked), make snapshotter dirs d_type-compatible, then point the
+/// engine and the saved config at `target`.
+async fn move_data_root(
+    state: &AppState,
+    old_data_root: &std::path::Path,
+    target: &std::path::Path,
+    move_data: bool,
+) -> Result<(), String> {
+    tokio::fs::create_dir_all(target)
+        .await
+        .map_err(|e| format!("Failed to create target directory: {e}"))?;
+
+    if move_data && old_data_root.exists() && old_data_root != target {
+        tracing::info!("Copying data from {:?} to {:?}", old_data_root, target);
+        // `cp -a` keeps the rootless layer's ownership, modes and symlinks.
+        // Async so a multi-GB copy does not pin a runtime worker.
+        let status = tokio::process::Command::new("cp")
+            .arg("-a")
+            .arg(format!("{}/.", old_data_root.display()))
+            .arg(format!("{}/", target.display()))
+            .status()
+            .await
+            .map_err(|e| format!("Failed to copy data root content: {e}"))?;
+        if !status.success() {
+            return Err("Failed to copy existing data to new path".to_string());
+        }
+    }
+
+    // After the copy, make containerd's snapshotter dirs d_type-compatible if
+    // the new root's filesystem needs it. Idempotent.
+    let compat_target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::docker::engine::ensure_snapshotter_compat(&compat_target)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let target_str = target.to_string_lossy().to_string();
+    {
+        let mut config = state.config.write().await;
+        let mut next = config.clone();
+        next.data_root = target_str.clone();
+        next.save().await.map_err(|e| e.to_string())?;
+        *config = next;
+    }
+    state.engine.set_data_root(Some(&target_str));
     Ok(())
 }
 
@@ -423,6 +489,9 @@ pub async fn install_engine_update(
     if version.is_empty() {
         return Err("No engine version to install".to_string());
     }
+    // A second click (or Settings and the first-run wizard both firing) ran two
+    // installs over the same staging dir and stopped/started the daemon twice.
+    let _lifecycle = crate::runtime::claim_engine_lifecycle()?;
 
     let was_running = state.daemon_state() == DaemonState::Running;
     // A first-ever install leaves the engine stopped unless we start it here:
@@ -835,6 +904,19 @@ pub struct EmbeddedBinaryInfo {
 pub async fn get_embedded_binaries(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<EmbeddedBinaryInfo>, String> {
+    // Every row probes a binary (`--version`); run them off the async
+    // runtime so the Settings panel cannot stall other commands.
+    let caddy_running = state.caddy.is_running().await;
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || embedded_binaries_blocking(&state, caddy_running))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn embedded_binaries_blocking(
+    state: &AppState,
+    caddy_running: bool,
+) -> Result<Vec<EmbeddedBinaryInfo>, String> {
     let engine_paths = state.engine.paths();
     let bin_dir = engine_paths.bin_dir();
     let mut list = Vec::new();
@@ -959,7 +1041,7 @@ pub async fn get_embedded_binaries(
         category: "Gateway & Proxy".into(),
         version: caddy_ver,
         path: caddy_installed.then(|| caddy_paths.binary().display().to_string()),
-        is_active: state.caddy.is_running().await,
+        is_active: caddy_running,
         description: "Zero-config HTTPS reverse proxy gateway with automatic local CA certificate".into(),
     });
 
@@ -967,10 +1049,10 @@ pub async fn get_embedded_binaries(
 }
 
 fn run_cmd_version(bin: &std::path::Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    // Bounded: a hung binary froze the "Embedded binaries" settings panel.
+    let out = crate::procutil::output_with_timeout(cmd, crate::procutil::PROBE, &bin.display().to_string()).ok()?;
     let text = if !out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stdout).to_string()
     } else {

@@ -81,8 +81,9 @@ pub async fn prune_images(
     dangling_only: Option<bool>,
 ) -> Result<(u64, u64), String> {
     let client = state.get_client().await?;
+    let configured = state.config.read().await.kind_default_image.clone();
     client
-        .prune_images_mode(dangling_only.unwrap_or(false))
+        .prune_images_mode(dangling_only.unwrap_or(false), Some(configured.as_str()))
         .await
         .map_err(|e| e.to_string())
 }
@@ -150,6 +151,15 @@ pub(crate) async fn pull_image_core(
     app: Option<&AppHandle>,
     image: String,
 ) -> Result<(), String> {
+    let image = with_default_tag(image.trim());
+    if image.is_empty() {
+        return Err("Image name is required".to_string());
+    }
+    // A second click on Pull (or the same image from MCP) used to start a
+    // parallel stream whose progress interleaved with the first one's.
+    let Some(slot) = PullSlot::claim(&image) else {
+        return Ok(());
+    };
     let client = state.get_client().await?;
     let docker = client.docker();
     let opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
@@ -171,9 +181,23 @@ pub(crate) async fn pull_image_core(
     let img_name = image.clone();
 
     tokio::spawn(async move {
+        let _slot = slot;
+        // Byte-level progress arrives hundreds of times a second across
+        // layers; the UI only needs a few frames.
+        let mut last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
         while let Some(msg) = stream.next().await {
             match msg {
                 Ok(info) => {
+                    let is_tick = info
+                        .progress_detail
+                        .as_ref()
+                        .is_some_and(|d| d.current.is_some());
+                    if is_tick {
+                        if last_tick.elapsed() < std::time::Duration::from_millis(100) {
+                            continue;
+                        }
+                        last_tick = std::time::Instant::now();
+                    }
                     let (current, total) = if let Some(ref detail) = info.progress_detail {
                         (
                             detail.current.map(|v| v as u64),
@@ -228,6 +252,67 @@ pub(crate) async fn pull_image_core(
     });
 
     Ok(())
+}
+
+/// The Engine API pulls *every* tag of a repository when `fromImage` has no
+/// tag, unlike `docker pull`, which defaults to `latest`.
+fn with_default_tag(image: &str) -> String {
+    if image.is_empty() || image.contains('@') {
+        return image.to_string();
+    }
+    let last = image.rsplit('/').next().unwrap_or(image);
+    if last.contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
+    }
+}
+
+/// Marks an image as being pulled for as long as the value lives.
+struct PullSlot(String);
+
+fn pulls_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+impl PullSlot {
+    fn claim(image: &str) -> Option<Self> {
+        let mut set = pulls_in_flight().lock().ok()?;
+        set.insert(image.to_string()).then(|| Self(image.to_string()))
+    }
+}
+
+impl Drop for PullSlot {
+    fn drop(&mut self) {
+        if let Ok(mut set) = pulls_in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use super::*;
+
+    #[test]
+    fn untagged_images_default_to_latest() {
+        assert_eq!(with_default_tag("nginx"), "nginx:latest");
+        assert_eq!(with_default_tag("library/nginx"), "library/nginx:latest");
+        assert_eq!(with_default_tag("localhost:5000/app"), "localhost:5000/app:latest");
+        assert_eq!(with_default_tag("nginx:1.27"), "nginx:1.27");
+        assert_eq!(with_default_tag("localhost:5000/app:v2"), "localhost:5000/app:v2");
+        assert_eq!(with_default_tag("nginx@sha256:abc"), "nginx@sha256:abc");
+    }
+
+    #[test]
+    fn a_pull_slot_is_exclusive_until_dropped() {
+        let a = PullSlot::claim("x:1").unwrap();
+        assert!(PullSlot::claim("x:1").is_none());
+        drop(a);
+        assert!(PullSlot::claim("x:1").is_some());
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -414,6 +499,21 @@ fn build_final_payload(
     }
 }
 
+/// Key for one registry in the build's X-Registry-Config: the bare host, as
+/// the docker CLI writes it, except Docker Hub's legacy index address.
+fn build_auth_key(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/');
+    let host = host
+        .strip_prefix("https://")
+        .or_else(|| host.strip_prefix("http://"))
+        .unwrap_or(host);
+    if matches!(host, "docker.io" | "index.docker.io" | "registry-1.docker.io") {
+        crate::config::server_address_for_host("docker.io")
+    } else {
+        host.to_string()
+    }
+}
+
 #[tauri::command]
 pub async fn build_image(
     app: AppHandle,
@@ -457,6 +557,18 @@ pub(crate) async fn build_image_core(
         }
     };
 
+    // Saved registry logins go to the daemon as X-Registry-Config, like
+    // `docker build` does: a `FROM` on a private registry failed with
+    // "unauthorized" even though the user had logged in through the app.
+    let registry_auth = {
+        let cfg = state.config.read().await;
+        let map: std::collections::HashMap<String, bollard::auth::DockerCredentials> = cfg
+            .registries
+            .iter()
+            .map(|r| (build_auth_key(&r.host), r.credentials()))
+            .collect();
+        (!map.is_empty()).then_some(map)
+    };
     let cancel = state.build_cancel.clone();
     let running = state.build_running.clone();
     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -465,6 +577,15 @@ pub(crate) async fn build_image_core(
     let tag = req.tag.trim().to_string();
 
     tokio::spawn(async move {
+        // Cleared on every exit, a panic included: a stuck flag rejected every
+        // later build until the app restarted.
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _release = Release(running);
         let starting = build_final_payload(
             &tag,
             "Starting",
@@ -484,7 +605,7 @@ pub(crate) async fn build_image_core(
         emit_progress(&app_handle, "build-progress", starting);
 
         let result = client
-            .build_image(&req, &cancel, |step: BuildStep| {
+            .build_image(&req, &cancel, registry_auth, |step: BuildStep| {
                 let payload = build_step_payload(&tag, &step, false, false, None, None);
                 emit_progress(&app_handle, "build-progress", payload);
             })
@@ -516,7 +637,6 @@ pub(crate) async fn build_image_core(
             }
         };
         emit_progress(&app_handle, "build-progress", final_payload);
-        running.store(false, std::sync::atomic::Ordering::Relaxed);
     });
 
     Ok(())
@@ -586,12 +706,17 @@ pub(crate) fn validate_build_context_core(path: &str) -> Result<BuildContextInfo
         Err(_) => Vec::new(),
     };
     entries.sort();
-    entries.truncate(50);
+    // Dockerfiles are picked before the preview list is cut, so a large
+    // directory cannot hide them past entry 50.
     info.dockerfiles = entries
         .iter()
-        .filter(|name| name.to_lowercase().starts_with("dockerfile"))
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.starts_with("dockerfile") || lower.ends_with(".dockerfile")
+        })
         .cloned()
         .collect();
+    entries.truncate(50);
     info.entries = entries;
 
     let dir_name = context

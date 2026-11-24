@@ -111,15 +111,32 @@ export const HostsManagerModal: React.FC<{
     }
   };
 
-  const handleToggleEntry = async (index: number) => {
-    if (!model) return;
-    const lines = rawText.split("\n");
+  /**
+   * The entry's own line in the file as loaded. Entries carry their 1-based
+   * line number (`line-N`); matching by text hit the first identical line
+   * (e.g. a duplicate entry) and edited unsaved raw-tab text along the way.
+   */
+  const locateLine = (index: number) => {
+    if (!model) return null;
     const target = model.entries[index];
-    if (!target) return;
+    if (!target) return null;
+    if (rawText !== model.raw_content) {
+      toast.info("Unsaved raw edits", "Save or reload the raw text before changing single entries.");
+      return null;
+    }
+    const lines = model.raw_content.split("\n");
+    const n = Number(target.id.replace(/^line-/, "")) - 1;
+    if (!Number.isInteger(n) || lines[n] === undefined || lines[n] !== target.raw_line) {
+      toast.error("/etc/hosts changed", "Reload and try again.");
+      return null;
+    }
+    return { lines, targetIdx: n, target };
+  };
 
-    // Find line index matching raw_line
-    const targetIdx = lines.findIndex((l) => l.trim() === target.raw_line.trim());
-    if (targetIdx === -1) return;
+  const handleToggleEntry = async (index: number) => {
+    const found = locateLine(index);
+    if (!found) return;
+    const { lines, targetIdx } = found;
 
     if (lines[targetIdx].trim().startsWith("#")) {
       lines[targetIdx] = lines[targetIdx].replace(/^#\s*/, "");
@@ -151,9 +168,9 @@ export const HostsManagerModal: React.FC<{
       return;
     }
 
-    const lines = rawText.split("\n");
-    const targetIdx = lines.findIndex((l) => l.trim() === target.raw_line.trim());
-    if (targetIdx === -1) return;
+    const found = locateLine(index);
+    if (!found) return;
+    const { lines, targetIdx } = found;
 
     lines.splice(targetIdx, 1);
     const updated = lines.join("\n");

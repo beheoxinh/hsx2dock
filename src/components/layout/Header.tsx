@@ -76,7 +76,10 @@ export const Header = React.memo<HeaderProps>(function Header({
         });
     };
     load();
-    const timer = window.setInterval(load, 10_000);
+    // A window hidden to the tray polls nothing; the next visible tick catches up.
+    const timer = window.setInterval(() => {
+      if (!document.hidden) load();
+    }, 10_000);
     return () => {
       disposed = true;
       window.clearInterval(timer);

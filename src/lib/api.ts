@@ -409,6 +409,10 @@ export const events = {
   onGroupOp: (cb: (op: GroupOp) => void): Promise<UnlistenFn> =>
     listen<GroupOp>("group-op", (event) => cb(event.payload)),
 
+  /** The saved group list changed (this window, another one, or MCP). */
+  onContainerGroupsChanged: (cb: (groups: ContainerGroup[]) => void): Promise<UnlistenFn> =>
+    listen<ContainerGroup[]>("container-groups-changed", (event) => cb(event.payload)),
+
   onEngineStateChanged: (cb: (state: DaemonState) => void): Promise<UnlistenFn> =>
     listen<DaemonState>("engine-state-changed", (event) => cb(event.payload)),
 

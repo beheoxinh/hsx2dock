@@ -48,7 +48,13 @@ fn engine_thread() -> &'static Mutex<Sender<Job>> {
             .name("docker-engine".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    job();
+                    // A panicking job must not take the thread down: every
+                    // later start/stop would fail with "engine thread:
+                    // closed" until the app restarted. The job's reply sender
+                    // is dropped by the unwind, so its caller gets an error.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        tracing::error!("an engine operation panicked; the engine thread keeps running");
+                    }
                 }
             })
             .expect("failed to spawn persistent engine thread");
@@ -94,4 +100,27 @@ where
         .recv()
         .await
         .map_err(|e| format!("engine thread: {e}"))
+}
+
+static ENGINE_LIFECYCLE_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Held for the whole of a start, stop, restart, install or data-root move.
+///
+/// Each of those reads the daemon state and then acts on it; two of them
+/// overlapping (a double click, the tray and the window, an MCP agent) both
+/// saw "stopped" and started twice, or stopped the engine mid-install.
+pub struct EngineLifecycle(());
+
+impl Drop for EngineLifecycle {
+    fn drop(&mut self) {
+        ENGINE_LIFECYCLE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn claim_engine_lifecycle() -> Result<EngineLifecycle, String> {
+    if ENGINE_LIFECYCLE_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err("The engine is busy with another start, stop or update — try again when it finishes".to_string());
+    }
+    Ok(EngineLifecycle(()))
 }

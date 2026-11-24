@@ -69,10 +69,9 @@ pub async fn project_action(project: &str, subcommand: &str) -> anyhow::Result<S
         }
         let args = ["compose", "-p", project.as_str(), subcommand.as_str()];
         let paths = crate::docker::engine::EnginePaths::new();
-        let out = crate::docker::engine::docker_command_resolved(&paths)
-            .args(&args)
-            .output()
-            .context("failed to run `docker compose`")?;
+        let mut cmd = crate::docker::engine::docker_command_resolved(&paths);
+        cmd.args(&args);
+        let out = output_with_timeout(cmd, LIFECYCLE_TIMEOUT)?;
         finish_output("compose", out)
     })
     .await
@@ -109,11 +108,29 @@ fn run_compose(file: &Path, subcommand: &str, extra: &[&str]) -> anyhow::Result<
     let mut args: Vec<&str> = vec!["compose", "-f", &file_str, subcommand];
     args.extend(extra.iter().copied());
     let paths = crate::docker::engine::EnginePaths::new();
-    let out = crate::docker::engine::docker_command_resolved(&paths)
-        .args(&args)
-        .output()
-        .context("failed to run `docker compose`")?;
+    let mut cmd = crate::docker::engine::docker_command_resolved(&paths);
+    cmd.args(&args);
+    let limit = match subcommand {
+        "ps" | "logs" => QUERY_TIMEOUT,
+        _ => LIFECYCLE_TIMEOUT,
+    };
+    let out = output_with_timeout(cmd, limit)?;
     finish_output("compose", out)
+}
+
+/// Upper bound for up/down/start/stop/restart (image pulls included).
+const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Command::output` with a deadline. A compose CLI stuck on a wedged daemon
+/// used to hold the project's busy state (and its members' spinners) until
+/// the app restarted; now it is killed and the caller gets an error.
+fn output_with_timeout(
+    cmd: std::process::Command,
+    limit: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    crate::procutil::output_with_timeout(cmd, limit, "docker compose")
+        .context("failed to run `docker compose`")
 }
 
 fn finish_output(label: &str, out: std::process::Output) -> anyhow::Result<String> {

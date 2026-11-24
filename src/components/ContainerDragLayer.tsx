@@ -319,6 +319,12 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     // A cancelled pointer (OS gesture, window blur) must clear the ghost too,
     // otherwise it would hang on screen with nothing driving it.
     const onCancel = () => finish();
+    // Releasing the button outside the webview never delivers pointerup, so
+    // the ghost stayed and the next click anywhere dropped the card. Losing
+    // focus or pressing Escape cancels the drag without a drop.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") finish();
+    };
 
     // Swallow the click that follows a drag so dropping a card onto a group
     // does not also open whatever sits underneath. The window is short, so a
@@ -333,12 +339,16 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("blur", onCancel);
+    window.addEventListener("keydown", onKey);
     window.addEventListener("click", onClickCapture, true);
     return () => {
       if (frame) cancelAnimationFrame(frame);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("blur", onCancel);
+      window.removeEventListener("keydown", onKey);
       window.removeEventListener("click", onClickCapture, true);
     };
   }, []);

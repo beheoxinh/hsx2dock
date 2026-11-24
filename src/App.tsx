@@ -1,4 +1,5 @@
 import React, { useState, useEffect, Suspense } from "react";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar, NavTab } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
@@ -45,7 +46,6 @@ import { primeContainerStore, startContainerStoreSync } from "./lib/containerSto
 import { startContainerOpsSync, subscribeOpNotices } from "./lib/containerOps";
 import { primeDashboardStore, resetDashboardEngineData } from "./lib/dashboardStore";
 import type { DaemonState } from "./types";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
 const MainLayout: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
@@ -85,21 +85,9 @@ const MainLayout: React.FC = () => {
       document.documentElement.classList.add("light");
     }
 
-    // Enforce 90% width and 95% height on application mount
-    try {
-      const appWin = getCurrentWindow();
-      if (window.screen && window.screen.availWidth && window.screen.availHeight) {
-        const targetW = Math.round(window.screen.availWidth * 0.90);
-        const targetH = Math.round(window.screen.availHeight * 0.95);
-        appWin.setSize(new LogicalSize(targetW, targetH)).then(() => {
-          appWin.center();
-        }).catch((err) => {
-          console.warn("Failed to set window size from frontend:", err);
-        });
-      }
-    } catch (err) {
-      console.warn("Could not access Tauri window API:", err);
-    }
+    // The startup window size is set once by the backend (lib.rs). Doing it
+    // here as well made the window jump and undid the user's own resize on
+    // every remount.
 
     fetchEngineStatus();
 
@@ -182,7 +170,6 @@ const MainLayout: React.FC = () => {
       setIsTogglingEngine(true);
       const newState = await api.toggleEngine();
       setDaemonState(newState);
-      setRefreshKey((k) => k + 1);
       // Re-verify against the backend: `toggle_engine` may return Running from
       // a process that has not opened its socket yet, and a failed start must
       // not leave a stale "Running" label on the button.
@@ -254,6 +241,8 @@ const MainLayout: React.FC = () => {
           }}
           onRefresh={() => {
             setRefreshKey((k) => k + 1);
+            void primeContainerStore(true);
+            void primeDashboardStore(true);
             // The refresh button spins and the page data visibly re-renders;
             // a toast here would just be noise.
           }}
@@ -265,13 +254,17 @@ const MainLayout: React.FC = () => {
         <main className="flex-1 overflow-hidden relative">
           <AnimatePresence mode="wait">
             <motion.div
-              key={activeTab + refreshKey}
+              // Pages that refetch on `refreshKey` (or live in a store) keep
+              // their state across engine changes and manual refreshes; a
+              // remount threw away open modals, filters and scroll.
+              key={REFRESH_IN_PLACE.has(activeTab) ? activeTab : `${activeTab}:${refreshKey}`}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.18, ease: "easeInOut" }}
               className="h-full w-full"
             >
+              <ErrorBoundary key={activeTab} label="This page">
               <Suspense fallback={<div className="h-full w-full flex items-center justify-center text-xs text-zinc-500">Loading…</div>}>
                 {activeTab === "dashboard" && (
                   <DashboardPage
@@ -305,6 +298,7 @@ const MainLayout: React.FC = () => {
                 {activeTab === "mcp" && <McpPage />}
                 {activeTab === "settings" && <SettingsPage />}
               </Suspense>
+              </ErrorBoundary>
             </motion.div>
           </AnimatePresence>
         </main>
@@ -314,6 +308,7 @@ const MainLayout: React.FC = () => {
       {selectedContainerId && (
         <Suspense fallback={null}>
           <ContainerDetailsDrawer
+            key={selectedContainerId}
             containerId={selectedContainerId}
             initialTab={drawerTab}
             debug={drawerDebug}
@@ -343,6 +338,10 @@ const MainLayout: React.FC = () => {
             }}
             onSuccess={(newId) => {
               setRefreshKey((k) => k + 1);
+              // Recreate swaps the container id inside its group on the
+              // backend; reload list and groups so the next group save does
+              // not write the stale id back.
+              void primeContainerStore(true);
               if (wizardEditTarget && selectedContainerId === wizardEditTarget.id) {
                 if (newId) {
                   setSelectedContainerId(newId);
@@ -357,6 +356,16 @@ const MainLayout: React.FC = () => {
     </div>
   );
 };
+
+/** Tabs whose data follows `refreshKey` or a store instead of a remount. */
+const REFRESH_IN_PLACE = new Set([
+  "dashboard",
+  "containers",
+  "images",
+  "volumes",
+  "networks",
+  "kubernetes",
+]);
 
 export const App: React.FC = () => {
   return (

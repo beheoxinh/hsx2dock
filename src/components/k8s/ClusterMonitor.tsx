@@ -259,7 +259,10 @@ export const ClusterMonitor: React.FC<{
       );
     };
     fast();
-    const t1 = window.setInterval(fast, 6000);
+    // A window hidden to the tray polls nothing; the next visible tick catches up.
+    const t1 = window.setInterval(() => {
+      if (!document.hidden) fast();
+    }, 6000);
     return () => {
       alive = false;
       window.clearInterval(t1);
@@ -271,47 +274,53 @@ export const ClusterMonitor: React.FC<{
   useEffect(() => {
     let alive = true;
 
+    // A slow API server (or a cluster still booting) made 15s ticks stack up
+    // behind each other, each spawning more `docker exec kubectl` processes.
+    let inflight = false;
+    const settle = <T,>(p: Promise<T>, apply: (v: T) => void) =>
+      p.then((v) => {
+        if (alive) apply(v);
+      }).catch(() => {});
+
     const fetchTab = async () => {
-      if (document.hidden) return;
-      if (tab === "overview") {
-        const [n, ev] = await Promise.allSettled([
-          api.getClusterNodes(cluster),
-          api.getClusterEvents(cluster),
-        ]);
-        if (!alive) return;
-        if (n.status === "fulfilled") setNodes(n.value);
-        if (ev.status === "fulfilled") setEvents(ev.value);
-      } else if (tab === "nodes") {
-        api.getClusterNodes(cluster).then((v) => alive && setNodes(v)).catch(() => {});
-      } else if (tab === "workloads") {
-        api.getClusterWorkloads(cluster).then((v) => alive && setWorkloads(v)).catch(() => {});
-      } else if (tab === "services") {
-        const [sv, ing] = await Promise.allSettled([
-          api.getClusterServices(cluster),
-          api.getClusterIngresses(cluster),
-        ]);
-        if (!alive) return;
-        if (sv.status === "fulfilled") setServices(sv.value);
-        if (ing.status === "fulfilled") setIngresses(ing.value);
-      } else if (tab === "config") {
-        api.getClusterConfigResources(cluster).then((v) => alive && setConfigs(v)).catch(() => {});
-      } else if (tab === "pvcs") {
-        const [pv, pvol] = await Promise.allSettled([
-          api.getClusterPvcs(cluster),
-          api.getClusterPvs(cluster),
-        ]);
-        if (!alive) return;
-        if (pv.status === "fulfilled") setPvcs(pv.value);
-        if (pvol.status === "fulfilled") setPvs(pvol.value);
-      } else if (tab === "namespaces") {
-        api.getClusterNamespaces(cluster).then((v) => alive && setNamespaceList(v)).catch(() => {});
-      } else if (tab === "events") {
-        api.getClusterEvents(cluster).then((v) => alive && setEvents(v)).catch(() => {});
+      if (inflight || document.hidden) return;
+      inflight = true;
+      try {
+        if (tab === "overview") {
+          await Promise.all([
+            settle(api.getClusterNodes(cluster), setNodes),
+            settle(api.getClusterEvents(cluster), setEvents),
+          ]);
+        } else if (tab === "nodes") {
+          await settle(api.getClusterNodes(cluster), setNodes);
+        } else if (tab === "workloads") {
+          await settle(api.getClusterWorkloads(cluster), setWorkloads);
+        } else if (tab === "services") {
+          await Promise.all([
+            settle(api.getClusterServices(cluster), setServices),
+            settle(api.getClusterIngresses(cluster), setIngresses),
+          ]);
+        } else if (tab === "config") {
+          await settle(api.getClusterConfigResources(cluster), setConfigs);
+        } else if (tab === "pvcs") {
+          await Promise.all([
+            settle(api.getClusterPvcs(cluster), setPvcs),
+            settle(api.getClusterPvs(cluster), setPvs),
+          ]);
+        } else if (tab === "namespaces") {
+          await settle(api.getClusterNamespaces(cluster), setNamespaceList);
+        } else if (tab === "events") {
+          await settle(api.getClusterEvents(cluster), setEvents);
+        }
+      } finally {
+        inflight = false;
       }
     };
 
     fetchTab();
-    const t2 = window.setInterval(fetchTab, 15000);
+    const t2 = window.setInterval(() => {
+      if (!document.hidden) fetchTab();
+    }, 15000);
     return () => {
       alive = false;
       window.clearInterval(t2);
