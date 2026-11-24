@@ -9,12 +9,63 @@ pub mod docker;
 pub mod fsutil;
 pub mod mcp;
 pub mod migrate;
+pub mod ops;
 pub mod runtime;
 pub mod state;
 pub mod tray;
 
 use commands::*;
 use state::AppState;
+
+/// Upper bound for one `list_containers` call in the monitor. A wedged daemon
+/// must not freeze the loop that also detects engine state transitions.
+const MONITOR_LIST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Per-container stats deadline; one stuck container (mid-stop, paused cgroup)
+/// must not hold the whole tick back.
+const MONITOR_STATS_TIMEOUT: Duration = Duration::from_secs(4);
+/// How many stats requests the monitor keeps in flight. With 200 running
+/// containers the old `join_all` fired 200 requests at dockerd every 2s.
+const MONITOR_STATS_CONCURRENCY: usize = 12;
+/// Consecutive identical readings required before an engine state change is
+/// believed. A busy daemon can refuse one socket connect, and a fake
+/// Running→Stopped→Running flap used to re-run auto-start (which stops every
+/// running container whose group has auto-start off).
+const STATE_CONFIRM_TICKS: u8 = 2;
+
+/// Samples stats for `ids` with bounded concurrency and per-call timeouts,
+/// turning one-shot samples into a real CPU % against the previous sample.
+async fn sample_stats(
+    client: &crate::docker::client::DockerClient,
+    ids: Vec<String>,
+    prev: &HashMap<String, crate::docker::models::ContainerStats>,
+) -> HashMap<String, crate::docker::models::ContainerStats> {
+    use futures_util::stream::{self, StreamExt};
+    let futs: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let c = client.clone();
+            async move {
+                let s = tokio::time::timeout(MONITOR_STATS_TIMEOUT, c.container_stats_one_shot(&id))
+                    .await
+                    .ok()?
+                    .ok()?;
+                Some((id, s))
+            }
+        })
+        .collect();
+    let results: Vec<Option<(String, crate::docker::models::ContainerStats)>> = stream::iter(futs)
+        .buffer_unordered(MONITOR_STATS_CONCURRENCY)
+        .collect()
+        .await;
+    results
+        .into_iter()
+        .flatten()
+        .map(|(id, mut s)| {
+            s.cpu_percent = prev.get(&id).map(|p| s.cpu_percent_since(p)).unwrap_or(0.0);
+            (id, s)
+        })
+        .collect()
+}
 
 fn start_background_monitoring(app_handle: AppHandle) {
     let handle = app_handle.clone();
@@ -26,104 +77,166 @@ fn start_background_monitoring(app_handle: AppHandle) {
         .unwrap_or(0);
     crate::runtime::spawn(async move {
         let mut last_state = None;
+        // Candidate state and how many ticks in a row it was observed.
+        let mut pending_state: Option<(crate::docker::models::DaemonState, u8)> = None;
+        let mut last_containers: Option<Vec<crate::docker::models::ContainerItem>> = None;
+        let mut hidden_ticks: u32 = 0;
+        let mut was_hidden = false;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
-                let status = state.daemon_state();
-                if last_state.as_ref() != Some(&status) {
-                    // The first tick after launch proves nothing about what the
-                    // engine did while the app was closed; only a real
-                    // stopped→running transition may drop restored clusters.
-                    let had_previous_state = last_state.is_some();
-                    last_state = Some(status.clone());
-                    // The bridge can only attach once the daemon's socket
-                    // exists, so enabling it while the engine was stopped left
-                    // the config on with nothing linked. Re-apply on every
-                    // transition; reconcile is a no-op when the bridge is off.
-                    let is_live = status == crate::docker::models::DaemonState::Running;
-                    if is_live {
-                        let _ = crate::commands::system::apply_cli_bridge(&state).await;
-                        // Every path that brings the engine up (app open with
-                        // auto-start, manual start, restart after crash) gets
-                        // the configured caps + group auto-start. Off the
-                        // monitor's critical path so a slow cgroup write or a
-                        // misbehaving container never stalls the tick.
-                        let handle2 = handle.clone();
+            let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() else {
+                continue;
+            };
+            let observed = state.daemon_state();
+            // The very first reading is accepted as-is; later changes must be
+            // seen STATE_CONFIRM_TICKS times in a row.
+            let status = if last_state.is_none() || last_state.as_ref() == Some(&observed) {
+                pending_state = None;
+                observed
+            } else {
+                let count = match &pending_state {
+                    Some((s, n)) if *s == observed => n + 1,
+                    _ => 1,
+                };
+                pending_state = Some((observed.clone(), count));
+                if count >= STATE_CONFIRM_TICKS {
+                    pending_state = None;
+                    observed
+                } else {
+                    last_state.clone().unwrap_or(observed)
+                }
+            };
+            let is_live = status == crate::docker::models::DaemonState::Running;
+            if !is_live {
+                last_containers = None;
+            }
+            if last_state.as_ref() != Some(&status) {
+                // The first tick after launch proves nothing about what the
+                // engine did while the app was closed; only a real
+                // stopped→running transition may drop restored clusters.
+                let had_previous_state = last_state.is_some();
+                last_state = Some(status.clone());
+                // The bridge can only attach once the daemon's socket
+                // exists, so enabling it while the engine was stopped left
+                // the config on with nothing linked. Re-apply on every
+                // transition; reconcile is a no-op when the bridge is off.
+                if is_live {
+                    let _ = crate::commands::system::apply_cli_bridge(&state).await;
+                    // Every path that brings the engine up (app open with
+                    // auto-start, manual start, restart after crash) gets
+                    // the configured caps + group auto-start. Off the
+                    // monitor's critical path so a slow cgroup write or a
+                    // misbehaving container never stalls the tick.
+                    let handle2 = handle.clone();
+                    crate::runtime::spawn(async move {
+                        let Some(st) = handle2.try_state::<std::sync::Arc<AppState>>() else {
+                            return;
+                        };
+                        if let Err(e) =
+                            crate::commands::system::apply_engine_limits_now(&st).await
+                        {
+                            tracing::warn!("could not apply engine resource limits: {e}");
+                        }
+                        // Groups are this engine's lifecycle — never
+                        // auto-start them into a remote endpoint.
+                        if st.config.read().await.active_endpoint.is_none() {
+                            let restored_since = if had_previous_state { 0 } else { app_started };
+                            crate::commands::groups::auto_start_groups(&st, restored_since).await;
+                        }
+                    });
+                    // Kind clusters: pin node restart policies (kind's
+                    // on-failure:1 lets Docker resurrect clusters behind
+                    // the app's back), drop clusters restored against the
+                    // auto-start switches, then start the flagged ones
+                    // staggered and capped.
+                    {
+                        let app = handle.clone();
+                        let restored_since = if had_previous_state { 0 } else { app_started };
                         crate::runtime::spawn(async move {
-                            let Some(st) = handle2.try_state::<std::sync::Arc<AppState>>() else {
+                            let Some(st2) = app.try_state::<std::sync::Arc<AppState>>() else {
                                 return;
                             };
-                            if let Err(e) =
-                                crate::commands::system::apply_engine_limits_now(&st).await
+                            if let Err(e) = crate::commands::kind::reconcile_kind_auto_start(
+                                app.clone(),
+                                &st2,
+                                restored_since,
+                            )
+                            .await
                             {
-                                tracing::warn!("could not apply engine resource limits: {e}");
-                            }
-                            // Groups are this engine's lifecycle — never
-                            // auto-start them into a remote endpoint.
-                            if st.config.read().await.active_endpoint.is_none() {
-                                let restored_since = if had_previous_state { 0 } else { app_started };
-                                crate::commands::groups::auto_start_groups(&st, restored_since).await;
+                                tracing::warn!("kind auto-start reconcile failed: {e}");
                             }
                         });
-                        // Kind clusters: pin node restart policies (kind's
-                        // on-failure:1 lets Docker resurrect clusters behind
-                        // the app's back), drop clusters restored against the
-                        // auto-start switches, then start the flagged ones
-                        // staggered and capped.
-                        {
-                            let app = handle.clone();
-                            let restored_since = if had_previous_state { 0 } else { app_started };
-                            tauri::async_runtime::spawn(async move {
-                                let Some(st2) = app.try_state::<std::sync::Arc<AppState>>() else {
-                                    return;
-                                };
-                                if let Err(e) = crate::commands::kind::reconcile_kind_auto_start(
-                                    app.clone(),
-                                    &st2,
-                                    restored_since,
-                                )
-                                .await
-                                {
-                                    tracing::warn!("kind auto-start reconcile failed: {e}");
-                                }
-                            });
-                        }
                     }
-                    let _ = handle.emit("engine-state-changed", status);
                 }
+                let _ = handle.emit("engine-state-changed", status.clone());
+            }
 
-                // If running, poll running containers stats and broadcast list
-                if let Ok(client) = state.get_client().await {
-                    if let Ok(all_containers) = client.list_containers(true).await {
-                        let _ = handle.emit("containers-tick", all_containers.clone());
+            // Engine down: nothing to poll. Drop stale figures so the tray
+            // and a re-opened window never show yesterday's CPU/RAM.
+            if !is_live {
+                if !state.cached_stats.read().await.is_empty() {
+                    state.cached_stats.write().await.clear();
+                }
+                continue;
+            }
 
-                        let running_ids: Vec<String> = all_containers
-                            .into_iter()
-                            .filter(|c| c.state == "running")
-                            .map(|c| c.id)
-                            .collect();
+            let window_visible = handle
+                .get_webview_window("main")
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(true);
 
-                        if !running_ids.is_empty() {
-                            // Query stats concurrently with futures::future::join_all
-                            let futures = running_ids.iter().map(|id| {
-                                let c = client.clone();
-                                let id_clone = id.clone();
-                                async move {
-                                    c.container_stats(&id_clone).await.ok().map(|s| (id_clone, s))
-                                }
-                            });
-                            let results = futures_util::future::join_all(futures).await;
-                            let mut stats_map = HashMap::new();
-                            for item in results.into_iter().flatten() {
-                                stats_map.insert(item.0, item.1);
-                            }
+            if !window_visible {
+                was_hidden = true;
+                hidden_ticks = hidden_ticks.wrapping_add(1);
+                // When hidden to tray, only refresh cached_stats every ~14s
+                // (matching tray REFRESH_INTERVAL) and skip WebView IPC emits.
+                if hidden_ticks % 7 != 0 {
+                    continue;
+                }
+            } else if was_hidden {
+                was_hidden = false;
+                hidden_ticks = 0;
+                // Force a fresh containers-tick emit when the window returns.
+                last_containers = None;
+            }
 
-                            // Keep app_state's cached_stats current for tray & background readers
-                            *state.cached_stats.write().await = stats_map.clone();
-                            let _ = handle.emit("container-stats-tick", stats_map);
-                        } else {
-                            state.cached_stats.write().await.clear();
-                        }
+            let Ok(client) = state.get_client().await else {
+                continue;
+            };
+            let Ok(Ok(all_containers)) =
+                tokio::time::timeout(MONITOR_LIST_TIMEOUT, client.list_containers(true)).await
+            else {
+                continue;
+            };
+            if window_visible && last_containers.as_ref() != Some(&all_containers) {
+                let _ = handle.emit("containers-tick", &all_containers);
+                last_containers = Some(all_containers.clone());
+            }
+
+            let running_ids: Vec<String> = all_containers
+                .into_iter()
+                .filter(|c| c.state == "running")
+                .map(|c| c.id)
+                .collect();
+
+            if !running_ids.is_empty() {
+                let prev = state.cached_stats.read().await.clone();
+                let stats_map = sample_stats(&client, running_ids, &prev).await;
+                // Keep app_state's cached_stats current for tray & background
+                // readers. Replaced wholesale, so removed containers drop out.
+                *state.cached_stats.write().await = stats_map.clone();
+                if window_visible {
+                    let _ = handle.emit("container-stats-tick", stats_map);
+                }
+            } else {
+                let was_not_empty = !state.cached_stats.read().await.is_empty();
+                if was_not_empty {
+                    state.cached_stats.write().await.clear();
+                    if window_visible {
+                        let _ = handle.emit(
+                            "container-stats-tick",
+                            HashMap::<String, crate::docker::models::ContainerStats>::new(),
+                        );
                     }
                 }
             }
@@ -171,6 +284,12 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Lifecycle progress (group starts, auto-start) reaches the UI as
+            // `container-op` / `group-op` events once the registry has a handle.
+            if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
+                state.ops.attach(handle.clone());
+            }
 
             // Check auto-start engine daemon
             if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
@@ -428,6 +547,7 @@ pub fn run() {
             groups::save_container_groups,
             groups::start_container_group,
             groups::stop_container_group,
+            groups::list_container_ops,
             // System
             system::get_engine_status,
             system::apply_engine_limits,

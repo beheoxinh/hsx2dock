@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { api, events } from "./api";
+import { containersEqual, reconcileContainers, sizesEqual } from "./containerGroups";
 import type {
   ContainerGroup,
   ContainerItem,
@@ -67,7 +68,10 @@ function attachTicks() {
   ticksAttached = true;
   events
     .onContainersTick((containers) => {
-      emit({ containers, ready: true });
+      if (snapshot.ready && containersEqual(snapshot.containers, containers)) {
+        return;
+      }
+      emit({ containers: reconcileContainers(snapshot.containers, containers), ready: true });
     })
     .catch(() => {
       // No Tauri bridge (tests, plain browser) — polling still works.
@@ -107,7 +111,9 @@ export function primeContainerStore(force = false): Promise<void> {
     const containersOk = containers.status === "fulfilled";
 
     emit({
-      containers: containersOk ? containers.value : snapshot.containers,
+      containers: containersOk
+        ? reconcileContainers(snapshot.containers, containers.value)
+        : snapshot.containers,
       groups: groups.status === "fulfilled" ? groups.value : snapshot.groups,
       gatewayRoutes:
         routes.status === "fulfilled" ? routes.value : snapshot.gatewayRoutes,
@@ -138,13 +144,18 @@ export function refreshContainers(): Promise<void> {
   const run = (async () => {
     try {
       const containers = await api.listContainers(true);
-      emit({ containers, ready: true });
+      if (!containersEqual(snapshot.containers, containers)) {
+        emit({ containers: reconcileContainers(snapshot.containers, containers), ready: true });
+      }
     } catch {
       /* engine offline — keep the last known list */
     }
     try {
       const sizes = await api.getContainerSizes();
-      emit({ sizes: sizes ?? {} });
+      const nextSizes = sizes ?? {};
+      if (!sizesEqual(snapshot.sizes, nextSizes)) {
+        emit({ sizes: nextSizes });
+      }
     } catch {
       /* keep the previous figures */
     }
@@ -161,7 +172,10 @@ export function refreshContainerSizes(): Promise<void> {
   const run = (async () => {
     try {
       const sizes = await api.getContainerSizes();
-      emit({ sizes: sizes ?? {} });
+      const nextSizes = sizes ?? {};
+      if (!sizesEqual(snapshot.sizes, nextSizes)) {
+        emit({ sizes: nextSizes });
+      }
     } catch {
       /* engine offline — keep the last known figures */
     }
@@ -191,7 +205,7 @@ export function startContainerStoreSync() {
   if (pollTimer) return;
   pollTimer = setInterval(() => {
     void refreshContainerSizes();
-  }, 30_000);
+  }, 120_000);
 }
 
 /** React binding. Components re-render whenever the snapshot changes. */

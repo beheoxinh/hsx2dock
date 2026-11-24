@@ -2869,8 +2869,12 @@ pub fn compose_plugin_version(bin: &Path) -> Option<String> {
 /// sends none. Release-asset downloads are served from a CDN where the header
 /// is optional, but sending it everywhere keeps one code path.
 pub async fn http_get(url: &str) -> Result<reqwest::Response> {
+    // No overall timeout (release assets can be large), but a dead network
+    // must fail instead of hanging an install or "Check update" forever.
     let resp = reqwest::Client::builder()
         .user_agent(concat!("hsx2dock/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .context("build HTTP client")?
         .get(url)

@@ -11,6 +11,10 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ logs }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  // What the terminal currently shows. Streaming logs only ever grow, so the
+  // new tail is appended; clearing and re-parsing the whole buffer on every
+  // change made long logs slower with each line.
+  const writtenRef = useRef("");
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -64,6 +68,8 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ logs }) => {
 
     termRef.current = term;
     fitAddonRef.current = fitAddon;
+    // A fresh terminal is empty, whatever an earlier instance had written.
+    writtenRef.current = "";
 
     const handleResize = () => {
       try {
@@ -81,11 +87,19 @@ export const TerminalViewer: React.FC<TerminalViewerProps> = ({ logs }) => {
   }, []);
 
   useEffect(() => {
-    if (termRef.current) {
-      termRef.current.clear();
-      termRef.current.write(logs);
+    const term = termRef.current;
+    if (!term) return;
+    const prev = writtenRef.current;
+    if (prev && logs.startsWith(prev)) {
+      const tail = logs.slice(prev.length);
+      if (tail) term.write(tail);
+    } else {
+      // Replaced or trimmed content: start over.
+      term.reset();
+      term.write(logs);
       fitAddonRef.current?.fit();
     }
+    writtenRef.current = logs;
   }, [logs]);
 
   return <div ref={containerRef} className="h-full w-full overflow-hidden" />;

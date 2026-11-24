@@ -74,13 +74,26 @@ const listeners = new Set<() => void>();
 let inflight: Promise<void> | null = null;
 let clustersInflight: Promise<void> | null = null;
 
-function persist() {
+/** Serialized form last written, and when — to skip redundant writes. */
+let lastPersisted = "";
+let lastPersistAt = 0;
+/**
+ * An unchanged poll only moves the freshness stamps. Rewriting (and
+ * re-serializing) the whole cache for that on every poll was wasted work; a
+ * stamp up to this old is just as good for the next cold start.
+ */
+const STAMP_PERSIST_INTERVAL_MS = 60_000;
+
+function persist(stampsOnly = false) {
   try {
     if (typeof localStorage === "undefined") return;
-    localStorage.setItem(
-      STORAGE_KEY,
-      serializeDashboardCache(snapshot, statusFetchedAt, listsFetchedAt)
-    );
+    const now = Date.now();
+    if (stampsOnly && now - lastPersistAt < STAMP_PERSIST_INTERVAL_MS) return;
+    const value = serializeDashboardCache(snapshot, statusFetchedAt, listsFetchedAt);
+    if (value === lastPersisted) return;
+    localStorage.setItem(STORAGE_KEY, value);
+    lastPersisted = value;
+    lastPersistAt = now;
   } catch {
     /* storage disabled or full — the cache is a convenience, not a requirement */
   }
@@ -107,7 +120,7 @@ function applyData(
   if (snapshot.ready && Object.keys(changed).length === 0) {
     // Same values as before: persist the new freshness stamps, but leave the
     // snapshot identity alone so no component re-renders.
-    persist();
+    persist(true);
     return false;
   }
 

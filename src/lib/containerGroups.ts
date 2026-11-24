@@ -1,4 +1,9 @@
-import type { ContainerGroup, ContainerItem } from "../types";
+import type {
+  ContainerGroup,
+  ContainerItem,
+  ContainerStats,
+  PublishedPort,
+} from "../types";
 
 /**
  * Maps every token a stored group might hold (full id, short id, container
@@ -116,3 +121,166 @@ export function pruneMissingMembers(
       : { ...g, container_ids: ids };
   });
 }
+
+/**
+ * Fast equality comparison for container snapshots. Prevents redundant React re-renders
+ * across background poll intervals when container items haven't changed.
+ */
+export function containersEqual(a: ContainerItem[], b: ContainerItem[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!containerEqual(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+const sameList = (a?: string[], b?: string[]) =>
+  a === b ||
+  ((a?.length ?? 0) === (b?.length ?? 0) &&
+    (a ?? []).every((x, i) => x === (b ?? [])[i]));
+
+const samePorts = (a?: PublishedPort[], b?: PublishedPort[]) =>
+  a === b ||
+  ((a?.length ?? 0) === (b?.length ?? 0) &&
+    (a ?? []).every((p, i) => {
+      const q = (b ?? [])[i];
+      return (
+        p.host_ip === q.host_ip &&
+        p.host_port === q.host_port &&
+        p.container_port === q.container_port &&
+        p.protocol === q.protocol
+      );
+    }));
+
+/** Field-level equality of one container row (what the cards render). */
+export function containerEqual(ca: ContainerItem, cb: ContainerItem): boolean {
+  return (
+    ca === cb ||
+    (ca.id === cb.id &&
+      ca.state === cb.state &&
+      ca.status === cb.status &&
+      ca.name === cb.name &&
+      ca.image === cb.image &&
+      ca.ports === cb.ports &&
+      ca.compose_project === cb.compose_project &&
+      ca.kind_cluster === cb.kind_cluster &&
+      ca.compose_service === cb.compose_service &&
+      sameList(ca.networks, cb.networks) &&
+      sameList(ca.broken_networks, cb.broken_networks) &&
+      samePorts(ca.published_ports, cb.published_ports))
+  );
+}
+
+/**
+ * Keeps the previous object for every row that did not change, so a tick that
+ * flips one container re-renders one memoised card instead of all of them.
+ */
+export function reconcileContainers(
+  prev: ContainerItem[],
+  next: ContainerItem[]
+): ContainerItem[] {
+  if (prev.length === 0) return next;
+  const byId = new Map(prev.map((c) => [c.id, c]));
+  let reused = 0;
+  const out = next.map((c) => {
+    const old = byId.get(c.id);
+    if (old && containerEqual(old, c)) {
+      reused++;
+      return old;
+    }
+    return c;
+  });
+  // Same rows in the same order: keep the old array too.
+  if (reused === prev.length && reused === next.length && out.every((c, i) => c === prev[i])) {
+    return prev;
+  }
+  return out;
+}
+
+/**
+ * Replaces the live stats map with this tick's sample (containers that went
+ * away drop out instead of accumulating forever) while reusing the previous
+ * entry for every container whose figures did not change.
+ */
+export function reconcileStats(
+  prev: Record<string, ContainerStats>,
+  next: Record<string, ContainerStats>
+): Record<string, ContainerStats> {
+  const out: Record<string, ContainerStats> = {};
+  let changed = Object.keys(prev).length !== Object.keys(next).length;
+  for (const [id, s] of Object.entries(next)) {
+    const old = prev[id];
+    if (
+      old &&
+      old.cpu_percent === s.cpu_percent &&
+      old.mem_usage === s.mem_usage &&
+      old.mem_limit === s.mem_limit &&
+      old.net_rx === s.net_rx &&
+      old.net_tx === s.net_tx
+    ) {
+      out[id] = old;
+    } else {
+      out[id] = s;
+      changed = true;
+    }
+  }
+  return changed ? out : prev;
+}
+
+export interface RouteLike {
+  domain: string;
+  target: string;
+  path?: string | null;
+  container_name?: string | null;
+}
+
+/**
+ * Gateway routes that point at each container (by name or published port),
+ * computed once per list change instead of once per card per render. Rows
+ * whose matches did not change keep the previous array, so memoised cards
+ * stay put.
+ */
+export function routesByContainer<R extends RouteLike>(
+  containers: ContainerItem[],
+  routes: R[],
+  prev?: Map<string, R[]>
+): Map<string, R[]> {
+  const out = new Map<string, R[]>();
+  if (routes.length === 0) return out;
+  for (const c of containers) {
+    const cleanName = c.name.replace(/^\//, "");
+    const ports = new Set<string>();
+    for (const p of c.published_ports ?? []) {
+      ports.add(`127.0.0.1:${p.host_port}`);
+      ports.add(`localhost:${p.host_port}`);
+    }
+    const matched = routes.filter(
+      (r) => r.container_name === cleanName || ports.has(r.target)
+    );
+    if (matched.length === 0) continue;
+    const old = prev?.get(c.id);
+    out.set(
+      c.id,
+      old && old.length === matched.length && old.every((r, i) => r === matched[i])
+        ? old
+        : matched
+    );
+  }
+  return out;
+}
+
+/**
+ * Compares two size maps to avoid re-rendering container cards when byte counts are unchanged.
+ */
+export function sizesEqual(a: Record<string, number>, b: Record<string, number>): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+

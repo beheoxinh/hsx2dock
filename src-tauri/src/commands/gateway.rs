@@ -98,15 +98,21 @@ pub async fn toggle_gateway(
         config.save().await.map_err(|e| e.to_string())?;
     }
 
-    let config = state.config.read().await;
+    // Copy what Caddy needs and release the lock: start polls for up to 3s,
+    // and a held read lock stalls every config writer (and, behind it, every
+    // reader) for that long.
+    let (http_port, https_port, routes) = {
+        let config = state.config.read().await;
+        (
+            config.gateway_http_port,
+            config.gateway_https_port,
+            config.gateway_routes.clone(),
+        )
+    };
     if enabled {
         state
             .caddy
-            .start(
-                config.gateway_http_port,
-                config.gateway_https_port,
-                &config.gateway_routes,
-            )
+            .start(http_port, https_port, &routes)
             .await
             .map_err(|e| e.to_string())?;
     } else {
@@ -129,8 +135,14 @@ pub async fn check_hosts_sync(state: State<'_, Arc<AppState>>) -> Result<HostsSy
 
 #[tauri::command]
 pub async fn sync_hosts_file(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let config = state.config.read().await;
-    update_hosts_file(&config.gateway_routes).map_err(|e| e.to_string())
+    // `update_hosts_file` runs pkexec synchronously; the password dialog can
+    // stay open for minutes. Run it off the async workers and without the
+    // config lock held.
+    let routes = state.config.read().await.gateway_routes.clone();
+    tokio::task::spawn_blocking(move || update_hosts_file(&routes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -228,11 +240,18 @@ pub async fn set_gateway_ports(
 
 #[tauri::command]
 pub async fn save_raw_hosts(new_content: String) -> Result<(), String> {
-    save_raw_hosts_content(&new_content).map_err(|e| e.to_string())
+    // pkexec blocks on the password dialog — keep it off the async workers.
+    tokio::task::spawn_blocking(move || save_raw_hosts_content(&new_content))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn clear_app_hosts(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let _ = state;
-    clear_app_hosts_entries().map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(clear_app_hosts_entries)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }

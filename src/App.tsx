@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, Suspense } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar, NavTab } from "./components/layout/Sidebar";
 import { Header } from "./components/layout/Header";
@@ -8,21 +8,41 @@ import { ModalProvider } from "./components/ui/ModalContext";
 import { ContainerDragProvider } from "./components/ContainerDragLayer";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ContainersPage } from "./pages/ContainersPage";
-import { ContainerDetailsDrawer } from "./pages/ContainerDetailsDrawer";
-import {
-  RunContainerWizard,
-  type EditContainerTarget,
-} from "./pages/RunContainerWizard";
-import { ImagesPage } from "./pages/ImagesPage";
-import { VolumesPage } from "./pages/VolumesPage";
-import { NetworksPage } from "./pages/NetworksPage";
-import { KubernetesPage } from "./pages/KubernetesPage";
-import { ComposePage } from "./pages/ComposePage";
-import { GatewayPage } from "./pages/GatewayPage";
-import { McpPage } from "./pages/McpPage";
-import { SettingsPage } from "./pages/SettingsPage";
-import { api, events } from "./lib/api";
+import type { EditContainerTarget } from "./pages/RunContainerWizard";
+
+const ContainerDetailsDrawer = React.lazy(() =>
+  import("./pages/ContainerDetailsDrawer").then((m) => ({ default: m.ContainerDetailsDrawer }))
+);
+const RunContainerWizard = React.lazy(() =>
+  import("./pages/RunContainerWizard").then((m) => ({ default: m.RunContainerWizard }))
+);
+const ImagesPage = React.lazy(() =>
+  import("./pages/ImagesPage").then((m) => ({ default: m.ImagesPage }))
+);
+const VolumesPage = React.lazy(() =>
+  import("./pages/VolumesPage").then((m) => ({ default: m.VolumesPage }))
+);
+const NetworksPage = React.lazy(() =>
+  import("./pages/NetworksPage").then((m) => ({ default: m.NetworksPage }))
+);
+const KubernetesPage = React.lazy(() =>
+  import("./pages/KubernetesPage").then((m) => ({ default: m.KubernetesPage }))
+);
+const ComposePage = React.lazy(() =>
+  import("./pages/ComposePage").then((m) => ({ default: m.ComposePage }))
+);
+const GatewayPage = React.lazy(() =>
+  import("./pages/GatewayPage").then((m) => ({ default: m.GatewayPage }))
+);
+const McpPage = React.lazy(() =>
+  import("./pages/McpPage").then((m) => ({ default: m.McpPage }))
+);
+const SettingsPage = React.lazy(() =>
+  import("./pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))
+);
+import { api, disposeListener, events } from "./lib/api";
 import { primeContainerStore, startContainerStoreSync } from "./lib/containerStore";
+import { startContainerOpsSync, subscribeOpNotices } from "./lib/containerOps";
 import { primeDashboardStore, resetDashboardEngineData } from "./lib/dashboardStore";
 import type { DaemonState } from "./types";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
@@ -87,12 +107,16 @@ const MainLayout: React.FC = () => {
     // groups and gateway routes are fetched once here so the tab paints from
     // memory instead of waiting on Docker on first visit.
     startContainerStoreSync();
+    // Container/group operations in flight (group starts, auto-start on
+    // engine boot, tray actions) drive the per-card spinners; failures that
+    // happen in the background are surfaced here.
+    startContainerOpsSync();
+    const stopNotices = subscribeOpNotices((n) => toast.error(n.title, n.detail));
     // Warm the Dashboard too: it is the opening screen, so its engine figures,
     // storage donut and tool list should already be in memory when it paints.
     void primeDashboardStore();
 
-    let unlisten: (() => void) | undefined;
-    events.onEngineStateChanged((state) => {
+    const unlisten = disposeListener(events.onEngineStateChanged((state) => {
       setDaemonState(state);
       // Every engine-backed page re-fetches: data appears/disappears with the
       // daemon instead of lingering stale or erroring behind the scenes.
@@ -108,24 +132,22 @@ const MainLayout: React.FC = () => {
       }
       // Engine start/stop is visible in the header and every page gate, so it
       // is not announced with a toast; only failures are.
-    }).then((u) => (unlisten = u));
+    }));
 
     // A different endpoint is a different daemon: every page must re-fetch,
     // otherwise the UI keeps showing the previous engine's resources.
-    let unlistenEndpoint: (() => void) | undefined;
-    events
-      .onEndpointChanged(() => {
+    const unlistenEndpoint = disposeListener(
+      events.onEndpointChanged(() => {
         setRefreshKey((k) => k + 1);
         // A different daemon means a different container list.
         void primeContainerStore(true);
         void primeDashboardStore(true);
       })
-      .then((u) => (unlistenEndpoint = u));
+    );
 
     // Tray quick actions. A payload of `kubernetes:<name>` (a cluster row) also
     // asks the Kubernetes page to open that monitor; plain payloads are just
     // navigation. Validate the tab: an old build must never blank the shell.
-    let unlistenTray: (() => void) | undefined;
     const NAV_TABS: NavTab[] = [
       "dashboard",
       "containers",
@@ -138,19 +160,20 @@ const MainLayout: React.FC = () => {
       "mcp",
       "settings",
     ];
-    events
-      .onTrayNavigate((payload) => {
+    const unlistenTray = disposeListener(
+      events.onTrayNavigate((payload) => {
         const [rawTab, cluster] = payload.split(":", 2);
         if (!NAV_TABS.includes(rawTab as NavTab)) return;
         setTrayCluster(cluster ?? null);
         setActiveTab(rawTab as NavTab);
       })
-      .then((u) => (unlistenTray = u));
+    );
 
     return () => {
-      if (unlisten) unlisten();
-      if (unlistenEndpoint) unlistenEndpoint();
-      if (unlistenTray) unlistenTray();
+      unlisten();
+      unlistenEndpoint();
+      unlistenTray();
+      stopNotices();
     };
   }, []);
 
@@ -249,37 +272,39 @@ const MainLayout: React.FC = () => {
               transition={{ duration: 0.18, ease: "easeInOut" }}
               className="h-full w-full"
             >
-              {activeTab === "dashboard" && (
-                <DashboardPage
-                  daemonState={daemonState}
-                  onNavigate={(tab) => setActiveTab(tab)}
-                />
-              )}
-              {activeTab === "containers" && (
-                <ContainersPage
-                  daemonState={daemonState}
-                  onOpenDetails={handleOpenDetails}
-                  onOpenWizard={() => {
-                    setWizardEditTarget(null);
-                    setIsWizardOpen(true);
-                  }}
-                  onEditContainer={handleOpenEditContainer}
-                />
-              )}
-              {activeTab === "images" && <ImagesPage refreshKey={refreshKey} daemonState={daemonState} />}
-              {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} daemonState={daemonState} />}
-              {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} daemonState={daemonState} />}
-              {activeTab === "kubernetes" && (
-                <KubernetesPage
-                  refreshKey={refreshKey}
-                  daemonState={daemonState}
-                  openCluster={trayCluster}
-                />
-              )}
-              {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
-              {activeTab === "gateway" && <GatewayPage daemonState={daemonState} />}
-              {activeTab === "mcp" && <McpPage />}
-              {activeTab === "settings" && <SettingsPage />}
+              <Suspense fallback={<div className="h-full w-full flex items-center justify-center text-xs text-zinc-500">Loading…</div>}>
+                {activeTab === "dashboard" && (
+                  <DashboardPage
+                    daemonState={daemonState}
+                    onNavigate={(tab) => setActiveTab(tab)}
+                  />
+                )}
+                {activeTab === "containers" && (
+                  <ContainersPage
+                    daemonState={daemonState}
+                    onOpenDetails={handleOpenDetails}
+                    onOpenWizard={() => {
+                      setWizardEditTarget(null);
+                      setIsWizardOpen(true);
+                    }}
+                    onEditContainer={handleOpenEditContainer}
+                  />
+                )}
+                {activeTab === "images" && <ImagesPage refreshKey={refreshKey} daemonState={daemonState} />}
+                {activeTab === "volumes" && <VolumesPage refreshKey={refreshKey} daemonState={daemonState} />}
+                {activeTab === "networks" && <NetworksPage refreshKey={refreshKey} daemonState={daemonState} />}
+                {activeTab === "kubernetes" && (
+                  <KubernetesPage
+                    refreshKey={refreshKey}
+                    daemonState={daemonState}
+                    openCluster={trayCluster}
+                  />
+                )}
+                {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
+                {activeTab === "gateway" && <GatewayPage daemonState={daemonState} />}
+                {activeTab === "mcp" && <McpPage />}
+                {activeTab === "settings" && <SettingsPage />}
+              </Suspense>
             </motion.div>
           </AnimatePresence>
         </main>
@@ -287,42 +312,48 @@ const MainLayout: React.FC = () => {
 
       {/* Slide-over Container Details Drawer */}
       {selectedContainerId && (
-        <ContainerDetailsDrawer
-          containerId={selectedContainerId}
-          initialTab={drawerTab}
-          debug={drawerDebug}
-          editLimits={drawerEdit}
-          onOpenEditConfig={(details) => {
-            setWizardEditTarget({ id: details.id, details });
-            setIsWizardOpen(true);
-          }}
-          onClose={() => {
-            setSelectedContainerId(null);
-            setDrawerDebug(false);
-            setDrawerEdit(false);
-          }}
-        />
+        <Suspense fallback={null}>
+          <ContainerDetailsDrawer
+            containerId={selectedContainerId}
+            initialTab={drawerTab}
+            debug={drawerDebug}
+            editLimits={drawerEdit}
+            onOpenEditConfig={(details) => {
+              setWizardEditTarget({ id: details.id, details });
+              setIsWizardOpen(true);
+            }}
+            onClose={() => {
+              setSelectedContainerId(null);
+              setDrawerDebug(false);
+              setDrawerEdit(false);
+            }}
+          />
+        </Suspense>
       )}
 
       {/* Run / Edit Container Wizard Modal */}
-      <RunContainerWizard
-        isOpen={isWizardOpen}
-        editTarget={wizardEditTarget}
-        onClose={() => {
-          setIsWizardOpen(false);
-          setWizardEditTarget(null);
-        }}
-        onSuccess={(newId) => {
-          setRefreshKey((k) => k + 1);
-          if (wizardEditTarget && selectedContainerId === wizardEditTarget.id) {
-            if (newId) {
-              setSelectedContainerId(newId);
-            } else {
-              setSelectedContainerId(null);
-            }
-          }
-        }}
-      />
+      {isWizardOpen && (
+        <Suspense fallback={null}>
+          <RunContainerWizard
+            isOpen={isWizardOpen}
+            editTarget={wizardEditTarget}
+            onClose={() => {
+              setIsWizardOpen(false);
+              setWizardEditTarget(null);
+            }}
+            onSuccess={(newId) => {
+              setRefreshKey((k) => k + 1);
+              if (wizardEditTarget && selectedContainerId === wizardEditTarget.id) {
+                if (newId) {
+                  setSelectedContainerId(newId);
+                } else {
+                  setSelectedContainerId(null);
+                }
+              }
+            }}
+          />
+        </Suspense>
+      )}
     </div>
   );
 };

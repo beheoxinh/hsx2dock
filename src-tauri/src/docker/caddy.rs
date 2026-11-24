@@ -439,6 +439,19 @@ impl CaddySupervisor {
             bail!("Caddy process failed to start or open admin API on 127.0.0.1:2019. Details: {stderr_msg}");
         }
 
+        // stderr stays piped for the failure message above, but nothing read
+        // it afterwards: once Caddy's TLS/upstream logging filled the ~64KB
+        // pipe buffer, its next write blocked and the gateway stopped serving.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "caddy", "{line}");
+                }
+            });
+        }
+
         let mut guard = self.child.lock().await;
         *guard = Some(child);
         Ok(())
@@ -451,8 +464,12 @@ impl CaddySupervisor {
         }
 
         // Try graceful stop via admin API
-        let client = reqwest::Client::new();
-        let _ = client.post("http://127.0.0.1:2019/stop").send().await;
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            let _ = client.post("http://127.0.0.1:2019/stop").send().await;
+        }
 
         Ok(())
     }

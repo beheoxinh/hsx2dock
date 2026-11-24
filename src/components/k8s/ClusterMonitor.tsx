@@ -233,15 +233,22 @@ export const ClusterMonitor: React.FC<{
 
   useEffect(() => {
     let alive = true;
+    // Each tick is three `docker exec kubectl` calls; a slow API server must
+    // not let ticks pile up behind it.
+    let inflight = false;
 
     const fast = async () => {
+      if (inflight || document.hidden) return;
+      inflight = true;
       // Each query settles on its own: without metrics-server only the
       // metrics call fails, and it must not blank the pods/summary panes.
       const [s, p, m] = await Promise.allSettled([
         api.getClusterSummary(cluster),
         api.getClusterPods(cluster),
         api.getClusterMetrics(cluster),
-      ]);
+      ]).finally(() => {
+        inflight = false;
+      });
       if (!alive) return;
       if (s.status === "fulfilled") setSummary(s.value);
       if (p.status === "fulfilled") setPods(p.value);
@@ -251,41 +258,65 @@ export const ClusterMonitor: React.FC<{
         failed && failed.status === "rejected" ? String(failed.reason) : null
       );
     };
-    const slow = async () => {
-      // Independent again: a failing sub-query (e.g. PVC listing on an old
-      // apiserver) must not wipe the tabs that answered fine.
-      const [n, ev, w, sv, cf, pv, ing, pvol, ns] = await Promise.allSettled([
-        api.getClusterNodes(cluster),
-        api.getClusterEvents(cluster),
-        api.getClusterWorkloads(cluster),
-        api.getClusterServices(cluster),
-        api.getClusterConfigResources(cluster),
-        api.getClusterPvcs(cluster),
-        api.getClusterIngresses(cluster),
-        api.getClusterPvs(cluster),
-        api.getClusterNamespaces(cluster),
-      ]);
-      if (!alive) return;
-      if (n.status === "fulfilled") setNodes(n.value);
-      if (ev.status === "fulfilled") setEvents(ev.value);
-      if (w.status === "fulfilled") setWorkloads(w.value);
-      if (sv.status === "fulfilled") setServices(sv.value);
-      if (cf.status === "fulfilled") setConfigs(cf.value);
-      if (pv.status === "fulfilled") setPvcs(pv.value);
-      if (ing.status === "fulfilled") setIngresses(ing.value);
-      if (pvol.status === "fulfilled") setPvs(pvol.value);
-      if (ns.status === "fulfilled") setNamespaceList(ns.value);
-    };
     fast();
-    slow();
     const t1 = window.setInterval(fast, 6000);
-    const t2 = window.setInterval(slow, 15000);
     return () => {
       alive = false;
       window.clearInterval(t1);
-      window.clearInterval(t2);
     };
   }, [cluster]);
+
+  // Tab-scoped slow poll (15s): only query the kubectl resources needed by the
+  // active tab instead of spawning 9 concurrent `docker exec kubectl` calls.
+  useEffect(() => {
+    let alive = true;
+
+    const fetchTab = async () => {
+      if (document.hidden) return;
+      if (tab === "overview") {
+        const [n, ev] = await Promise.allSettled([
+          api.getClusterNodes(cluster),
+          api.getClusterEvents(cluster),
+        ]);
+        if (!alive) return;
+        if (n.status === "fulfilled") setNodes(n.value);
+        if (ev.status === "fulfilled") setEvents(ev.value);
+      } else if (tab === "nodes") {
+        api.getClusterNodes(cluster).then((v) => alive && setNodes(v)).catch(() => {});
+      } else if (tab === "workloads") {
+        api.getClusterWorkloads(cluster).then((v) => alive && setWorkloads(v)).catch(() => {});
+      } else if (tab === "services") {
+        const [sv, ing] = await Promise.allSettled([
+          api.getClusterServices(cluster),
+          api.getClusterIngresses(cluster),
+        ]);
+        if (!alive) return;
+        if (sv.status === "fulfilled") setServices(sv.value);
+        if (ing.status === "fulfilled") setIngresses(ing.value);
+      } else if (tab === "config") {
+        api.getClusterConfigResources(cluster).then((v) => alive && setConfigs(v)).catch(() => {});
+      } else if (tab === "pvcs") {
+        const [pv, pvol] = await Promise.allSettled([
+          api.getClusterPvcs(cluster),
+          api.getClusterPvs(cluster),
+        ]);
+        if (!alive) return;
+        if (pv.status === "fulfilled") setPvcs(pv.value);
+        if (pvol.status === "fulfilled") setPvs(pvol.value);
+      } else if (tab === "namespaces") {
+        api.getClusterNamespaces(cluster).then((v) => alive && setNamespaceList(v)).catch(() => {});
+      } else if (tab === "events") {
+        api.getClusterEvents(cluster).then((v) => alive && setEvents(v)).catch(() => {});
+      }
+    };
+
+    fetchTab();
+    const t2 = window.setInterval(fetchTab, 15000);
+    return () => {
+      alive = false;
+      window.clearInterval(t2);
+    };
+  }, [cluster, tab]);
 
   // Metrics-server is a *post-start* check. A freshly started cluster needs
   // roughly a minute before the addon has had a chance to become ready; probing
@@ -309,6 +340,7 @@ export const ClusterMonitor: React.FC<{
     const waitMs = startedAtMs ? Math.max(0, 60_000 - (Date.now() - startedAtMs)) : 0;
 
     const probe = () => {
+      if (document.hidden) return;
       api
         .metricsServerStatus(cluster)
         .then((s) => {

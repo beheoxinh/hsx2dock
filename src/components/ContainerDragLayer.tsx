@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -88,7 +89,26 @@ interface DragContextValue {
   ) => () => void;
 }
 
+type DragActions = Pick<
+  DragContextValue,
+  "startDrag" | "registerTarget" | "registerMemberList"
+>;
+
 const DragContext = createContext<DragContextValue | null>(null);
+/**
+ * The stable half of the layer. Every card calls `useDraggable`; reading the
+ * live drag state there made all cards re-render on each pointermove.
+ */
+const DragActionsContext = createContext<DragActions | null>(null);
+
+const samePreview = (a: ReorderPreview | null, b: ReorderPreview | null) =>
+  a === b ||
+  (!!a &&
+    !!b &&
+    a.groupId === b.groupId &&
+    a.beforeKey === b.beforeKey &&
+    a.index === b.index &&
+    a.unchanged === b.unchanged);
 const DropHandlerContext = createContext<
   ((fn: DropHandler | null) => void) | null
 >(null);
@@ -228,6 +248,27 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
       setReorder(null);
     };
 
+    // Hit-testing reads layout (elementFromPoint, getBoundingClientRect on
+    // every card of the group), so it runs at most once per frame.
+    let frame = 0;
+    const hitTest = () => {
+      frame = 0;
+      if (!active.current) return;
+      const { x, y } = pointer.current;
+      const t = targetAt(x, y);
+      setOverGroupId(t ? t.groupId : null);
+      setOverIsolated(!!t && t.groupId === null);
+      // Only the group that already holds the card gets a reorder preview;
+      // anywhere else the layer is showing a move, not a reorder.
+      const owning = active.current?.ownGroupId;
+      const next =
+        t && t.groupId && t.groupId === owning ? previewAt(t.groupId, y) : null;
+      if (!samePreview(reorderRef.current, next)) {
+        reorderRef.current = next;
+        setReorder(next);
+      }
+    };
+
     const onMove = (e: PointerEvent) => {
       pointer.current = { x: e.clientX, y: e.clientY };
       const p = pending.current;
@@ -244,18 +285,7 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
         return;
       }
       moveGhost();
-      const t = targetAt(e.clientX, e.clientY);
-      setOverGroupId(t ? t.groupId : null);
-      setOverIsolated(!!t && t.groupId === null);
-      // Only the group that already holds the card gets a reorder preview;
-      // anywhere else the layer is showing a move, not a reorder.
-      const owning = active.current?.ownGroupId;
-      const next =
-        t && t.groupId && t.groupId === owning
-          ? previewAt(t.groupId, e.clientY)
-          : null;
-      reorderRef.current = next;
-      setReorder(next);
+      if (!frame) frame = requestAnimationFrame(hitTest);
     };
 
     const onUp = (e: PointerEvent) => {
@@ -264,8 +294,17 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
         pending.current = null;
         return;
       }
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
       const t = targetAt(e.clientX, e.clientY);
-      const preview = reorderRef.current;
+      // The last frame may not have run yet: recompute so the drop matches
+      // where the pointer actually is.
+      const preview =
+        t && t.groupId && t.groupId === dragging.ownGroupId
+          ? previewAt(t.groupId, e.clientY)
+          : null;
       finish();
       if (!t) return; // released over nothing — cancel, no click follows
       // The group bar decides whether a drop is allowed — a compose member, for
@@ -296,6 +335,7 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     window.addEventListener("pointercancel", onCancel);
     window.addEventListener("click", onClickCapture, true);
     return () => {
+      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
@@ -314,18 +354,18 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
     dropHandler.current = fn;
   }, []);
 
+  const actions = useMemo<DragActions>(
+    () => ({ startDrag, registerTarget, registerMemberList }),
+    [startDrag, registerTarget, registerMemberList]
+  );
+  const value = useMemo<DragContextValue>(
+    () => ({ payload, overGroupId, overIsolated, reorder, ...actions }),
+    [payload, overGroupId, overIsolated, reorder, actions]
+  );
+
   return (
-    <DragContext.Provider
-      value={{
-        payload,
-        overGroupId,
-        overIsolated,
-        reorder,
-        startDrag,
-        registerTarget,
-        registerMemberList,
-      }}
-    >
+    <DragActionsContext.Provider value={actions}>
+    <DragContext.Provider value={value}>
       <DropHandlerContext.Provider value={setDropHandler}>
         {children}
         {payload && (
@@ -338,6 +378,7 @@ export const ContainerDragProvider: React.FC<{ children: React.ReactNode }> = ({
         )}
       </DropHandlerContext.Provider>
     </DragContext.Provider>
+    </DragActionsContext.Provider>
   );
 };
 
@@ -360,11 +401,18 @@ export const useDropHandler = (fn: DropHandler) => {
 
 /** Props that make an element draggable. */
 export const useDraggable = (payload: DragPayload) => {
-  const ctx = useContext(DragContext);
+  const ctx = useContext(DragActionsContext);
   if (!ctx) throw new Error("useDraggable requires <ContainerDragProvider>");
-  return {
-    onPointerDown: (e: React.PointerEvent) => ctx.startDrag(payload, e),
-  };
+  const { startDrag } = ctx;
+  const { id, label, ownGroupId, composeOwned } = payload;
+  // Stable per card, so memoised cards are not invalidated by a new handler.
+  return useMemo(
+    () => ({
+      onPointerDown: (e: React.PointerEvent) =>
+        startDrag({ id, label, ownGroupId, composeOwned }, e),
+    }),
+    [startDrag, id, label, ownGroupId, composeOwned]
+  );
 };
 
 /**

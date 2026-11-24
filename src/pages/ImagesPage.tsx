@@ -1,6 +1,6 @@
 import { useModal } from "../components/ui/ModalContext";
 import { useToast } from "../components/ui/Toast";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Layers,
@@ -26,7 +26,7 @@ import { BuildImageModal } from "../components/images/BuildImageModal";
 import { LoadToKindModal } from "../components/images/LoadToKindModal";
 import { TagImageModal } from "../components/images/TagImageModal";
 import { ImageHistoryModal } from "../components/images/ImageHistoryModal";
-import { api, events } from "../lib/api";
+import { api, disposeListener, events } from "../lib/api";
 import { formatBytes, formatRelativeTime, truncateId } from "../lib/utils";
 import type {
   ImageItem,
@@ -70,6 +70,9 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
   const [autoPrune, setAutoPrune] = useState(false);
   const [pruningAuto, setPruningAuto] = useState(false);
+  const pendingPull = useRef<PullProgressPayload | null>(null);
+  const pendingPush = useRef<PushProgressPayload | null>(null);
+  const progressFrame = useRef(0);
 
   const loadImages = async (checkAutoPrune: boolean = true) => {
     try {
@@ -113,26 +116,53 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     loadImages();
     api.listRegistries().then(setRegistries).catch(() => {});
 
-    let unlistenPull: (() => void) | undefined;
-    events.onPullProgress((payload) => {
-      setPullStatus(payload);
-      if (payload.done) {
-        setIsPulling(false);
-        loadImages();
-      }
-    }).then((u) => (unlistenPull = u));
+    // A layer download emits progress many times a second; only the latest
+    // payload per frame is rendered. Terminal payloads apply at once.
+    const flush = () => {
+      progressFrame.current = 0;
+      const pull = pendingPull.current;
+      const push = pendingPush.current;
+      pendingPull.current = null;
+      pendingPush.current = null;
+      if (pull) setPullStatus(pull);
+      if (push) setPushStatus(push);
+    };
+    const schedule = () => {
+      if (!progressFrame.current) progressFrame.current = requestAnimationFrame(flush);
+    };
 
-    let unlistenPush: (() => void) | undefined;
-    events.onPushProgress((payload) => {
-      setPushStatus(payload);
-      if (payload.done) {
-        setIsPushing(false);
-      }
-    }).then((u) => (unlistenPush = u));
+    const unlistenPull = disposeListener(
+      events.onPullProgress((payload) => {
+        if (payload.done) {
+          pendingPull.current = null;
+          setPullStatus(payload);
+          setIsPulling(false);
+          loadImages();
+          return;
+        }
+        pendingPull.current = payload;
+        schedule();
+      })
+    );
+
+    const unlistenPush = disposeListener(
+      events.onPushProgress((payload) => {
+        if (payload.done) {
+          pendingPush.current = null;
+          setPushStatus(payload);
+          setIsPushing(false);
+          return;
+        }
+        pendingPush.current = payload;
+        schedule();
+      })
+    );
 
     return () => {
-      if (unlistenPull) unlistenPull();
-      if (unlistenPush) unlistenPush();
+      unlistenPull();
+      unlistenPush();
+      if (progressFrame.current) cancelAnimationFrame(progressFrame.current);
+      progressFrame.current = 0;
     };
   }, [refreshKey]);
 

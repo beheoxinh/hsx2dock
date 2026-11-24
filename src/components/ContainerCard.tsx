@@ -19,12 +19,14 @@ import {
   Globe,
   Wrench,
   AlertTriangle,
+  Loader2,
 } from "lucide-react";
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
 import { useToast } from "./ui/Toast";
 import { formatBytes, truncateId } from "../lib/utils";
 import { portChips, type PortChip } from "../lib/portExposure";
+import { useContainerOp, type PendingOp } from "../lib/containerOps";
 import type { ContainerItem, ContainerStats } from "../types";
 
 export type ContainerAction =
@@ -134,17 +136,58 @@ const PortChipBadge: React.FC<{ chip: PortChip; containerName: string }> = ({
   );
 };
 
+const PENDING_LABEL: Record<string, [string, string]> = {
+  start: ["Starting…", "Waiting to start"],
+  stop: ["Stopping…", "Waiting to stop"],
+  restart: ["Restarting…", "Waiting to restart"],
+  pause: ["Pausing…", "Waiting to pause"],
+  unpause: ["Resuming…", "Waiting to resume"],
+  remove: ["Removing…", "Waiting to remove"],
+};
+
+/**
+ * Replaces the lifecycle buttons while an action is in flight: a spinning
+ * indicator for the running call, a slower dimmed one while it waits for a
+ * concurrency slot. The card stays interactive for logs/details.
+ */
+const PendingIndicator: React.FC<{ pending: PendingOp; name: string }> = ({
+  pending,
+  name,
+}) => {
+  const [active, waiting] = PENDING_LABEL[pending.op] ?? ["Working…", "Waiting"];
+  const queued = pending.phase === "queued";
+  const label = queued ? waiting : active;
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label={`${name}: ${label}`}
+      title={label}
+      className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-medium ${
+        queued
+          ? "border-zinc-700/70 bg-zinc-800/60 text-zinc-400"
+          : "border-blue-500/40 bg-blue-500/10 text-blue-300"
+      }`}
+    >
+      <Loader2
+        className={`w-3.5 h-3.5 animate-spin ${queued ? "opacity-60 [animation-duration:2s]" : ""}`}
+      />
+      <span className="whitespace-nowrap">{label}</span>
+    </span>
+  );
+};
+
 /**
  * One container, rendered identically whether it sits in the flat list or
  * inside a group card. `compact` trims the padding and tightens the stats grid
  * for the nested case; the figures themselves stay, because the group header's
  * aggregate pills are a summary, not a replacement for per-container data.
  */
-export const ContainerCard: React.FC<ContainerCardProps> = ({
+export const ContainerCard = React.memo<ContainerCardProps>(function ContainerCard({
   container: c,
   stats,
   sizeBytes,
-  busy = false,
+  busy: busyProp = false,
   dragHandle,
   isDragSource = false,
   compact = false,
@@ -154,10 +197,13 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   onRepairNetwork,
   gatewayRoutes: propGatewayRoutes,
   gatewayDomain,
-}) => {
+}) {
   const isRunning = c.state === "running";
   const name = c.name.replace(/^\//, "");
   const toast = useToast();
+  // Subscribed per card, so a group pass only re-renders the cards it touches.
+  const pending = useContainerOp(c.id);
+  const busy = busyProp || !!pending;
 
   // Combine gatewayDomain (legacy single prop) and gatewayRoutes (list)
   const activeRoutes = useMemo(() => {
@@ -190,7 +236,7 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
   return (
     <Card
       data-container-card={c.id}
-      className={`flex flex-col lg:flex-row lg:items-center justify-between transition-all ${
+      className={`flex flex-col lg:flex-row lg:items-center justify-between transition-colors duration-150 ${
         compact ? "gap-3 p-3" : "gap-5 p-4"
       } ${
         dragHandle ? "cursor-grab active:cursor-grabbing" : ""
@@ -215,19 +261,21 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
             {/* Status indicator dot positioned directly in front of the container name */}
             <span
               className="relative flex h-2.5 w-2.5 shrink-0"
-              title={`Status: ${c.state}`}
+              title={pending ? `Status: ${c.state} (${pending.op} pending)` : `Status: ${c.state}`}
             >
-              {isRunning && (
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              {pending && (
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-60" />
               )}
               <span
                 className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
-                  isRunning
-                    ? "bg-emerald-400"
-                    : c.state.includes("pause")
-                    ? "bg-amber-400"
-                    : c.state.includes("restart")
+                  pending
                     ? "bg-blue-400"
+                    : isRunning
+                    ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]"
+                    : c.state.includes("pause")
+                    ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.6)]"
+                    : c.state.includes("restart")
+                    ? "bg-blue-400 shadow-[0_0_6px_rgba(96,165,250,0.6)]"
                     : "bg-zinc-500"
                 }`}
               />
@@ -292,7 +340,7 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
                   e.stopPropagation();
                   onRepairNetwork?.();
                 }}
-                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition font-mono text-[10px] font-medium animate-pulse cursor-pointer shadow-sm shadow-amber-950/30"
+                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition-colors font-mono text-[10px] font-medium cursor-pointer shadow-sm shadow-amber-950/30"
                 title={`Network "${net}" is broken (ID missing from Docker). Click to fix.`}
               >
                 <AlertTriangle className="w-2.5 h-2.5 text-amber-400 shrink-0" />
@@ -379,7 +427,9 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
           compact ? "shrink-0" : "self-end lg:self-center shrink-0"
         }`}
       >
-        {isRunning ? (
+        {pending ? (
+          <PendingIndicator pending={pending} name={name} />
+        ) : isRunning ? (
           <>
             <Button
               variant="ghost"
@@ -492,4 +542,4 @@ export const ContainerCard: React.FC<ContainerCardProps> = ({
       </div>
     </Card>
   );
-};
+});

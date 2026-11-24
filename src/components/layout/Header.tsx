@@ -16,13 +16,13 @@ interface HeaderProps {
   onOpenClusters?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({
+export const Header = React.memo<HeaderProps>(function Header({
   daemonState,
   onToggleEngine,
   isToggling = false,
   onRefresh,
   onOpenClusters,
-}) => {
+}) {
   const isRunning = daemonState === "Running";
   const stateStr = typeof daemonState === "string" ? daemonState : "Error";
   const [isDark, setIsDark] = useState(true);
@@ -40,14 +40,39 @@ export const Header: React.FC<HeaderProps> = ({
       return;
     }
     let disposed = false;
+    let inflight = false;
     const load = () => {
+      // Hidden window: nobody reads the badge. A slow answer: skip the tick
+      // instead of stacking another `kind get clusters` behind it.
+      if (inflight || document.hidden) return;
+      inflight = true;
       api
         .listKindClusters()
         .then((list) => {
-          if (!disposed) setClusters(list);
+          if (!disposed) {
+            setClusters((prev) => {
+              if (
+                prev.length === list.length &&
+                prev.every(
+                  (c, i) =>
+                    c.name === list[i]?.name &&
+                    c.running === list[i]?.running &&
+                    c.pod_count === list[i]?.pod_count &&
+                    c.running_pod_count === list[i]?.running_pod_count &&
+                    c.api_ready === list[i]?.api_ready
+                )
+              ) {
+                return prev;
+              }
+              return list;
+            });
+          }
         })
         .catch(() => {
           /* engine went away mid-poll — keep the last snapshot */
+        })
+        .finally(() => {
+          inflight = false;
         });
     };
     load();
@@ -75,7 +100,7 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   return (
-    <header className="h-16 px-6 bg-zinc-950/60 backdrop-blur-xl border-b border-zinc-800/80 flex items-center justify-between select-none z-10">
+    <header className="h-16 px-6 bg-zinc-950/95 border-b border-zinc-800/80 flex items-center justify-between select-none z-10">
       <div className="flex items-center gap-5">
         <div className="flex items-center gap-2.5">
           <span className="text-xs font-medium text-zinc-400">Docker Daemon:</span>
@@ -149,4 +174,4 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
     </header>
   );
-};
+});

@@ -14,6 +14,8 @@ use super::models::{
 #[derive(Clone)]
 pub struct DockerClient {
     docker: Docker,
+    network_cache: std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, Vec<NetworkItem>)>>>,
+    sizes_cache: std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, std::collections::HashMap<String, u64>)>>>,
 }
 
 /// A stopped container is a prune candidate unless it is a kind node — those
@@ -36,7 +38,9 @@ impl DockerClient {
             }
             None => Docker::connect_with_socket_defaults()?,
         };
-        Ok(Self { docker })
+        let network_cache = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let sizes_cache = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        Ok(Self { docker, network_cache, sizes_cache })
     }
 
     /// Connects to an explicit endpoint.
@@ -70,7 +74,9 @@ impl DockerClient {
             }
             other => anyhow::bail!("Unsupported endpoint kind: {other}"),
         };
-        Ok(Self { docker })
+        let network_cache = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let sizes_cache = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        Ok(Self { docker, network_cache, sizes_cache })
     }
 
     /// The daemon's reported version, used to label a reachable endpoint.
@@ -82,7 +88,11 @@ impl DockerClient {
     /// Real daemon health check: the Engine API must answer.
     /// A present-but-stale socket file alone does not count as healthy.
     pub async fn is_healthy(&self) -> bool {
-        self.docker.ping().await.map(|_| true).unwrap_or(false)
+        // Bounded: a wedged daemon must not hang every command that asks.
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.docker.ping()).await,
+            Ok(Ok(_))
+        )
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
@@ -118,26 +128,51 @@ impl DockerClient {
 
     /// One-shot disk usage per container (bytes written to its RW layer).
     /// `size=true` makes the daemon walk each container's layer, so this is
-    /// deliberately separate from the cheap `list_containers` the tick uses.
+    /// deliberately separate from the cheap `list_containers` the tick uses,
+    /// and cached for 60s to avoid hammering disk I/O on repeated refreshes.
     pub async fn container_sizes(&self) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+        {
+            let guard = self.sizes_cache.read().await;
+            if let Some((ts, ref map)) = *guard {
+                if ts.elapsed() < std::time::Duration::from_secs(60) {
+                    return Ok(map.clone());
+                }
+            }
+        }
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(true)
             .size(true)
             .build();
         let list = self.docker.list_containers(Some(opts)).await?;
-        Ok(list
+        let map: std::collections::HashMap<String, u64> = list
             .into_iter()
             .filter_map(|c| {
                 let id = c.id?;
                 let bytes = c.size_rw.unwrap_or(0).max(0) as u64;
                 Some((id, bytes))
             })
-            .collect())
+            .collect();
+        *self.sizes_cache.write().await = Some((std::time::Instant::now(), map.clone()));
+        Ok(map)
     }
 
     /// One-shot exec: runs `cmd` inside `container`, returns combined stdout+stderr.
     /// Errors on non-zero exit. Used for kubectl queries inside kind nodes.
     pub async fn exec_capture(&self, container: &str, cmd: Vec<String>) -> anyhow::Result<String> {
+        // A kubectl against a dead API server can block for minutes; every
+        // caller polls, so a bounded failure is always the better answer.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.exec_capture_unbounded(container, cmd),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("exec in {container} timed out after 30s"),
+        }
+    }
+
+    async fn exec_capture_unbounded(&self, container: &str, cmd: Vec<String>) -> anyhow::Result<String> {
         use anyhow::Context;
         use bollard::container::LogOutput;
         use bollard::exec::StartExecResults;
@@ -241,7 +276,7 @@ impl DockerClient {
             .all(all)
             .build();
         let list = self.docker.list_containers(Some(opts)).await?;
-        let live_networks = self.list_networks().await.unwrap_or_default();
+        let live_networks = self.cached_networks(std::time::Duration::from_secs(15)).await.unwrap_or_default();
         let live_net_ids: std::collections::HashSet<String> = live_networks.iter().map(|n| n.id.clone()).collect();
         let live_net_names: std::collections::HashSet<String> = live_networks.iter().map(|n| n.name.clone()).collect();
 
@@ -412,10 +447,22 @@ impl DockerClient {
         Ok(removed)
     }
 
+    /// One stats sample with a correct CPU %: the daemon waits for a second
+    /// cycle so `precpu` is a real baseline (~1s). Use for one-off reads.
     pub async fn container_stats(&self, id: &str) -> anyhow::Result<ContainerStats> {
+        self.container_stats_opt(id, false).await
+    }
+
+    /// Immediate sample without a CPU baseline (`cpu_percent` is 0). The
+    /// caller diffs consecutive samples via [`ContainerStats::cpu_percent_since`].
+    pub async fn container_stats_one_shot(&self, id: &str) -> anyhow::Result<ContainerStats> {
+        self.container_stats_opt(id, true).await
+    }
+
+    async fn container_stats_opt(&self, id: &str, one_shot: bool) -> anyhow::Result<ContainerStats> {
         let opts = bollard::query_parameters::StatsOptionsBuilder::default()
             .stream(false)
-            .one_shot(true)
+            .one_shot(one_shot)
             .build();
         let mut stream = self.docker.stats(id, Some(opts));
         if let Some(stat) = stream.next().await {
@@ -448,10 +495,27 @@ impl DockerClient {
                     })
                     .unwrap_or(1)
                     .max(1) as f64;
-                if sys_delta > 0.0 && cpu_delta >= 0.0 {
+                // One-shot samples carry an empty precpu block: a "delta"
+                // against zero is the lifetime average, not current load.
+                if !one_shot && pre_sys > 0.0 && sys_delta > 0.0 && cpu_delta >= 0.0 {
                     cpu_percent = (cpu_delta / sys_delta) * online * 100.0;
                 }
             }
+            let cpu_total = cpu
+                .and_then(|c| c.cpu_usage.as_ref())
+                .and_then(|u| u.total_usage)
+                .unwrap_or(0);
+            let system_total = cpu.and_then(|c| c.system_cpu_usage).unwrap_or(0);
+            let online_cpus = cpu
+                .and_then(|c| {
+                    c.online_cpus.map(|v| v as u64).or_else(|| {
+                        c.cpu_usage
+                            .as_ref()
+                            .and_then(|u| u.percpu_usage.as_ref().map(|v| v.len() as u64))
+                    })
+                })
+                .unwrap_or(1)
+                .max(1);
             let mem_usage = stat
                 .memory_stats
                 .as_ref()
@@ -476,6 +540,9 @@ impl DockerClient {
                     .as_ref()
                     .map(|n| n.iter().map(|(_, s)| s.tx_bytes.unwrap_or(0)).sum())
                     .unwrap_or(0),
+                cpu_total,
+                system_total,
+                online_cpus,
             });
         }
         Ok(ContainerStats::default())
@@ -823,7 +890,7 @@ impl DockerClient {
     pub async fn list_networks(&self) -> anyhow::Result<Vec<NetworkItem>> {
         let opts = bollard::query_parameters::ListNetworksOptionsBuilder::default().build();
         let list = self.docker.list_networks(Some(opts)).await?;
-        Ok(list
+        let items: Vec<NetworkItem> = list
             .into_iter()
             .map(|n| {
                 let id = n.id.unwrap_or_default();
@@ -852,7 +919,21 @@ impl DockerClient {
                     protected,
                 }
             })
-            .collect())
+            .collect();
+        *self.network_cache.write().await = Some((std::time::Instant::now(), items.clone()));
+        Ok(items)
+    }
+
+    pub async fn cached_networks(&self, ttl: std::time::Duration) -> anyhow::Result<Vec<NetworkItem>> {
+        {
+            let guard = self.network_cache.read().await;
+            if let Some((ts, ref items)) = *guard {
+                if ts.elapsed() < ttl {
+                    return Ok(items.clone());
+                }
+            }
+        }
+        self.list_networks().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -906,11 +987,13 @@ impl DockerClient {
             ..Default::default()
         };
         self.docker.create_network(body).await?;
+        *self.network_cache.write().await = None;
         Ok(())
     }
 
     pub async fn remove_network(&self, name: &str) -> anyhow::Result<()> {
         self.docker.remove_network(name).await?;
+        *self.network_cache.write().await = None;
         Ok(())
     }
 
@@ -1023,6 +1106,7 @@ impl DockerClient {
                 removed += 1;
             }
         }
+        *self.network_cache.write().await = None;
         Ok(removed)
     }
 

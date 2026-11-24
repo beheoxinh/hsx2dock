@@ -137,8 +137,38 @@ pub async fn list_kind_clusters(
     list_kind_clusters_core(&state).await
 }
 
+static KIND_CLUSTERS_CACHE: std::sync::OnceLock<
+    tokio::sync::Mutex<Option<(std::time::Instant, Vec<KindCluster>)>>,
+> = std::sync::OnceLock::new();
+
+fn kind_clusters_cache(
+) -> &'static tokio::sync::Mutex<Option<(std::time::Instant, Vec<KindCluster>)>> {
+    KIND_CLUSTERS_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
+
+pub(crate) async fn invalidate_kind_clusters_cache() {
+    *kind_clusters_cache().lock().await = None;
+}
+
 /// App-free core of [`list_kind_clusters`], shared with the MCP server.
+/// Cached for 5s behind a mutex so concurrent pollers (Header, Dashboard,
+/// KubernetesPage) share one `docker exec kubectl` pass instead of spawning
+/// duplicate processes.
 pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<KindCluster>, String> {
+    let mut guard = kind_clusters_cache().lock().await;
+    if let Some((ts, ref cached)) = *guard {
+        // Header, Dashboard and the Kubernetes page each poll every 10s; a
+        // 9s window lets them share one pass instead of each missing.
+        if ts.elapsed() < std::time::Duration::from_secs(9) {
+            return Ok(cached.clone());
+        }
+    }
+    let list = list_kind_clusters_uncached(state).await?;
+    *guard = Some((std::time::Instant::now(), list.clone()));
+    Ok(list)
+}
+
+async fn list_kind_clusters_uncached(state: &AppState) -> Result<Vec<KindCluster>, String> {
     // kind targets the bundled engine even when a remote endpoint is active.
     let client = local_client(state).await?;
     // Docker's filter grammar: {"label": ["key"]} = "has this label key".
@@ -201,10 +231,20 @@ pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<Kind
     }
 
     let mut list: Vec<KindCluster> = map.into_values().collect();
-    for cluster in list.iter_mut() {
-        cluster.has_kubeconfig = kubeconfig_has_context(&state.kind, &cluster.name).await;
-        enrich_cluster_card(&client, cluster).await;
-    }
+    // Clusters are enriched concurrently: each one does inspects plus two
+    // kubectl execs, and one booting cluster must not delay the others.
+    let stats = state.cached_stats.read().await.clone();
+    let sizes = client.container_sizes().await.unwrap_or_default();
+    futures_util::future::join_all(list.iter_mut().map(|cluster| {
+        let client = &client;
+        let stats = &stats;
+        let sizes = &sizes;
+        async move {
+            cluster.has_kubeconfig = kubeconfig_has_context(&state.kind, &cluster.name).await;
+            enrich_cluster_card(client, cluster, stats, sizes).await;
+        }
+    }))
+    .await;
     list.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(list)
 }
@@ -216,6 +256,8 @@ pub(crate) async fn list_kind_clusters_core(state: &AppState) -> Result<Vec<Kind
 async fn enrich_cluster_card(
     client: &crate::docker::client::DockerClient,
     cluster: &mut KindCluster,
+    cached_stats: &HashMap<String, crate::docker::models::ContainerStats>,
+    sizes: &HashMap<String, u64>,
 ) {
     // The Overview tile reports memory as a share of the host, mirroring the
     // CPU tile's `% of host`; read it even when the cluster is stopped so the
@@ -246,14 +288,19 @@ async fn enrich_cluster_card(
             .docker()
             .inspect_container(
                 id,
-                Some(bollard::query_parameters::InspectContainerOptions { size: true }),
+                None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
         else {
             continue;
         };
-        if let Some(bytes) = details.size_rw.filter(|b| *b > 0) {
-            disk_size_bytes += bytes as u64;
+        // Inspect without `size=true` never carries SizeRw; the 60s-cached
+        // size pass does, without walking the node's layer on every poll.
+        let full_id = details.id.clone().unwrap_or_else(|| id.clone());
+        if let Some(bytes) = sizes.get(&full_id).copied().or_else(|| {
+            sizes.iter().find(|(k, _)| k.starts_with(id.as_str())).map(|(_, v)| *v)
+        }) {
+            disk_size_bytes += bytes;
         }
         if let Some(ports) = details
             .network_settings
@@ -332,7 +379,18 @@ async fn enrich_cluster_card(
     let mut mem_mb = 0.0f64;
     let mut any_stats = false;
     for id in &ids {
-        if let Ok(s) = client.container_stats(id).await {
+        // The background monitor already samples every running container
+        // (with a correct CPU delta); only fall back to a fresh sample when
+        // it has not caught up with a node yet.
+        let cached = cached_stats
+            .get(id.as_str())
+            .or_else(|| cached_stats.iter().find(|(k, _)| k.starts_with(id.as_str())).map(|(_, v)| v))
+            .cloned();
+        let sample = match cached {
+            Some(s) => Ok(s),
+            None => client.container_stats(id).await,
+        };
+        if let Ok(s) = sample {
             cpu_pct += s.cpu_percent;
             mem_mb += s.mem_usage as f64 / (1024.0 * 1024.0);
             any_stats = true;
@@ -693,6 +751,7 @@ pub(crate) async fn create_kind_cluster_core(
         // kind ships nodes with on-failure:1 — pin them so a later engine
         // start cannot resurrect a cluster the user stopped.
         let _ = enforce_kind_restart_policy(state).await;
+        invalidate_kind_clusters_cache().await;
     }
     result
 }
@@ -735,6 +794,7 @@ pub(crate) async fn delete_kind_cluster_core(
                 crate::tray::notify_kind_event(app, false, &name);
             }
             cleanup_cluster_state(&name);
+            invalidate_kind_clusters_cache().await;
         }
         return result;
     }
@@ -749,6 +809,7 @@ pub(crate) async fn delete_kind_cluster_core(
             crate::tray::notify_kind_event(app, false, &name);
         }
         cleanup_cluster_state(&name);
+        invalidate_kind_clusters_cache().await;
     }
     result
 }
@@ -938,6 +999,7 @@ pub(crate) async fn set_cluster_power(
         app,
         serde_json::json!({ "action": action, "name": name, "line": summary }),
     );
+    invalidate_kind_clusters_cache().await;
     Ok(())
 }
 

@@ -299,7 +299,7 @@ impl McpServer {
             "container_stats" => {
                 self.with_id(args, |id| async move {
                     let client = state.get_client().await?;
-                    client.container_stats(&id).await.map_err(|e| e.to_string())
+                    state.container_stats(&client, &id).await.map_err(|e| e.to_string())
                 })
                 .await
             }

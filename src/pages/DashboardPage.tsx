@@ -92,7 +92,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   // First-load gate for the summary tiles: placeholders instead of zeros that
   // snap to real figures a moment later.
   const loading = !dashboard.ready;
-  const [, setStats] = useState<Record<string, ContainerStats>>({});
   const [pruning, setPruning] = useState(false);
 
   // Kind node ids, so their CPU/memory never inflates the user's charts.
@@ -171,7 +170,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       }
       prevNet = nextNet;
 
-      setStats(tick);
       const sample: StatSample = {
         cpu: counted ? cpuSum / counted : 0,
         mem: memSum,
@@ -199,7 +197,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     if (!isRunning) {
       seriesCache.length = 0;
       reset();
-      setStats({});
     }
   }, [isRunning, reset]);
 

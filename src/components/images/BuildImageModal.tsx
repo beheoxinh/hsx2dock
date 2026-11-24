@@ -17,7 +17,11 @@ import {
 import { Button } from "../ui/Button";
 import { TerminalViewer } from "../ui/TerminalViewer";
 import { useToast } from "../ui/Toast";
-import { api, events } from "../../lib/api";
+import { api, disposeListener, events } from "../../lib/api";
+
+/** Build log lines kept in memory (and in the terminal view). */
+const MAX_BUILD_LINES = 2000;
+const LINE_TRIM_CHUNK = 500;
 import type {
   BuildArg,
   BuildContextInfo,
@@ -192,14 +196,19 @@ export const BuildImageModal: React.FC<BuildImageModalProps> = ({
   // Live build stream — subscribed only while the modal is open.
   useEffect(() => {
     if (!isOpen) return;
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-
-    events
-      .onBuildProgress((payload: BuildProgressPayload) => {
+    return disposeListener(
+      events.onBuildProgress((payload: BuildProgressPayload) => {
         if (payload.log) {
           const text = payload.log;
-          setLines((prev) => [...prev, { text, error: /error|failed/i.test(text) && !!payload.error }]);
+          setLines((prev) => {
+            const next = [...prev, { text, error: /error|failed/i.test(text) && !!payload.error }];
+            // A long build streams tens of thousands of lines. Keep the tail,
+            // trimmed in chunks so the terminal view is rebuilt once per
+            // chunk rather than on every line.
+            return next.length > MAX_BUILD_LINES + LINE_TRIM_CHUNK
+              ? next.slice(-MAX_BUILD_LINES)
+              : next;
+          });
         }
         setStatus(payload.status);
         setProgress({ current: payload.current, total: payload.total });
@@ -219,15 +228,7 @@ export const BuildImageModal: React.FC<BuildImageModalProps> = ({
           }
         }
       })
-      .then((u) => {
-        if (disposed) u();
-        else unlisten = u;
-      });
-
-    return () => {
-      disposed = true;
-      if (unlisten) unlisten();
-    };
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 

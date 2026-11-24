@@ -42,7 +42,6 @@ async-channel = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 dirs = "7.0"
-sysinfo = "0.39"
 uuid = { version = "1.27", features = ["v4", "serde"] }
 toml = "0.9"
 anyhow = "1.0"

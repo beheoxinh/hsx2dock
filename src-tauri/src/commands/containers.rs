@@ -126,7 +126,10 @@ pub async fn get_container_stats(
     id: String,
 ) -> Result<ContainerStats, String> {
     let client = state.get_client().await?;
-    client.container_stats(&id).await.map_err(|e| e.to_string())
+    state
+        .container_stats(&client, &id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

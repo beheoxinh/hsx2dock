@@ -15,7 +15,7 @@ pub enum DaemonState {
     Error(String),
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerItem {
     pub id: String,
     pub short_id: String,
@@ -432,9 +432,29 @@ pub struct ContainerStats {
     /// dashboard diffs consecutive samples to turn these into rates.
     pub net_rx: u64,
     pub net_tx: u64,
+    /// Raw cumulative CPU counters of this sample. A one-shot sample has no
+    /// `precpu` baseline, so the monitor diffs consecutive samples itself;
+    /// these never cross the IPC boundary.
+    #[serde(skip)]
+    pub cpu_total: u64,
+    #[serde(skip)]
+    pub system_total: u64,
+    #[serde(skip)]
+    pub online_cpus: u64,
 }
 
 impl ContainerStats {
+    /// CPU % between two cumulative samples of the same container.
+    pub fn cpu_percent_since(&self, prev: &ContainerStats) -> f64 {
+        let cpu_delta = self.cpu_total.saturating_sub(prev.cpu_total) as f64;
+        let sys_delta = self.system_total.saturating_sub(prev.system_total) as f64;
+        if sys_delta <= 0.0 || self.cpu_total < prev.cpu_total {
+            return 0.0;
+        }
+        let pct = (cpu_delta / sys_delta) * self.online_cpus.max(1) as f64 * 100.0;
+        (pct * 100.0).round() / 100.0
+    }
+
     pub fn mem_percent(&self) -> f64 {
         if self.mem_limit == 0 {
             0.0

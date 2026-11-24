@@ -12,7 +12,9 @@ pub fn runtime() -> &'static Runtime {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            // Monitor, tray, auto-start, gateway and MCP all share this
+            // runtime; two workers let one slow sync call starve the tray.
+            .worker_threads(4)
             .thread_name("hsx2dock-rt")
             .build()
             .expect("failed to build shared Tokio runtime")

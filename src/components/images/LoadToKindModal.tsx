@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X, Hexagon, Loader2, CheckCircle2, Rocket, FolderOpen } from "lucide-react";
 import { Button } from "../ui/Button";
 import { StatusBadge } from "../ui/StatusBadge";
-import { api, events } from "../../lib/api";
+import { api, disposeListener, events } from "../../lib/api";
 import type { KindCluster, KindProgressPayload } from "../../types";
 
 interface LoadToKindModalProps {
@@ -47,11 +47,9 @@ export const LoadToKindModal: React.FC<LoadToKindModalProps> = ({ image, onClose
 
   useEffect(() => {
     if (!image || !loading) return;
-    let unlisten: (() => void) | undefined;
-    events
-      .onKindProgress((payload) => setLines((prev) => [...prev.slice(-149), payload]))
-      .then((u) => (unlisten = u));
-    return () => unlisten?.();
+    return disposeListener(
+      events.onKindProgress((payload) => setLines((prev) => [...prev.slice(-149), payload]))
+    );
   }, [image, loading]);
 
   useEffect(() => {

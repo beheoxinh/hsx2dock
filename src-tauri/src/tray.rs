@@ -64,11 +64,19 @@ enum Signal {
 #[derive(Clone)]
 struct TrayParts {
     tray: Option<TrayIcon<Wry>>,
+    menu: Menu<Wry>,
     title_row: MenuItem<Wry>,
     stats_row: MenuItem<Wry>,
     toggle: MenuItem<Wry>,
     restart: MenuItem<Wry>,
+    group_items: Vec<(String, Submenu<Wry>)>,
+    cluster_items: Vec<(String, Submenu<Wry>)>,
     menu_sig: String,
+    last_color: Option<[u8; 3]>,
+    last_tooltip: Option<String>,
+    last_status_text: Option<String>,
+    last_toggle_state: Option<(bool, bool)>,
+    last_restart_enabled: Option<bool>,
     tx: tokio::sync::mpsc::UnboundedSender<Signal>,
 }
 
@@ -77,10 +85,6 @@ pub struct TrayState {
 }
 
 impl TrayState {
-    fn parts(&self) -> Option<TrayParts> {
-        self.parts.lock().ok().map(|guard| guard.clone())
-    }
-
     fn send(&self, signal: Signal) {
         if let Ok(parts) = self.parts.lock() {
             let _ = parts.tx.send(signal);
@@ -126,9 +130,6 @@ pub fn notify_hidden_to_tray(app: &AppHandle) {
 struct MonitorCtx {
     notified: HashMap<String, Instant>,
     last_engine: Option<DaemonState>,
-    /// Last colour pushed to the tray — StatusNotifier hosts reload the
-    /// pixmap on every `set_icon`, which flickers if we rewrite it each tick.
-    last_color: Option<[u8; 3]>,
 }
 
 /// The freshly built menu plus the handles `refresh` mutates in place.
@@ -138,6 +139,8 @@ struct MenuParts {
     stats_row: MenuItem<Wry>,
     toggle: MenuItem<Wry>,
     restart: MenuItem<Wry>,
+    group_items: Vec<(String, Submenu<Wry>)>,
+    cluster_items: Vec<(String, Submenu<Wry>)>,
     /// Signature of dynamic sections (groups, clusters, gateway routes); changes trigger rebuild.
     menu_sig: String,
 }
@@ -147,16 +150,14 @@ fn menu_signature(daemon: &DaemonState, stats: Option<&TrayStats>) -> String {
     let Some(s) = stats else {
         return parts.join("|");
     };
+    // Only structural changes (membership, running/total counts, gateway routes)
+    // trigger a full GTK/DBusMenu rebuild; CPU/RAM figures update in-place via
+    // `Submenu::set_text` so an open tray menu never flickers or closes.
     for g in &s.groups {
-        // Bin CPU to integer and RAM to 10MB blocks to avoid rebuilding the GTK menu on minor floating jitter
-        let cpu_bin = g.cpu_percent.round() as i64;
-        let mem_bin = (g.mem_usage_mb / 10.0).round() as i64 * 10;
-        parts.push(format!("g:{}:{}:{}:{}:{}", g.id, g.running, g.total, cpu_bin, mem_bin));
+        parts.push(format!("g:{}:{}:{}", g.id, g.running, g.total));
     }
     for c in &s.clusters {
-        let cpu_bin = c.cpu_percent.round() as i64;
-        let mem_bin = (c.mem_usage_mb / 10.0).round() as i64 * 10;
-        parts.push(format!("c:{}:{}:{}:{}:{}", c.name, c.running, c.nodes, cpu_bin, mem_bin));
+        parts.push(format!("c:{}:{}:{}", c.name, c.running, c.nodes));
     }
     parts.push(format!("gw:{}:{}", s.gateway_running, s.active_routes.len()));
     for r in &s.active_routes {
@@ -186,6 +187,34 @@ fn build_menu(
     daemon: &DaemonState,
     stats: Option<&TrayStats>,
 ) -> tauri::Result<MenuParts> {
+    let menu = Menu::new(app)?;
+    populate_menu(&menu, app, daemon, stats)
+}
+
+/// Clears `menu` in-place and populates it with fresh items.
+///
+/// Mutating the single `Menu` instance instead of calling `tray.set_menu(...)`
+/// keeps the underlying `GtkMenu` / `DbusmenuServer` alive on Linux
+/// (`libayatana-appindicator`), preventing GNOME Shell's AppIndicator extension
+/// from losing the menu layout and rendering an empty popup.
+fn populate_menu(
+    menu: &Menu<Wry>,
+    app: &AppHandle,
+    daemon: &DaemonState,
+    stats: Option<&TrayStats>,
+) -> tauri::Result<MenuParts> {
+    if let Ok(existing) = menu.items() {
+        for item in existing {
+            let _ = match item {
+                tauri::menu::MenuItemKind::MenuItem(i) => menu.remove(&i),
+                tauri::menu::MenuItemKind::Submenu(s) => menu.remove(&s),
+                tauri::menu::MenuItemKind::Predefined(p) => menu.remove(&p),
+                tauri::menu::MenuItemKind::Check(c) => menu.remove(&c),
+                tauri::menu::MenuItemKind::Icon(i) => menu.remove(&i),
+            };
+        }
+    }
+
     let title_row = MenuItem::with_id(
         app,
         "app-title",
@@ -232,9 +261,11 @@ fn build_menu(
     )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
-    let menu = Menu::new(app)?;
     menu.append(&title_row)?;
     menu.append(&stats_row)?;
+
+    let mut group_items: Vec<(String, Submenu<Wry>)> = Vec::new();
+    let mut cluster_items: Vec<(String, Submenu<Wry>)> = Vec::new();
 
     if let Some(s) = stats {
         // ================= Container Groups Section =================
@@ -250,12 +281,7 @@ fn build_menu(
             menu.append(&groups_header)?;
 
             for g in &s.groups {
-                let res_str = if g.running > 0 && (g.cpu_percent > 0.0 || g.mem_usage_mb > 0.0) {
-                    format!(" · CPU: {:.1}% | RAM: {:.0} MB", g.cpu_percent, g.mem_usage_mb)
-                } else {
-                    String::new()
-                };
-                let group_title = format!("{} ({}/{} running){}", g.name, g.running, g.total, res_str);
+                let group_title = format_group_title(g);
                 let group_sub = Submenu::new(app, &group_title, true)?;
 
                 let start_item = MenuItem::with_id(
@@ -276,6 +302,7 @@ fn build_menu(
                 group_sub.append(&start_item)?;
                 group_sub.append(&stop_item)?;
                 menu.append(&group_sub)?;
+                group_items.push((g.id.clone(), group_sub));
             }
         }
 
@@ -293,19 +320,7 @@ fn build_menu(
             menu.append(&cls_header)?;
 
             for c in &s.clusters {
-                let phase = if c.running == 0 {
-                    "stopped"
-                } else if c.running == c.nodes {
-                    "running"
-                } else {
-                    "degraded"
-                };
-                let res_str = if c.running > 0 && (c.cpu_percent > 0.0 || c.mem_usage_mb > 0.0) {
-                    format!(" · CPU: {:.1}% | RAM: {:.0} MB", c.cpu_percent, c.mem_usage_mb)
-                } else {
-                    String::new()
-                };
-                let cluster_title = format!("{} ({}/{} nodes, {}){}", c.name, c.running, c.nodes, phase, res_str);
+                let cluster_title = format_cluster_title(c);
                 let cluster_sub = Submenu::new(app, &cluster_title, true)?;
 
                 let nav_item = MenuItem::with_id(
@@ -334,6 +349,7 @@ fn build_menu(
                 cluster_sub.append(&start_item)?;
                 cluster_sub.append(&stop_item)?;
                 menu.append(&cluster_sub)?;
+                cluster_items.push((c.name.clone(), cluster_sub));
             }
         }
 
@@ -387,13 +403,40 @@ fn build_menu(
     menu.append(&quit)?;
 
     Ok(MenuParts {
-        menu,
+        menu: menu.clone(),
         title_row,
         stats_row,
         toggle,
         restart,
+        group_items,
+        cluster_items,
         menu_sig: menu_signature(daemon, stats),
     })
+}
+
+fn format_group_title(g: &GroupStat) -> String {
+    let res_str = if g.running > 0 && (g.cpu_percent > 0.0 || g.mem_usage_mb > 0.0) {
+        format!(" · CPU: {:.1}% | RAM: {:.0} MB", g.cpu_percent, g.mem_usage_mb)
+    } else {
+        String::new()
+    };
+    format!("{} ({}/{} running){}", g.name, g.running, g.total, res_str)
+}
+
+fn format_cluster_title(c: &ClusterStat) -> String {
+    let phase = if c.running == 0 {
+        "stopped"
+    } else if c.running == c.nodes {
+        "running"
+    } else {
+        "degraded"
+    };
+    let res_str = if c.running > 0 && (c.cpu_percent > 0.0 || c.mem_usage_mb > 0.0) {
+        format!(" · CPU: {:.1}% | RAM: {:.0} MB", c.cpu_percent, c.mem_usage_mb)
+    } else {
+        String::new()
+    };
+    format!("{} ({}/{} nodes, {}){}", c.name, c.running, c.nodes, phase, res_str)
 }
 
 /// Creates the tray + menu, manages [`TrayState`], wires event listeners, and
@@ -409,11 +452,13 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     // the menu when that set changes, so the tray never grows blank rows.
     let built = build_menu(app, &daemon, None)?;
 
+    let initial_color = state_color(&daemon);
+    let initial_tooltip = format_tooltip(&state_label(&daemon), None);
     let tx_menu = tx.clone();
     let tray = TrayIconBuilder::with_id("main-tray")
-        .icon(state_icon(state_color(&daemon)))
+        .icon(state_icon(initial_color))
         .icon_as_template(false)
-        .tooltip(&format_tooltip(&state_label(&daemon), None))
+        .tooltip(&initial_tooltip)
         .menu(&built.menu)
         .show_menu_on_left_click(true)
         // Menu clicks only enqueue: engine ops and config writes are async and
@@ -426,11 +471,22 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayState {
         parts: Mutex::new(TrayParts {
             tray: Some(tray),
+            menu: built.menu,
             title_row: built.title_row,
             stats_row: built.stats_row,
             toggle: built.toggle,
             restart: built.restart,
-            menu_sig: built.menu_sig,
+            group_items: built.group_items,
+            cluster_items: built.cluster_items,
+            // Leave empty so the first `refresh` on the running GTK main loop
+            // always populates the menu and emits `LayoutUpdated` for GNOME
+            // AppIndicator, even when the Docker engine is stopped.
+            menu_sig: String::new(),
+            last_color: Some(initial_color),
+            last_tooltip: Some(initial_tooltip),
+            last_status_text: None,
+            last_toggle_state: None,
+            last_restart_enabled: None,
             tx: tx.clone(),
         }),
     });
@@ -443,6 +499,11 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             .map(Signal::Engine)
     });
     listen_signal(app, "build-progress", tx.clone(), |payload| {
+        // Progress fires per layer chunk (hundreds/s); only the final event
+        // matters here, so skip the full parse for the rest.
+        if !payload.contains("\"done\":true") {
+            return None;
+        }
         serde_json::from_str::<BuildEvt>(payload)
             .ok()
             .filter(|e| e.done)
@@ -453,6 +514,11 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             })
     });
     listen_signal(app, "pull-progress", tx.clone(), |payload| {
+        // Progress fires per layer chunk (hundreds/s); only the final event
+        // matters here, so skip the full parse for the rest.
+        if !payload.contains("\"done\":true") {
+            return None;
+        }
         serde_json::from_str::<TransferEvt>(payload)
             .ok()
             .filter(|e| e.done)
@@ -463,6 +529,11 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             })
     });
     listen_signal(app, "push-progress", tx.clone(), |payload| {
+        // Progress fires per layer chunk (hundreds/s); only the final event
+        // matters here, so skip the full parse for the rest.
+        if !payload.contains("\"done\":true") {
+            return None;
+        }
         serde_json::from_str::<TransferEvt>(payload)
             .ok()
             .filter(|e| e.done)
@@ -480,7 +551,6 @@ pub fn init_tray(app: &AppHandle) -> tauri::Result<()> {
             // Deliberately None: the first `engine-state-changed` we hear is a
             // real transition (autostart, toggle, or death), so toast it.
             last_engine: None,
-            last_color: None,
         };
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -864,74 +934,118 @@ struct ActiveRouteStat {
     container_name: Option<String>,
 }
 
-async fn refresh(app: &AppHandle, ctx: &mut MonitorCtx) {
-    let Some(parts) = app.try_state::<TrayState>().and_then(|t| t.parts()) else {
-        return;
-    };
+async fn refresh(app: &AppHandle, _ctx: &mut MonitorCtx) {
     let Some(state) = app.try_state::<std::sync::Arc<AppState>>() else {
         return;
     };
     let daemon = state.daemon_state();
-
     let stats = fetch_stats(&state, &daemon).await;
-    let label = state_label(&daemon);
 
-    if let Some(tray) = &parts.tray {
-        let color = state_color(&daemon);
-        if ctx.last_color != Some(color) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        apply_tray_update(&handle, &daemon, stats.as_ref());
+    });
+}
+
+/// Runs on the GTK/UI main thread so `Menu`, `Submenu`, `set_menu`, `set_icon`,
+/// and `set_tooltip` never touch GTK3/libayatana-appindicator from a Tokio worker.
+fn apply_tray_update(app: &AppHandle, daemon: &DaemonState, stats: Option<&TrayStats>) {
+    let Some(ts) = app.try_state::<TrayState>() else {
+        return;
+    };
+    let Ok(mut guard) = ts.parts.lock() else {
+        return;
+    };
+
+    let label = state_label(daemon);
+    let color = state_color(daemon);
+    let tooltip = format_tooltip(
+        &label,
+        stats.map(|s| (s.containers, s.running, s.images, s.kinds)),
+    );
+
+    if guard.last_color != Some(color) {
+        if let Some(tray) = &guard.tray {
             let _ = tray.set_icon(Some(state_icon(color)));
-            ctx.last_color = Some(color);
         }
-        let _ = tray.set_tooltip(Some(&format_tooltip(
-            &label,
-            stats
-                .as_ref()
-                .map(|s| (s.containers, s.running, s.images, s.kinds)),
-        )));
+        guard.last_color = Some(color);
+    }
+    if guard.last_tooltip.as_deref() != Some(tooltip.as_str()) {
+        if let Some(tray) = &guard.tray {
+            let _ = tray.set_tooltip(Some(&tooltip));
+        }
+        guard.last_tooltip = Some(tooltip);
     }
 
-    let sig = menu_signature(&daemon, stats.as_ref());
-    // Menu rebuilds whenever dynamic items change (counts, resources, routes, or engine state).
-    if parts.menu_sig != sig {
-        if let Some(ts) = app.try_state::<TrayState>() {
-            if let Ok(mut guard) = ts.parts.lock() {
-                if let Ok(built) = build_menu(app, &daemon, stats.as_ref()) {
-                    if let Some(tray) = &guard.tray {
-                        let _ = tray.set_menu(Some(built.menu));
-                    }
-                    guard.title_row = built.title_row;
-                    guard.stats_row = built.stats_row;
-                    guard.toggle = built.toggle;
-                    guard.restart = built.restart;
-                    guard.menu_sig = built.menu_sig;
-                    let refreshed = guard.clone();
-                    drop(guard);
-                    update_rows(&refreshed, &daemon, &label, stats.as_ref());
-                    return;
-                }
-            }
+    let sig = menu_signature(daemon, stats);
+    if guard.menu_sig != sig {
+        let menu = guard.menu.clone();
+        if let Ok(built) = populate_menu(&menu, app, daemon, stats) {
+            guard.title_row = built.title_row;
+            guard.stats_row = built.stats_row;
+            guard.toggle = built.toggle;
+            guard.restart = built.restart;
+            guard.group_items = built.group_items;
+            guard.cluster_items = built.cluster_items;
+            guard.menu_sig = built.menu_sig;
+            guard.last_status_text = Some(format_status_row(daemon, stats));
+            let running = *daemon == DaemonState::Running;
+            let transitioning = matches!(
+                daemon,
+                DaemonState::Starting | DaemonState::Stopping | DaemonState::Installing
+            );
+            guard.last_toggle_state = Some((running, !transitioning));
+            guard.last_restart_enabled = Some(running);
+            return;
         }
     }
 
-    update_rows(&parts, &daemon, &label, stats.as_ref());
+    update_rows(&mut guard, daemon, &label, stats);
 }
 
 /// Writes the live values into the current menu handles. Row count and names
-/// are owned by `build_menu`; this only updates text and enabled state.
-fn update_rows(parts: &TrayParts, daemon: &DaemonState, _label: &str, stats: Option<&TrayStats>) {
-    let _ = parts.stats_row.set_text(format_status_row(daemon, stats));
+/// are owned by `populate_menu`; this only updates text and enabled state when
+/// values actually change so DBusMenu revision does not churn every tick.
+fn update_rows(parts: &mut TrayParts, daemon: &DaemonState, _label: &str, stats: Option<&TrayStats>) {
+    let status_text = format_status_row(daemon, stats);
+    if parts.last_status_text.as_deref() != Some(status_text.as_str()) {
+        let _ = parts.stats_row.set_text(&status_text);
+        parts.last_status_text = Some(status_text);
+    }
+
     let running = *daemon == DaemonState::Running;
     let transitioning = matches!(
         daemon,
         DaemonState::Starting | DaemonState::Stopping | DaemonState::Installing
     );
-    let _ = parts.toggle.set_text(if running {
-        "Stop Engine"
-    } else {
-        "Start Engine"
-    });
-    let _ = parts.toggle.set_enabled(!transitioning);
-    let _ = parts.restart.set_enabled(running);
+    let toggle_state = (running, !transitioning);
+    if parts.last_toggle_state != Some(toggle_state) {
+        let _ = parts.toggle.set_text(if running {
+            "Stop Engine"
+        } else {
+            "Start Engine"
+        });
+        let _ = parts.toggle.set_enabled(!transitioning);
+        parts.last_toggle_state = Some(toggle_state);
+    }
+
+    if parts.last_restart_enabled != Some(running) {
+        let _ = parts.restart.set_enabled(running);
+        parts.last_restart_enabled = Some(running);
+    }
+
+    if let Some(s) = stats {
+        for (id, sub) in &parts.group_items {
+            if let Some(g) = s.groups.iter().find(|g| &g.id == id) {
+                let _ = sub.set_text(format_group_title(g));
+            }
+        }
+        for (name, sub) in &parts.cluster_items {
+            if let Some(c) = s.clusters.iter().find(|c| &c.name == name) {
+                let _ = sub.set_text(format_cluster_title(c));
+            }
+        }
+    }
 }
 
 async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats> {
@@ -1172,77 +1286,146 @@ pub fn state_label(state: &DaemonState) -> String {
     }
 }
 
-/// Docker-engine blue while Running, zinc when Stopped, amber for transitions
-/// and errors — the same vocabulary the dashboard uses.
+/// Docker-engine blue while Running, cool slate when Stopped, amber for
+/// transitions, and rose red for errors.
 fn state_color(state: &DaemonState) -> [u8; 3] {
     match state {
         DaemonState::Running => [36, 150, 237], // #2496ED
-        DaemonState::Stopped | DaemonState::NotInstalled => [113, 113, 122], // #71717A
+        DaemonState::Stopped | DaemonState::NotInstalled => [100, 116, 139], // #64748B
         DaemonState::Starting | DaemonState::Stopping | DaemonState::Installing => {
             [245, 158, 11] // #F59E0B
         }
-        DaemonState::Error(_) => [245, 158, 11],
+        DaemonState::Error(_) => [239, 68, 68], // #EF4444
     }
 }
-
-/// The container glyph the app is branded with. It ships white, so its alpha
-/// channel is the shape (anti-aliased edges included).
-const TRAY_GLYPH_PNG: &[u8] = include_bytes!("../icons/tray-glyph.png");
 
 fn state_icon(rgb: [u8; 3]) -> Image<'static> {
-    badge_icon(rgb).unwrap_or_else(|| Image::new_owned(vec![0u8; 32 * 32 * 4], 32, 32))
+    static ICON_CACHE: std::sync::OnceLock<Mutex<HashMap<[u8; 3], Image<'static>>>> =
+        std::sync::OnceLock::new();
+    let cache = ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(img) = guard.get(&rgb) {
+            return img.clone();
+        }
+    }
+    let img = badge_icon(rgb).unwrap_or_else(|| Image::new_owned(vec![0u8; 64 * 64 * 4], 64, 64));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(rgb, img.clone());
+    }
+    img
 }
 
-/// A solid disc in the state colour with the container glyph knocked out in
-/// white.
-///
-/// The bare tinted glyph is a thin outline that vanishes on panels close to
-/// its colour — the stopped grey on a light GNOME bar reads as "no icon at
-/// all". A filled badge keeps the state colour as the signal and stays
-/// visible on light and dark panels alike.
-fn badge_icon(rgb: [u8; 3]) -> Option<Image<'static>> {
-    const SIZE: usize = 32;
-    const CENTER: f32 = (SIZE - 1) as f32 / 2.0;
-    // The glyph is shrunk a touch so its outline never sits on the disc's
-    // anti-aliased rim, where white on half-coverage would wash out.
-    const GLYPH_SCALE: f32 = 30.0 / 32.0;
+/// Signed distance to an axis-aligned rounded rectangle centred at the origin.
+#[inline]
+fn sd_rounded_box(px: f32, py: f32, half: f32, radius: f32) -> f32 {
+    let bx = half - radius;
+    let qx = px.abs() - bx;
+    let qy = py.abs() - bx;
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - radius
+}
 
-    let glyph = Image::from_bytes(TRAY_GLYPH_PNG).ok()?;
-    let src = glyph.rgba().to_vec();
-    if src.len() != SIZE * SIZE * 4 {
-        return None;
+/// Point-in-convex-quad test (works regardless of winding order).
+#[inline]
+fn point_in_quad(px: f32, py: f32, q: &[(f32, f32); 4]) -> bool {
+    let mut pos = 0u8;
+    let mut neg = 0u8;
+    for i in 0..4 {
+        let (x1, y1) = q[i];
+        let (x2, y2) = q[(i + 1) % 4];
+        let cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+        if cross >= 0.0 {
+            pos += 1;
+        }
+        if cross <= 0.0 {
+            neg += 1;
+        }
     }
+    pos == 4 || neg == 4
+}
+
+/// A crisp 64x64 HiDPI squircle badge in the state colour with a subtle
+/// gradient, inner rim, and 4x4 supersampled isometric container cube.
+///
+/// Designed to stay sharp and legible on both light and dark GNOME panels at
+/// any scale factor (16px–64px).
+fn badge_icon(rgb: [u8; 3]) -> Option<Image<'static>> {
+    const SIZE: usize = 64;
+    const CENTER: f32 = (SIZE - 1) as f32 / 2.0;
+    const HALF: f32 = 27.0;
+    const CORNER_R: f32 = 13.0;
+    const CUBE_SCALE: f32 = 15.5;
+    const SS: usize = 4;
+    const INV_SS2: f32 = 1.0 / (SS * SS) as f32;
+
+    const TOP_FACE: [(f32, f32); 4] = [(0.0, -0.92), (0.84, -0.46), (0.0, 0.0), (-0.84, -0.46)];
+    const LEFT_FACE: [(f32, f32); 4] = [(-0.88, -0.34), (-0.06, 0.12), (-0.06, 0.94), (-0.88, 0.48)];
+    const RIGHT_FACE: [(f32, f32); 4] = [(0.06, 0.12), (0.88, -0.34), (0.88, 0.48), (0.06, 0.94)];
 
     let mut out = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let i = (y * SIZE + x) * 4;
-            // Disc coverage with a 1px anti-aliased edge.
-            let d = ((x as f32 - CENTER).powi(2) + (y as f32 - CENTER).powi(2)).sqrt();
-            let disc = (15.5 - d).clamp(0.0, 1.0);
-            if disc <= 0.0 {
-                continue;
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_a = 0.0f32;
+
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let fx = x as f32 + (sx as f32 + 0.5) / SS as f32 - 0.5;
+                    let fy = y as f32 + (sy as f32 + 0.5) / SS as f32 - 0.5;
+                    let px = fx - CENTER;
+                    let py = fy - CENTER;
+
+                    let dist = sd_rounded_box(px, py, HALF, CORNER_R);
+                    if dist > 0.0 {
+                        continue;
+                    }
+
+                    // Vertical gradient + subtle inner rim for panel contrast.
+                    let t = ((py + HALF) / (2.0 * HALF)).clamp(0.0, 1.0);
+                    let grad = (0.5 - t) * 26.0;
+                    let rim = if dist > -1.35 {
+                        (0.5 - t) * 36.0 + 8.0
+                    } else {
+                        0.0
+                    };
+                    let mut r = (rgb[0] as f32 + grad + rim).clamp(0.0, 255.0);
+                    let mut g = (rgb[1] as f32 + grad + rim).clamp(0.0, 255.0);
+                    let mut b = (rgb[2] as f32 + grad + rim).clamp(0.0, 255.0);
+
+                    // Isometric 3D container cube in the centre.
+                    let cx = px / CUBE_SCALE;
+                    let cy = py / CUBE_SCALE;
+                    if point_in_quad(cx, cy, &TOP_FACE) {
+                        r = 255.0;
+                        g = 255.0;
+                        b = 255.0;
+                    } else if point_in_quad(cx, cy, &LEFT_FACE) {
+                        r = 236.0;
+                        g = 243.0;
+                        b = 252.0;
+                    } else if point_in_quad(cx, cy, &RIGHT_FACE) {
+                        r = 210.0;
+                        g = 224.0;
+                        b = 240.0;
+                    }
+
+                    acc_r += r;
+                    acc_g += g;
+                    acc_b += b;
+                    acc_a += 1.0;
+                }
             }
 
-            // Nearest-neighbour sample of the glyph, shrunk about the centre.
-            let sx = ((x as f32 - CENTER) / GLYPH_SCALE + CENTER).round()
-                .clamp(0.0, (SIZE - 1) as f32) as usize;
-            let sy = ((y as f32 - CENTER) / GLYPH_SCALE + CENTER).round()
-                .clamp(0.0, (SIZE - 1) as f32) as usize;
-            let glyph_a = src[(sy * SIZE + sx) * 4 + 3];
-
-            // "White glyph over coloured disc", straight-alpha compositing.
-            let a_g = glyph_a as f32 / 255.0;
-            let a_d = disc;
-            let a_out = a_g + a_d * (1.0 - a_g);
-            if a_out <= 0.0 {
-                continue;
+            if acc_a > 0.0 {
+                let i = (y * SIZE + x) * 4;
+                out[i] = (acc_r / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[i + 1] = (acc_g / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[i + 2] = (acc_b / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[i + 3] = (acc_a * INV_SS2 * 255.0).round().clamp(0.0, 255.0) as u8;
             }
-            let mix = |g: f32, d: f32| ((g * a_g + d * a_d * (1.0 - a_g)) / a_out).round() as u8;
-            out[i] = mix(255.0, rgb[0] as f32);
-            out[i + 1] = mix(255.0, rgb[1] as f32);
-            out[i + 2] = mix(255.0, rgb[2] as f32);
-            out[i + 3] = (a_out * 255.0).round() as u8;
         }
     }
     Some(Image::new_owned(out, SIZE as u32, SIZE as u32))
@@ -1291,28 +1474,28 @@ mod tests {
         assert!(two.ends_with("2 kind clusters"), "got: {two}");
     }
 
- #[test]
+    #[test]
     fn badge_icon_is_visible_on_any_panel() {
-        let img = badge_icon([113, 113, 122]).expect("bundled glyph must decode");
+        let img = badge_icon([100, 116, 139]).expect("badge icon must render");
         let rgba = img.rgba();
-        assert_eq!(rgba.len(), 32 * 32 * 4);
+        assert_eq!(rgba.len(), 64 * 64 * 4);
         let mut opaque = 0usize;
-        let mut disc_colored = 0usize;
+        let mut badge_colored = 0usize;
         let mut glyph_white = 0usize;
         for px in rgba.chunks_exact(4) {
             if px[3] > 200 {
                 opaque += 1;
-                if px[0] == 255 && px[1] == 255 && px[2] == 255 {
+                if px[0] >= 205 && px[1] >= 220 && px[2] >= 235 {
                     glyph_white += 1;
-                } else if px[0] == 113 && px[1] == 113 && px[2] == 122 {
-                    disc_colored += 1;
+                } else if px[2] > px[0] {
+                    badge_colored += 1;
                 }
             }
         }
-        // A solid badge, not a thin outline: most of the disc is filled.
-        assert!(opaque > 500, "badge must be a filled disc, got {opaque}");
-        assert!(disc_colored > 150, "disc must carry the state colour");
-        assert!(glyph_white > 150, "glyph must be knocked out in white");
+        // A solid 64x64 squircle badge with crisp 3D cube inside.
+        assert!(opaque > 2200, "badge must be a filled squircle, got {opaque}");
+        assert!(badge_colored > 1200, "badge must carry the state colour, got {badge_colored}");
+        assert!(glyph_white > 400, "cube glyph must be rendered in white, got {glyph_white}");
     }
 
     #[test]
@@ -1321,7 +1504,7 @@ mod tests {
             state_color(&DaemonState::Running),
             state_color(&DaemonState::Stopped)
         );
-        assert_eq!(
+        assert_ne!(
             state_color(&DaemonState::Starting),
             state_color(&DaemonState::Error("x".into()))
         );
@@ -1333,16 +1516,23 @@ mod tests {
 
     #[test]
     fn tray_badge_keeps_the_glyph_silhouette_inside_the_disc() {
-        let img = badge_icon([36, 150, 237]).expect("bundled glyph decodes");
+        let img = badge_icon([36, 150, 237]).expect("badge icon renders");
         let rgba = img.rgba();
-        let px = |x: usize, y: usize| &rgba[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        let px = |x: usize, y: usize| &rgba[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
 
         assert_eq!(px(0, 0)[3], 0, "corner stays transparent");
-        // The glyph silhouette survives: white pixels inside the blue disc.
-        let white = rgba.chunks_exact(4).filter(|p| p[3] == 255 && p[..3] == [255, 255, 255]).count();
-        assert!(white > 50, "glyph must be visible in white, got {white}");
-        let blue = rgba.chunks_exact(4).filter(|p| p[3] == 255 && p[..3] == [36, 150, 237]).count();
-        assert!(blue > 150, "disc must be filled with the state colour");
+        assert_eq!(px(63, 63)[3], 0, "bottom-right corner stays transparent");
+        // The glyph silhouette survives: white pixels inside the blue squircle.
+        let white = rgba
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[0] >= 205 && p[1] >= 220 && p[2] >= 235)
+            .count();
+        assert!(white > 400, "glyph must be visible in white, got {white}");
+        let blue = rgba
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[2] > p[0].saturating_add(100))
+            .count();
+        assert!(blue > 1200, "squircle must be filled with the state colour, got {blue}");
     }
 
     #[test]

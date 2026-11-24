@@ -967,3 +967,30 @@ export interface KindClusterPrefs {
   /** Per-node memory cap in MiB (0 = unlimited). */
   nodeMemoryMb: number;
 }
+
+/** Phase of a container lifecycle operation tracked by the backend. */
+export type OpPhase = "queued" | "running" | "done" | "failed";
+
+/** `container-op` event: one container's start/stop/restart progress. */
+export interface ContainerOp {
+  id: string;
+  op: "start" | "stop" | "restart" | string;
+  phase: OpPhase;
+  group?: string | null;
+  error?: string | null;
+}
+
+/** `group-op` event: a bulk group start/stop pass. */
+export interface GroupOp {
+  group: string;
+  op: "start" | "stop" | string;
+  phase: OpPhase;
+  total: number;
+  completed: number;
+  summary?: string | null;
+}
+
+export interface ContainerOpsSnapshot {
+  containers: ContainerOp[];
+  groups: GroupOp[];
+}
