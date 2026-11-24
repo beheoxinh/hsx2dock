@@ -674,7 +674,48 @@ fn grant_net_bind_service(bin: &Path) -> Result<()> {
 /// failure on a privileged port as "permission" made Caddy try `:80` while
 /// another listener held it, and the whole gateway failed to start.
 fn http_port_bindable(bin: &Path, port: u16) -> bool {
+    // The kernel checks the privilege before the address, so an unprivileged
+    // probe gets "permission denied" for a privileged port whether or not it
+    // is taken. Ask the socket table instead in that case.
     bind_probe_allows(probe_bind(port), port < 1024 && has_net_bind_service(bin))
+        && !port_has_listener(port)
+}
+
+/// True when some socket is listening on TCP `port` (any address), read from
+/// `/proc/net/tcp{,6}`. Elsewhere, or when the tables are unreadable, a
+/// connect to loopback stands in.
+fn port_has_listener(port: u16) -> bool {
+    let mut read_any = false;
+    let mut found = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(table) {
+            read_any = true;
+            found |= proc_net_tcp_listens_on(&text, port);
+        }
+    }
+    if read_any {
+        return found;
+    }
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// Parses one `/proc/net/tcp`-style table: `local_address` is `HEXIP:HEXPORT`
+/// and state `0A` is LISTEN.
+fn proc_net_tcp_listens_on(text: &str, port: u16) -> bool {
+    text.lines().skip(1).any(|line| {
+        let mut cols = line.split_whitespace();
+        let local = cols.nth(1);
+        let state = cols.nth(1);
+        state == Some("0A")
+            && local
+                .and_then(|l| l.rsplit_once(':'))
+                .and_then(|(_, p)| u16::from_str_radix(p, 16).ok())
+                == Some(port)
+    })
 }
 
 /// Bind the wildcard address, as Caddy's `:<port>` listener does.
@@ -1277,6 +1318,16 @@ mod tests {
         assert!(bind_probe_allows(Err(Error::from(ErrorKind::PermissionDenied)), true));
         assert!(!bind_probe_allows(Err(Error::from(ErrorKind::PermissionDenied)), false));
         assert!(!bind_probe_allows(Err(Error::from(ErrorKind::AddrInUse)), true));
+    }
+
+    #[test]
+    fn proc_net_tcp_listen_rows_are_found_by_port() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue\n\
+   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000\n\
+   1: 0100007F:07E3 0100007F:9C40 01 00000000:00000000 00:00000000 00000000\n";
+        assert!(proc_net_tcp_listens_on(table, 80));
+        assert!(!proc_net_tcp_listens_on(table, 2019), "an established socket is not a listener");
+        assert!(!proc_net_tcp_listens_on(table, 443));
     }
 
     #[test]
