@@ -92,7 +92,18 @@ fn start_background_monitoring(app_handle: AppHandle) {
             let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() else {
                 continue;
             };
-            let observed = state.daemon_state();
+            // A saved remote endpoint is live when it answers; the bundled
+            // engine's state says nothing about it. Bounded, so a dead remote
+            // cannot stall the tick.
+            let remote_active = state.remote_endpoint_active().await;
+            let observed = if remote_active {
+                match tokio::time::timeout(MONITOR_LIST_TIMEOUT, state.get_client()).await {
+                    Ok(Ok(_)) => crate::docker::models::DaemonState::Running,
+                    _ => crate::docker::models::DaemonState::Stopped,
+                }
+            } else {
+                state.daemon_state()
+            };
             // The very first reading is accepted as-is; later changes must be
             // seen STATE_CONFIRM_TICKS times in a row.
             let status = if last_state.is_none() || last_state.as_ref() == Some(&observed) {
@@ -170,7 +181,9 @@ fn start_background_monitoring(app_handle: AppHandle) {
                     // the app's back), drop clusters restored against the
                     // auto-start switches, then start the flagged ones
                     // staggered and capped.
-                    {
+                    // Bundled-engine lifecycle only: its restart policies and
+                    // clusters must never be rewritten on a remote endpoint.
+                    if !remote_active {
                         let app = handle.clone();
                         let restored_since = if had_previous_state { 0 } else { app_started };
                         crate::runtime::spawn(async move {
@@ -402,17 +415,27 @@ pub fn run() {
                     .block_on(async { state.config.read().await.auto_start_daemon });
                 if should_autostart && state.daemon_state() != docker::models::DaemonState::Running
                 {
-                    let engine = state.engine.clone();
-                    let h = handle.clone();
-                    crate::runtime::spawn(async move {
-                        tracing::info!("Auto-starting engine daemon...");
-                        let _ = crate::runtime::engine_op(move || engine.start()).await;
-                        // Trigger client reconnection
-                        if let Some(s) = h.try_state::<std::sync::Arc<AppState>>() {
-                            let _ = s.get_client().await;
-                            let _ = h.emit("engine-state-changed", s.daemon_state());
+                    // Claimed here, like every other start path, so a manual
+                    // start or data-root move that wins the race makes this one
+                    // back off instead of starting the engine twice.
+                    match crate::runtime::claim_engine_lifecycle() {
+                        Err(e) => tracing::warn!("skipping engine auto-start: {e}"),
+                        Ok(lifecycle) => {
+                            let engine = state.engine.clone();
+                            let h = handle.clone();
+                            crate::runtime::spawn(async move {
+                                // Held until the start has finished.
+                                let _lifecycle = lifecycle;
+                                tracing::info!("Auto-starting engine daemon...");
+                                let _ = crate::runtime::engine_op(move || engine.start()).await;
+                                // Trigger client reconnection
+                                if let Some(s) = h.try_state::<std::sync::Arc<AppState>>() {
+                                    let _ = s.get_client().await;
+                                    let _ = h.emit("engine-state-changed", s.daemon_state());
+                                }
+                            });
                         }
-                    });
+                    }
                 }
             }
 
@@ -552,6 +575,7 @@ pub fn run() {
             exec::write_exec_stdin,
             exec::resize_exec_session,
             exec::stop_exec_session,
+            exec::close_all_exec_sessions,
             // Images
             images::list_images,
             images::remove_image,

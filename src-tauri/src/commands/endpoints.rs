@@ -150,16 +150,16 @@ pub(crate) async fn save_endpoint_core(state: &AppState, ep: EndpointInput) -> R
         kind: ep.kind.clone(),
         uri: ep.uri.clone(),
     };
-    let is_active = {
-        let mut config = state.config.write().await;
-        // Edit in place so the list keeps its order.
-        match config.endpoints.iter_mut().find(|x| x.id == id) {
-            Some(slot) => *slot = cfg,
-            None => config.endpoints.push(cfg),
-        }
-        config.active_endpoint.as_deref() == Some(id.as_str())
-    };
-    state.save_config().await?;
+    let is_active = state
+        .update_config(|config| {
+            // Edit in place so the list keeps its order.
+            match config.endpoints.iter_mut().find(|x| x.id == id) {
+                Some(slot) => *slot = cfg,
+                None => config.endpoints.push(cfg),
+            }
+            Ok(config.active_endpoint.as_deref() == Some(id.as_str()))
+        })
+        .await?;
     if is_active {
         retarget(state).await;
     }
@@ -184,21 +184,21 @@ pub(crate) async fn remove_endpoint_core(state: &AppState, id: &str) -> Result<b
     if id == "local" {
         return Err("Cannot remove the bundled engine".to_string());
     }
-    let was_active = {
-        let mut config = state.config.write().await;
-        let before = config.endpoints.len();
-        config.endpoints.retain(|x| x.id != id);
-        if config.endpoints.len() == before {
-            // Nothing removed: return a non-destructive error to the UI.
-            return Err("Unknown endpoint".to_string());
-        }
-        let was_active = config.active_endpoint.as_deref() == Some(id);
-        if was_active {
-            config.active_endpoint = None;
-        }
-        was_active
-    };
-    state.save_config().await?;
+    let was_active = state
+        .update_config(|config| {
+            let before = config.endpoints.len();
+            config.endpoints.retain(|x| x.id != id);
+            if config.endpoints.len() == before {
+                // Nothing removed: return a non-destructive error to the UI.
+                return Err("Unknown endpoint".to_string());
+            }
+            let was_active = config.active_endpoint.as_deref() == Some(id);
+            if was_active {
+                config.active_endpoint = None;
+            }
+            Ok(was_active)
+        })
+        .await?;
     if was_active {
         retarget(state).await;
     }
@@ -211,41 +211,54 @@ pub async fn set_active_endpoint(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<(), String> {
+    set_active_endpoint_core(&state, Some(&app), id).await
+}
+
+/// App-free core of [`set_active_endpoint`], shared with the MCP server. The
+/// Tauri window passes its handle so the UI hears about the switch; MCP passes
+/// `None` only when no handle exists.
+pub(crate) async fn set_active_endpoint_core(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    id: String,
+) -> Result<(), String> {
     // Switching requires a live daemon for the new target. For the local
     // engine the supervisor owns the socket; for remotes we test on-connect.
     if id == "local" {
-        {
-            let mut config = state.config.write().await;
-            config.active_endpoint = None;
-        }
-        state.save_config().await?;
-        state.invalidate_client();
-        crate::commands::system::refresh_shim(&state, &*state.config.read().await);
-        let _ = crate::commands::system::apply_cli_bridge(&state).await;
+        state
+            .update_config(|config| {
+                config.active_endpoint = None;
+                Ok(())
+            })
+            .await?;
+    } else {
+        let target = {
+            let cfg = state.config.read().await;
+            cfg.endpoints.iter().find(|x| x.id == id).cloned()
+        };
+        let Some(target) = target else {
+            return Err("Unknown endpoint".to_string());
+        };
+        validate_endpoint(&target.kind, &target.uri)?;
+        // Prove reachability before committing the switch.
+        let socket = None;
+        let probe = DockerClient::connect_for_endpoint(&target.kind, &target.uri, socket)
+            .map_err(|e| format!("{e:#}"))?;
+        probe.ping().await.map_err(|e| format!("{e:#}"))?;
+        let target_id = id.clone();
+        state
+            .update_config(|config| {
+                config.active_endpoint = Some(target_id);
+                Ok(())
+            })
+            .await?;
+    }
+    // One retarget for both branches: client, CLI shim and CLI bridge all
+    // follow the new endpoint, whichever surface asked for the switch.
+    retarget(state).await;
+    if let Some(app) = app {
         let _ = app.emit("endpoint-changed", id);
-        return Ok(());
     }
-    let target = {
-        let cfg = state.config.read().await;
-        cfg.endpoints.iter().find(|x| x.id == id).cloned()
-    };
-    let Some(target) = target else {
-        return Err("Unknown endpoint".to_string());
-    };
-    validate_endpoint(&target.kind, &target.uri)?;
-    // Prove reachability before committing the switch.
-    let socket = None;
-    let probe = DockerClient::connect_for_endpoint(&target.kind, &target.uri, socket)
-        .map_err(|e| format!("{e:#}"))?;
-    probe.ping().await.map_err(|e| format!("{e:#}"))?;
-    {
-        let mut config = state.config.write().await;
-        config.active_endpoint = Some(id.clone());
-    }
-    state.save_config().await?;
-    // Same retarget as the local branch, which also re-pointed the CLI bridge.
-    retarget(&state).await;
-    let _ = app.emit("endpoint-changed", id);
     Ok(())
 }
 

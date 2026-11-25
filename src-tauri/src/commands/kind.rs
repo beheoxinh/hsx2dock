@@ -96,9 +96,56 @@ pub async fn check_kind_update(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// True when a pod's waiting/terminated reason means it is not serving.
+fn pod_is_broken(p: &K8sPodInfo) -> bool {
+    matches!(
+        p.reason.as_deref(),
+        Some(
+            "CrashLoopBackOff"
+                | "ImagePullBackOff"
+                | "ErrImagePull"
+                | "CreateContainerConfigError"
+                | "CreateContainerError"
+                | "InvalidImageName"
+                | "RunContainerError"
+                | "Error"
+                | "OOMKilled"
+        )
+    )
+}
+
+/// A kind release tag the installer accepts: `[v]MAJOR.MINOR.PATCH` with an
+/// optional `-suffix` of `[A-Za-z0-9.]`. The version becomes a directory name
+/// and part of a download URL, so `..` or `/` must never reach it.
+fn valid_kind_version(v: &str) -> bool {
+    let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
+    let (core, suffix) = v.split_once('-').unwrap_or((v, ""));
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
+        && suffix.len() <= 32
+        && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
 async fn run_kind_install(app: &AppHandle, paths: &KindPaths, version: &str) -> Result<(), String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    if !valid_kind_version(version) {
+        return Err(format!("invalid kind version '{version}'"));
+    }
+    // One install at a time: two concurrent downloads share the staging file.
+    static INSTALLING: AtomicBool = AtomicBool::new(false);
+    if INSTALLING.swap(true, Ordering::AcqRel) {
+        return Err("A kind install is already running".into());
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            INSTALLING.store(false, Ordering::Release);
+        }
+    }
+    let _release = Release;
 
     let plan = crate::docker::engine::step_plan(crate::docker::kind::KIND_UPDATE_STEPS);
     let step = Arc::new(AtomicUsize::new(0));
@@ -564,6 +611,28 @@ mod cluster_card_tests {
     use super::*;
 
     #[test]
+    fn kind_version_rejects_path_tricks() {
+        assert!(valid_kind_version("0.27.0"));
+        assert!(valid_kind_version("v0.27.0"));
+        assert!(valid_kind_version("v0.28.0-alpha.1"));
+        assert!(!valid_kind_version("../../etc"));
+        assert!(!valid_kind_version("0.27.0/../x"));
+        assert!(!valid_kind_version("0.27"));
+        assert!(!valid_kind_version(""));
+    }
+
+    #[test]
+    fn kubectl_queries_get_a_request_timeout() {
+        assert_eq!(kubectl_request_timeout(&["get", "pods"]), Some("--request-timeout=25s"));
+        assert_eq!(kubectl_request_timeout(&["patch", "node", "x"]), Some("--request-timeout=60s"));
+        assert_eq!(kubectl_request_timeout(&["exec", "-n", "a", "p"]), None);
+        assert_eq!(kubectl_request_timeout(&["drain", "n", "--timeout=120s"]), None);
+        assert!(apply_script("QUJD").contains("--kubeconfig=/etc/kubernetes/admin.conf"));
+        assert!(apply_script("QUJD").contains(" apply -f -"));
+        assert!(!apply_script("QUJD").starts_with("kubectl"));
+    }
+
+    #[test]
     fn parse_docker_ts_reads_rfc3339_and_rejects_zero_or_garbage() {
         assert_eq!(parse_docker_ts("1970-01-01T00:00:10Z"), Some(10));
         assert_eq!(parse_docker_ts("1970-01-01T00:00:10.500Z"), Some(10));
@@ -812,7 +881,13 @@ pub(crate) async fn create_kind_cluster_core(
     let _busy = ClusterBusy::claim(&name)?;
     // A failed create cleans up after itself below; that must never touch a
     // cluster that already existed under this name.
-    if count_cluster_nodes(state, &name).await.unwrap_or(0) > 0 {
+    // An engine hiccup here must abort: treating "could not count" as zero
+    // would let the failure cleanup below delete a cluster that exists.
+    if count_cluster_nodes(state, &name)
+        .await
+        .map_err(|e| format!("Could not check for an existing cluster '{name}': {e}"))?
+        > 0
+    {
         return Err(format!("A cluster named '{name}' already exists"));
     }
 
@@ -1393,8 +1468,41 @@ pub(crate) async fn apply_yaml_core(
         return Err("Manifest yaml is required".into());
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(yaml.as_bytes());
-    let script = format!("printf '%s' '{encoded}' | base64 -d | kubectl apply -f -");
-    kubectl_raw(state, cluster, &["sh", "-c", &script]).await
+    let script = apply_script(&encoded);
+    forget_kubectl_reads(cluster);
+    // Not `kubectl_raw`: that prefixes `kubectl --kubeconfig=…`, which would
+    // turn this into `kubectl … sh -c …` and fail every apply.
+    let client = local_client(state).await?;
+    client
+        .exec_capture(
+            &control_plane_node(cluster),
+            vec!["sh".to_string(), "-c".to_string(), script],
+        )
+        .await
+        .map_err(|e| format!("kubectl apply: {e}"))
+}
+
+/// Shell script that decodes a base64 manifest and applies it with the node's
+/// admin kubeconfig. The `apply` word keeps the exec on the mutating budget.
+fn apply_script(encoded: &str) -> String {
+    format!(
+        "printf '%s' '{encoded}' | base64 -d | kubectl --kubeconfig=/etc/kubernetes/admin.conf \
+         --request-timeout=60s apply -f -"
+    )
+}
+
+/// `--request-timeout` for a kubectl call, so kubectl gives up on a dead API
+/// server before the exec budget does — otherwise the timed-out exec leaves
+/// kubectl running inside the node and they pile up. Interactive `exec` and
+/// verbs that carry their own `--timeout` are left alone.
+fn kubectl_request_timeout(args: &[&str]) -> Option<&'static str> {
+    match args.first().copied() {
+        Some("exec") | Some("drain") | Some("wait") => None,
+        _ if args.iter().any(|a| a.starts_with("--request-timeout")) => None,
+        Some("apply" | "delete" | "create" | "replace" | "scale" | "patch" | "rollout"
+            | "cordon" | "uncordon" | "label" | "annotate") => Some("--request-timeout=60s"),
+        _ => Some("--request-timeout=25s"),
+    }
 }
 
 // ==================== Cluster monitoring (kubectl inside the control-plane node) ====================
@@ -1419,6 +1527,14 @@ pub(crate) async fn kubectl_raw(
         "kubectl".to_string(),
         "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
     ];
+    if let Some(flag) = kubectl_request_timeout(args) {
+        cmd.push(flag.to_string());
+    }
+    if !matches!(args.first().copied(), Some("get" | "top" | "version" | "api-resources")) {
+        // Anything that may change the cluster drops its cached reads, so the
+        // refresh after an action never shows the state from before it.
+        forget_kubectl_reads(cluster);
+    }
     cmd.extend(args.iter().map(|s| s.to_string()));
     client
         .exec_capture(&control_plane_node(cluster), cmd)
@@ -1434,8 +1550,67 @@ pub(crate) async fn kubectl_json(
     cluster: &str,
     args: &[&str],
 ) -> Result<serde_json::Value, String> {
+    if args.first().copied() != Some("get") {
+        let out = kubectl_raw(state, cluster, args).await?;
+        return extract_json(&out).ok_or_else(|| format!("bad kubectl JSON from {args:?}"));
+    }
+    // The monitor asks for the same listing from several commands at once
+    // (summary and pods both read every pod each tick). Identical reads share
+    // one exec: callers queue on a per-key lock and take a fresh result.
+    let key = format!("{cluster}\0{}", args.join("\0"));
+    let lock = {
+        let mut locks = kubectl_read_locks().lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(key.clone()).or_default().clone()
+    };
+    let _turn = lock.lock().await;
+    if let Some(v) = cached_kubectl_read(&key) {
+        return Ok(v);
+    }
     let out = kubectl_raw(state, cluster, args).await?;
-    extract_json(&out).ok_or_else(|| format!("bad kubectl JSON from {args:?}"))
+    let parsed = tokio::task::spawn_blocking(move || extract_json(&out))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("bad kubectl JSON from {args:?}"))?;
+    let mut cache = kubectl_read_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, (at, _)| at.elapsed() < KUBECTL_READ_TTL * 4);
+    cache.insert(key, (std::time::Instant::now(), parsed.clone()));
+    Ok(parsed)
+}
+
+/// How long one `kubectl get` result serves identical reads.
+const KUBECTL_READ_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+type KubectlReadCache = HashMap<String, (std::time::Instant, serde_json::Value)>;
+
+fn kubectl_read_cache() -> &'static std::sync::Mutex<KubectlReadCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<KubectlReadCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn kubectl_read_locks(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default)
+}
+
+fn cached_kubectl_read(key: &str) -> Option<serde_json::Value> {
+    let cache = kubectl_read_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(key)
+        .filter(|(at, _)| at.elapsed() < KUBECTL_READ_TTL)
+        .map(|(_, v)| v.clone())
+}
+
+/// Drops every cached read of `cluster` (after a write, or a delete).
+fn forget_kubectl_reads(cluster: &str) {
+    let prefix = format!("{cluster}\0");
+    kubectl_read_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|k, _| !k.starts_with(&prefix));
 }
 
 /// Parses `out` as JSON, tolerating leading warning lines.
@@ -2139,9 +2314,7 @@ pub(crate) async fn set_node_schedulable_core(
     schedulable: bool,
 ) -> Result<(), String> {
     let node = node.trim();
-    if node.is_empty() || node.chars().any(|c| c.is_whitespace()) {
-        return Err("Invalid node name".to_string());
-    }
+    k8s_name_check(node).map_err(|_| "Invalid node name".to_string())?;
     let unschedulable = if schedulable { "false" } else { "true" };
     let patch = format!(r#"{{"spec":{{"unschedulable":{unschedulable}}}}}"#);
     kubectl_raw(
@@ -2174,9 +2347,7 @@ pub(crate) async fn drain_node_core(
     node: String,
 ) -> Result<String, String> {
     let node = node.trim();
-    if node.is_empty() || node.chars().any(|c| c.is_whitespace()) {
-        return Err("Invalid node name".to_string());
-    }
+    k8s_name_check(node).map_err(|_| "Invalid node name".to_string())?;
     kubectl_raw(
         state,
         &cluster,
@@ -2380,6 +2551,9 @@ pub(crate) async fn get_cluster_summary_core(
     let (mut pod_running, mut pod_pending, mut pod_failed, mut pod_succeeded) = (0, 0, 0, 0);
     for p in &pods {
         match p.phase.as_str() {
+            // A Running pod whose container is crash-looping or cannot pull
+            // its image is not healthy, so it counts as failed.
+            "Running" if pod_is_broken(p) => pod_failed += 1,
             "Running" => pod_running += 1,
             "Pending" => pod_pending += 1,
             "Failed" => pod_failed += 1,
@@ -2960,6 +3134,13 @@ pub(crate) async fn install_metrics_server_core(
     state: &AppState,
     cluster: String,
 ) -> Result<MetricsServerStatus, String> {
+    // Two installs (UI button + MCP, or a double click) raced on the patch
+    // below and could append the kubelet flag twice.
+    static INSTALLING: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _one = INSTALLING
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .try_lock()
+        .map_err(|_| "metrics-server is already being installed".to_string())?;
     kubectl_raw(state, &cluster, &["apply", "-f", METRICS_SERVER_MANIFEST]).await?;
 
     // Only patch when the flag is missing: a second `add` would append a
@@ -3295,10 +3476,12 @@ pub(crate) async fn set_cluster_prefs_core(
         return Err("Cluster name is required".into());
     }
     {
+        // Save a copy first so a failed write leaves memory matching disk.
         let mut cfg = state.config.write().await;
-        cfg.kind_cluster_prefs
-            .insert(cluster.clone(), prefs.clone());
-        cfg.save().await.map_err(|e| e.to_string())?;
+        let mut next = cfg.clone();
+        next.kind_cluster_prefs.insert(cluster.clone(), prefs.clone());
+        next.save().await.map_err(|e| e.to_string())?;
+        *cfg = next;
     }
     if prefs.node_cpu_m > 0 || prefs.node_memory_mb > 0 {
         let capped = apply_cluster_limits(state, &cluster, &prefs).await?;
@@ -3477,6 +3660,11 @@ pub async fn reconcile_kind_auto_start(
                     if !should_stop_restored(allowed.contains(cluster), started, restored_since) {
                         continue;
                     }
+                    // A create/start/delete of this cluster owns it right now;
+                    // stopping its nodes underneath would break that operation.
+                    let Ok(_busy) = ClusterBusy::claim(cluster) else {
+                        continue;
+                    };
                     let _ = client.stop_container(&c.id).await;
                     let _ = app.emit(
                         "kind-progress",

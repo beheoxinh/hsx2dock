@@ -241,14 +241,49 @@ impl AppState {
         if let Ok(mut guard) = self.client.try_write() {
             *guard = None;
         }
+        // Sampled stats belong to the endpoint they were read from. When the
+        // lock is busy the monitor clears them on its next pass anyway.
+        if let Ok(mut stats) = self.cached_stats.try_write() {
+            stats.clear();
+        }
     }
 
     /// Persists the in-memory config to disk.
+    ///
+    /// The write lock is held across the save. A snapshot taken under a read
+    /// lock could be overtaken by a later save, leaving the older copy on disk.
     pub async fn save_config(&self) -> Result<(), String> {
-        let config = self.config.read().await.clone();
+        let config = self.config.write().await;
         let result = config.save().await.map_err(|e| e.to_string());
         self.set_close_to_tray(config.close_to_tray);
         result
+    }
+
+    /// Applies `change` to a copy of the config, saves the copy and only then
+    /// swaps it in. When the change or the save fails, memory keeps the
+    /// previous state and still matches the file.
+    pub async fn update_config<T>(
+        &self,
+        change: impl FnOnce(&mut AppConfig) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut live = self.config.write().await;
+        let mut next = live.clone();
+        let out = change(&mut next)?;
+        next.save().await.map_err(|e| e.to_string())?;
+        self.set_close_to_tray(next.close_to_tray);
+        *live = next;
+        Ok(out)
+    }
+
+    /// True when the active endpoint is a saved remote one. Liveness checks
+    /// use this: a remote target counts as live when it answers, whatever the
+    /// bundled engine is doing.
+    pub async fn remote_endpoint_active(&self) -> bool {
+        let cfg = self.config.read().await;
+        match cfg.active_endpoint.as_deref() {
+            None | Some("local") => false,
+            Some(id) => cfg.endpoints.iter().any(|e| e.id == id),
+        }
     }
 
     /// Mirrors the persisted preference into the flag the window-close handler

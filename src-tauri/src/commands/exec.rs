@@ -304,6 +304,11 @@ pub async fn write_exec_stdin(
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| "No active terminal session with that id".to_string())?;
+    // A session whose output pump ended (shell exited, attach dropped) has no
+    // reader left; its input pump may still accept bytes, so say so instead.
+    if session.task.is_finished() {
+        return Err("The terminal session has closed".to_string());
+    }
     session
         .stdin_tx
         .send(data.into_bytes())
@@ -352,13 +357,38 @@ pub async fn stop_exec_session(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<(), String> {
-    if let Some(session) = state.exec_sessions.write().await.remove(&session_id) {
-        // The input pump drains queued bytes before it sees the channel close.
-        let _ = session.stdin_tx.send(b"\x03\x04".to_vec());
-        drop(session.stdin_tx);
-        session.task.abort();
+    let removed = state.exec_sessions.write().await.remove(&session_id);
+    if let Some(session) = removed {
+        end_session(session);
     }
     Ok(())
+}
+
+/// Tears down every live session. The webview calls this on start-up: a
+/// reloaded page has forgotten its session ids, so the shells it left running
+/// could never be reached or closed from the UI.
+#[tauri::command]
+pub async fn close_all_exec_sessions(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let drained: Vec<ExecSession> = state
+        .exec_sessions
+        .write()
+        .await
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
+    for session in drained {
+        end_session(session);
+    }
+    Ok(())
+}
+
+/// Same teardown as [`stop_exec_session`]: Ctrl-C then Ctrl-D over the pty,
+/// close stdin, abort the output pump.
+fn end_session(session: ExecSession) {
+    // The input pump drains queued bytes before it sees the channel close.
+    let _ = session.stdin_tx.send(b"\x03\x04".to_vec());
+    drop(session.stdin_tx);
+    session.task.abort();
 }
 
 #[cfg(test)]

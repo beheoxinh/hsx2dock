@@ -185,11 +185,49 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
     }
   };
 
+  // A different container must not show the previous one's details, logs or
+  // stats while its own load is in flight. Bumping loadSeq also drops any
+  // answer still on its way for the old container.
   useEffect(() => {
+    setDetails(null);
+    setStats(null);
+    setLogs("");
+    setLimitsDraft(null);
+    setRenaming(false);
     if (containerId) {
       loadAll();
     }
+    return () => {
+      loadSeq.current++;
+    };
   }, [containerId]);
+
+  // Live telemetry: while the Stats tab is open on a running container, refresh
+  // the figures every 2s. One request at a time; a switch of container or tab
+  // cancels the loop so a late answer cannot land on the wrong view.
+  useEffect(() => {
+    if (!containerId || activeTab !== "stats" || !isRunning) return;
+    let cancelled = false;
+    let busy = false;
+    const tick = async () => {
+      if (busy || (typeof document !== "undefined" && document.hidden)) return;
+      busy = true;
+      try {
+        const next = await api.getContainerStats(containerId);
+        if (!cancelled) setStats(next);
+      } catch {
+        /* keep the last figures; the next tick retries */
+      } finally {
+        busy = false;
+      }
+    };
+    void tick();
+    const timer = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [containerId, activeTab, isRunning]);
 
   const handleCopyInspect = () => {
     if (!details?.raw_json) return;

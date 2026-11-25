@@ -71,12 +71,19 @@ export function subscribeOpNotices(cb: (n: OpNotice) => void): () => void {
   };
 }
 
+function sameOp(a: PendingOp, b: PendingOp): boolean {
+  return a.op === b.op && a.phase === b.phase && a.group === b.group && a.until === b.until && a.since === b.since;
+}
+
 function setContainerOp(id: string, next: PendingOp | null) {
   const prev = containerOps[id];
   if (next && next.phase !== "settling" && next.since === undefined) {
     next = { ...next, since: prev?.phase === next.phase ? prev.since : Date.now() };
   }
   if (!next && !prev) return;
+  // Repeated identical events (every "running" re-send) must not copy the map
+  // and re-render every subscribed card.
+  if (next && prev && sameOp(prev, next)) return;
   const copy = { ...containerOps };
   if (next) copy[id] = next;
   else delete copy[id];
@@ -117,19 +124,19 @@ function sweep() {
   const now = Date.now();
   const { containers } = getContainerStore();
   const byId = new Map(containers.map((c) => [c.id, c]));
-  let changed = false;
+  const drop: string[] = [];
   let nextDeadline = Infinity;
-  const copy = { ...containerOps };
-  for (const [id, entry] of Object.entries(copy)) {
+  for (const [id, entry] of Object.entries(containerOps)) {
     if (entry.phase !== "settling") continue;
     if ((entry.until ?? 0) <= now || settled(entry.op, byId.get(id))) {
-      delete copy[id];
-      changed = true;
+      drop.push(id);
     } else {
       nextDeadline = Math.min(nextDeadline, entry.until ?? now);
     }
   }
-  if (changed) {
+  if (drop.length > 0) {
+    const copy = { ...containerOps };
+    for (const id of drop) delete copy[id];
     containerOps = copy;
     notify();
   }
@@ -184,6 +191,7 @@ function applyGroupOp(ev: GroupOp) {
     requestTimers.delete(ev.group);
   }
   if (ev.phase === "done" || ev.phase === "failed") {
+    groupStarted.delete(ev.group);
     if (groupOps[ev.group]) {
       const copy = { ...groupOps };
       delete copy[ev.group];
@@ -203,6 +211,7 @@ function applyGroupOp(ev: GroupOp) {
     }
     return;
   }
+  if (!groupStarted.has(ev.group)) groupStarted.set(ev.group, Date.now());
   groupOps = { ...groupOps, [ev.group]: ev };
   notify();
 }
@@ -249,20 +258,37 @@ export function startContainerOpsSync() {
 
 const AUTOSTART_PASS = "__autostart__";
 const STUCK_AFTER_MS = 120_000;
+/** Past this, an entry is dropped even if the backend still claims it. */
+const HARD_STUCK_MS = 600_000;
 const WATCHDOG_EVERY_MS = 30_000;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+/** When each group pass first showed as busy (ms epoch), for the watchdog. */
+const groupStarted = new Map<string, number>();
 
 /**
  * Entries queued/running for minutes are re-checked against the backend: an
  * op it no longer reports finished while its event was lost, so the entry
  * settles (and clears once the list agrees) instead of spinning forever.
+ * Entries past HARD_STUCK_MS are dropped even when the backend (or the
+ * request itself) cannot answer, so a wedged op cannot pin a card forever.
  */
 function watchdog() {
   const now = Date.now();
+  for (const [group, since] of groupStarted) {
+    if (now - since > HARD_STUCK_MS && groupOps[group]) {
+      releaseGroup(group);
+      clearGroup(group);
+    }
+  }
   const stale = Object.entries(containerOps).filter(
     ([, e]) => e.phase !== "settling" && now - (e.since ?? now) > STUCK_AFTER_MS
   );
   if (stale.length === 0) return;
+  for (const [id, e] of stale) {
+    if (now - (e.since ?? now) > HARD_STUCK_MS && containerOps[id] === e) {
+      setContainerOp(id, null);
+    }
+  }
   api
     .listContainerOps()
     .then((snap) => {
@@ -314,7 +340,7 @@ export function markQueued(ids: string[], op: string, group: string) {
   if (ids.length === 0) return;
   const copy = { ...containerOps };
   for (const id of ids) {
-    if (!copy[id]) copy[id] = { op, phase: "queued", group };
+    if (!copy[id]) copy[id] = { op, phase: "queued", group, since: Date.now() };
   }
   containerOps = copy;
   notify();
@@ -331,6 +357,7 @@ const requestTimers = new Map<string, ReturnType<typeof setTimeout>>();
  */
 export function requestGroup(group: string, op: string) {
   if (groupOps[group]) return false;
+  groupStarted.set(group, Date.now());
   groupOps = {
     ...groupOps,
     [group]: { group, op, phase: "queued", total: 0, completed: 0, summary: null },
@@ -355,6 +382,7 @@ export function releaseGroup(group: string) {
     clearTimeout(t);
     requestTimers.delete(group);
   }
+  groupStarted.delete(group);
   if (!groupOps[group]) return;
   const copy = { ...groupOps };
   delete copy[group];
@@ -376,18 +404,12 @@ export function settleGroup(group: string) {
 
 /** Drops every entry still owned by `group` (bulk call failed outright). */
 export function clearGroup(group: string) {
+  const drop = Object.keys(containerOps).filter((id) => containerOps[id]?.group === group);
+  if (drop.length === 0) return;
   const copy = { ...containerOps };
-  let changed = false;
-  for (const [id, e] of Object.entries(copy)) {
-    if (e.group === group) {
-      delete copy[id];
-      changed = true;
-    }
-  }
-  if (changed) {
-    containerOps = copy;
-    notify();
-  }
+  for (const id of drop) delete copy[id];
+  containerOps = copy;
+  notify();
 }
 
 /** Per-card binding: only the card whose entry changed re-renders. */
@@ -416,6 +438,7 @@ export function __resetContainerOpsForTests() {
   if (watchdogTimer) clearInterval(watchdogTimer);
   watchdogTimer = null;
   requestTimers.clear();
+  groupStarted.clear();
   listeners.clear();
   noticeListeners.clear();
   attached = false;

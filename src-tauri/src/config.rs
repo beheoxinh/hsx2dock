@@ -394,10 +394,21 @@ impl AppConfig {
             if path.exists() {
                 let (cfg, stale) = match Self::load_and_migrate(&path).await {
                     Ok(loaded) => loaded,
+                    Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
+                        // Could not read the file (permissions, I/O). It may be
+                        // perfectly valid, so leave it where it is and refuse to
+                        // save over it for the rest of this run.
+                        CONFIG_UNREADABLE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::error!(
+                            "Config file {} could not be read ({e:#}); started with defaults and will not overwrite it",
+                            path.display()
+                        );
+                        return Ok(Self::default());
+                    }
                     Err(e) => {
-                        // Falling back to defaults is fine, but the next save
-                        // would overwrite the only copy of the user's groups,
-                        // endpoints and tokens. Keep the unreadable file aside.
+                        // The file is there but does not parse: keep it aside
+                        // so the next save does not overwrite the only copy of
+                        // the user's groups, endpoints and tokens.
                         let stamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_secs());
@@ -474,6 +485,11 @@ impl AppConfig {
     }
 
     pub async fn save(&self) -> anyhow::Result<()> {
+        if CONFIG_UNREADABLE.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!(
+                "the saved config could not be read at startup, so it is not overwritten; fix its permissions and restart the app"
+            );
+        }
         if let Some(dir) = Self::config_dir() {
             tokio::fs::create_dir_all(&dir).await?;
             if let Some(path) = Self::config_path() {
@@ -493,6 +509,10 @@ impl AppConfig {
         write_atomic(path, content.into_bytes()).await
     }
 }
+
+/// Set when the config file exists but could not be read (an I/O error, not a
+/// parse error). Saving over it would destroy data we never managed to see.
+static CONFIG_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Serialises config writes: two saves racing on the same temp file would
 /// interleave.

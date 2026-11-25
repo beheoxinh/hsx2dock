@@ -125,9 +125,11 @@ pub(crate) async fn set_default_registry_core(state: &AppState, id: &str) -> Res
     if !id.is_empty() && !cfg.registries.iter().any(|r| r.id == id) {
         return Err("No registry login with that id".into());
     }
-    cfg.default_registry = id.to_string();
-    drop(cfg);
-    state.save_config().await
+    let mut next = cfg.clone();
+    next.default_registry = id.to_string();
+    next.save().await.map_err(|e| e.to_string())?;
+    *cfg = next;
+    Ok(())
 }
 
 /// Probes `GET /v2/` with the given credentials. Every registry that speaks
@@ -150,22 +152,39 @@ pub async fn test_registry_auth(input: RegistryInput) -> Result<RegistryTestResu
 /// URL candidates to probe for a registry's v2 API. `docker.io` maps to the
 /// real registry host — `docker.io/v2/` would hit the marketing site and
 /// report a bogus success.
+///
+/// Basic-auth credentials must never travel in clear text to a remote host, so
+/// plain HTTP is offered only for a loopback registry (a local dev registry).
+/// A remote self-signed registry is still reachable over HTTPS with `insecure`.
 pub fn probe_urls(host: &str, insecure: bool) -> Vec<String> {
     let effective = match host {
         "docker.io" | "index.docker.io" => "registry-1.docker.io",
         other => other,
     };
-    if insecure {
-        // Self-signed TLS first, then plain HTTP (docker's
-        // --insecure-registry means "allow HTTP", so cover both
-        // personal-Harbor cases).
-        vec![
-            format!("https://{effective}/v2/"),
-            format!("http://{effective}/v2/"),
-        ]
-    } else {
-        vec![format!("https://{effective}/v2/")]
+    let mut urls = vec![format!("https://{effective}/v2/")];
+    if insecure && is_loopback_host(effective) {
+        urls.push(format!("http://{effective}/v2/"));
     }
+    urls
+}
+
+/// True for `localhost`, `*.localhost` and loopback IP literals, with or
+/// without a port: `localhost:5000`, `127.0.0.1:5000`, `[::1]:5000`.
+fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(bracketed) = host.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, _port)) if !name.contains(':') => name,
+            _ => host,
+        }
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn probe_registry(
@@ -281,7 +300,14 @@ pub(crate) async fn save_registry_auth_core(
 
     let auth = if input.password.is_empty() {
         match existing {
-            Some(prev) => prev.auth.clone(),
+            // The stored secret belongs to the host it was saved for. Moving
+            // the login to another host needs the secret typed again.
+            Some(prev) if normalize_host(&prev.host) == host => prev.auth.clone(),
+            Some(_) => {
+                return Err(format!(
+                    "Enter the password or token again: the saved one belongs to a different registry than {host}"
+                ))
+            }
             None => return Err("Password or access token is required".into()),
         }
     } else {
@@ -328,11 +354,15 @@ pub(crate) async fn save_registry_auth_core(
         insecure: input.insecure,
     };
 
-    match cfg.registries.iter_mut().find(|r| r.id == entry.id) {
+    // Save a copy first: on a write error memory must keep the old logins.
+    let mut next = cfg.clone();
+    match next.registries.iter_mut().find(|r| r.id == entry.id) {
         Some(slot) => *slot = entry,
-        None => cfg.registries.push(entry),
+        None => next.registries.push(entry),
     }
-    state.save_config().await
+    next.save().await.map_err(|e| e.to_string())?;
+    *cfg = next;
+    Ok(())
 }
 
 #[tauri::command]
@@ -347,17 +377,19 @@ pub async fn remove_registry_auth(
 pub(crate) async fn remove_registry_auth_core(state: &AppState, id: &str) -> Result<(), String> {
     let mut cfg = state.config.write().await;
     let before = cfg.registries.len();
-    cfg.registries.retain(|r| r.id != id);
-    if cfg.registries.len() == before {
+    let mut next = cfg.clone();
+    next.registries.retain(|r| r.id != id);
+    if next.registries.len() == before {
         return Err("No registry login with that id".into());
     }
     // The removed login may have been the default; clear it so the resolver
     // falls back to the first remaining login instead of a dangling id.
-    if cfg.default_registry == id {
-        cfg.default_registry.clear();
+    if next.default_registry == id {
+        next.default_registry.clear();
     }
-    drop(cfg);
-    state.save_config().await
+    next.save().await.map_err(|e| e.to_string())?;
+    *cfg = next;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -385,13 +417,21 @@ mod tests {
             probe_urls("ghcr.io", false),
             vec!["https://ghcr.io/v2/".to_string()]
         );
+        // A remote registry never gets plain HTTP, Basic auth or not.
         assert_eq!(
             probe_urls("harbor.lan:8443", true),
+            vec!["https://harbor.lan:8443/v2/".to_string()]
+        );
+        // Plain HTTP is only tried for a loopback registry.
+        assert_eq!(
+            probe_urls("localhost:5000", true),
             vec![
-                "https://harbor.lan:8443/v2/".to_string(),
-                "http://harbor.lan:8443/v2/".to_string(),
+                "https://localhost:5000/v2/".to_string(),
+                "http://localhost:5000/v2/".to_string(),
             ]
         );
+        assert_eq!(probe_urls("127.0.0.1:5000", true).len(), 2);
+        assert_eq!(probe_urls("localhost:5000", false).len(), 1);
     }
 
     #[test]

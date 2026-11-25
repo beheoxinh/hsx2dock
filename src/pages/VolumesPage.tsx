@@ -128,11 +128,28 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
     const confirmed = await modal.showConfirm(`Are you sure you want to remove volume '${name}'?`, "Remove Volume", "danger");
     if (!confirmed) return;
     try {
-      await api.removeVolume(name, true);
-      await loadVolumes();
+      // Never force on the first attempt; an in-use refusal offers the forced path.
+      await api.removeVolume(name, false);
     } catch (err) {
-      toast.error("Remove Volume Failed", String(err));
+      const message = String(err);
+      if (!/in use|being used|must be forced|conflict|referenced/i.test(message)) {
+        toast.error("Remove Volume Failed", message);
+        return;
+      }
+      const forced = await modal.showConfirm(
+        `${message}\n\nForce removal can break containers that mount this volume and deletes its data. Remove it anyway?`,
+        "Force Remove Volume",
+        "danger"
+      );
+      if (!forced) return;
+      try {
+        await api.removeVolume(name, true);
+      } catch (forceErr) {
+        toast.error("Remove Volume Failed", String(forceErr));
+        return;
+      }
     }
+    await loadVolumes();
   };
 
   const totalSize = volumes.reduce((sum, v) => sum + (v.size ?? 0), 0);

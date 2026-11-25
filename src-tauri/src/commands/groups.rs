@@ -372,7 +372,21 @@ async fn power_one(client: &DockerClient, c: &ContainerItem, start: bool) -> Res
     let limit = if start { START_TIMEOUT } else { STOP_TIMEOUT };
     match tokio::time::timeout(limit, fut).await {
         Ok(r) => r.map_err(|e| e.to_string()),
-        Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
+        Err(_) => {
+            // The daemon keeps carrying out the call after we stop waiting, so
+            // a timeout is not proof of failure. Report what it actually reached.
+            if let Ok(d) = client.inspect_container(&c.id).await {
+                let reached = if start {
+                    d.state == "running"
+                } else {
+                    matches!(d.state.as_str(), "exited" | "created")
+                };
+                if reached {
+                    return Ok(());
+                }
+            }
+            Err(format!("timed out after {}s", limit.as_secs()))
+        }
     }
 }
 
@@ -388,14 +402,14 @@ async fn power_many(
 ) -> (usize, usize, Vec<String>) {
     let op = if start { "start" } else { "stop" };
     let mut busy = 0usize;
-    let claimed: Vec<ContainerItem> = targets
+    let claimed: Vec<(ContainerItem, crate::ops::ContainerClaim<'_>)> = targets
         .into_iter()
-        .filter(|c| {
-            let ok = state.ops.claim(&c.id, op, group);
-            if !ok {
+        .filter_map(|c| match state.ops.claim_guard(&c.id, op, group) {
+            Some(claim) => Some((c, claim)),
+            None => {
                 busy += 1;
+                None
             }
-            ok
         })
         .collect();
 
@@ -403,10 +417,10 @@ async fn power_many(
     // start call first, but never more than BULK_CONCURRENCY at a time.
     let futs: Vec<_> = claimed
         .into_iter()
-        .map(|c| async move {
-            state.ops.running(&c.id);
+        .map(|(c, claim)| async move {
+            claim.running();
             let r = power_one(client, &c, start).await;
-            state.ops.finish(&c.id, r.clone());
+            claim.finish(r.clone());
             if let Some(g) = group {
                 state.ops.group_progress(g);
             }
@@ -452,21 +466,21 @@ pub(crate) async fn set_group_power(
         };
         // The CLI reports no per-container progress: total 0 makes the UI
         // show "Starting…" instead of a counter stuck at 0/N.
-        if !state.ops.begin_group(id, op, 0) {
+        let Some(pass) = state.ops.begin_group_guard(id, op, 0) else {
             return Err("This project is already being started or stopped".to_string());
-        }
-        let claimed: Vec<String> = members
-            .into_iter()
-            .filter(|cid| state.ops.claim(cid, op, Some(id)))
+        };
+        let claimed: Vec<crate::ops::ContainerClaim<'_>> = members
+            .iter()
+            .filter_map(|cid| state.ops.claim_guard(cid, op, Some(id)))
             .collect();
-        for cid in &claimed {
-            state.ops.running(cid);
+        for claim in &claimed {
+            claim.running();
         }
         let result = crate::commands::compose::compose_project_action_core(project, op).await;
-        for cid in &claimed {
-            state.ops.finish(cid, result.as_ref().map(|_| ()).map_err(Clone::clone));
+        for claim in claimed {
+            claim.finish(result.as_ref().map(|_| ()).map_err(Clone::clone));
         }
-        state.ops.end_group(id, &result);
+        pass.end(&result);
         return result;
     }
 
@@ -474,9 +488,9 @@ pub(crate) async fn set_group_power(
         return Err("This group is already being started or stopped".to_string());
     }
 
-    // Whether this pass owns the group entry. Only the owner may end it: a
-    // pass refused because another one is running must not clear that one.
-    let began = std::sync::atomic::AtomicBool::new(false);
+    // The guard owns the group entry: only the pass that began it may end it,
+    // and a dropped pass ends it as interrupted instead of leaving it busy.
+    let mut pass: Option<crate::ops::GroupClaim<'_>> = None;
     let run = async {
         let client = state.get_client().await?;
         let live = client
@@ -495,10 +509,10 @@ pub(crate) async fn set_group_power(
             .filter(|c| if start { !c.running } else { c.running || c.state == "paused" || c.state == "restarting" })
             .collect();
         let skipped = total - targets.len();
-        if !state.ops.begin_group(id, op, targets.len()) {
+        let Some(claim) = state.ops.begin_group_guard(id, op, targets.len()) else {
             return Err("This group is already being started or stopped".to_string());
-        }
-        began.store(true, std::sync::atomic::Ordering::Relaxed);
+        };
+        pass = Some(claim);
         let (done, busy, errors) = power_many(state, &client, Some(id), targets, start).await;
         let verb = if start { "started" } else { "stopped" };
         let mut summary = format!("{done} {verb}, {} skipped", skipped + busy);
@@ -511,8 +525,8 @@ pub(crate) async fn set_group_power(
         Ok(summary)
     };
     let result = run.await;
-    if began.load(std::sync::atomic::Ordering::Relaxed) {
-        state.ops.end_group(id, &result);
+    if let Some(claim) = pass {
+        claim.end(&result);
     } else if result.is_err() && state.ops.begin_group(id, op, 0) {
         // Failed before the pass began (engine down, empty group): the caller
         // already got "scheduled", so the failure still has to reach the UI.

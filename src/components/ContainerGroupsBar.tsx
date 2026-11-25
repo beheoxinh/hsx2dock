@@ -29,6 +29,7 @@ import {
   useReorderTarget,
 } from "./ContainerDragLayer";
 import { api } from "../lib/api";
+import { getContainerStore } from "../lib/containerStore";
 import {
   clearGroup,
   isContainerBusy,
@@ -408,7 +409,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   // the choice survives a restart.
   const isolatedOpen = expanded[ISOLATED_GROUP_ID] !== false;
   const toggleIsolated = () => toggleGroupExpanded(ISOLATED_GROUP_ID);
-  const [logsGroup, setLogsGroup] = useState<{ name: string; containers: ContainerItem[] } | null>(null);
+  // The logs modal remembers the group, not its members: membership is derived
+  // live below, so containers moved in or out while it is open show up.
+  const [logsGroupId, setLogsGroupId] = useState<string | null>(null);
 
   const loadSizes = useCallback(async () => {
     try {
@@ -570,7 +573,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       "danger"
     );
     if (!confirmed) return;
-    if (!requestGroup(g.id, "remove")) return;
+    // The confirm dialog is open for a while: read the saved groups as they are
+    // now, not as they were when the button was clicked.
+    if (!requestGroup(g.id, "remove")) {
+      toast.error("Project busy", "It is already being started, stopped or removed.");
+      return;
+    }
     markQueued(
       members.map((c) => c.id).filter((id) => !isContainerBusy(id)),
       "remove",
@@ -580,19 +588,19 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       const out = await api.composeProjectAction(project, "down");
       toast.success("Project deleted", out.trim() ? `${project}: ${out.trim()}` : project);
       // Clean up saved order entry if any
-      await saveAll(groups.filter((x) => x.id !== g.id));
+      await saveAll(getContainerStore().groups.filter((x) => x.id !== g.id));
       forgetGroupExpanded(g.id);
       onChanged?.();
     } catch (e) {
       // Fallback: remove containers directly if compose down fails
       try {
         await Promise.allSettled(members.map((c) => api.removeContainer(c.id, true)));
-        await saveAll(groups.filter((x) => x.id !== g.id));
+        await saveAll(getContainerStore().groups.filter((x) => x.id !== g.id));
         forgetGroupExpanded(g.id);
         toast.success("Project deleted", project);
         onChanged?.();
       } catch (err) {
-        toast.error("Could not delete compose project", String(e || err));
+        toast.error("Could not delete compose project", String(err));
       }
     } finally {
       settleGroup(g.id);
@@ -628,7 +636,10 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
       "danger"
     );
     if (!choice) return;
-    if (isGroupBusy(g.id)) return;
+    if (isGroupBusy(g.id)) {
+      toast.error("Group busy", `"${g.name}" is being started or stopped. Try again when it finishes.`);
+      return;
+    }
     try {
       if (choice === "delete") {
         requestGroup(g.id, "remove");
@@ -657,7 +668,8 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         }
         onChanged?.();
       }
-      await saveAll(groups.filter((x) => x.id !== g.id));
+      // Latest saved groups: the confirm and the container removals above took time.
+      await saveAll(getContainerStore().groups.filter((x) => x.id !== g.id));
       // The group is gone, so its remembered expansion must go too — a future
       // group that happens to reuse the id would otherwise open by surprise.
       forgetGroupExpanded(g.id);
@@ -939,9 +951,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const onUserAutoStart = useStableCallback((g: ContainerGroup) => void toggleAutoStart(g));
   const onRemoveCompose = useStableCallback((g: ContainerGroup) => void removeComposeProject(g));
   const onRemoveGroup = useStableCallback((g: ContainerGroup) => void removeGroup(g));
-  const openLogs = useStableCallback((g: ContainerGroup) =>
-    setLogsGroup({ name: g.name, containers: membersByGroupId.get(g.id) ?? [] })
-  );
+  const openLogs = useStableCallback((g: ContainerGroup) => setLogsGroupId(g.id));
+  const logsTarget = useMemo(() => {
+    if (!logsGroupId) return null;
+    const g = [...composeGroups, ...userGroups].find((x) => x.id === logsGroupId);
+    return g ? { name: g.name, containers: membersByGroupId.get(g.id) ?? [] } : null;
+  }, [logsGroupId, composeGroups, userGroups, membersByGroupId]);
   const onRenameStart = useStableCallback((g: ContainerGroup) => setEditing({ id: g.id, name: g.name }));
   const onRenameChange = useStableCallback((g: ContainerGroup, name: string) => setEditing({ id: g.id, name }));
   const onRenameCommit = useStableCallback(() => void commitRename());
@@ -1047,12 +1062,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         </IsolatedCard>
       </div>
 
-      {logsGroup && (
+      {logsTarget && (
         <GroupLogsModal
           isOpen={true}
-          onClose={() => setLogsGroup(null)}
-          groupName={logsGroup.name}
-          containers={logsGroup.containers}
+          onClose={() => setLogsGroupId(null)}
+          groupName={logsTarget.name}
+          containers={logsTarget.containers}
         />
       )}
     </div>

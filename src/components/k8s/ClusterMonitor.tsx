@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -143,6 +143,19 @@ export const ClusterMonitor: React.FC<{
   clusterStats?: KindCluster | null;
 }> = ({ cluster, clusterStats }) => {
   const toast = useToast();
+  // Ad-hoc refreshes (after an action, "Refresh now") resolve whenever kubectl
+  // answers; by then the user may have switched clusters. `forCluster` drops a
+  // result that belongs to a cluster no longer on screen.
+  const clusterRef = useRef(cluster);
+  clusterRef.current = cluster;
+  const forCluster =
+    <T,>(apply: (v: T) => void) => {
+      const owner = cluster;
+      return (v: T) => {
+        if (clusterRef.current === owner) apply(v);
+      };
+    };
+  const logsSeq = useRef(0);
   const [tab, setTab] = useState<MonitorTab>("overview");
   const [summary, setSummary] = useState<K8sClusterSummary | null>(null);
   const [nodes, setNodes] = useState<K8sNodeInfo[]>([]);
@@ -473,7 +486,7 @@ export const ClusterMonitor: React.FC<{
       const status = await api.installMetricsServer(cluster);
       setMsStatus(status);
       // Fresh usage numbers as soon as the API answers.
-      api.getClusterMetrics(cluster).then(setMetrics).catch(() => {});
+      api.getClusterMetrics(cluster).then(forCluster(setMetrics)).catch(() => {});
       if (status.top_works) {
         toast.success(
           "metrics-server ready",
@@ -503,19 +516,23 @@ export const ClusterMonitor: React.FC<{
     tail = 300,
     workloadKind?: string
   ) => {
+    // Only the newest request may write: switching pods (or clusters) while
+    // an older, slower fetch is in flight used to show the wrong pod's logs.
+    const seq = ++logsSeq.current;
     setLogsLoading(true);
     setLogsError(null);
     try {
-      setLogsText(
-        workloadKind
-          ? await api.getWorkloadLogs(cluster, workloadKind, ns, name, tail)
-          : await api.getPodLogs(cluster, ns, name, tail)
-      );
+      const text = workloadKind
+        ? await api.getWorkloadLogs(cluster, workloadKind, ns, name, tail)
+        : await api.getPodLogs(cluster, ns, name, tail);
+      if (seq === logsSeq.current) setLogsText(text);
     } catch (e) {
-      setLogsText("");
-      setLogsError(String(e));
+      if (seq === logsSeq.current) {
+        setLogsText("");
+        setLogsError(String(e));
+      }
     } finally {
-      setLogsLoading(false);
+      if (seq === logsSeq.current) setLogsLoading(false);
     }
   };
 
@@ -623,7 +640,7 @@ export const ClusterMonitor: React.FC<{
     try {
       await api.deletePod(cluster, p.namespace, p.name);
       toast.success("Pod deleted", `${p.namespace}/${p.name}`);
-      api.getClusterPods(cluster).then(setPods).catch(() => {});
+      api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
     } catch (e) {
       toast.error("Delete failed", String(e));
     }
@@ -675,7 +692,7 @@ export const ClusterMonitor: React.FC<{
         `${scaleFor.name} → ${Math.max(0, scaleValue)} replica(s)`
       );
       setScaleFor(null);
-      api.getClusterWorkloads(cluster).then(setWorkloads).catch(() => {});
+      api.getClusterWorkloads(cluster).then(forCluster(setWorkloads)).catch(() => {});
     } catch (e) {
       toast.error("Scale failed", String(e));
     }
@@ -690,7 +707,7 @@ export const ClusterMonitor: React.FC<{
     try {
       await api.setNodeSchedulable(cluster, n.name, !cordon);
       toast.success(cordon ? "Node cordoned" : "Node uncordoned", n.name);
-      api.getClusterNodes(cluster).then(setNodes).catch(() => {});
+      api.getClusterNodes(cluster).then(forCluster(setNodes)).catch(() => {});
     } catch (e) {
       toast.error(cordon ? "Cordon failed" : "Uncordon failed", String(e));
     } finally {
@@ -713,8 +730,8 @@ export const ClusterMonitor: React.FC<{
       // kubectl warns about unmanaged pods on stderr; keep that visible in the
       // dev console without turning a completed drain into an error toast.
       if (out.trim()) console.info("drain:", out.trim());
-      api.getClusterNodes(cluster).then(setNodes).catch(() => {});
-      api.getClusterPods(cluster).then(setPods).catch(() => {});
+      api.getClusterNodes(cluster).then(forCluster(setNodes)).catch(() => {});
+      api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
     } catch (e) {
       toast.error("Drain failed", String(e));
     } finally {
@@ -737,7 +754,7 @@ export const ClusterMonitor: React.FC<{
     try {
       await api.createNamespace(cluster, name);
       toast.success("Namespace created", name);
-      api.getClusterNamespaces(cluster).then(setNamespaceList).catch(() => {});
+      api.getClusterNamespaces(cluster).then(forCluster(setNamespaceList)).catch(() => {});
     } catch (e) {
       toast.error("Create failed", String(e));
     }
@@ -762,17 +779,17 @@ export const ClusterMonitor: React.FC<{
   };
 
   const slowRefresh = () => {
-    api.getClusterNodes(cluster).then(setNodes).catch(() => {});
-    api.getClusterEvents(cluster).then(setEvents).catch(() => {});
-    api.getClusterWorkloads(cluster).then(setWorkloads).catch(() => {});
-    api.getClusterServices(cluster).then(setServices).catch(() => {});
-    api.getClusterConfigResources(cluster).then(setConfigs).catch(() => {});
-    api.getClusterPvcs(cluster).then(setPvcs).catch(() => {});
-    api.getClusterIngresses(cluster).then(setIngresses).catch(() => {});
-    api.getClusterPvs(cluster).then(setPvs).catch(() => {});
-    api.getClusterNamespaces(cluster).then(setNamespaceList).catch(() => {});
-    api.getClusterPods(cluster).then(setPods).catch(() => {});
-    api.getClusterSummary(cluster).then(setSummary).catch(() => {});
+    api.getClusterNodes(cluster).then(forCluster(setNodes)).catch(() => {});
+    api.getClusterEvents(cluster).then(forCluster(setEvents)).catch(() => {});
+    api.getClusterWorkloads(cluster).then(forCluster(setWorkloads)).catch(() => {});
+    api.getClusterServices(cluster).then(forCluster(setServices)).catch(() => {});
+    api.getClusterConfigResources(cluster).then(forCluster(setConfigs)).catch(() => {});
+    api.getClusterPvcs(cluster).then(forCluster(setPvcs)).catch(() => {});
+    api.getClusterIngresses(cluster).then(forCluster(setIngresses)).catch(() => {});
+    api.getClusterPvs(cluster).then(forCluster(setPvs)).catch(() => {});
+    api.getClusterNamespaces(cluster).then(forCluster(setNamespaceList)).catch(() => {});
+    api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
+    api.getClusterSummary(cluster).then(forCluster(setSummary)).catch(() => {});
   };
 
   const cpuPct = totalCpuCap > 0 ? (totalCpuUsed / totalCpuCap) * 100 : 0;
@@ -2506,13 +2523,13 @@ export const ClusterMonitor: React.FC<{
           onClick={() => {
             api
               .getClusterSummary(cluster)
-              .then(setSummary)
+              .then(forCluster(setSummary))
               .catch((e) => setMonitorError(String(e)));
-            api.getClusterNodes(cluster).then(setNodes).catch(() => {});
-            api.getClusterPods(cluster).then(setPods).catch(() => {});
-            api.getClusterEvents(cluster).then(setEvents).catch(() => {});
-            api.getClusterWorkloads(cluster).then(setWorkloads).catch(() => {});
-            api.getClusterMetrics(cluster).then(setMetrics).catch(() => {});
+            api.getClusterNodes(cluster).then(forCluster(setNodes)).catch(() => {});
+            api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
+            api.getClusterEvents(cluster).then(forCluster(setEvents)).catch(() => {});
+            api.getClusterWorkloads(cluster).then(forCluster(setWorkloads)).catch(() => {});
+            api.getClusterMetrics(cluster).then(forCluster(setMetrics)).catch(() => {});
           }}
         >
           <RefreshCw className="h-3.5 w-3.5" />

@@ -1095,49 +1095,74 @@ fn update_rows(parts: &mut TrayParts, daemon: &DaemonState, _label: &str, stats:
     }
 }
 
-/// Image count for the status row. Listing images walks every layer on the
-/// daemon side; the count rarely changes, so a minute-old figure is fine and
-/// saves three of every four list calls.
+/// Image count for the status row, per endpoint. Listing images walks every
+/// layer on the daemon side; the count rarely changes, so a minute-old figure
+/// is fine. A failed listing falls back to the last good count for the same
+/// endpoint (or 0), so one slow call does not blank every tray statistic.
 async fn cached_image_count(
     client: &crate::docker::client::DockerClient,
     configured: &str,
-) -> Option<usize> {
-    static CACHE: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+    endpoint_key: &str,
+) -> usize {
+    static CACHE: Mutex<Option<HashMap<String, (Instant, usize)>>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(60);
-    if let Ok(guard) = CACHE.lock() {
-        if let Some((at, n)) = *guard {
-            if at.elapsed() < TTL {
-                return Some(n);
-            }
+    let last = CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(endpoint_key).copied()));
+    if let Some((at, n)) = last {
+        if at.elapsed() < TTL {
+            return n;
         }
     }
-    let n = client.list_images_visible(Some(configured)).await.ok()?.len();
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), n));
+    match tokio::time::timeout(TRAY_CALL_TIMEOUT, client.list_images_visible(Some(configured))).await
+    {
+        Ok(Ok(images)) => {
+            let n = images.len();
+            if let Ok(mut g) = CACHE.lock() {
+                g.get_or_insert_with(HashMap::new)
+                    .insert(endpoint_key.to_string(), (Instant::now(), n));
+            }
+            n
+        }
+        _ => last.map_or(0, |(_, n)| n),
     }
-    Some(n)
 }
 
+/// Upper bound for one docker call made for the tray, so a hung daemon cannot
+/// hold the tray refresh forever. Same bound the background monitor uses.
+const TRAY_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
 async fn fetch_stats(state: &AppState, daemon: &DaemonState) -> Option<TrayStats> {
-    if *daemon != DaemonState::Running {
+    // The bundled engine's state only speaks for the bundled engine. A remote
+    // endpoint is live when it answers, so it is asked directly.
+    let remote = state.remote_endpoint_active().await;
+    if !remote && *daemon != DaemonState::Running {
         return None;
     }
-    let client = state.get_client().await.ok()?;
-    let containers = client.list_containers(true).await.ok()?;
+    let client = tokio::time::timeout(TRAY_CALL_TIMEOUT, state.get_client())
+        .await
+        .ok()?
+        .ok()?;
+    let containers = tokio::time::timeout(TRAY_CALL_TIMEOUT, client.list_containers(true))
+        .await
+        .ok()?
+        .ok()?;
     let total = containers.len();
     let running = containers.iter().filter(|c| c.running).count();
     // Only the pieces of config the tray reads, in one lock: cloning the whole
     // config (endpoints, registries, kind prefs…) every tick was wasted work.
-    let (configured, container_groups, gateway_routes, https_port) = {
+    let (configured, container_groups, gateway_routes, https_port, endpoint_key) = {
         let cfg = state.config.read().await;
         (
             cfg.kind_default_image.clone(),
             cfg.container_groups.clone(),
             cfg.gateway_routes.clone(),
             cfg.gateway_https_port,
+            cfg.active_endpoint.clone().unwrap_or_else(|| "local".to_string()),
         )
     };
-    let images = cached_image_count(&client, &configured).await?;
+    let images = cached_image_count(&client, &configured, &endpoint_key).await;
 
     // 1. Group stats: read from cached_stats updated by background monitor
     // so tray refresh is instant and does not bombard the Docker socket with sequential HTTP calls

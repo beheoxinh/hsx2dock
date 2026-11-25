@@ -205,6 +205,27 @@ impl OpsRegistry {
         self.emit("group-op", &entry);
     }
 
+    /// [`claim`](Self::claim) as a guard. Dropping it unfinished releases the
+    /// container as failed, so a cancelled or panicking task cannot leave it
+    /// marked busy forever.
+    pub fn claim_guard(&self, id: &str, op: &str, group: Option<&str>) -> Option<ContainerClaim<'_>> {
+        self.claim(id, op, group).then(|| ContainerClaim {
+            ops: self,
+            id: id.to_string(),
+            armed: true,
+        })
+    }
+
+    /// [`begin_group`](Self::begin_group) as a guard. Dropping it unfinished
+    /// ends the group as interrupted.
+    pub fn begin_group_guard(&self, group: &str, op: &str, total: usize) -> Option<GroupClaim<'_>> {
+        self.begin_group(group, op, total).then(|| GroupClaim {
+            ops: self,
+            group: group.to_string(),
+            armed: true,
+        })
+    }
+
     pub fn snapshot(&self) -> OpsSnapshot {
         OpsSnapshot {
             containers: self
@@ -217,6 +238,56 @@ impl OpsRegistry {
                 .lock()
                 .map(|m| m.values().cloned().collect())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+/// One container owned by a lifecycle operation; see [`OpsRegistry::claim_guard`].
+pub struct ContainerClaim<'a> {
+    ops: &'a OpsRegistry,
+    id: String,
+    armed: bool,
+}
+
+impl ContainerClaim<'_> {
+    pub fn running(&self) {
+        self.ops.running(&self.id);
+    }
+
+    pub fn finish(mut self, result: Result<(), String>) {
+        self.armed = false;
+        self.ops.finish(&self.id, result);
+    }
+}
+
+impl Drop for ContainerClaim<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ops
+                .finish(&self.id, Err("interrupted before it finished".to_string()));
+        }
+    }
+}
+
+/// One group pass owned by its caller; see [`OpsRegistry::begin_group_guard`].
+pub struct GroupClaim<'a> {
+    ops: &'a OpsRegistry,
+    group: String,
+    armed: bool,
+}
+
+impl GroupClaim<'_> {
+    pub fn end(mut self, result: &Result<String, String>) {
+        self.armed = false;
+        self.ops.end_group(&self.group, result);
+    }
+}
+
+impl Drop for GroupClaim<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ops
+                .end_group(&self.group, &Err("interrupted before it finished".to_string()));
         }
     }
 }
@@ -236,6 +307,22 @@ mod tests {
         ops.finish("a", Ok(()));
         assert!(!ops.is_busy("a"));
         assert!(ops.claim("a", "stop", None));
+    }
+
+    #[test]
+    fn dropped_guards_release_their_entries() {
+        let ops = OpsRegistry::default();
+        {
+            let claim = ops.claim_guard("a", "start", None);
+            assert!(claim.is_some());
+            assert!(ops.is_busy("a"));
+        }
+        assert!(!ops.is_busy("a"));
+        {
+            let _pass = ops.begin_group_guard("g", "start", 1);
+            assert!(ops.group_is_busy("g"));
+        }
+        assert!(!ops.group_is_busy("g"));
     }
 
     #[test]

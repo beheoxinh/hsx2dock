@@ -757,7 +757,9 @@ impl DockerClient {
 
         // For manual "Prune All Unused Images", identify all images not currently in use by any container,
         // and delete them safely while ensuring kind cluster images are never touched.
-        let protected_kind_ids = self.kind_node_image_ids().await.unwrap_or_default();
+        // Fail closed: without the node list, a kind image in use only by a
+        // stopped node could be taken as unused, so the prune is refused.
+        let protected_kind_ids = self.kind_node_image_ids().await?;
 
         // Collect all image IDs and tags currently referenced by existing containers (running or stopped)
         let containers_opts = bollard::query_parameters::ListContainersOptionsBuilder::default()

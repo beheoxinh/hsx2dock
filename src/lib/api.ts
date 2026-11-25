@@ -205,6 +205,8 @@ export const api = {
     invoke<void>("resize_exec_session", { sessionId, cols, rows }),
   stopExecSession: (sessionId: string) =>
     invoke<void>("stop_exec_session", { sessionId }),
+  /** Ends every exec session (sessions left over from before a webview reload). */
+  closeAllExecSessions: () => invoke<void>("close_all_exec_sessions"),
 
   // Images
   listImages: () => invoke<ImageItem[]>("list_images"),

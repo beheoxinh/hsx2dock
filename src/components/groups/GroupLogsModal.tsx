@@ -34,6 +34,27 @@ interface LogLine {
   message: string;
 }
 
+/** One member's log call may not hang the whole pass past this. */
+const LOG_FETCH_TIMEOUT_MS = 15_000;
+/** Newest lines kept on screen; the DOM and the parse stay bounded. */
+const MAX_RENDERED_LINES = 1000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms / 1000}s`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 // Deterministic distinct badge colors for container tags & log line prefixes
 const TAG_COLORS = [
   {
@@ -110,7 +131,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
   const toast = useToast();
   // Filter chips: selected container IDs. Empty Set = "All"
   const [selectedContainerIds, setSelectedContainerIds] = useState<Set<string>>(new Set());
-  const [tail, setTail] = useState<string>("300");
+  const [tail, setTail] = useState<string>("100");
   const [searchTerm, setSearchTerm] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -131,7 +152,8 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
 
   // Fetch logs for all containers in the group. One pass at a time: with many
   // members a pass can outlast the 4s refresh, and overlapping passes would
-  // race each other's results.
+  // race each other's results. Each call has a deadline, so one hung member
+  // cannot keep the pass (and the inflight flag) open forever.
   const fetchInflight = useRef(false);
   const fetchAllLogs = useCallback(async () => {
     if (containers.length === 0 || fetchInflight.current) return;
@@ -139,7 +161,9 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
     try {
       setLoading(true);
       const results = await Promise.allSettled(
-        containers.map((c) => api.getContainerLogs(c.id, tail, true))
+        containers.map((c) =>
+          withTimeout(api.getContainerLogs(c.id, tail, true), LOG_FETCH_TIMEOUT_MS)
+        )
       );
       const next: Record<string, string> = {};
       results.forEach((res, idx) => {
@@ -175,7 +199,10 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
 
   useEffect(() => {
     if (!isOpen || !autoRefresh) return;
-    const interval = setInterval(fetchAllLogs, 4000);
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void fetchAllLogs();
+    }, 4000);
     return () => clearInterval(interval);
   }, [isOpen, autoRefresh, fetchAllLogs]);
 
@@ -293,6 +320,10 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
   if (!isOpen) return null;
 
   const isAllSelected = selectedContainerIds.size === 0;
+  const visibleLines =
+    filteredLines.length > MAX_RENDERED_LINES
+      ? filteredLines.slice(-MAX_RENDERED_LINES)
+      : filteredLines;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
@@ -423,7 +454,6 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
                   <option value="200">200</option>
                   <option value="300">300</option>
                   <option value="500">500</option>
-                  <option value="1000">1000</option>
                 </select>
               </div>
 
@@ -500,7 +530,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
           ref={scrollRef}
           className="flex-1 overflow-y-auto bg-zinc-950 p-4 font-mono text-xs leading-relaxed select-text"
         >
-          {filteredLines.length === 0 ? (
+          {visibleLines.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-zinc-500 gap-2">
               <FileText className="w-8 h-8 opacity-40" />
               <p className="text-sm">
@@ -513,7 +543,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
             </div>
           ) : (
             <div className="space-y-1">
-              {filteredLines.map((line) => (
+              {visibleLines.map((line) => (
                 <div
                   key={line.id}
                   className="flex items-start gap-2.5 hover:bg-zinc-900/50 px-2 py-0.5 rounded transition-colors group"
@@ -551,7 +581,11 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
         {/* Footer info bar */}
         <div className="px-6 py-2.5 border-t border-zinc-800/80 bg-zinc-950 flex items-center justify-between text-[11px] text-zinc-400 shrink-0">
           <div>
-            Showing <span className="font-semibold text-zinc-200">{filteredLines.length}</span> lines
+            Showing <span className="font-semibold text-zinc-200">{visibleLines.length}</span>
+            {filteredLines.length > visibleLines.length && (
+              <span> of {filteredLines.length} (newest kept)</span>
+            )}{" "}
+            lines
             {selectedContainerIds.size > 0 && (
               <span>
                 {" "}

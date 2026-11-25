@@ -106,7 +106,7 @@ pub async fn save_app_config(
 
 /// App-free core of [`save_app_config`], shared with the MCP server.
 pub(crate) async fn save_app_config_core(
-    state: &AppState,
+    state: &Arc<AppState>,
     mut config: AppConfig,
 ) -> Result<(), String> {
     // Turning off "Auto startup on boot" also clears its dependent switch, so
@@ -145,7 +145,9 @@ pub(crate) async fn save_app_config_core(
     if let Err(e) = apply_engine_limits_now(state).await {
         tracing::warn!("could not apply engine resource limits after save: {e}");
     }
-    Ok(())
+    // The MCP listener follows its saved flags from any save path (Settings,
+    // an agent, the MCP settings card), so the listener and the file agree.
+    crate::commands::mcp::reconcile_http_server(state).await
 }
 
 /// Copies the fields that dedicated commands own from `live` into `incoming`.
@@ -213,11 +215,12 @@ pub async fn toggle_cli_bridge(
     enabled: bool,
 ) -> Result<CliBridgeStatus, String> {
     state.engine_control_guard().await?;
-    {
-        let mut config = state.config.write().await;
-        config.cli_bridge_enabled = enabled;
-        config.save().await.map_err(|e| e.to_string())?;
-    }
+    state
+        .update_config(|config| {
+            config.cli_bridge_enabled = enabled;
+            Ok(())
+        })
+        .await?;
     let link_state = apply_cli_bridge(&state).await;
 
     let config = state.config.read().await;
@@ -234,15 +237,26 @@ pub async fn toggle_cli_bridge(
 pub async fn apply_cli_bridge(state: &AppState) -> Option<bool> {
     let engine_socket = state.engine.paths().socket.clone();
     let is_live = state.daemon_state() == DaemonState::Running;
-    {
+    // Copy what reconcile needs and release the config lock first: reconcile
+    // runs `docker context` subprocesses, and holding the lock across them
+    // stalled every config reader behind it.
+    let (enabled, set_default, prev_context) = {
         let config = state.config.read().await;
-        let _ = reconcile(
-            &engine_socket,
+        (
             config.cli_bridge_enabled,
             config.cli_bridge_set_default,
-            is_live,
-            &config.cli_bridge_prev_context,
-        );
+            config.cli_bridge_prev_context.clone(),
+        )
+    };
+    let socket = engine_socket.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        let _ = reconcile(&socket, enabled, set_default, is_live, &prev_context);
+    });
+    if tokio::time::timeout(std::time::Duration::from_secs(10), job)
+        .await
+        .is_err()
+    {
+        tracing::warn!("applying the CLI bridge timed out");
     }
     xdg_symlink_state(&engine_socket)
 }
@@ -342,6 +356,16 @@ pub(crate) async fn migrate_data_root_core(
     if canon(&target) == canon(&old_data_root) {
         return Err("This path is already the active data root — nothing to migrate.".to_string());
     }
+    // Nested roots break the clear step: deleting the old root would delete
+    // the new one, and the reverse would delete the copy. Refuse both.
+    if paths_overlap(
+        &resolve_for_overlap(&target),
+        &resolve_for_overlap(&old_data_root),
+    ) {
+        return Err(
+            "The new data root cannot be inside the current one, or contain it.".to_string(),
+        );
+    }
 
     // Fail fast, before stopping the engine or copying anything, if the target
     // filesystem cannot report d_type and no compatible fallback exists. Also,
@@ -398,14 +422,53 @@ pub(crate) async fn migrate_data_root_core(
 
     // Only now, with the new root saved (and running, when it was), is the old
     // copy expendable. Clearing it first lost the data whenever a later step failed.
-    if clear_old && old_data_root.exists() && old_data_root != target {
-        tracing::info!("Clearing old data root directory: {:?}", old_data_root);
-        if let Err(e) = tokio::fs::remove_dir_all(&old_data_root).await {
-            tracing::warn!("could not clear the old data root: {e}");
+    // Only a finished move makes the old copy expendable. Without a move the
+    // old root still holds the only copy of the data, so clear_old is ignored.
+    if clear_old && !move_data {
+        tracing::warn!("clear_old ignored: the data was not moved, so the old root is kept");
+    }
+    if move_data && clear_old && old_data_root.exists() {
+        let still_disjoint = !paths_overlap(
+            &resolve_for_overlap(&target),
+            &resolve_for_overlap(&old_data_root),
+        );
+        if still_disjoint {
+            tracing::info!("Clearing old data root directory: {:?}", old_data_root);
+            if let Err(e) = tokio::fs::remove_dir_all(&old_data_root).await {
+                tracing::warn!("could not clear the old data root: {e}");
+            }
         }
     }
 
     Ok(())
+}
+
+/// True when one path is the other or lies beneath it. Component-wise, so
+/// `/data/a` and `/data/ab` do not overlap.
+pub(crate) fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Canonical form of `p` for containment checks. A path that does not exist
+/// yet is resolved through its nearest existing ancestor, so a symlink in the
+/// middle of the path cannot hide an overlap.
+fn resolve_for_overlap(p: &std::path::Path) -> std::path::PathBuf {
+    let mut existing = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        let name = existing.file_name().map(|n| n.to_os_string());
+        let parent = existing.parent().map(|q| q.to_path_buf());
+        match (name, parent) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// Copy (when asked), make snapshotter dirs d_type-compatible, then point the
@@ -713,15 +776,33 @@ pub async fn toggle_cli_shim(
     let paths = state.engine.paths();
     let mode = state.config.read().await.cli_mode.clone();
 
-    if enabled {
-        crate::docker::engine::ensure_shim(&paths, &mode).map_err(|e| format!("{e:#}"))?;
+    // Persist the choice before touching the shim. If the shim cannot be
+    // written, the saved flag goes back so the file keeps matching the disk.
+    let previous = state
+        .update_config(|config| {
+            let previous = config.cli_shim_enabled;
+            config.cli_shim_enabled = enabled;
+            Ok(previous)
+        })
+        .await?;
+    let applied: Result<(), String> = if enabled {
+        crate::docker::engine::ensure_shim(&paths, &mode)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
     } else {
-        crate::docker::engine::remove_shim().map_err(|e| format!("{e:#}"))?;
+        crate::docker::engine::remove_shim()
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    };
+    if let Err(e) = applied {
+        let _ = state
+            .update_config(|config| {
+                config.cli_shim_enabled = previous;
+                Ok(())
+            })
+            .await;
+        return Err(e);
     }
-
-    let mut config = state.config.write().await;
-    config.cli_shim_enabled = enabled;
-    config.save().await.map_err(|e| e.to_string())?;
 
     let expected = crate::docker::engine::resolve_cli(&paths, &mode, &[])
         .ok()
@@ -797,12 +878,38 @@ pub async fn check_compose_update(
 
 /// Download and install a newer docker-compose plugin, streaming progress on
 /// the same channel the engine update uses.
+static COMPOSE_INSTALL_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLI_INSTALL_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds one installer's slot; released on drop, including on error.
+struct InstallSlot(&'static std::sync::atomic::AtomicBool);
+
+impl Drop for InstallSlot {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Single-flight for an installer: a second request while one runs is refused
+/// instead of two downloads racing over the same install directory.
+fn claim_install_slot(
+    flag: &'static std::sync::atomic::AtomicBool,
+    what: &str,
+) -> Result<InstallSlot, String> {
+    if flag.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err(format!("A {what} install is already running"));
+    }
+    Ok(InstallSlot(flag))
+}
+
 #[tauri::command]
 pub async fn install_compose_update(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<String, String> {
+    let _slot = claim_install_slot(&COMPOSE_INSTALL_BUSY, "docker-compose")?;
     let version = version.trim().trim_start_matches('v').to_string();
     let plan = crate::docker::engine::step_plan(crate::docker::engine::COMPOSE_UPDATE_STEPS);
     let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -853,6 +960,7 @@ pub async fn install_cli_update(
     state: State<'_, Arc<AppState>>,
     version: String,
 ) -> Result<String, String> {
+    let _slot = claim_install_slot(&CLI_INSTALL_BUSY, "docker CLI")?;
     let version = version.trim().trim_start_matches('v').to_string();
     let plan = crate::docker::engine::step_plan(crate::docker::engine::CLI_UPDATE_STEPS);
     let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1083,4 +1191,38 @@ fn clean_rootless_version(s: &str) -> String {
     s.strip_prefix("rootlesskit version ")
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{paths_overlap, resolve_for_overlap};
+    use std::path::Path;
+
+    #[test]
+    fn overlap_covers_identity_and_nesting_in_both_directions() {
+        assert!(paths_overlap(Path::new("/data"), Path::new("/data")));
+        assert!(paths_overlap(Path::new("/data/new"), Path::new("/data")));
+        assert!(paths_overlap(Path::new("/data"), Path::new("/data/new")));
+    }
+
+    #[test]
+    fn overlap_is_component_wise_and_ignores_siblings() {
+        assert!(!paths_overlap(Path::new("/data/ab"), Path::new("/data/a")));
+        assert!(!paths_overlap(Path::new("/mnt/new"), Path::new("/home/u/old")));
+    }
+
+    #[test]
+    fn nonexistent_target_inside_existing_root_is_detected() {
+        let base = std::env::temp_dir().join(format!("dm-overlap-{}", std::process::id()));
+        let old = base.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        let inside = old.join("not/yet/created");
+        let sibling = base.join("sibling-not-created");
+
+        let old_r = resolve_for_overlap(&old);
+        assert!(paths_overlap(&resolve_for_overlap(&inside), &old_r));
+        assert!(!paths_overlap(&resolve_for_overlap(&sibling), &old_r));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

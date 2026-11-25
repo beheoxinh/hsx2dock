@@ -818,8 +818,15 @@ impl McpServer {
                 args.req_str("target_path"),
                 args.bool_or("move_data", true),
                 args.bool_or("clear_old", false),
+                args.bool_or("confirm_clear_old", false),
             ) {
-                (Ok(target_path), Ok(move_data), Ok(clear_old)) => done_unit(
+                // Deleting the old data root is irreversible, so an agent has to
+                // say so explicitly; a bare clear_old is refused.
+                (Ok(_), Ok(_), Ok(true), Ok(false)) => fail(
+                    "clear_old deletes the old data root permanently; pass confirm_clear_old=true to allow it"
+                        .to_string(),
+                ),
+                (Ok(target_path), Ok(move_data), Ok(clear_old), Ok(_)) => done_unit(
                     crate::commands::system::migrate_data_root_core(
                         state,
                         target_path,
@@ -828,7 +835,10 @@ impl McpServer {
                     )
                     .await,
                 ),
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+                (Err(e), _, _, _)
+                | (_, Err(e), _, _)
+                | (_, _, Err(e), _)
+                | (_, _, _, Err(e)) => fail(e.to_string()),
             },
             "system_prune" => done(self.prune_system().await),
 
@@ -955,8 +965,7 @@ impl McpServer {
     /// Without this, an agent could leave the config saying "enabled" while
     /// nothing is listening until the next app launch.
     async fn save_config(&self, config: AppConfig) -> Result<(), String> {
-        crate::commands::system::save_app_config_core(&self.state, config).await?;
-        crate::commands::mcp::reconcile_http_server(&self.state).await
+        crate::commands::system::save_app_config_core(&self.state, config).await
     }
 
     async fn cli_bridge_status(&self) -> crate::commands::system::CliBridgeStatus {
@@ -973,11 +982,12 @@ impl McpServer {
         &self,
         enabled: bool,
     ) -> Result<crate::commands::system::CliBridgeStatus, String> {
-        {
-            let mut config = self.state.config.write().await;
-            config.cli_bridge_enabled = enabled;
-            config.save().await.map_err(|e| e.to_string())?;
-        }
+        self.state
+            .update_config(|config| {
+                config.cli_bridge_enabled = enabled;
+                Ok(())
+            })
+            .await?;
         let link_state = crate::commands::system::apply_cli_bridge(&self.state).await;
         let config = self.state.config.read().await;
         Ok(crate::commands::system::CliBridgeStatus {
@@ -1164,11 +1174,7 @@ impl McpServer {
     }
 
     async fn remove_image(&self, id: &str, force: bool) -> Result<(), String> {
-        let client = self.state.get_client().await?;
-        client
-            .remove_image(id, force)
-            .await
-            .map_err(|e| e.to_string())
+        crate::commands::images::remove_image_core(&self.state, id, force).await
     }
 
     async fn prune_images(&self) -> Result<Value, String> {
@@ -1252,42 +1258,10 @@ impl McpServer {
         crate::commands::endpoints::remove_endpoint_core(&self.state, id).await.map(|_| ())
     }
 
-    /// Mirrors `commands::endpoints::set_active_endpoint`: probe the new target
-    /// before committing, then refresh the shim so the terminal follows.
+    /// Same core as the Settings command, so an agent switch also re-points the
+    /// CLI bridge and tells the window (`endpoint-changed`).
     async fn set_active_endpoint(&self, id: String) -> Result<(), String> {
-        let state = &self.state;
-        if id == "local" {
-            {
-                let mut config = state.config.write().await;
-                config.active_endpoint = None;
-            }
-            state.save_config().await?;
-            state.invalidate_client();
-            crate::commands::system::refresh_shim(state, &*state.config.read().await);
-            let _ = crate::commands::system::apply_cli_bridge(state).await;
-            return Ok(());
-        }
-        let target = {
-            let cfg = state.config.read().await;
-            cfg.endpoints.iter().find(|x| x.id == id).cloned()
-        }
-        .ok_or_else(|| format!("No saved endpoint with id '{id}'"))?;
-        let socket = None;
-        let probe = crate::docker::client::DockerClient::connect_for_endpoint(
-            &target.kind,
-            &target.uri,
-            socket,
-        )
-        .map_err(|e| format!("{e:#}"))?;
-        probe.ping().await.map_err(|e| format!("{e:#}"))?;
-        {
-            let mut config = state.config.write().await;
-            config.active_endpoint = Some(id);
-        }
-        state.save_config().await?;
-        state.invalidate_client();
-        crate::commands::system::refresh_shim(state, &*state.config.read().await);
-        Ok(())
+        crate::commands::endpoints::set_active_endpoint_core(&self.state, self.app_ref(), id).await
     }
 
     async fn list_registries(

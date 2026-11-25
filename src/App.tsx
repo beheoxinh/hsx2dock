@@ -91,6 +91,11 @@ const MainLayout: React.FC = () => {
 
     fetchEngineStatus();
 
+    // A webview reload drops every terminal without telling the backend, so
+    // their exec sessions (and the shells inside containers) lived on. This
+    // is the only window, so anything still open now belongs to a dead page.
+    api.closeAllExecSessions().catch(() => {});
+
     // Warm the Containers screen before it is ever opened: the list, sizes,
     // groups and gateway routes are fetched once here so the tab paints from
     // memory instead of waiting on Docker on first visit.

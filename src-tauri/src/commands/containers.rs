@@ -15,25 +15,50 @@ pub async fn list_containers(
     client.list_containers(all).await.map_err(|e| e.to_string())
 }
 
+/// Runs one lifecycle call while the container is claimed in the ops registry,
+/// so a single-container action cannot race a group pass or a double click.
+async fn claimed_lifecycle<Fut>(state: &AppState, id: &str, op: &str, call: Fut) -> Result<(), String>
+where
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let claim = state
+        .ops
+        .claim_guard(id, op, None)
+        .ok_or_else(|| "This container is already being started, stopped or restarted".to_string())?;
+    claim.running();
+    let result = call.await;
+    claim.finish(result.clone());
+    result
+}
+
 #[tauri::command]
 pub async fn start_container(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let client = state.get_client().await?;
-    client.start_container(&id).await.map_err(|e| e.to_string())
+    claimed_lifecycle(&state, &id, "start", async {
+        let client = state.get_client().await?;
+        client.start_container(&id).await.map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn stop_container(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let client = state.get_client().await?;
-    client.stop_container(&id).await.map_err(|e| e.to_string())
+    claimed_lifecycle(&state, &id, "stop", async {
+        let client = state.get_client().await?;
+        client.stop_container(&id).await.map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn restart_container(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let client = state.get_client().await?;
-    client
-        .restart_container(&id)
-        .await
-        .map_err(|e| e.to_string())
+    claimed_lifecycle(&state, &id, "restart", async {
+        let client = state.get_client().await?;
+        client
+            .restart_container(&id)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -101,12 +126,16 @@ pub(crate) async fn rename_container_core(
     new_name: &str,
 ) -> Result<(), String> {
     let client = state.get_client().await?;
-    let old = client.inspect_container(id).await.ok();
+    // Read the old name first: without it the routes and groups that refer to
+    // the container by name cannot be found, so do not rename at all.
+    let old = client
+        .inspect_container(id)
+        .await
+        .map_err(|e| format!("Cannot read the container before renaming it: {e}"))?;
     client
         .rename_container(id, new_name)
         .await
         .map_err(|e| e.to_string())?;
-    let Some(old) = old else { return Ok(()) };
     let old_name = old.name.trim_start_matches('/').to_string();
     let new_name = new_name.trim_start_matches('/');
     if old_name.is_empty() || old_name == new_name {
@@ -408,7 +437,12 @@ pub(crate) async fn recreate_container_core(
             } else {
                 group.container_ids.push(new_id.clone());
             }
-            let _ = cfg.save().await;
+            if let Err(e) = cfg.save().await {
+                tracing::error!("recreate: could not save group membership for {group_id}: {e}");
+            }
+            state
+                .ops
+                .emit("container-groups-changed", &cfg.container_groups);
         }
     }
 

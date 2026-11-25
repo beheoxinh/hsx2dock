@@ -176,8 +176,9 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         if (!confirmed) return;
       }
       // The card swaps its buttons for a spinner while this runs and until
-      // the live list shows the new state.
-      await trackContainerOp(c.id, action, async () => {
+      // the live list shows the new state. The container may have been claimed
+      // while the confirm dialog was open; say so instead of dropping the action.
+      const ran = await trackContainerOp(c.id, action, async () => {
         switch (action) {
           case "start":
             // `docker start` refuses a paused container; resume it instead.
@@ -194,6 +195,9 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
             return api.removeContainer(c.id, true);
         }
       });
+      if (!ran) {
+        toast.error(`Could not ${action} ${cName}`, "Another action on this container is still running.");
+      }
     } catch (e) {
       toast.error("Operation failed", String(e));
     }

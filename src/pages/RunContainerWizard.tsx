@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { setGatewayRoutes } from "../lib/containerStore";
+import { primeContainerStore, setGatewayRoutes } from "../lib/containerStore";
 import { joinArgs, splitArgs } from "../lib/shellArgs";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -342,6 +342,9 @@ export const RunContainerWizard: React.FC<RunContainerWizardProps> = ({
         if (hasAdvancedChanged) {
           // Advanced parameters changed -> Recreate the container
           activeContainerId = await api.recreateContainer(editTarget.id, config);
+          // The backend re-attaches the new id to its group and broadcasts it;
+          // re-reading the store also covers a missed event.
+          void primeContainerStore(true);
           toast.success(
             "Container Recreated",
             `Container ${name || editTarget.details.name} updated and recreated.`

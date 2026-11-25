@@ -39,6 +39,20 @@ import type { DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
 import { useProgressiveList } from "../hooks/useProgressiveList";
 
+/**
+ * Mirrors the backend's default tag: an untagged reference means `:latest`, so
+ * the progress events (which carry the normalised name) match the request.
+ */
+const withDefaultTag = (ref: string): string => {
+  const image = ref.trim();
+  if (!image || image.includes("@")) return image;
+  const last = image.split("/").pop() ?? image;
+  return last.includes(":") ? image : `${image}:latest`;
+};
+
+/** Engine refusals that mean "in use": a forced removal is the only way through. */
+const IN_USE_ERROR = /in use|being used|must be forced|conflict|referenced/i;
+
 interface ImagesPageProps {
   refreshKey?: number;
   /** Engine state — the page renders an EngineGate panel unless Running. */
@@ -58,7 +72,12 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [buildModalOpen, setBuildModalOpen] = useState(false);
   const [imageToPull, setImageToPull] = useState("");
   const [pullStatus, setPullStatus] = useState<PullProgressPayload | null>(null);
-  const [isPulling, setIsPulling] = useState(false);
+  // Pulls in flight, keyed by normalised reference. Each pull clears its own
+  // entry in `finally`, so a failed request cannot leave the form locked.
+  const [pullingRefs, setPullingRefs] = useState<ReadonlySet<string>>(() => new Set());
+  const isPulling = pullingRefs.size > 0;
+  // The reference the pull modal shows; progress for any other image is ignored.
+  const pullTargetRef = useRef<string | null>(null);
   const [hubResults, setHubResults] = useState<SearchResult[]>([]);
   const [searchingHub, setSearchingHub] = useState(false);
   const [registries, setRegistries] = useState<RegistryStatus[]>([]);
@@ -69,6 +88,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [historyTarget, setHistoryTarget] = useState<string | null>(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
+  const pushTargetRef = useRef<string | null>(null);
   const [autoPrune, setAutoPrune] = useState(false);
   const [pruningAuto, setPruningAuto] = useState(false);
   const pendingPull = useRef<PullProgressPayload | null>(null);
@@ -134,10 +154,10 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
 
     const unlistenPull = disposeListener(
       events.onPullProgress((payload) => {
+        if (payload.image !== pullTargetRef.current) return;
         if (payload.done) {
           pendingPull.current = null;
           setPullStatus(payload);
-          setIsPulling(false);
           loadImages();
           return;
         }
@@ -148,10 +168,10 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
 
     const unlistenPush = disposeListener(
       events.onPushProgress((payload) => {
+        if (payload.image !== pushTargetRef.current) return;
         if (payload.done) {
           pendingPush.current = null;
           setPushStatus(payload);
-          setIsPushing(false);
           return;
         }
         pendingPush.current = payload;
@@ -168,32 +188,40 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   }, [refreshKey]);
 
   const handlePull = async (imgName?: string) => {
-    const target = imgName || imageToPull;
-    if (!target.trim()) return;
+    const target = withDefaultTag(imgName || imageToPull);
+    if (!target) return;
 
+    pullTargetRef.current = target;
+    setPullingRefs((prev) => new Set(prev).add(target));
+    setPullStatus({
+      image: target,
+      status: "Initiating pull request...",
+      progress: null,
+      current: null,
+      total: null,
+      done: false,
+      error: null,
+    });
     try {
-      setIsPulling(true);
-      setPullStatus({
-        image: target,
-        status: "Initiating pull request...",
-        progress: null,
-        current: null,
-        total: null,
-        done: false,
-        error: null,
-      });
-      await api.pullImage(target.trim());
+      await api.pullImage(target);
     } catch (err) {
-      setPullStatus({
-        image: target,
-        status: "Failed",
-        progress: null,
-        current: null,
-        total: null,
-        done: true,
-        error: String(err),
+      if (pullTargetRef.current === target) {
+        setPullStatus({
+          image: target,
+          status: "Failed",
+          progress: null,
+          current: null,
+          total: null,
+          done: true,
+          error: String(err),
+        });
+      }
+    } finally {
+      setPullingRefs((prev) => {
+        const next = new Set(prev);
+        next.delete(target);
+        return next;
       });
-      setIsPulling(false);
     }
   };
 
@@ -245,10 +273,11 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   };
 
   const handlePush = async () => {
-    const target = pushTarget.trim();
+    const target = withDefaultTag(pushTarget);
     if (!target || isPushing) return;
+    pushTargetRef.current = target;
+    setIsPushing(true);
     try {
-      setIsPushing(true);
       setPushStatus({
         image: target,
         status: "Starting push…",
@@ -260,15 +289,18 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
       });
       await api.pushImage(target);
     } catch (err) {
-      setPushStatus({
-        image: target,
-        status: "Failed",
-        progress: null,
-        current: null,
-        total: null,
-        done: true,
-        error: String(err),
-      });
+      if (pushTargetRef.current === target) {
+        setPushStatus({
+          image: target,
+          status: "Failed",
+          progress: null,
+          current: null,
+          total: null,
+          done: true,
+          error: String(err),
+        });
+      }
+    } finally {
       setIsPushing(false);
     }
   };
@@ -290,11 +322,29 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     const confirmed = await modal.showConfirm("Are you sure you want to remove this image?", "Remove Image", "danger");
     if (!confirmed) return;
     try {
-      await api.removeImage(id, true);
-      await loadImages();
+      // Never force on the first attempt: the engine refuses an image that a
+      // container uses, and that refusal is what offers the forced path.
+      await api.removeImage(id, false);
     } catch (e) {
-      toast.error("Remove Error", String(e));
+      const message = String(e);
+      if (!IN_USE_ERROR.test(message)) {
+        toast.error("Remove Error", message);
+        return;
+      }
+      const forced = await modal.showConfirm(
+        `${message}\n\nForce removal can break containers that depend on this image. Remove it anyway?`,
+        "Force Remove Image",
+        "danger"
+      );
+      if (!forced) return;
+      try {
+        await api.removeImage(id, true);
+      } catch (forceErr) {
+        toast.error("Remove Error", String(forceErr));
+        return;
+      }
     }
+    await loadImages();
   };
 
   const handleToggleAutoPrune = async () => {

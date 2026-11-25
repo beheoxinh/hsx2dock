@@ -417,7 +417,15 @@ impl EngineManager {
         let child = cmd.spawn().context("failed to spawn rootlesskit")?;
         let _ = fs::write(&paths.pid_file, child.id().to_string());
         let pid = child.id();
-        self.inner_lock().child = Some(child);
+        // Replacing the handle must not drop an unreaped child (a zombie). It is
+        // normally gone already, since is_running() clears an exited handle.
+        let previous = self.inner_lock().child.replace(child);
+        if let Some(mut old) = previous {
+            if matches!(old.try_wait(), Ok(None)) {
+                signal(old.id(), libc::SIGKILL);
+            }
+            let _ = old.wait();
+        }
 
         // Verify the daemon actually reaches a live API socket. dockerd can
         // spawn fine and then die during init (e.g. buildkit/containerd
@@ -446,10 +454,13 @@ impl EngineManager {
                 );
             }
             if Instant::now() >= deadline {
-                // Still alive but never opened the socket — kill and report.
-                if let Some(c) = self.inner_lock().child.take() {
+                // Still alive but never opened the socket — kill, reap, report.
+                let taken = self.inner_lock().child.take();
+                if let Some(mut c) = taken {
                     signal(c.id(), libc::SIGKILL);
+                    let _ = c.wait();
                 }
+                stop_pidfile_process(&paths.dockerd_pid_file(), &["dockerd"], Duration::from_secs(5));
                 let _ = fs::remove_file(&paths.pid_file);
                 bail!(
                     "engine did not open its API socket within {HEALTH_TIMEOUT_SECS}s; see {}",
@@ -477,11 +488,19 @@ impl EngineManager {
                         let _ = child.wait();
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
                 }
             }
         }
-        let _ = fs::remove_file(&self.paths().pid_file);
+        // SIGKILL to rootlesskit does not reach the dockerd it spawned, so the
+        // daemon is stopped through its own pidfile (checked by process name).
+        let paths = self.paths();
+        stop_pidfile_process(&paths.dockerd_pid_file(), &["dockerd"], Duration::from_secs(5));
+        let _ = fs::remove_file(&paths.pid_file);
         Ok(())
     }
 
@@ -489,26 +508,41 @@ impl EngineManager {
     /// if the pidfile's process is really ours — never signal a recycled PID.
     fn kill_stale(&self) -> Result<()> {
         let paths = self.paths();
-        let Ok(raw) = fs::read_to_string(&paths.pid_file) else {
-            return Ok(());
-        };
-        let Ok(pid) = raw.trim().parse::<i32>() else {
-            let _ = fs::remove_file(&paths.pid_file);
-            return Ok(());
-        };
-        if matches!(
-            proc_comm(pid).as_deref(),
-            Some("rootlesskit") | Some("dockerd")
-        ) {
-            signal(pid as u32, libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while pid_alive(pid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
+        // The supervisor first, then the daemon it may have left running when
+        // it was hard-killed. Each pid is only signalled if its name still
+        // matches, so a recycled pid is left alone.
+        let grace = Duration::from_secs(5);
+        stop_pidfile_process(&paths.pid_file, &["rootlesskit", "dockerd"], grace);
+        stop_pidfile_process(&paths.dockerd_pid_file(), &["dockerd"], grace);
         let _ = fs::remove_file(&paths.pid_file);
+        let _ = fs::remove_file(paths.dockerd_pid_file());
         Ok(())
     }
+}
+
+/// Asks the process named in `pid_file` to exit: SIGTERM, up to `grace` to
+/// comply, then SIGKILL. Does nothing unless the pid's `comm` is one of
+/// `names`, so a pid recycled since the file was written is never signalled.
+/// Returns whether a matching process was found.
+fn stop_pidfile_process(pid_file: &Path, names: &[&str], grace: Duration) -> bool {
+    let Ok(raw) = fs::read_to_string(pid_file) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    if !proc_comm(pid).is_some_and(|comm| names.contains(&comm.as_str())) {
+        return false;
+    }
+    signal(pid as u32, libc::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while pid_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if pid_alive(pid) {
+        signal(pid as u32, libc::SIGKILL);
+    }
+    true
 }
 
 /// Inspects on-disk container metadata under `<data_root>/containers/<id>/`
@@ -1213,9 +1247,62 @@ pub fn check_data_root_filesystem(dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Is this a live unix socket we can actually connect to (not a stale file)?
+///
+/// Called from async code, so the connect must not block: a blocking
+/// `UnixStream::connect` waits for a free slot when the listener's backlog is
+/// full. Linux uses a non-blocking connect, where a full backlog still means a
+/// live listener.
+#[cfg(target_os = "linux")]
+pub fn is_usable_socket(path: &Path) -> bool {
+    path.exists() && nonblocking_unix_connect(path)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn is_usable_socket(path: &Path) -> bool {
     use std::os::unix::net::UnixStream;
     path.exists() && UnixStream::connect(path).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn nonblocking_unix_connect(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain libc calls on a socket fd this function owns; the fd is
+    // closed on every path, and `addr` is fully initialised before connect.
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        );
+        if fd < 0 {
+            return false;
+        }
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        if bytes.len() >= addr.sun_path.len() {
+            libc::close(fd);
+            return false;
+        }
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        let rc = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        );
+        let usable = rc == 0
+            || matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                // Backlog full (EAGAIN) or still completing (EINPROGRESS): the
+                // listener is there, just busy.
+                Some(libc::EAGAIN) | Some(libc::EINPROGRESS)
+            );
+        libc::close(fd);
+        usable
+    }
 }
 
 fn prefixed_path(bin: &Path) -> String {
@@ -3318,6 +3405,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usable_socket_detects_live_listener_and_stale_files() {
+        let dir = std::env::temp_dir().join(format!("dm-sock-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let live = dir.join("live.sock");
+        let _ = fs::remove_file(&live);
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(is_usable_socket(&live));
+
+        let plain = dir.join("plain.txt");
+        fs::write(&plain, b"not a socket").unwrap();
+        assert!(!is_usable_socket(&plain));
+        assert!(!is_usable_socket(&dir.join("missing.sock")));
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pasta_selinux_denial_signature_is_matched_from_log_tail() {

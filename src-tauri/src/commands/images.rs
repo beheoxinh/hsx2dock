@@ -36,6 +36,13 @@ pub async fn remove_image(
     id: String,
     force: bool,
 ) -> Result<(), String> {
+    remove_image_core(&state, &id, force).await
+}
+
+/// App-free core of [`remove_image`], shared with the MCP server so an agent
+/// cannot delete a kind node image the UI protects.
+pub(crate) async fn remove_image_core(state: &AppState, id: &str, force: bool) -> Result<(), String> {
+    let id = id.to_string();
     let client = state.get_client().await?;
     let tags = client
         .image_repo_tags(&id)
@@ -44,7 +51,11 @@ pub async fn remove_image(
     let configured = state.config.read().await.kind_default_image.clone();
     // Tags cover official and configured node images; container-derived IDs
     // cover retagged or digest-only ones.
-    let kind_ids = client.kind_node_image_ids().await.unwrap_or_default();
+    // Fail closed: if the kind nodes cannot be listed, the image may be one
+    // a cluster needs, so it is refused rather than removed unchecked.
+    let kind_ids = client.kind_node_image_ids().await.map_err(|e| {
+        format!("Could not check whether this image is a kind node image, so it was not removed: {e}")
+    })?;
     let normalised_id = id.trim_start_matches("sha256:");
     if crate::docker::kind::is_kind_image(&tags, Some(configured.as_str()))
         || kind_ids.contains(normalised_id)
@@ -144,8 +155,10 @@ pub async fn pull_image(
     pull_image_core(&state, Some(&app), image).await
 }
 
-/// App-free core of [`pull_image`]. Without an `AppHandle` the progress lines
-/// are dropped — the MCP server has no window to emit to.
+/// App-free core of [`pull_image`]. Resolves only once the pull has finished,
+/// failed or stalled, so the caller gets the real outcome. Without an
+/// `AppHandle` the progress lines are dropped — the MCP server has no window
+/// to emit to.
 pub(crate) async fn pull_image_core(
     state: &AppState,
     app: Option<&AppHandle>,
@@ -157,7 +170,7 @@ pub(crate) async fn pull_image_core(
     }
     // A second click on Pull (or the same image from MCP) used to start a
     // parallel stream whose progress interleaved with the first one's.
-    let Some(slot) = PullSlot::claim(&image) else {
+    let Some(_slot) = PullSlot::claim(&image) else {
         return Ok(());
     };
     let client = state.get_client().await?;
@@ -165,93 +178,65 @@ pub(crate) async fn pull_image_core(
     let opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
         .from_image(image.as_str())
         .build();
-
-    // Attach the saved login for this image's registry, if there is one.
-    let creds = {
-        let cfg = state.config.read().await;
-        let host = registry_host_for_image(&image);
-        cfg.registries
-            .iter()
-            .find(|r| r.host == host)
-            .map(|r| r.credentials())
-    };
-
+    let creds = saved_credentials(state, &registry_host_for_image(&image)).await;
     let mut stream = docker.create_image(Some(opts), None, creds);
     let app_handle = app.cloned();
-    let img_name = image.clone();
 
-    tokio::spawn(async move {
-        let _slot = slot;
-        // Byte-level progress arrives hundreds of times a second across
-        // layers; the UI only needs a few frames.
-        let mut last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(info) => {
-                    let is_tick = info
-                        .progress_detail
-                        .as_ref()
-                        .is_some_and(|d| d.current.is_some());
-                    if is_tick {
-                        if last_tick.elapsed() < std::time::Duration::from_millis(100) {
-                            continue;
-                        }
-                        last_tick = std::time::Instant::now();
-                    }
-                    let (current, total) = if let Some(ref detail) = info.progress_detail {
-                        (
-                            detail.current.map(|v| v as u64),
-                            detail.total.map(|v| v as u64),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let progress_str = match (current, total) {
-                        (Some(c), Some(t)) => Some(format!("{c}/{t}")),
-                        _ => info.id.clone(),
-                    };
-                    let payload = PullProgressPayload {
-                        image: img_name.clone(),
-                        status: info.status.unwrap_or_default(),
-                        progress: progress_str,
-                        current,
-                        total,
-                        done: false,
-                        error: None,
-                    };
-                    emit_progress(&app_handle, "pull-progress", payload);
-                }
-                Err(e) => {
-                    let payload = PullProgressPayload {
-                        image: img_name.clone(),
-                        status: "Error".to_string(),
-                        progress: None,
-                        current: None,
-                        total: None,
-                        done: true,
-                        error: Some(e.to_string()),
-                    };
-                    emit_progress(&app_handle, "pull-progress", payload);
-                    return;
-                }
+    // Byte-level progress arrives hundreds of times a second across layers;
+    // the UI only needs a few frames.
+    let mut last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let outcome: Result<(), String> = loop {
+        let info = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+            Err(_) => break Err(stalled_message("pull")),
+            Ok(None) => break Ok(()),
+            Ok(Some(Err(e))) => break Err(e.to_string()),
+            Ok(Some(Ok(info))) => info,
+        };
+        let is_tick = info
+            .progress_detail
+            .as_ref()
+            .is_some_and(|d| d.current.is_some());
+        if is_tick {
+            if last_tick.elapsed() < std::time::Duration::from_millis(100) {
+                continue;
             }
+            last_tick = std::time::Instant::now();
         }
-        emit_progress(
-            &app_handle,
-            "pull-progress",
-            PullProgressPayload {
-                image: img_name,
-                status: "Complete".to_string(),
-                progress: None,
-                current: None,
-                total: None,
-                done: true,
-                error: None,
-            },
-        );
-    });
+        let (current, total) = if let Some(ref detail) = info.progress_detail {
+            (
+                detail.current.map(|v| v as u64),
+                detail.total.map(|v| v as u64),
+            )
+        } else {
+            (None, None)
+        };
+        let progress_str = match (current, total) {
+            (Some(c), Some(t)) => Some(format!("{c}/{t}")),
+            _ => info.id.clone(),
+        };
+        let payload = PullProgressPayload {
+            image: image.clone(),
+            status: info.status.unwrap_or_default(),
+            progress: progress_str,
+            current,
+            total,
+            done: false,
+            error: None,
+        };
+        emit_progress(&app_handle, "pull-progress", payload);
+    };
 
-    Ok(())
+    let finished = PullProgressPayload {
+        image: image.clone(),
+        status: if outcome.is_ok() { "Complete" } else { "Error" }.to_string(),
+        progress: None,
+        current: None,
+        total: None,
+        done: true,
+        error: outcome.as_ref().err().cloned(),
+    };
+    emit_progress(&app_handle, "pull-progress", finished);
+    outcome
 }
 
 /// The Engine API pulls *every* tag of a repository when `fromImage` has no
@@ -289,6 +274,51 @@ impl Drop for PullSlot {
         if let Ok(mut set) = pulls_in_flight().lock() {
             set.remove(&self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_and_preview_tests {
+    use super::*;
+    use crate::docker::models::BuildArg;
+
+    #[test]
+    fn docker_hub_spellings_share_one_auth_key() {
+        let hub = build_auth_key("docker.io");
+        assert_eq!(build_auth_key("index.docker.io"), hub);
+        assert_eq!(build_auth_key("Docker.IO/"), hub);
+        assert_eq!(build_auth_key("registry-1.docker.io"), hub);
+        assert_eq!(
+            build_auth_key(&registry_host_for_image("index.docker.io/library/nginx")),
+            hub
+        );
+        assert_eq!(build_auth_key("https://GHCR.io/"), "ghcr.io");
+    }
+
+    #[test]
+    fn build_preview_shows_keys_and_hides_values() {
+        let req = BuildOptions {
+            context_dir: "/ctx".into(),
+            dockerfile: "Dockerfile".into(),
+            tag: "local/app:dev".into(),
+            build_args: vec![
+                BuildArg {
+                    key: "NPM_TOKEN".into(),
+                    value: "s3cr3t-value".into(),
+                },
+                BuildArg {
+                    key: "EMPTY".into(),
+                    value: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let preview = masked_for_preview(req.clone()).command_preview();
+        assert!(!preview.contains("s3cr3t-value"), "{preview}");
+        assert!(preview.contains("NPM_TOKEN="), "{preview}");
+        assert!(preview.contains("EMPTY="), "{preview}");
+        // The real request is untouched; only the preview copy is masked.
+        assert_eq!(req.build_args[0].value, "s3cr3t-value");
     }
 }
 
@@ -337,25 +367,20 @@ pub async fn push_image(
     push_image_core(&state, Some(&app), image).await
 }
 
-/// App-free core of [`push_image`].
+/// App-free core of [`push_image`]. Resolves once the push has finished,
+/// failed or stalled.
 pub(crate) async fn push_image_core(
     state: &AppState,
     app: Option<&AppHandle>,
     image: String,
 ) -> Result<(), String> {
-    let name = image.trim().to_string();
+    // Like pull, an untagged name would push every tag of the repository.
+    let name = with_default_tag(image.trim());
     if name.is_empty() {
         return Err("Image name is required to push".into());
     }
     let host = registry_host_for_image(&name);
-    let creds = {
-        let cfg = state.config.read().await;
-        cfg.registries
-            .iter()
-            .find(|r| r.host == host)
-            .map(|r| r.credentials())
-    };
-    let creds = creds.ok_or_else(|| {
+    let creds = saved_credentials(state, &host).await.ok_or_else(|| {
         format!("No saved login for {host} — add one under Settings → Registries before pushing")
     })?;
 
@@ -368,80 +393,51 @@ pub(crate) async fn push_image_core(
     );
 
     let app_handle = app.cloned();
-    let img_name = name.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(info) => {
-                    if let Some(message) =
-                        info.error_detail.as_ref().and_then(|e| e.message.clone())
-                    {
-                        let payload = PushProgressPayload {
-                            image: img_name.clone(),
-                            status: "Error".to_string(),
-                            progress: None,
-                            current: None,
-                            total: None,
-                            done: true,
-                            error: Some(message),
-                        };
-                        emit_progress(&app_handle, "push-progress", payload);
-                        return;
-                    }
-                    let (current, total) = if let Some(ref detail) = info.progress_detail {
-                        (
-                            detail.current.map(|v| v as u64),
-                            detail.total.map(|v| v as u64),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let progress_str = match (current, total) {
-                        (Some(c), Some(t)) => Some(format!("{c}/{t}")),
-                        _ => None,
-                    };
-                    let payload = PushProgressPayload {
-                        image: img_name.clone(),
-                        status: info.status.clone().unwrap_or_else(|| "Pushing".to_string()),
-                        progress: progress_str,
-                        current,
-                        total,
-                        done: false,
-                        error: None,
-                    };
-                    emit_progress(&app_handle, "push-progress", payload);
-                }
-                Err(e) => {
-                    let payload = PushProgressPayload {
-                        image: img_name.clone(),
-                        status: "Error".to_string(),
-                        progress: None,
-                        current: None,
-                        total: None,
-                        done: true,
-                        error: Some(e.to_string()),
-                    };
-                    emit_progress(&app_handle, "push-progress", payload);
-                    return;
-                }
-            }
+    let outcome: Result<(), String> = loop {
+        let info = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+            Err(_) => break Err(stalled_message("push")),
+            Ok(None) => break Ok(()),
+            Ok(Some(Err(e))) => break Err(e.to_string()),
+            Ok(Some(Ok(info))) => info,
+        };
+        if let Some(message) = info.error_detail.as_ref().and_then(|e| e.message.clone()) {
+            break Err(message);
         }
-        emit_progress(
-            &app_handle,
-            "push-progress",
-            PushProgressPayload {
-                image: img_name,
-                status: "Complete".to_string(),
-                progress: None,
-                current: None,
-                total: None,
-                done: true,
-                error: None,
-            },
-        );
-    });
+        let (current, total) = if let Some(ref detail) = info.progress_detail {
+            (
+                detail.current.map(|v| v as u64),
+                detail.total.map(|v| v as u64),
+            )
+        } else {
+            (None, None)
+        };
+        let progress_str = match (current, total) {
+            (Some(c), Some(t)) => Some(format!("{c}/{t}")),
+            _ => None,
+        };
+        let payload = PushProgressPayload {
+            image: name.clone(),
+            status: info.status.clone().unwrap_or_else(|| "Pushing".to_string()),
+            progress: progress_str,
+            current,
+            total,
+            done: false,
+            error: None,
+        };
+        emit_progress(&app_handle, "push-progress", payload);
+    };
 
-    Ok(())
+    let finished = PushProgressPayload {
+        image: name.clone(),
+        status: if outcome.is_ok() { "Complete" } else { "Error" }.to_string(),
+        progress: None,
+        current: None,
+        total: None,
+        done: true,
+        error: outcome.as_ref().err().cloned(),
+    };
+    emit_progress(&app_handle, "push-progress", finished);
+    outcome
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -499,19 +495,62 @@ fn build_final_payload(
     }
 }
 
+/// How long a pull, push or build may go without a single event before it is
+/// stopped. A stream that never ends otherwise held the UI's busy flag forever.
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn stalled_message(what: &str) -> String {
+    format!(
+        "No progress from the registry for {} minutes, so the {what} was stopped.",
+        STALL_TIMEOUT.as_secs() / 60
+    )
+}
+
 /// Key for one registry in the build's X-Registry-Config: the bare host, as
-/// the docker CLI writes it, except Docker Hub's legacy index address.
+/// the docker CLI writes it, except Docker Hub's legacy index address. Hosts
+/// are normalised first, so `Docker.IO/` and `docker.io` share one key.
 fn build_auth_key(host: &str) -> String {
-    let host = host.trim().trim_end_matches('/');
-    let host = host
-        .strip_prefix("https://")
-        .or_else(|| host.strip_prefix("http://"))
-        .unwrap_or(host);
-    if matches!(host, "docker.io" | "index.docker.io" | "registry-1.docker.io") {
+    let host = crate::commands::registries::normalize_host(host);
+    if matches!(host.as_str(), "docker.io" | "index.docker.io" | "registry-1.docker.io") {
         crate::config::server_address_for_host("docker.io")
     } else {
-        host.to_string()
+        host
     }
+}
+
+/// The saved login for the registry `host` names. Matched on the same key as
+/// the build's registry map, so `index.docker.io/...` finds the Docker Hub login.
+async fn saved_credentials(
+    state: &AppState,
+    host: &str,
+) -> Option<bollard::auth::DockerCredentials> {
+    let wanted = build_auth_key(host);
+    let cfg = state.config.read().await;
+    cfg.registries
+        .iter()
+        .find(|r| build_auth_key(&r.host) == wanted)
+        .map(|r| r.credentials())
+}
+
+/// Clears the build-running flag on every exit, a panic included: a stuck flag
+/// rejected every later build until the app restarted.
+struct BuildRelease(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BuildRelease {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Clones of build-argument values are secrets more often than not, so the
+/// command preview shows the keys and hides the values.
+fn masked_for_preview(mut req: BuildOptions) -> BuildOptions {
+    for arg in req.build_args.iter_mut() {
+        if !arg.value.is_empty() {
+            arg.value = "***".to_string();
+        }
+    }
+    req
 }
 
 #[tauri::command]
@@ -520,21 +559,36 @@ pub async fn build_image(
     state: State<'_, Arc<AppState>>,
     req: BuildOptions,
 ) -> Result<(), String> {
-    build_image_core(&state, Some(&app), req).await
+    // Refusals the form can act on come back synchronously, before the modal
+    // switches to its progress view. The build itself runs detached and
+    // reports through `build-progress`, which the modal listens to.
+    req.validate()?;
+    if state
+        .build_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("A build is already in progress".to_string());
+    }
+    let state = state.inner().clone();
+    tokio::spawn(async move {
+        // The outcome already reached the modal as a build-progress event.
+        let _ = build_image_core(&state, Some(&app), req).await;
+    });
+    Ok(())
 }
 
-/// App-free core of [`build_image`]. Without an `AppHandle` the step lines are
-/// dropped; the build itself is identical.
+/// App-free core of [`build_image`]. Resolves once the build has succeeded,
+/// failed or been cancelled, so MCP callers get the real result. Progress is
+/// also emitted for the window when there is one.
 pub(crate) async fn build_image_core(
     state: &AppState,
     app: Option<&AppHandle>,
     req: BuildOptions,
 ) -> Result<(), String> {
-    // Validate up front so a bad path fails synchronously, before the modal
-    // switches to the progress view.
+    // Validate up front so a bad path fails before anything starts.
     req.validate()?;
 
-    let already = state
+    let claimed = state
         .build_running
         .compare_exchange(
             false,
@@ -542,51 +596,20 @@ pub(crate) async fn build_image_core(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         )
-        .is_err();
-    if already {
+        .is_ok();
+    if !claimed {
         return Err("A build is already in progress".to_string());
     }
-
-    let client = match state.get_client().await {
-        Ok(client) => client,
-        Err(e) => {
-            state
-                .build_running
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            return Err(e);
-        }
-    };
-
-    // Saved registry logins go to the daemon as X-Registry-Config, like
-    // `docker build` does: a `FROM` on a private registry failed with
-    // "unauthorized" even though the user had logged in through the app.
-    let registry_auth = {
-        let cfg = state.config.read().await;
-        let map: std::collections::HashMap<String, bollard::auth::DockerCredentials> = cfg
-            .registries
-            .iter()
-            .map(|r| (build_auth_key(&r.host), r.credentials()))
-            .collect();
-        (!map.is_empty()).then_some(map)
-    };
-    let cancel = state.build_cancel.clone();
-    let running = state.build_running.clone();
-    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _release = BuildRelease(state.build_running.clone());
 
     let app_handle = app.cloned();
     let tag = req.tag.trim().to_string();
+    let cancel = state.build_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    tokio::spawn(async move {
-        // Cleared on every exit, a panic included: a stuck flag rejected every
-        // later build until the app restarted.
-        struct Release(Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        let _release = Release(running);
-        let starting = build_final_payload(
+    let starting = BuildProgressPayload {
+        done: false,
+        ..build_final_payload(
             &tag,
             "Starting",
             Some(format!(
@@ -597,22 +620,16 @@ pub(crate) async fn build_image_core(
             None,
             false,
             None,
-        );
-        let starting = BuildProgressPayload {
-            done: false,
-            ..starting
-        };
-        emit_progress(&app_handle, "build-progress", starting);
+        )
+    };
+    emit_progress(&app_handle, "build-progress", starting);
 
-        let result = client
-            .build_image(&req, &cancel, registry_auth, |step: BuildStep| {
-                let payload = build_step_payload(&tag, &step, false, false, None, None);
-                emit_progress(&app_handle, "build-progress", payload);
-            })
-            .await;
+    let result = run_build(state, &req, &tag, &app_handle, &cancel).await;
 
-        let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
-        let final_payload = if cancelled {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        emit_progress(
+            &app_handle,
+            "build-progress",
             build_final_payload(
                 &tag,
                 "Cancelled",
@@ -620,10 +637,16 @@ pub(crate) async fn build_image_core(
                 None,
                 true,
                 None,
-            )
-        } else {
-            match result {
-                Ok(image_id) => build_final_payload(
+            ),
+        );
+        return Err("Build cancelled.".to_string());
+    }
+    match result {
+        Ok(image_id) => {
+            emit_progress(
+                &app_handle,
+                "build-progress",
+                build_final_payload(
                     &tag,
                     "Succeeded",
                     Some("Build succeeded.".to_string()),
@@ -631,15 +654,48 @@ pub(crate) async fn build_image_core(
                     false,
                     image_id,
                 ),
-                Err(e) => {
-                    build_final_payload(&tag, "Failed", None, Some(e.to_string()), false, None)
-                }
-            }
-        };
-        emit_progress(&app_handle, "build-progress", final_payload);
-    });
+            );
+            Ok(())
+        }
+        Err(e) => {
+            emit_progress(
+                &app_handle,
+                "build-progress",
+                build_final_payload(&tag, "Failed", None, Some(e.clone()), false, None),
+            );
+            Err(e)
+        }
+    }
+}
 
-    Ok(())
+/// Runs the engine build with the saved registry logins attached. Saved logins
+/// go to the daemon as X-Registry-Config, like `docker build` does: a `FROM`
+/// on a private registry failed with "unauthorized" even though the user had
+/// logged in through the app.
+async fn run_build(
+    state: &AppState,
+    req: &BuildOptions,
+    tag: &str,
+    app: &Option<AppHandle>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Option<String>, String> {
+    let client = state.get_client().await?;
+    let registry_auth = {
+        let cfg = state.config.read().await;
+        let map: std::collections::HashMap<String, bollard::auth::DockerCredentials> = cfg
+            .registries
+            .iter()
+            .map(|r| (build_auth_key(&r.host), r.credentials()))
+            .collect();
+        (!map.is_empty()).then_some(map)
+    };
+    client
+        .build_image(req, cancel, registry_auth, |step: BuildStep| {
+            let payload = build_step_payload(tag, &step, false, false, None, None);
+            emit_progress(app, "build-progress", payload);
+        })
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -665,7 +721,7 @@ pub async fn preview_build_command(req: BuildOptions) -> Result<String, String> 
 
 /// App-free core of [`preview_build_command`].
 pub(crate) fn preview_build_command_core(req: BuildOptions) -> Result<String, String> {
-    Ok(req.command_preview())
+    Ok(masked_for_preview(req).command_preview())
 }
 
 /// Inspects a build context so the UI can validate it and offer the

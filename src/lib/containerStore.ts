@@ -42,6 +42,11 @@ const EMPTY: ContainerStoreSnapshot = {
 };
 
 let snapshot = EMPTY;
+/**
+ * Bumped on every local or echoed group write. A group list fetched before a
+ * bump is older than what the store now holds and must not replace it.
+ */
+let groupsSeq = 0;
 const listeners = new Set<() => void>();
 let inflight: Promise<void> | null = null;
 let sizesInflight: Promise<void> | null = null;
@@ -82,6 +87,7 @@ function attachTicks() {
       // While our own saves are queued the optimistic list is newer than any
       // echo; the last save's echo lands once the queue drains.
       if (pendingGroupSaves > 0) return;
+      groupsSeq += 1;
       emit({ groups });
     })
     .catch(() => {});
@@ -124,18 +130,23 @@ export function primeContainerStore(force = false): Promise<void> {
     // The list, groups and routes are cheap; disk usage is a per-container
     // inspect pass. Paint the list as soon as it arrives and let the DISK
     // figures fill in afterwards instead of holding the whole page back.
+    const seqAtStart = groupsSeq;
     const [containers, groups, routes] = await Promise.allSettled([
       api.listContainers(true),
       api.listContainerGroups(),
       api.listGatewayRoutes(),
     ]);
     const containersOk = containers.status === "fulfilled";
+    // The group fetch may have been sent before a save: keep the store's list
+    // whenever a save is queued or landed since this load began.
+    const groupsFresh =
+      groups.status === "fulfilled" && pendingGroupSaves === 0 && groupsSeq === seqAtStart;
 
     emit({
       containers: containersOk
         ? reconcileContainers(snapshot.containers, containers.value)
         : snapshot.containers,
-      groups: groups.status === "fulfilled" ? groups.value : snapshot.groups,
+      groups: groupsFresh ? groups.value : snapshot.groups,
       gatewayRoutes:
         routes.status === "fulfilled" ? routes.value : snapshot.gatewayRoutes,
       // A failed first fetch must not look like "no containers": stay on the
@@ -209,6 +220,7 @@ export function refreshContainerSizes(): Promise<void> {
 
 /** The page owns group edits; mirror them into the cache immediately. */
 export function setContainerGroups(groups: ContainerGroup[]) {
+  groupsSeq += 1;
   emit({ groups });
 }
 
@@ -222,6 +234,7 @@ let groupSaveChain: Promise<unknown> = Promise.resolve();
  * list from the backend and rethrows so the caller can report it.
  */
 export function saveContainerGroups(groups: ContainerGroup[]): Promise<void> {
+  groupsSeq += 1;
   emit({ groups });
   pendingGroupSaves += 1;
   const run = groupSaveChain.then(() => api.saveContainerGroups(groups));
@@ -233,7 +246,13 @@ export function saveContainerGroups(groups: ContainerGroup[]): Promise<void> {
     async (err) => {
       pendingGroupSaves -= 1;
       try {
-        emit({ groups: await api.listContainerGroups() });
+        const seqAtFailure = groupsSeq;
+        const fresh = await api.listContainerGroups();
+        // Later saves still queued hold newer edits than the backend list.
+        if (pendingGroupSaves === 0 && groupsSeq === seqAtFailure) {
+          groupsSeq += 1;
+          emit({ groups: fresh });
+        }
       } catch {
         // keep the optimistic list; the next prime corrects it
       }
