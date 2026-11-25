@@ -871,8 +871,11 @@ pub fn catalogue() -> Vec<ToolSpec> {
         ToolSpec {
             name: "compose_list_projects",
             title: "List compose projects",
-            description: "Compose projects discovered from container labels, with the path of each \
-                          project's compose file and its services.",
+            description: "Compose projects: the Settings compose file, files saved with \
+                          compose_project_pin, and projects found from container labels. Each has \
+                          its compose file path, running containers (services), the services the \
+                          file declares (image, depends_on, ports, profiles, healthcheck) and its \
+                          profiles.",
             access: Access::Read,
             engine_only: false,
             input_schema: no_args(),
@@ -881,8 +884,88 @@ pub fn catalogue() -> Vec<ToolSpec> {
             name: "compose_up",
             title: "Compose up",
             description: "Bring a compose project up detached from its compose file, creating and \
-                          starting its containers and networks. Slow for a project that needs to \
-                          pull or build images; consider interrupting on completion.",
+                          starting its containers and networks. Optional profiles, env file \
+                          (relative to the project directory), --force-recreate, \
+                          --remove-orphans, or a subset of services. Slow for a project that needs \
+                          to pull or build images.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("profiles", string_array(), false, "Compose profiles to enable"),
+                ("env_file", string(), false, "Env file relative to the project directory"),
+                ("force_recreate", boolean(), false, "Recreate containers even if unchanged"),
+                ("remove_orphans", boolean(), false, "Remove containers of services no longer in the file"),
+                ("services", string_array(), false, "Only these services (and their dependencies)"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_down",
+            title: "Compose down",
+            description: "Tear a compose project down: stop and remove its containers and networks \
+                          (services of every profile). Named volumes are kept unless \
+                          remove_volumes is true.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("remove_volumes", boolean(), false, "Also remove named volumes (-v)"),
+                ("remove_orphans", boolean(), false, "Also remove orphaned containers"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_logs",
+            title: "Compose logs",
+            description: "Logs from the containers of a compose project, optionally only some \
+                          services.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("tail", integer(), false, "Number of trailing lines per container (default 200, max 5000)"),
+                ("services", string_array(), false, "Only these services"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_service_action",
+            title: "Compose service action",
+            description: "Act on one service of a compose project: start, stop, restart (by project \
+                          name), or up, recreate (force-recreate without deps) and scale (set the \
+                          replica count), which need file_path.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("project", string(), true, "Compose project name"),
+                ("service", string(), true, "Service name"),
+                (
+                    "action",
+                    enumerated(&["start", "stop", "restart", "up", "recreate", "scale"]),
+                    true,
+                    "What to do with the service",
+                ),
+                ("file_path", string(), false, "Compose file; required for up, recreate and scale"),
+                ("replicas", integer(), false, "Replica count for scale (0-100)"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_config",
+            title: "Compose config / validate",
+            description: "Validate a compose project with `compose config` and return its resolved \
+                          model (services, depends_on, ports, profiles). Pass content to validate \
+                          unsaved YAML as if it were the file; nothing is written.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("content", string(), false, "YAML to validate instead of the file on disk"),
+                ("env_file", string(), false, "Env file relative to the project directory"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_project_pin",
+            title: "Save compose project",
+            description: "Add a compose file (or a directory holding one) to the app's Compose \
+                          project list. The file must pass `compose config`.",
             access: Access::Write,
             engine_only: false,
             input_schema: obj(&[(
@@ -893,33 +976,25 @@ pub fn catalogue() -> Vec<ToolSpec> {
             )]),
         },
         ToolSpec {
-            name: "compose_down",
-            title: "Compose down",
-            description: "Tear a compose project down: stop and remove its containers and networks. \
-                          Named volumes are kept.",
-            access: Access::Destructive,
+            name: "compose_project_unpin",
+            title: "Forget compose project",
+            description: "Remove a compose file from the app's Compose project list. Containers and \
+                          files are left untouched.",
+            access: Access::Write,
             engine_only: false,
-            input_schema: obj(&[(
-                "file_path",
-                string(),
-                true,
-                "Path to the compose file (or its directory)",
-            )]),
+            input_schema: obj(&[("file_path", string(), true, "The saved compose file path")]),
         },
         ToolSpec {
-            name: "compose_logs",
-            title: "Compose logs",
-            description: "Combined logs from every container in a compose project.",
+            name: "compose_scan",
+            title: "Find compose files",
+            description: "Find compose files (compose.yaml, docker-compose.yml, ...) under a \
+                          directory. Hidden, node_modules, target and similar directories are \
+                          skipped.",
             access: Access::Read,
             engine_only: false,
             input_schema: obj(&[
-                (
-                    "file_path",
-                    string(),
-                    true,
-                    "Path to the compose file (or its directory)",
-                ),
-                ("tail", integer(), false, "Number of trailing lines (default 200)"),
+                ("dir", string(), true, "Directory to search (~ allowed)"),
+                ("depth", integer(), false, "How many levels deep (default 3, max 6)"),
             ]),
         },
         ToolSpec {
@@ -973,8 +1048,469 @@ pub fn catalogue() -> Vec<ToolSpec> {
                     "nodes",
                     integer(),
                     false,
-                    "Number of nodes (1–5, default from config)",
+                    "Number of nodes (1–10; one control plane, the rest workers). Ignored with `spec`",
                 ),
+                (
+                    "spec",
+                    object(),
+                    false,
+                    "Full cluster spec (camelCase): image, controlPlanes (1/3/5), workers, ingress \
+                     (bool), ingressHttpPort (default 18080), ingressHttpsPort (18443), \
+                     portMappings [{containerPort, hostPort, protocol}], mounts [{hostPath, \
+                     containerPath, readOnly}], podSubnet, serviceSubnet, featureGates \
+                     [\"Name=true\"], localRegistry (bool). Preview it first with \
+                     `cluster_preview_config`",
+                ),
+                (
+                    "config",
+                    string(),
+                    false,
+                    "A complete kind Cluster config (YAML) to use instead of `spec`; the app \
+                     still adds its node state mounts and API port",
+                ),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_add_worker",
+            title: "Add worker node",
+            description: "Add one worker node to a running kind cluster (cloned from an \
+                          existing node, joined with kubeadm). Takes about a minute. Returns \
+                          the new node's name.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[("cluster", string(), true, "Cluster name")]),
+        },
+        ToolSpec {
+            name: "cluster_remove_node",
+            title: "Remove worker node",
+            description: "Drain and delete a worker node, then remove its container and \
+                          state. Pods on it are evicted. Control-plane nodes are refused.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("node", string(), true, "Node name, e.g. dev-worker2"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_preview_config",
+            title: "Preview kind cluster config",
+            description: "Render and validate the kind config a `cluster_create` call with this \
+                          `spec` (or `config`) would use, without creating anything. Returns \
+                          {yaml, finalYaml, nodes, errors, warnings}.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("spec", object(), false, "Cluster spec, as for cluster_create"),
+                ("config", string(), false, "kind config YAML to validate instead"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_node_images",
+            title: "List kind node images",
+            description: "Kubernetes versions available as kind node images: kind's default, \
+                          images already pulled, and tags published on Docker Hub. Newest first.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: no_args(),
+        },
+        ToolSpec {
+            name: "local_registry_status",
+            title: "Local registry status",
+            description: "State of the shared local registry (kind-registry, localhost:5001): \
+                          whether it runs, which clusters pull from it, its repositories.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: no_args(),
+        },
+        ToolSpec {
+            name: "local_registry_start",
+            title: "Start local registry",
+            description: "Create (pulling registry:2 if needed) and start the shared local \
+                          registry on localhost:5001.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: no_args(),
+        },
+        ToolSpec {
+            name: "local_registry_remove",
+            title: "Remove local registry",
+            description: "Remove the local registry container; with delete_data also its \
+                          volume (every pushed image is lost).",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[(
+                "delete_data",
+                boolean(),
+                false,
+                "Also delete the registry volume",
+            )]),
+        },
+        ToolSpec {
+            name: "local_registry_push",
+            title: "Push image to local registry",
+            description: "Tag a local image as localhost:5001/<name>:<tag> and push it to the \
+                          local registry. Pods in connected clusters can then use that ref.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[("image", string(), true, "Local image, e.g. myapp:dev")]),
+        },
+        ToolSpec {
+            name: "cluster_connect_registry",
+            title: "Connect cluster to local registry",
+            description: "Start the local registry if needed and let a running cluster's nodes \
+                          pull localhost:5001/… images from it.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[("cluster", string(), true, "Cluster name")]),
+        },
+        ToolSpec {
+            name: "portforward_list",
+            title: "List port-forwards",
+            description: "Port-forwards the app manages (active and saved auto-start ones), with status and local URL.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), false, "Only this cluster"),
+            ]),
+        },
+        ToolSpec {
+            name: "portforward_start",
+            title: "Start port-forward",
+            description: "Forward a host port (127.0.0.1) to a Service, Pod or Deployment port in a cluster. Runs in the background, reconnects on failure, stops when the cluster stops. local_port 0/omitted picks a free port below the ephemeral range. auto_start saves it to start with the cluster.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("kind", string(), true, "svc, pod or deployment"),
+                ("name", string(), true, "Object name"),
+                ("remote_port", integer(), true, "Port on the target"),
+                ("local_port", integer(), false, "Host port (below 32768)"),
+                ("auto_start", boolean(), false, "Start again whenever the cluster starts"),
+            ]),
+        },
+        ToolSpec {
+            name: "portforward_stop",
+            title: "Stop port-forward",
+            description: "Stop a port-forward by id (from portforward_list). forget also removes it from the auto-start list.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("id", string(), true, "Forward id"),
+                ("forget", boolean(), false, "Also drop it from auto-start"),
+            ]),
+        },
+        ToolSpec {
+            name: "addon_list",
+            title: "List cluster addons",
+            description: "Addon catalog (ingress-nginx, metallb, cert-manager, dashboard, metrics-server) with each one's state in the cluster.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+            ]),
+        },
+        ToolSpec {
+            name: "addon_install",
+            title: "Install cluster addon",
+            description: "Install a pinned, checksum-verified addon and wait until it is ready (minutes). metallb gets an address pool on the kind network, cert-manager a self-signed ClusterIssuer 'selfsigned', dashboard an admin-user ServiceAccount.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("addon", string(), true, "ingress-nginx, metallb, cert-manager, dashboard or metrics-server"),
+            ]),
+        },
+        ToolSpec {
+            name: "addon_uninstall",
+            title: "Uninstall cluster addon",
+            description: "Delete everything an addon installed (its namespace and CRDs included).",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("addon", string(), true, "Addon id"),
+            ]),
+        },
+        ToolSpec {
+            name: "dashboard_token",
+            title: "Dashboard login token",
+            description: "A 24 h token for the Kubernetes Dashboard admin-user (dashboard addon required).",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+            ]),
+        },
+        ToolSpec {
+            name: "ingress_list",
+            title: "List ingresses",
+            description: "Ingresses in a cluster with their hosts and how to open each from this machine.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+            ]),
+        },
+        ToolSpec {
+            name: "ingress_expose",
+            title: "Expose ingress host",
+            description: "Add (or with expose=false remove) an app gateway route so http://<host> on this machine reaches the cluster's ingress controller. The gateway writes the hosts entry.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("host", string(), true, "Ingress host, e.g. app.local"),
+                ("expose", boolean(), false, "false removes the route"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_link_service",
+            title: "Link service across clusters",
+            description: "Make a NodePort or LoadBalancer Service of one cluster reachable by name in another: creates a selector-less Service plus EndpointSlice in the target.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("source_cluster", string(), true, "Cluster that runs the service"),
+                ("source_namespace", string(), true, "Its namespace"),
+                ("source_service", string(), true, "Service name"),
+                ("target_cluster", string(), true, "Cluster that should reach it"),
+                ("target_namespace", string(), true, "Namespace for the link"),
+                ("name", string(), false, "Service name in the target (default: same)"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_service_links",
+            title: "List service links",
+            description: "Cross-cluster service links that exist in a cluster.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_unlink_service",
+            title: "Remove service link",
+            description: "Delete a cross-cluster service link (its Service and EndpointSlice).",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Link service name"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_check_link",
+            title: "Check service link",
+            description: "TCP-connect from the cluster's node to each endpoint of a service link.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Link service name"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_list",
+            title: "List Helm releases",
+            description: "Helm releases in all namespaces of a cluster.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_release",
+            title: "Helm release detail",
+            description: "Values (user and computed), manifest, notes and revision history of a release.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Release name"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_install",
+            title: "Install or upgrade Helm chart",
+            description: "helm install (or upgrade --install with upgrade=true) and wait up to 10 min. values is YAML.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Release name"),
+                ("chart", string(), true, "repo/chart, oci://… or a chart URL"),
+                ("version", string(), false, "Chart version"),
+                ("values", string(), false, "Values YAML"),
+                ("upgrade", boolean(), false, "Upgrade an existing release"),
+                ("reuse_values", boolean(), false, "With upgrade: keep current values"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_rollback",
+            title: "Roll back Helm release",
+            description: "Roll a release back to an earlier revision.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Release name"),
+                ("revision", integer(), true, "Revision number"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_uninstall",
+            title: "Uninstall Helm release",
+            description: "helm uninstall a release and its resources.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("name", string(), true, "Release name"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_repo_list",
+            title: "List Helm repositories",
+            description: "Chart repositories known to the app's helm.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: no_args(),
+        },
+        ToolSpec {
+            name: "helm_repo_add",
+            title: "Add Helm repository",
+            description: "Add (or update) a chart repository for helm_search and helm_install.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("name", string(), true, "Repository name"),
+                ("url", string(), true, "https URL"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_repo_remove",
+            title: "Remove Helm repository",
+            description: "Remove a chart repository from the app's helm.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("name", string(), true, "Repository name"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_repo_update",
+            title: "Update Helm repositories",
+            description: "Refresh the index of every added chart repository.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: no_args(),
+        },
+        ToolSpec {
+            name: "helm_search",
+            title: "Search Helm charts",
+            description: "Search the added repositories for charts.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("query", string(), false, "Keyword"),
+                ("versions", boolean(), false, "List every version"),
+            ]),
+        },
+        ToolSpec {
+            name: "helm_show_values",
+            title: "Show chart values",
+            description: "Default values.yaml of a chart, to edit before installing.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("chart", string(), true, "repo/chart or oci://…"),
+                ("version", string(), false, "Chart version"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_snapshot_list",
+            title: "List cluster snapshots",
+            description: "Saved snapshots (all clusters, or one).",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), false, "Only this cluster"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_snapshot_create",
+            title: "Snapshot cluster",
+            description: "Snapshot every node (docker commit plus /var and containerd state). A running cluster is stopped during the snapshot and started again. Slow for large clusters.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("note", string(), false, "Label for the snapshot"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_snapshot_delete",
+            title: "Delete cluster snapshot",
+            description: "Delete a snapshot's images and files.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("id", string(), true, "Snapshot id"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_snapshot_restore",
+            title: "Restore cluster snapshot",
+            description: "Replace the cluster's current nodes and state with a snapshot. Everything changed since the snapshot is lost.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("id", string(), true, "Snapshot id"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_clone",
+            title: "Clone cluster from snapshot",
+            description: "Create a new cluster from a snapshot (single control plane only) with its own API port; node names inside Kubernetes stay those of the source.",
+            access: Access::Write,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("id", string(), true, "Snapshot id"),
+                ("new_name", string(), true, "Name of the new cluster"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_alerts",
+            title: "Cluster alerts",
+            description: "Current incidents in running clusters: CrashLoopBackOff, image pull errors, OOM kills, restart spikes, NotReady nodes, API down, Pending PVCs.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), false, "Only this cluster"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_history",
+            title: "Cluster resource history",
+            description: "CPU %, memory (MiB) and pod counts over time. range: 1h, 6h, 24h (1-minute samples) or 7d (15-minute).",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("range", string(), false, "1h (default), 6h, 24h or 7d"),
             ]),
         },
         ToolSpec {

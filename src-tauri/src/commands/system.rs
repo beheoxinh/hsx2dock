@@ -282,6 +282,7 @@ fn preserve_owned_fields(incoming: &mut AppConfig, live: &AppConfig) {
     incoming.registries = live.registries.clone(); // registry commands
     incoming.default_registry = live.default_registry.clone();
     incoming.container_groups = live.container_groups.clone(); // group saves
+    incoming.compose_projects = live.compose_projects.clone(); // compose pin/unpin
     incoming.kind_cluster_prefs = live.kind_cluster_prefs.clone(); // per-cluster prefs
     incoming.gateway_routes = live.gateway_routes.clone(); // gateway commands
     incoming.gateway_enabled = live.gateway_enabled;

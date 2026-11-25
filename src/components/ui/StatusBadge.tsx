@@ -65,7 +65,7 @@ export const StatusBadge = React.memo<StatusBadgeProps>(function StatusBadge({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border",
+        "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-xs font-medium border",
         colorClasses,
         className
       )}

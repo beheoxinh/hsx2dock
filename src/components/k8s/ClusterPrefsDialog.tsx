@@ -122,7 +122,7 @@ export const ClusterPrefsDialog: React.FC<ClusterPrefsDialogProps> = ({
                 aria-pressed={color === ""}
                 title="Default accent"
                 onClick={() => onChange({ ...draft, color: "" })}
-                className={`w-6 h-6 rounded-full border bg-zinc-950 flex items-center justify-center text-zinc-500 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                className={`w-6 h-6 rounded-none border bg-zinc-950 flex items-center justify-center text-zinc-500 outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
                   color === "" ? "border-white ring-2 ring-white/30" : "border-zinc-700"
                 }`}
               >
@@ -137,7 +137,7 @@ export const ClusterPrefsDialog: React.FC<ClusterPrefsDialogProps> = ({
                   title={hex}
                   onClick={() => onChange({ ...draft, color: hex })}
                   style={{ backgroundColor: hex }}
-                  className={`w-6 h-6 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                  className={`w-6 h-6 rounded-none outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
                     color === hex ? "ring-2 ring-white ring-offset-2 ring-offset-zinc-900" : ""
                   }`}
                 />

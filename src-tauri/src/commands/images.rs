@@ -380,16 +380,21 @@ pub(crate) async fn push_image_core(
         return Err("Image name is required to push".into());
     }
     let host = registry_host_for_image(&name);
-    let creds = saved_credentials(state, &host).await.ok_or_else(|| {
-        format!("No saved login for {host} — add one under Settings → Registries before pushing")
-    })?;
+    // The app's own local registry takes anonymous pushes.
+    let creds = if super::kind_registry::is_local_registry_host(&host) {
+        None
+    } else {
+        Some(saved_credentials(state, &host).await.ok_or_else(|| {
+            format!("No saved login for {host} — add one under Settings → Registries before pushing")
+        })?)
+    };
 
     let client = state.get_client().await?;
     let docker = client.docker();
     let mut stream = docker.push_image(
         name.as_str(),
         None::<bollard::query_parameters::PushImageOptions>,
-        Some(creds),
+        creds,
     );
 
     let app_handle = app.cloned();

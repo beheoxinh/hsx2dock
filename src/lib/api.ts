@@ -14,6 +14,12 @@ import type {
   VolumeItem,
   NetworkItem,
   ComposeProjectInfo,
+  ComposeUpOptions,
+  ComposeDownOptions,
+  ComposeServiceAction,
+  ComposeValidation,
+  ComposeEnvFile,
+  ComposeProgressPayload,
   DfReport,
   EngineInfo,
   EngineUpdateInfo,
@@ -50,6 +56,11 @@ import type {
   RegistryTestResult,
   PushProgressPayload,
   KindCluster,
+  ClusterSpec,
+  ClusterPreset,
+  ClusterConfigPreview,
+  NodeImageOption,
+  LocalRegistryStatus,
   KindInstallStatus,
   KindProgressPayload,
   KindUpdateInfo,
@@ -71,6 +82,23 @@ import type {
   ManifestDiff,
   SelectorLogs,
   ContainerGroup,
+  K8sToolStatus,
+  PortForwardInfo,
+  PortForwardSpec,
+  AddonStatus,
+  IngressInfo,
+  ServiceLink,
+  ServiceLinkRequest,
+  ServiceLinkCheck,
+  HelmRelease,
+  HelmReleaseDetail,
+  HelmInstallRequest,
+  HelmRepo,
+  HelmChart,
+  ClusterSnapshot,
+  ClusterAlert,
+  HistoryRange,
+  HistorySample,
 } from "../types";
 
 export const api = {
@@ -274,10 +302,47 @@ export const api = {
 
   // Compose
   listComposeProjects: () => invoke<ComposeProjectInfo[]>("list_compose_projects"),
-  composeUp: (filePath: string) => invoke<string>("compose_up", { filePath }),
-  composeDown: (filePath: string) => invoke<string>("compose_down", { filePath }),
-  composeLogs: (filePath: string, tail: string = "100") =>
-    invoke<string>("compose_logs", { filePath, tail }),
+  composeUp: (filePath: string, options?: ComposeUpOptions, opId?: string) =>
+    invoke<string>("compose_up", { filePath, options: options ?? null, opId: opId ?? null }),
+  composeDown: (filePath: string, options?: ComposeDownOptions, opId?: string) =>
+    invoke<string>("compose_down", { filePath, options: options ?? null, opId: opId ?? null }),
+  composeLogs: (filePath: string, tail: string = "100", services?: string[]) =>
+    invoke<string>("compose_logs", { filePath, tail, services: services ?? null }),
+  composeServiceAction: (
+    project: string,
+    filePath: string | null,
+    service: string,
+    action: ComposeServiceAction,
+    replicas?: number,
+    opId?: string
+  ) =>
+    invoke<string>("compose_service_action", {
+      project,
+      filePath,
+      service,
+      action,
+      replicas: replicas ?? null,
+      opId: opId ?? null,
+    }),
+  composePinProject: (filePath: string) => invoke<string>("compose_pin_project", { filePath }),
+  composeUnpinProject: (filePath: string) =>
+    invoke<string>("compose_unpin_project", { filePath }),
+  composeScanDir: (dir: string, depth?: number) =>
+    invoke<string[]>("compose_scan_dir", { dir, depth: depth ?? null }),
+  composeOpenFolder: (filePath: string) => invoke<void>("compose_open_folder", { filePath }),
+  composeReadFile: (filePath: string) => invoke<string>("compose_read_file", { filePath }),
+  composeValidate: (filePath: string, content?: string, envFile?: string) =>
+    invoke<ComposeValidation>("compose_validate", {
+      filePath,
+      content: content ?? null,
+      envFile: envFile ?? null,
+    }),
+  composeSaveFile: (filePath: string, content: string, original: string) =>
+    invoke<void>("compose_save_file", { filePath, content, original }),
+  composeReadEnv: (filePath: string, envFile?: string) =>
+    invoke<ComposeEnvFile>("compose_read_env", { filePath, envFile: envFile ?? null }),
+  composeSaveEnv: (filePath: string, envFile: string | null, content: string, original: string | null) =>
+    invoke<void>("compose_save_env", { filePath, envFile, content, original }),
 
   // Kind (Kubernetes IN Docker) — isolated binary + app-managed kubeconfig
   kindStatus: () => invoke<KindInstallStatus>("kind_status"),
@@ -288,6 +353,82 @@ export const api = {
   listKindClusters: () => invoke<KindCluster[]>("list_kind_clusters"),
   createKindCluster: (name: string, image?: string, nodes?: number) =>
     invoke<void>("create_kind_cluster", { name, image, nodes }),
+  /** Advanced create: a wizard spec, or a hand-edited kind config (wins over spec). */
+  createKindClusterAdvanced: (name: string, spec: ClusterSpec, config?: string) =>
+    invoke<void>("create_kind_cluster", { name, spec, config: config ?? null }),
+  previewClusterConfig: (spec: ClusterSpec, config?: string) =>
+    invoke<ClusterConfigPreview>("preview_cluster_config", { spec, config: config ?? null }),
+  listKindNodeImages: () => invoke<NodeImageOption[]>("list_kind_node_images"),
+  listClusterPresets: () => invoke<ClusterPreset[]>("list_cluster_presets"),
+  saveClusterPreset: (preset: ClusterPreset) =>
+    invoke<ClusterPreset[]>("save_cluster_preset", { preset }),
+  deleteClusterPreset: (name: string) => invoke<ClusterPreset[]>("delete_cluster_preset", { name }),
+  addClusterWorker: (cluster: string) => invoke<string>("add_cluster_worker", { cluster }),
+  removeClusterNode: (cluster: string, node: string) =>
+    invoke<void>("remove_cluster_node", { cluster, node }),
+  // Shared local registry (kind-registry on localhost:5001)
+  localRegistryStatus: () => invoke<LocalRegistryStatus>("registry_status"),
+  ensureLocalRegistry: () => invoke<LocalRegistryStatus>("ensure_registry"),
+  removeLocalRegistry: (deleteData: boolean) => invoke<void>("remove_registry", { deleteData }),
+  connectRegistryToCluster: (cluster: string) =>
+    invoke<void>("connect_registry_to_cluster", { cluster }),
+  pushToLocalRegistry: (image: string) => invoke<string>("push_to_local_registry", { image }),
+  // Port-forwards (host kubectl, app-managed)
+  k8sToolsStatus: () => invoke<K8sToolStatus[]>("k8s_tools_status"),
+  installK8sTools: () => invoke<K8sToolStatus[]>("install_k8s_tools"),
+  listPortForwards: (cluster?: string) =>
+    invoke<PortForwardInfo[]>("list_port_forwards", { cluster: cluster ?? null }),
+  startPortForward: (spec: PortForwardSpec) => invoke<PortForwardInfo>("start_port_forward", { spec }),
+  stopPortForward: (id: string, forget = false) => invoke<void>("stop_port_forward", { id, forget }),
+  // Addons, ingress, service links
+  listClusterAddons: (cluster: string) => invoke<AddonStatus[]>("list_cluster_addons", { cluster }),
+  installClusterAddon: (cluster: string, addon: string) =>
+    invoke<void>("install_cluster_addon", { cluster, addon }),
+  uninstallClusterAddon: (cluster: string, addon: string) =>
+    invoke<void>("uninstall_cluster_addon", { cluster, addon }),
+  dashboardToken: (cluster: string) => invoke<string>("dashboard_token", { cluster }),
+  listClusterIngresses: (cluster: string) =>
+    invoke<IngressInfo[]>("list_cluster_ingresses", { cluster }),
+  exposeIngressHost: (cluster: string, host: string, expose: boolean) =>
+    invoke<void>("expose_ingress_host", { cluster, host, expose }),
+  linkClusterService: (req: ServiceLinkRequest) => invoke<ServiceLink>("link_cluster_service", { req }),
+  listServiceLinks: (cluster: string) => invoke<ServiceLink[]>("list_service_links", { cluster }),
+  unlinkClusterService: (cluster: string, namespace: string, name: string) =>
+    invoke<void>("unlink_cluster_service", { cluster, namespace, name }),
+  checkServiceLink: (cluster: string, namespace: string, name: string) =>
+    invoke<ServiceLinkCheck[]>("check_service_link", { cluster, namespace, name }),
+  // Helm
+  helmListReleases: (cluster: string) => invoke<HelmRelease[]>("helm_list_releases", { cluster }),
+  helmReleaseDetail: (cluster: string, namespace: string, name: string) =>
+    invoke<HelmReleaseDetail>("helm_release_detail", { cluster, namespace, name }),
+  helmInstall: (req: HelmInstallRequest) => invoke<string>("helm_install", { req }),
+  helmRollback: (cluster: string, namespace: string, name: string, revision: number) =>
+    invoke<void>("helm_rollback", { cluster, namespace, name, revision }),
+  helmUninstall: (cluster: string, namespace: string, name: string) =>
+    invoke<void>("helm_uninstall", { cluster, namespace, name }),
+  helmRepoList: () => invoke<HelmRepo[]>("helm_repo_list"),
+  helmRepoAdd: (name: string, url: string) => invoke<void>("helm_repo_add", { name, url }),
+  helmRepoRemove: (name: string) => invoke<void>("helm_repo_remove", { name }),
+  helmRepoUpdate: () => invoke<string>("helm_repo_update"),
+  helmSearch: (query: string, versions = false) =>
+    invoke<HelmChart[]>("helm_search", { query, versions }),
+  helmShowValues: (chart: string, version?: string) =>
+    invoke<string>("helm_show_values", { chart, version: version ?? null }),
+  // Snapshots / clone
+  listClusterSnapshots: (cluster?: string) =>
+    invoke<ClusterSnapshot[]>("list_cluster_snapshots", { cluster: cluster ?? null }),
+  createClusterSnapshot: (cluster: string, note?: string) =>
+    invoke<string>("create_cluster_snapshot", { cluster, note: note ?? null }),
+  deleteClusterSnapshot: (cluster: string, id: string) =>
+    invoke<void>("delete_cluster_snapshot", { cluster, id }),
+  restoreClusterSnapshot: (cluster: string, id: string, newName?: string) =>
+    invoke<string>("restore_cluster_snapshot", { req: { cluster, id, newName: newName ?? null } }),
+  // Alerts and history
+  listClusterAlerts: (cluster?: string) =>
+    invoke<ClusterAlert[]>("list_cluster_alerts", { cluster: cluster ?? null }),
+  takeAlertFocus: () => invoke<string | null>("take_alert_focus"),
+  clusterHistory: (cluster: string, range: HistoryRange) =>
+    invoke<HistorySample[]>("cluster_history", { cluster, range }),
   deleteKindCluster: (name: string) => invoke<void>("delete_kind_cluster", { name }),
   startKindCluster: (name: string) => invoke<void>("start_kind_cluster", { name }),
   stopKindCluster: (name: string) => invoke<void>("stop_kind_cluster", { name }),
@@ -418,8 +559,11 @@ export const api = {
   listContainerOps: () => invoke<ContainerOpsSnapshot>("list_container_ops"),
 
   // Compose project lifecycle addressed by project name (no compose file)
-  composeProjectAction: (project: string, action: "start" | "stop" | "restart" | "down") =>
-    invoke<string>("compose_project_action", { project, action }),
+  composeProjectAction: (
+    project: string,
+    action: "start" | "stop" | "restart" | "down",
+    opId?: string
+  ) => invoke<string>("compose_project_action", { project, action, opId: opId ?? null }),
 };
 
 /**
@@ -472,6 +616,10 @@ export const events = {
     listen<EngineInstallProgress>("engine-install-progress", (event) =>
       cb(event.payload)
     ),
+
+  /** One output line of a running compose operation started with an `opId`. */
+  onComposeProgress: (cb: (payload: ComposeProgressPayload) => void): Promise<UnlistenFn> =>
+    listen<ComposeProgressPayload>("compose-progress", (event) => cb(event.payload)),
 
   onContainerStatsTick: (
     cb: (stats: Record<string, ContainerStats>) => void

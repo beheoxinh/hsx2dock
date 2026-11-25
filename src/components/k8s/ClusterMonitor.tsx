@@ -4,23 +4,29 @@ import {
   AlertTriangle,
   ArrowDownToLine,
   Ban,
+  Bell,
   Boxes,
+  Cable,
   CheckCircle2,
   Copy,
   Download,
   FileCode2,
   FileText,
   Folder,
+  Globe,
   Hexagon,
+  History,
   Layers,
   Loader2,
   Package,
   Plus,
+  Puzzle,
   RefreshCw,
   RotateCw,
   ScrollText,
   Search,
   Server,
+  Ship,
   Terminal,
   Trash2,
   X,
@@ -32,7 +38,16 @@ import { InteractiveTerminal } from "../terminal/InteractiveTerminal";
 import { YamlApplyModal } from "./YamlApplyModal";
 import { SelectorLogsModal } from "./SelectorLogsModal";
 import { KubeShellModal } from "./KubeShellModal";
-import { api } from "../../lib/api";
+import { AddonsPanel } from "./AddonsPanel";
+import { IngressPanel } from "./IngressPanel";
+import { HelmPanel } from "./HelmPanel";
+import { PortForwardPanel } from "./PortForwardPanel";
+import { PortForwardDialog } from "./PortForwardDialog";
+import { ServiceLinksPanel } from "./ServiceLinksPanel";
+import { HistoryPanel } from "./HistoryPanel";
+import { AlertsPanel } from "./AlertsPanel";
+import { parsePodContainerPorts, type ContainerPort } from "../../lib/portForward";
+import { api, disposeListener, events as apiEvents } from "../../lib/api";
 import { formatBytes, formatRelativeTime } from "../../lib/utils";
 import { stripServerFields } from "../../lib/k8sYaml";
 import type {
@@ -61,7 +76,13 @@ type MonitorTab =
   | "config"
   | "pvcs"
   | "namespaces"
-  | "events";
+  | "events"
+  | "addons"
+  | "ingress"
+  | "helm"
+  | "forwards"
+  | "history"
+  | "alerts";
 
 const TABS: { id: MonitorTab; label: string; icon: React.ElementType }[] = [
   { id: "overview", label: "Overview", icon: Activity },
@@ -73,7 +94,28 @@ const TABS: { id: MonitorTab; label: string; icon: React.ElementType }[] = [
   { id: "pvcs", label: "Storage", icon: Package },
   { id: "namespaces", label: "Namespaces", icon: Hexagon },
   { id: "events", label: "Events", icon: ScrollText },
+  { id: "addons", label: "Addons", icon: Puzzle },
+  { id: "ingress", label: "Ingress", icon: Globe },
+  { id: "helm", label: "Helm", icon: Ship },
+  { id: "forwards", label: "Port-forwards", icon: Cable },
+  { id: "history", label: "History", icon: History },
+  { id: "alerts", label: "Alerts", icon: Bell },
 ];
+
+/**
+ * Remote ports of a service, parsed from the `port[:nodePort]/PROTO, ...`
+ * string kind.rs builds in parse_services. Returns distinct port numbers.
+ */
+function servicePorts(ports: string): number[] {
+  const out: number[] = [];
+  for (const part of ports.split(",")) {
+    const m = /^\s*(\d+)(?::\d+)?\/[A-Za-z]+\s*$/.exec(part);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (n >= 1 && n <= 65535 && !out.includes(n)) out.push(n);
+  }
+  return out;
+}
 
 /** "1250m" → "1.25 cores"; "90m" → "90m". */
 const fmtCpu = (m: number): string =>
@@ -91,9 +133,9 @@ function UsageBar({ pct, danger }: { pct: number; danger?: boolean }) {
   const color =
     danger || clamped > 85 ? "bg-rose-500" : clamped > 65 ? "bg-amber-500" : "bg-emerald-500";
   return (
-    <div className="h-1.5 w-full min-w-16 rounded-full bg-zinc-800">
+    <div className="h-1.5 w-full min-w-16 rounded-none bg-zinc-800">
       <div
-        className={`h-full rounded-full ${color} transition-all duration-500`}
+        className={`h-full rounded-none ${color} transition-all duration-500`}
         style={{ width: `${clamped}%` }}
       />
     </div>
@@ -186,8 +228,11 @@ export const ClusterMonitor: React.FC<{
   const [ingresses, setIngresses] = useState<K8sIngressInfo[]>([]);
   const [pvs, setPvs] = useState<K8sPvInfo[]>([]);
   const [namespaceList, setNamespaceList] = useState<K8sNamespaceInfo[]>([]);
-  // Node name while a cordon/uncordon/drain request is in flight.
+  // Node name while a cordon/uncordon/drain/remove request is in flight.
   const [nodeBusy, setNodeBusy] = useState<string | null>(null);
+  // Adding a worker takes about a minute; its kind output streams into the toolbar.
+  const [addingWorker, setAddingWorker] = useState(false);
+  const [workerLine, setWorkerLine] = useState<string | null>(null);
   // Workloads with a scale or rolling restart in flight. The ref is the guard
   // (a double click lands before React re-renders); the state disables buttons.
   const workloadOpsRef = useRef<Set<string>>(new Set());
@@ -253,6 +298,11 @@ export const ClusterMonitor: React.FC<{
     } | null
   >(null);
   const [kubeShellOpen, setKubeShellOpen] = useState(false);
+  // Port-forward dialog for one service or pod port; pod YAML fetch in flight.
+  const [forwardFor, setForwardFor] = useState<
+    { kind: "svc" | "pod"; ns: string; name: string; port: number } | null
+  >(null);
+  const [podForwardBusy, setPodForwardBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setTab("overview");
@@ -282,6 +332,8 @@ export const ClusterMonitor: React.FC<{
     setApplyFor(null);
     setSelectorLogsFor(null);
     setKubeShellOpen(false);
+    setForwardFor(null);
+    setPodForwardBusy(null);
   }, [cluster]);
 
   useEffect(() => {
@@ -670,6 +722,62 @@ export const ClusterMonitor: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventsFor?.ns, eventsFor?.name, cluster]);
 
+  /** Opens a port-forward on one service port; asks first when there are several. */
+  const forwardService = async (s: K8sServiceInfo) => {
+    const ports = servicePorts(s.ports);
+    if (ports.length === 0) {
+      toast.info("No ports", `${s.namespace}/${s.name} exposes no ports.`);
+      return;
+    }
+    let port = ports[0];
+    if (ports.length > 1) {
+      const pick = await modal.showChoice(
+        `Forward which port of service '${s.name}'?`,
+        ports.map((p) => ({ value: String(p), label: `Port ${p}` })),
+        "Forward service",
+        "info"
+      );
+      if (pick === null) return;
+      port = Number(pick);
+    }
+    setForwardFor({ kind: "svc", ns: s.namespace, name: s.name, port });
+  };
+
+  /** Reads the pod's container ports from its YAML, then opens a port-forward. */
+  const forwardPod = async (p: K8sPodInfo) => {
+    if (podForwardBusy) return;
+    setPodForwardBusy(`${p.namespace}/${p.name}`);
+    let ports: ContainerPort[] = [];
+    try {
+      const yaml = await api.getResourceYaml(cluster, "pod", p.namespace, p.name);
+      ports = parsePodContainerPorts(yaml);
+    } catch (e) {
+      toast.error("Forward failed", String(e));
+      return;
+    } finally {
+      setPodForwardBusy(null);
+    }
+    if (ports.length === 0) {
+      toast.info("No container ports", `${p.name} declares no containerPort.`);
+      return;
+    }
+    let chosen = ports[0];
+    if (ports.length > 1) {
+      const pick = await modal.showChoice(
+        `Forward which container port of pod '${p.name}'?`,
+        ports.map((cp, i) => ({
+          value: String(i),
+          label: `${cp.container} ${cp.port}/${cp.protocol}`,
+        })),
+        "Forward pod",
+        "info"
+      );
+      if (pick === null) return;
+      chosen = ports[Number(pick)];
+    }
+    setForwardFor({ kind: "pod", ns: p.namespace, name: p.name, port: chosen.port });
+  };
+
   const handleDeletePod = async (p: K8sPodInfo) => {
     const ok = await modal.showConfirm(
       `Delete pod '${p.name}' in ${p.namespace}? Its controller will recreate it.`,
@@ -782,6 +890,58 @@ export const ClusterMonitor: React.FC<{
       api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
     } catch (e) {
       toast.error("Drain failed", String(e));
+    } finally {
+      setNodeBusy(null);
+    }
+  };
+
+  // Worker-add output (kind-progress, action "node") for this cluster only.
+  useEffect(() => {
+    return disposeListener(
+      apiEvents.onKindProgress((p) => {
+        if (p.action === "node" && p.name === cluster) setWorkerLine(p.line);
+      })
+    );
+  }, [cluster]);
+
+  // Control planes are never offered for removal.
+  const isControlPlane = (n: K8sNodeInfo) =>
+    n.roles.some((r) => r === "control-plane" || r === "master");
+
+  const refreshNodes = () => api.getClusterNodes(cluster).then(forCluster(setNodes)).catch(() => {});
+
+  const handleAddWorker = async () => {
+    if (addingWorker || nodeBusy) return;
+    setAddingWorker(true);
+    setWorkerLine(`Adding a worker to ${cluster}…`);
+    try {
+      const node = await api.addClusterWorker(cluster);
+      toast.success("Worker added", node);
+      refreshNodes();
+    } catch (e) {
+      toast.error("Add worker failed", String(e));
+    } finally {
+      setAddingWorker(false);
+      setWorkerLine(null);
+    }
+  };
+
+  const handleRemoveNode = async (n: K8sNodeInfo) => {
+    if (nodeBusy || addingWorker) return;
+    const ok = await modal.showConfirm(
+      `Remove worker '${n.name}'? Its pods are evicted and rescheduled onto the other nodes, then the node container is deleted.`,
+      "Remove Worker Node",
+      "danger"
+    );
+    if (!ok) return;
+    setNodeBusy(n.name);
+    try {
+      await api.removeClusterNode(cluster, n.name);
+      toast.success("Worker removed", n.name);
+      refreshNodes();
+      api.getClusterPods(cluster).then(forCluster(setPods)).catch(() => {});
+    } catch (e) {
+      toast.error("Remove failed", String(e));
     } finally {
       setNodeBusy(null);
     }
@@ -932,12 +1092,12 @@ export const ClusterMonitor: React.FC<{
       )}
 
       {/* Tabs */}
-      <div className="flex items-center gap-1 px-4 pt-2 border-b border-zinc-800/60">
+      <div className="flex items-center gap-1 px-4 pt-2 border-b border-zinc-800/60 overflow-x-auto">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             onClick={() => setTab(id)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-t-lg transition-colors ${
+            className={`flex shrink-0 whitespace-nowrap items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-t-lg transition-colors ${
               tab === id
                 ? "text-white border-b-2 border-indigo-400 bg-zinc-800/40"
                 : "text-zinc-400 hover:text-zinc-200"
@@ -946,7 +1106,7 @@ export const ClusterMonitor: React.FC<{
             <Icon className="h-3.5 w-3.5" />
             {label}
             {id === "events" && warnings.length > 0 && (
-              <span className="ml-0.5 rounded-full bg-rose-500/20 px-1.5 text-[10px] text-rose-300">
+              <span className="ml-0.5 rounded-none bg-rose-500/20 px-1.5 text-[10px] text-rose-300">
                 {events.filter((e) => e.type === "Warning").length}
               </span>
             )}
@@ -1244,6 +1404,24 @@ export const ClusterMonitor: React.FC<{
 
         {/* ============ NODES ============ */}
         {tab === "nodes" && (
+          <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="min-w-0 truncate font-mono text-[11px] text-zinc-500">
+              {addingWorker ? workerLine : "Workers can be added or removed; control planes stay."}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1.5 rounded-none"
+              title="Add a worker node to this cluster (takes about a minute)"
+              disabled={addingWorker || nodeBusy !== null || !!monitorError}
+              isLoading={addingWorker}
+              onClick={() => void handleAddWorker()}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Add worker
+            </Button>
+          </div>
           <div className="overflow-x-auto rounded-xl border border-zinc-800/80 select-text">
             <table className="w-full text-xs">
               <thead>
@@ -1348,6 +1526,18 @@ export const ClusterMonitor: React.FC<{
                           >
                             <ArrowDownToLine className="h-3.5 w-3.5" />
                           </Button>
+                          {!isControlPlane(n) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Remove worker node (its pods are evicted first)"
+                              disabled={nodeBusy === n.name || addingWorker}
+                              onClick={() => void handleRemoveNode(n)}
+                              className="hover:text-rose-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -1362,6 +1552,7 @@ export const ClusterMonitor: React.FC<{
                 )}
               </tbody>
             </table>
+          </div>
           </div>
         )}
 
@@ -1469,6 +1660,21 @@ export const ClusterMonitor: React.FC<{
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                               ) : (
                                 <Terminal className="h-3.5 w-3.5" />
+                              )}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Forward a container port of this pod to localhost"
+                              aria-label="Forward pod port"
+                              disabled={podForwardBusy !== null}
+                              onClick={() => void forwardPod(p)}
+                              className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-40"
+                            >
+                              {podForwardBusy === `${p.namespace}/${p.name}` ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Cable className="h-3.5 w-3.5" />
                               )}
                             </Button>
                             <Button
@@ -1734,6 +1940,35 @@ export const ClusterMonitor: React.FC<{
             </table>
           </div>
         )}
+        {/* ============ ADDONS ============ */}
+        {tab === "addons" && (
+          <AddonsPanel cluster={cluster} />
+        )}
+
+        {/* ============ INGRESS CONTROLLERS ============ */}
+        {tab === "ingress" && (
+          <IngressPanel cluster={cluster} onOpenAddons={() => setTab("addons")} />
+        )}
+
+        {/* ============ HELM ============ */}
+        {tab === "helm" && (
+          <HelmPanel key={cluster} cluster={cluster} />
+        )}
+
+        {/* ============ PORT-FORWARDS ============ */}
+        {tab === "forwards" && (
+          <PortForwardPanel cluster={cluster} />
+        )}
+
+        {/* ============ HISTORY ============ */}
+        {tab === "history" && (
+          <HistoryPanel cluster={cluster} />
+        )}
+
+        {/* ============ ALERTS ============ */}
+        {tab === "alerts" && (
+          <AlertsPanel cluster={cluster} />
+        )}
       </div>
 
         {/* ============ SERVICES ============ */}
@@ -1787,6 +2022,17 @@ export const ClusterMonitor: React.FC<{
                         className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-30"
                       >
                         <Layers className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Forward a port of this service to localhost"
+                        aria-label="Forward service port"
+                        disabled={servicePorts(s.ports).length === 0}
+                        onClick={() => void forwardService(s)}
+                        className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-30"
+                      >
+                        <Cable className="h-3.5 w-3.5" />
                       </Button>
                       <Button
                         variant="ghost"
@@ -1921,6 +2167,11 @@ export const ClusterMonitor: React.FC<{
                 </tbody>
               </table>
             </div>
+          </div>
+
+          <div>
+            <h3 className="mb-2 px-1 text-xs font-semibold text-zinc-300">Links</h3>
+            <ServiceLinksPanel cluster={cluster} />
           </div>
           </div>
         )}
@@ -2689,6 +2940,19 @@ export const ClusterMonitor: React.FC<{
             </div>
           </div>
         </div>
+      )}
+
+      {/* Port-forward dialog for a service or pod port */}
+      {forwardFor && (
+        <PortForwardDialog
+          cluster={cluster}
+          namespace={forwardFor.ns}
+          kind={forwardFor.kind}
+          name={forwardFor.name}
+          remotePort={forwardFor.port}
+          onClose={() => setForwardFor(null)}
+          onStarted={() => setForwardFor(null)}
+        />
       )}
 
       {/* Footer: manual refresh */}

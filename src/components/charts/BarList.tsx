@@ -46,9 +46,9 @@ export const BarList: React.FC<BarListProps> = ({
                   {d.display ?? `${d.value.toFixed(1)}%`}
                 </span>
               </div>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+              <div className="h-1.5 w-full overflow-hidden rounded-none bg-zinc-800">
                 <div
-                  className="h-1.5 rounded-full"
+                  className="h-1.5 rounded-none"
                   style={{ width: `${Math.max(5, pct)}%`, backgroundColor: d.color }}
                 />
               </div>

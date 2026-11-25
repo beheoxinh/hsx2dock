@@ -1,0 +1,368 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FileCode2,
+  FileKey2,
+  GitFork,
+  Layers,
+  ListTree,
+  Loader2,
+  Play,
+  Power,
+  RotateCw,
+  ScrollText,
+  SlidersHorizontal,
+  Square,
+  TerminalSquare,
+  X,
+} from "lucide-react";
+import { useModal } from "../ui/ModalContext";
+import { GroupLogsModal } from "../groups/GroupLogsModal";
+import { ServicesTab } from "./ServicesTab";
+import { GraphTab } from "./GraphTab";
+import { ConfigTab } from "./ConfigTab";
+import { EnvTab } from "./EnvTab";
+import { TerminalTab } from "./TerminalTab";
+import { ExposeDialog, ScaleDialog } from "./ComposeDialogs";
+import { IconAction, InfoCell, STATUS_STYLE } from "./composeUi";
+import { projectUsage } from "./ComposeProjectCard";
+import { isRunning, projectCounts, projectStatus, serviceRows, type ComposeServiceRow } from "../../lib/composeProject";
+import { cn, formatBytes } from "../../lib/utils";
+import type {
+  ComposeProjectInfo,
+  ComposeServiceAction,
+  ContainerItem,
+  ContainerStats,
+  GatewayRoute,
+} from "../../types";
+
+export type DrawerTab = "services" | "logs" | "graph" | "config" | "env" | "terminal";
+
+export interface ComposeDrawerProps {
+  project: ComposeProjectInfo;
+  stats: Record<string, ContainerStats>;
+  routes: GatewayRoute[];
+  busy: boolean;
+  initialTab?: DrawerTab;
+  onClose: () => void;
+  onUp: () => void;
+  onUpOptions: () => void;
+  onRestart: () => void;
+  onStop: () => void;
+  onDown: () => void;
+  onServiceAction: (row: ComposeServiceRow, action: ComposeServiceAction, replicas?: number) => void;
+  onRefresh: () => void;
+}
+
+const TABS: { key: DrawerTab; label: string; icon: React.ReactNode; needsFile?: boolean }[] = [
+  { key: "services", label: "Services", icon: <ListTree className="h-3.5 w-3.5" /> },
+  { key: "logs", label: "Logs", icon: <ScrollText className="h-3.5 w-3.5" /> },
+  { key: "graph", label: "Graph", icon: <GitFork className="h-3.5 w-3.5" /> },
+  { key: "config", label: "Compose file", icon: <FileCode2 className="h-3.5 w-3.5" />, needsFile: true },
+  { key: "env", label: "Env", icon: <FileKey2 className="h-3.5 w-3.5" />, needsFile: true },
+  { key: "terminal", label: "Terminal", icon: <TerminalSquare className="h-3.5 w-3.5" /> },
+];
+
+/** The minimal ContainerItem the shared log viewer needs. */
+function asContainerItems(rows: ComposeServiceRow[]): ContainerItem[] {
+  return rows.flatMap((r) =>
+    r.containers.map((c) => ({
+      id: c.id,
+      short_id: c.id.slice(0, 12),
+      name: c.name,
+      image: c.image,
+      state: c.state,
+      status: c.state,
+      created: 0,
+      ports: c.ports,
+      compose_service: r.name,
+    }))
+  );
+}
+
+/**
+ * Everything about one compose project in a right-hand panel: per-service
+ * table with actions, live logs, the depends_on graph, the compose file and
+ * env file editors, and a shell into any running container.
+ */
+export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
+  const { project: p, stats, routes, busy, onClose } = props;
+  const modal = useModal();
+  const [tab, setTab] = useState<DrawerTab>(props.initialTab ?? "services");
+  const [visited, setVisited] = useState<Set<DrawerTab>>(new Set([props.initialTab ?? "services"]));
+  const [dirty, setDirty] = useState<{ config: boolean; env: boolean }>({ config: false, env: false });
+  const [logService, setLogService] = useState<string | null>(null);
+  const [terminalId, setTerminalId] = useState<string | null>(null);
+  const [scaleRow, setScaleRow] = useState<ComposeServiceRow | null>(null);
+  const [exposeRow, setExposeRow] = useState<ComposeServiceRow | null>(null);
+
+  const rows = useMemo(() => serviceRows(p), [p]);
+  const status = projectStatus(p);
+  const style = STATUS_STYLE[status];
+  const { running, total } = projectCounts(p);
+  const usage = projectUsage(p, stats);
+  const hasFile = Boolean(p.path) && !p.config_error;
+  const canEditFile = Boolean(p.path);
+
+  const open = (next: DrawerTab) => {
+    setTab(next);
+    setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
+  };
+
+  const requestClose = useCallback(async () => {
+    if (dirty.config || dirty.env) {
+      const ok = await modal.showConfirm(
+        "The compose file or env file has unsaved changes. Close and discard them?",
+        "Unsaved changes",
+        "warning"
+      );
+      if (!ok) return;
+    }
+    onClose();
+  }, [dirty, modal, onClose]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Dialogs above the drawer handle their own Escape first.
+      if (e.key === "Escape" && !scaleRow && !exposeRow) void requestClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [requestClose, scaleRow, exposeRow]);
+
+  const setConfigDirty = useCallback((d: boolean) => setDirty((s) => (s.config === d ? s : { ...s, config: d })), []);
+  const setEnvDirty = useCallback((d: boolean) => setDirty((s) => (s.env === d ? s : { ...s, env: d })), []);
+
+  // Logs: the selected service's containers, or all. Keyed by the id list so
+  // the viewer does not restart on every 5s refresh of the project.
+  const logRows = logService ? rows.filter((r) => r.name === logService) : rows;
+  const logKey = logRows.flatMap((r) => r.containers.map((c) => c.id)).join(",");
+  const logContainers = useMemo(() => asContainerItems(logRows), [logKey]);
+
+  const anyRunning = running > 0;
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/50" onClick={() => void requestClose()}>
+      <aside
+        role="dialog"
+        aria-label={`Compose project ${p.name}`}
+        onClick={(e) => e.stopPropagation()}
+        className="flex h-full w-[min(1120px,94vw)] flex-col border-l border-zinc-800 bg-zinc-950 shadow-2xl"
+      >
+        {/* Header */}
+        <div className="border-b border-zinc-800 px-5 py-3">
+          <div className="flex items-center gap-3">
+            <span
+              role="img"
+              aria-label={`Status: ${style.label}`}
+              title={`${style.label} — ${running}/${total} services running`}
+              className={cn("flex h-9 w-9 shrink-0 items-center justify-center border", style.box)}
+            >
+              {busy ? (
+                <Loader2 className={cn("h-4 w-4 animate-spin", style.icon)} aria-hidden="true" />
+              ) : (
+                <Layers className={cn("h-4 w-4", style.icon)} aria-hidden="true" />
+              )}
+            </span>
+            <div className="min-w-0 flex-1">
+              <h2 className="truncate text-lg font-semibold text-white">{p.name}</h2>
+              <p className="truncate font-mono text-[11px] text-zinc-500" title={p.path}>
+                {p.path || "compose file unknown — found from container labels"}
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              {anyRunning ? (
+                <IconAction title="Restart all services" onClick={props.onRestart} disabled={busy}>
+                  <RotateCw className="h-4 w-4" />
+                </IconAction>
+              ) : null}
+              <IconAction
+                title={hasFile ? "Up (create and start everything)" : "Needs a readable compose file"}
+                onClick={props.onUp}
+                disabled={busy || !hasFile}
+                className="text-emerald-300"
+              >
+                <Play className="h-4 w-4" />
+              </IconAction>
+              <IconAction title="Up with options…" onClick={props.onUpOptions} disabled={busy || !hasFile}>
+                <SlidersHorizontal className="h-4 w-4" />
+              </IconAction>
+              <IconAction title="Stop all services" onClick={props.onStop} disabled={busy || !anyRunning}>
+                <Square className="h-4 w-4" />
+              </IconAction>
+              <IconAction title="Down (remove containers and networks)…" onClick={props.onDown} disabled={busy} danger>
+                <Power className="h-4 w-4" />
+              </IconAction>
+              <span className="mx-1 h-6 w-px bg-zinc-800" aria-hidden="true" />
+              <IconAction title="Close (Esc)" onClick={() => void requestClose()}>
+                <X className="h-4 w-4" />
+              </IconAction>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-2 divide-zinc-800 border border-zinc-800 sm:grid-cols-5 sm:divide-x">
+            <InfoCell label="Services">
+              {running}/{total} running
+            </InfoCell>
+            <InfoCell label="Containers">{p.services.length}</InfoCell>
+            <InfoCell label="CPU">{usage.sampled ? `${usage.cpu.toFixed(1)}%` : "—"}</InfoCell>
+            <InfoCell label="Memory">{usage.sampled ? formatBytes(usage.mem) : "—"}</InfoCell>
+            <InfoCell label="Profiles" title={(p.profiles ?? []).join(", ")}>
+              {(p.profiles ?? []).length ? p.profiles!.join(", ") : "—"}
+            </InfoCell>
+          </div>
+          {p.config_error && (
+            <p className="mt-2 border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 font-mono text-[11px] text-rose-200">
+              {p.config_error}
+            </p>
+          )}
+        </div>
+
+        {/* Tabs */}
+        <div role="tablist" className="flex gap-0 overflow-x-auto border-b border-zinc-800 px-3">
+          {TABS.map((t) => {
+            const disabled = t.needsFile && !canEditFile;
+            const isDirty = (t.key === "config" && dirty.config) || (t.key === "env" && dirty.env);
+            return (
+              <button
+                key={t.key}
+                type="button"
+                role="tab"
+                aria-selected={tab === t.key}
+                disabled={disabled}
+                title={disabled ? "This project has no known compose file" : undefined}
+                onClick={() => open(t.key)}
+                className={cn(
+                  "flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-xs",
+                  tab === t.key ? "border-indigo-500 text-white" : "border-transparent text-zinc-400 hover:text-zinc-200",
+                  disabled && "cursor-not-allowed opacity-40"
+                )}
+              >
+                {t.icon}
+                {t.label}
+                {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" aria-label="unsaved" />}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Body */}
+        <div className="min-h-0 flex-1 overflow-hidden p-4">
+          {tab === "services" && (
+            <div className="h-full overflow-y-auto">
+              <ServicesTab
+                rows={rows}
+                stats={stats}
+                routes={routes}
+                hasFile={hasFile}
+                busy={busy}
+                onAction={(row, action) => props.onServiceAction(row, action)}
+                onScale={setScaleRow}
+                onExpose={setExposeRow}
+                onLogs={(row) => {
+                  setLogService(row.name);
+                  open("logs");
+                }}
+                onTerminal={(row) => {
+                  setTerminalId(row.containers.find(isRunning)?.id ?? null);
+                  open("terminal");
+                }}
+              />
+            </div>
+          )}
+
+          {tab === "logs" && (
+            <div className="flex h-full min-h-0 flex-col gap-2">
+              <div className="flex flex-wrap gap-1">
+                {[null, ...rows.filter((r) => r.containers.length > 0).map((r) => r.name)].map((name) => (
+                  <button
+                    key={name ?? "__all"}
+                    type="button"
+                    onClick={() => setLogService(name)}
+                    className={cn(
+                      "border px-2 py-0.5 text-[11px]",
+                      logService === name
+                        ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-200"
+                        : "border-zinc-700 text-zinc-400 hover:text-zinc-200"
+                    )}
+                  >
+                    {name ?? "All services"}
+                  </button>
+                ))}
+              </div>
+              <div className="min-h-0 flex-1">
+                {logContainers.length > 0 ? (
+                  <GroupLogsModal
+                    key={logKey}
+                    embedded
+                    isOpen
+                    onClose={() => undefined}
+                    groupName={logService ? `${p.name} / ${logService}` : p.name}
+                    containers={logContainers}
+                  />
+                ) : (
+                  <p className="p-6 text-center text-sm text-zinc-500">No containers yet — bring the project up first.</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab === "graph" && (
+            <div className="h-full overflow-auto">
+              <GraphTab
+                rows={rows}
+                onSelect={(row) => {
+                  if (row.containers.length) {
+                    setLogService(row.name);
+                    open("logs");
+                  }
+                }}
+              />
+            </div>
+          )}
+
+          {/* Editors stay mounted once opened so drafts survive tab switches. */}
+          {canEditFile && visited.has("config") && (
+            <div className={cn("h-full", tab !== "config" && "hidden")}>
+              <ConfigTab
+                filePath={p.path}
+                busy={busy}
+                onSaved={props.onRefresh}
+                onApply={props.onUp}
+                onDirtyChange={setConfigDirty}
+              />
+            </div>
+          )}
+          {canEditFile && visited.has("env") && (
+            <div className={cn("h-full", tab !== "env" && "hidden")}>
+              <EnvTab
+                filePath={p.path}
+                busy={busy}
+                onSaved={props.onRefresh}
+                onApply={props.onUp}
+                onDirtyChange={setEnvDirty}
+              />
+            </div>
+          )}
+
+          {tab === "terminal" && <TerminalTab rows={rows} containerId={terminalId} onSelect={setTerminalId} />}
+        </div>
+      </aside>
+
+      {/* Dialog clicks must not reach the drawer backdrop below. */}
+      <div onClick={(e) => e.stopPropagation()}>
+      {scaleRow && (
+        <ScaleDialog
+          service={scaleRow.name}
+          current={scaleRow.containers.length}
+          declared={scaleRow.spec?.replicas ?? 1}
+          onClose={() => setScaleRow(null)}
+          onSubmit={(n) => {
+            props.onServiceAction(scaleRow, "scale", n);
+            setScaleRow(null);
+          }}
+        />
+      )}
+      {exposeRow && <ExposeDialog project={p} row={exposeRow} onClose={() => setExposeRow(null)} />}
+      </div>
+    </div>
+  );
+};

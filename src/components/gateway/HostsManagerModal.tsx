@@ -200,13 +200,13 @@ export const HostsManagerModal: React.FC<{
               <h2 className="text-sm font-semibold flex items-center gap-2">
                 /etc/hosts System Local DNS Manager
                 {model?.tampered && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-[11px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
                     <AlertTriangle className="w-3 h-3 text-amber-400" />
                     External Changes Detected
                   </span>
                 )}
                 {model?.managed_block_present && !model?.tampered && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-[11px] font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
                     App Managed Block Synced
                   </span>
@@ -358,7 +358,7 @@ export const HostsManagerModal: React.FC<{
                         <button
                           type="button"
                           onClick={() => handleToggleEntry(idx)}
-                          className={`w-4 h-4 rounded-full border transition flex items-center justify-center shrink-0 ${
+                          className={`w-4 h-4 rounded-none border transition flex items-center justify-center shrink-0 ${
                             item.is_enabled
                               ? "bg-emerald-500/20 border-emerald-500 text-emerald-400"
                               : "border-zinc-700 bg-zinc-800 text-transparent"

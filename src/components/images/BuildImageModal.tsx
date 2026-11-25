@@ -576,9 +576,9 @@ export const BuildImageModal: React.FC<BuildImageModalProps> = ({
                 </div>
               </div>
               {pct !== null && (
-                <div className="h-1 shrink-0 overflow-hidden rounded-full bg-zinc-800">
+                <div className="h-1 shrink-0 overflow-hidden rounded-none bg-zinc-800">
                   <div
-                    className="h-full rounded-full bg-cyan-500 transition-[width] duration-200"
+                    className="h-full rounded-none bg-cyan-500 transition-[width] duration-200"
                     style={{ width: `${pct}%` }}
                   />
                 </div>

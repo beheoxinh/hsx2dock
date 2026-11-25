@@ -348,7 +348,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
               <h1 className="text-xl font-semibold tracking-tight text-zinc-100 flex items-center gap-2">
                 HTTPS Gateway & Local Proxy
                 {status?.running && (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-none text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                     Active
                   </span>
@@ -620,7 +620,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                         <button
                           type="button"
                           onClick={() => handleToggleRoute(r.id)}
-                          className={`w-4 h-4 rounded-full border transition flex items-center justify-center ${
+                          className={`w-4 h-4 rounded-none border transition flex items-center justify-center ${
                             r.enabled
                               ? "bg-emerald-500/20 border-emerald-500 text-emerald-400"
                               : "border-zinc-700 bg-zinc-800 text-transparent"

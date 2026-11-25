@@ -146,7 +146,7 @@ export const Sidebar = React.memo<SidebarProps>(function Sidebar({
             <h1 className="font-semibold text-[15px] tracking-tight text-white">
               Hsx2Dock
             </h1>
-            <span className="text-[10px] font-medium uppercase px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
+            <span className="text-[10px] font-medium uppercase px-1.5 py-0.5 rounded-none bg-blue-500/10 text-blue-400 border border-blue-500/20">
               Desktop
             </span>
           </div>
@@ -228,7 +228,7 @@ export const Sidebar = React.memo<SidebarProps>(function Sidebar({
                     </div>
 
                     {badge !== undefined && (
-                      <span className="relative z-10 shrink-0 rounded-full border border-emerald-500/40 bg-emerald-500/20 px-2 py-0.5 text-[11px] font-semibold text-emerald-400 shadow-sm shadow-emerald-500/10">
+                      <span className="relative z-10 shrink-0 rounded-none border border-emerald-500/40 bg-emerald-500/20 px-2 py-0.5 text-[11px] font-semibold text-emerald-400 shadow-sm shadow-emerald-500/10">
                         {badge}
                       </span>
                     )}

@@ -317,7 +317,7 @@ export const ContainerDetailsDrawer: React.FC<ContainerDetailsDrawerProps> = ({
                   >
                     <Pencil className="w-3.5 h-3.5" />
                   </button>
-                  <span className="text-xs px-2.5 py-1 rounded-full bg-zinc-800/80 text-zinc-400 font-mono border border-zinc-700/60">
+                  <span className="text-xs px-2.5 py-1 rounded-none bg-zinc-800/80 text-zinc-400 font-mono border border-zinc-700/60">
                     {containerId.slice(0, 12)}
                   </span>
                 </>

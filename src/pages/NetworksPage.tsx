@@ -182,7 +182,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
                         <span className="font-semibold text-white tracking-tight text-sm">
                           {net.name}
                         </span>
-                        <span className="px-2 py-0.5 rounded-full text-[11px] bg-zinc-800 text-zinc-400 font-mono">
+                        <span className="px-2 py-0.5 rounded-none text-[11px] bg-zinc-800 text-zinc-400 font-mono">
                           {net.driver}
                         </span>
                         {net.protected && (

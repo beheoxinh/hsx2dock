@@ -41,11 +41,14 @@ const McpPage = React.lazy(() =>
 const SettingsPage = React.lazy(() =>
   import("./pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))
 );
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, disposeListener, events } from "./lib/api";
 import { primeContainerStore, startContainerStoreSync } from "./lib/containerStore";
 import { startContainerOpsSync, subscribeOpNotices } from "./lib/containerOps";
 import { primeDashboardStore, resetDashboardEngineData } from "./lib/dashboardStore";
-import type { DaemonState } from "./types";
+import { alertKindLabel } from "./lib/clusterAlerts";
+import type { ClusterAlertsEvent, DaemonState } from "./types";
 
 const MainLayout: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>("dashboard");
@@ -162,11 +165,37 @@ const MainLayout: React.FC = () => {
       })
     );
 
+    // Cluster incident alerts: one plain toast per newly raised alert.
+    const unlistenAlerts = disposeListener(
+      listen<ClusterAlertsEvent>("cluster-alerts", (e) => {
+        for (const a of e.payload.fresh) {
+          const title = `${alertKindLabel(a.kind)}: ${a.object}`;
+          const description = `${a.cluster}${a.namespace ? "/" + a.namespace : ""} — ${a.message}`;
+          if (a.severity === "error") toast.error(title, description);
+          else toast.info(title, description);
+        }
+      })
+    );
+
+    // Focusing the window after an alert click-through opens the cluster it names.
+    const unlistenFocus = disposeListener(
+      getCurrentWindow().onFocusChanged(async (e) => {
+        if (!e.payload) return;
+        const name = await api.takeAlertFocus().catch(() => null);
+        if (!name) return;
+        setTrayCluster(name);
+        setActiveTab("kubernetes");
+        window.dispatchEvent(new CustomEvent("hsx:open-cluster", { detail: name }));
+      })
+    );
+
     return () => {
       unlisten();
       unlistenEndpoint();
       unlistenTray();
       stopNotices();
+      unlistenAlerts();
+      unlistenFocus();
     };
   }, []);
 

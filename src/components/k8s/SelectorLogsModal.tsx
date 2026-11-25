@@ -371,7 +371,7 @@ export function SelectorLogsModal({
                     aria-pressed={on}
                     onClick={() => togglePod(pod)}
                     title={on ? `Hide ${pod}` : `Show ${pod}`}
-                    className={`inline-flex max-w-72 items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[10px] transition-opacity ${
+                    className={`inline-flex max-w-72 items-center gap-1.5 rounded-none border px-2 py-0.5 font-mono text-[10px] transition-opacity ${
                       on ? color.chip : "border-zinc-800 text-zinc-600 opacity-50 line-through"
                     }`}
                   >

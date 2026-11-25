@@ -585,6 +585,9 @@ pub fn run() {
                     })
                     .unwrap_or(false);
 
+            // Cluster incident alerts and resource history.
+            crate::commands::kind_watch::spawn_watcher(handle.clone());
+
             // Tray + desktop notifications. AppState is managed on the builder
             // so the tray can read daemon state immediately; a missing display
             // bus must not take the whole app down, hence the warn-and-continue.
@@ -697,6 +700,51 @@ pub fn run() {
             kind_access::diff_cluster_yaml,
             kind_access::apply_cluster_yaml,
             kind_access::get_selector_logs,
+            kind_spec::preview_cluster_config,
+            k8s_tools::k8s_tools_status,
+            k8s_tools::install_k8s_tools,
+            kind_portforward::start_port_forward,
+            kind_portforward::stop_port_forward,
+            kind_portforward::list_port_forwards,
+            kind_addons::list_cluster_addons,
+            kind_addons::install_cluster_addon,
+            kind_addons::uninstall_cluster_addon,
+            kind_addons::dashboard_token,
+            kind_addons::list_cluster_ingresses,
+            kind_addons::expose_ingress_host,
+            kind_links::link_cluster_service,
+            kind_links::list_service_links,
+            kind_links::unlink_cluster_service,
+            kind_links::check_service_link,
+            kind_helm::helm_list_releases,
+            kind_helm::helm_release_detail,
+            kind_helm::helm_install,
+            kind_helm::helm_rollback,
+            kind_helm::helm_uninstall,
+            kind_helm::helm_repo_list,
+            kind_helm::helm_repo_add,
+            kind_helm::helm_repo_remove,
+            kind_helm::helm_repo_update,
+            kind_helm::helm_search,
+            kind_helm::helm_show_values,
+            kind_snapshots::list_cluster_snapshots,
+            kind_snapshots::create_cluster_snapshot,
+            kind_snapshots::delete_cluster_snapshot,
+            kind_snapshots::restore_cluster_snapshot,
+            kind_watch::list_cluster_alerts,
+            kind_watch::take_alert_focus,
+            kind_watch::cluster_history,
+            kind_spec::list_cluster_presets,
+            kind_spec::save_cluster_preset,
+            kind_spec::delete_cluster_preset,
+            kind_nodes::add_cluster_worker,
+            kind_nodes::remove_cluster_node,
+            kind_spec::list_kind_node_images,
+            kind_registry::registry_status,
+            kind_registry::ensure_registry,
+            kind_registry::remove_registry,
+            kind_registry::connect_registry_to_cluster,
+            kind_registry::push_to_local_registry,
             // Registries
             registries::list_registries,
             registries::test_registry_auth,
@@ -715,6 +763,16 @@ pub fn run() {
             compose::compose_down,
             compose::compose_logs,
             compose::compose_project_action,
+            compose::compose_service_action,
+            compose::compose_pin_project,
+            compose::compose_unpin_project,
+            compose::compose_scan_dir,
+            compose::compose_read_file,
+            compose::compose_validate,
+            compose::compose_save_file,
+            compose::compose_read_env,
+            compose::compose_save_env,
+            compose::compose_open_folder,
             // Container groups
             groups::list_container_groups,
             groups::save_container_groups,
@@ -787,6 +845,7 @@ pub fn run() {
                 // with the app (PR_SET_PDEATHSIG) without dockerd getting the
                 // chance to stop containers with their own stop signal.
                 if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                    commands::kind_portforward::stop_all_forwards();
                     let supervisor = state.caddy.clone();
                     let engine = state.engine.clone();
                     crate::runtime::runtime().block_on(async move {

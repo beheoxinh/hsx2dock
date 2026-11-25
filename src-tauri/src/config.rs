@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub auto_start_daemon: bool,
     #[serde(default)]
     pub compose_file: String,
+    /// Compose files saved in the Compose page's project list.
+    #[serde(default)]
+    pub compose_projects: Vec<String>,
     /// Create/repair `$XDG_RUNTIME_DIR/docker.sock -> engine socket` (and the
     /// `hsx2dock-engine` context) so the system `docker` CLI reaches our
     /// engine. On by default: it is the feature this app exists for.
@@ -227,6 +230,49 @@ pub struct NotificationPrefs {
     /// The window was closed into the tray (the app and engine keep running).
     #[serde(default = "default_true")]
     pub tray_hidden: bool,
+    /// Kubernetes incident alerts from the cluster watcher.
+    #[serde(default)]
+    pub k8s_alerts: K8sAlertPrefs,
+}
+
+/// Which cluster incidents raise a desktop notification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct K8sAlertPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub crash_loop: bool,
+    #[serde(default = "default_true")]
+    pub image_pull: bool,
+    #[serde(default = "default_true")]
+    pub oom: bool,
+    #[serde(default = "default_true")]
+    pub restart_spike: bool,
+    #[serde(default = "default_true")]
+    pub node_not_ready: bool,
+    #[serde(default = "default_true")]
+    pub api_down: bool,
+    #[serde(default = "default_true")]
+    pub pvc_pending: bool,
+    /// Clusters whose alerts are listed but never notified.
+    #[serde(default)]
+    pub muted_clusters: Vec<String>,
+}
+
+impl Default for K8sAlertPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            crash_loop: true,
+            image_pull: true,
+            oom: true,
+            restart_spike: true,
+            node_not_ready: true,
+            api_down: true,
+            pvc_pending: true,
+            muted_clusters: Vec::new(),
+        }
+    }
 }
 
 impl Default for NotificationPrefs {
@@ -237,6 +283,7 @@ impl Default for NotificationPrefs {
             engine_state: default_true(),
             kind_events: default_true(),
             tray_hidden: default_true(),
+            k8s_alerts: K8sAlertPrefs::default(),
         }
     }
 }
@@ -341,6 +388,7 @@ impl Default for AppConfig {
         Self {
             auto_start_daemon: default_auto_start(),
             compose_file: String::new(),
+            compose_projects: Vec::new(),
             cli_bridge_enabled: default_true(),
             cli_bridge_set_default: default_true(),
             cli_bridge_prev_context: String::new(),
@@ -675,6 +723,7 @@ mod tests {
         let cfg = AppConfig {
             auto_start_daemon: false,
             compose_file: "/tmp/docker-compose.yml".to_string(),
+            compose_projects: vec!["/srv/app/compose.yaml".to_string()],
             cli_bridge_enabled: true,
             cli_bridge_set_default: true,
             cli_bridge_prev_context: "desktop-linux".to_string(),

@@ -69,13 +69,13 @@ const SETTINGS_TABS: {
 const Switch: React.FC<{ on: boolean }> = ({ on }) => (
   <span
     aria-hidden="true"
-    className={`relative w-10 rounded-full border transition-colors shrink-0 ${
+    className={`relative w-10 rounded-none border transition-colors shrink-0 ${
       on ? "bg-emerald-500/30 border-emerald-500/50" : "bg-zinc-800 border-zinc-700"
     }`}
     style={{ height: "1.375rem" }}
   >
     <span
-      className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-full transition-all ${
+      className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 rounded-none transition-all ${
         on ? "left-[1.3rem] bg-emerald-400" : "left-0.5 bg-zinc-500"
       }`}
     />
@@ -777,7 +777,7 @@ export const SettingsPage: React.FC = () => {
                   }
                   className="sr-only peer"
                 />
-                <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-none peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-none after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
               </label>
             </div>
 
@@ -1121,7 +1121,7 @@ export const SettingsPage: React.FC = () => {
                     checked={config.cli_bridge_enabled}
                     onChange={(e) => handleToggleCliBridge(e.target.checked)}
                   />
-                  <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+                  <div className="w-11 h-6 bg-zinc-800 peer-focus:outline-none rounded-none peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-none after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
                 </label>
               </div>
 
@@ -1259,7 +1259,7 @@ export const SettingsPage: React.FC = () => {
               {/* Status & Power toggle */}
               <div className="flex items-center gap-3">
                 <span
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-xs font-medium border ${
                     caddyStatus?.running
                       ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                       : "bg-zinc-800 text-zinc-400 border-zinc-700"

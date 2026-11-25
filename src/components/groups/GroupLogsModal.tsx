@@ -23,6 +23,8 @@ interface GroupLogsModalProps {
   onClose: () => void;
   groupName: string;
   containers: ContainerItem[];
+  /** Render inline (filling the parent) instead of as a modal overlay. */
+  embedded?: boolean;
 }
 
 interface LogLine {
@@ -132,6 +134,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
   onClose,
   groupName,
   containers,
+  embedded = false,
 }) => {
   const toast = useToast();
   // Filter chips: selected container IDs. Empty Set = "All"
@@ -394,9 +397,14 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
       ? filteredLines.slice(-MAX_RENDERED_LINES)
       : filteredLines;
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
-      <div className="w-full max-w-6xl h-[88vh] flex flex-col bg-zinc-950 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden">
+  const panel = (
+      <div
+        className={
+          embedded
+            ? "h-full min-h-0 flex flex-col bg-zinc-950 overflow-hidden"
+            : "w-full max-w-6xl h-[88vh] flex flex-col bg-zinc-950 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+        }
+      >
         {/* Header */}
         <div className="px-6 py-4 border-b border-zinc-800/80 bg-zinc-900/60 backdrop-blur flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
@@ -408,7 +416,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
                 <h2 className="text-base font-semibold text-white truncate tracking-tight">
                   {groupName}
                 </h2>
-                <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-zinc-800 text-zinc-300 border border-zinc-700/50">
+                <span className="px-2 py-0.5 rounded-none text-[11px] font-medium bg-zinc-800 text-zinc-300 border border-zinc-700/50">
                   {containers.length} {containers.length === 1 ? "container" : "containers"}
                 </span>
               </div>
@@ -475,14 +483,14 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
             </Button>
 
             {/* Close button */}
-            <button
+            {!embedded && <button
               type="button"
               onClick={onClose}
               className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors ml-1 cursor-pointer"
               aria-label="Close group logs modal"
             >
               <X className="w-5 h-5" />
-            </button>
+            </button>}
           </div>
         </div>
 
@@ -662,11 +670,18 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-3">
-            <span>Press Esc to close</span>
-          </div>
+          {!embedded && (
+            <div className="flex items-center gap-3">
+              <span>Press Esc to close</span>
+            </div>
+          )}
         </div>
       </div>
+  );
+  if (embedded) return panel;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+      {panel}
     </div>
   );
 };

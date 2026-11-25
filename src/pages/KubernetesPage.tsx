@@ -5,9 +5,9 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Hexagon,
   Plus,
-  X,
   Download,
   Loader2,
+  Package,
   RefreshCw,
   AlertTriangle,
   Rocket,
@@ -23,7 +23,12 @@ import { ClusterToolbar, type BulkProgress } from "../components/k8s/ClusterTool
 import { ClusterPrefsDialog } from "../components/k8s/ClusterPrefsDialog";
 import { YamlApplyModal } from "../components/k8s/YamlApplyModal";
 import { KubeShellModal } from "../components/k8s/KubeShellModal";
+import { CreateClusterWizard } from "../components/k8s/CreateClusterWizard";
+import { LocalRegistryModal } from "../components/k8s/LocalRegistryModal";
+import { SnapshotsModal } from "../components/k8s/SnapshotsModal";
+import { listen } from "@tauri-apps/api/event";
 import { api, disposeListener, events } from "../lib/api";
+import { HISTORY_REFRESH_MS, historyToCardSeries } from "../lib/clusterHistory";
 import { peekDashboardClusters } from "../lib/dashboardStore";
 import {
   browserStorage,
@@ -43,10 +48,14 @@ import {
 } from "../lib/k8sClusterList";
 import type {
   ClusterAccess,
+  ClusterAlert,
+  ClusterAlertsEvent,
+  ClusterSpec,
   KindCluster,
   KindClusterPrefs,
   KindInstallStatus,
   KindProgressPayload,
+  PortForwardInfo,
 } from "../types";
 import type { DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
@@ -78,24 +87,31 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   const [installPct, setInstallPct] = useState<number | null>(null);
   const [installDetail, setInstallDetail] = useState<string | null>(null);
 
-  // Create-cluster modal + form.
+  // Create-cluster wizard; its defaults come from Settings → Kubernetes.
   const [createOpen, setCreateOpen] = useState(false);
-  const [formName, setFormName] = useState("");
-  const [formImage, setFormImage] = useState("");
-  const [formNodes, setFormNodes] = useState(1);
-  /** Defaults from Settings → Kubernetes, re-applied after every create. */
-  const [formDefaults, setFormDefaults] = useState({ nodes: 1, image: "" });
+  const [createDefaults, setCreateDefaults] = useState({ nodes: 1, image: "" });
   const [creating, setCreating] = useState(false);
+  const [registryOpen, setRegistryOpen] = useState(false);
 
   // One long-running kind operation at a time (create/delete/kubeconfig).
   const [busyOp, setBusyOp] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<KindProgressPayload[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
 
-  // Per-cluster mini-monitor history for the card sparklines (capped ring).
+  // Per-cluster sparkline history: pods/cpu/mem come from the backend history,
+  // disk is accumulated from the polled list (the backend does not carry it).
   const [history, setHistory] = useState<
-    Record<string, { pods: number[]; cpu: number[]; mem: number[] }>
+    Record<string, { pods: number[]; cpu: number[]; mem: number[]; disk: number[] }>
   >({});
+
+  // Port-forwards across all clusters; each card receives its own slice.
+  const [forwards, setForwards] = useState<PortForwardInfo[]>([]);
+
+  // Active alerts per cluster, from the first pull and the pushed events.
+  const [alertsByCluster, setAlertsByCluster] = useState<Record<string, ClusterAlert[]>>({});
+
+  // Cluster whose snapshots modal is open (null = closed).
+  const [snapshotsFor, setSnapshotsFor] = useState<string | null>(null);
 
   // Full monitoring screen for the selected cluster (null = cluster list).
   const [detailFor, setDetailFor] = useState<string | null>(null);
@@ -106,6 +122,74 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   useEffect(() => {
     if (openCluster) setDetailFor(openCluster);
   }, [openCluster]);
+
+  // A window-level request (e.g. an alert click-through) opens that monitor.
+  useEffect(() => {
+    const onOpenCluster = (event: Event) => {
+      setDetailFor((event as CustomEvent<string>).detail);
+    };
+    window.addEventListener("hsx:open-cluster", onOpenCluster);
+    return () => window.removeEventListener("hsx:open-cluster", onOpenCluster);
+  }, []);
+
+  // Port-forwards: poll every 5 s while the document is visible.
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const load = () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
+      api
+        .listPortForwards()
+        .then((list) => {
+          if (!cancelled) setForwards(list);
+        })
+        .catch(() => {
+          /* keep the last list; the next tick retries */
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 5000);
+    const onVisible = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  // Alerts: one pull on mount, then the pushed `cluster-alerts` events.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listClusterAlerts()
+      .then((list) => {
+        if (cancelled) return;
+        const grouped: Record<string, ClusterAlert[]> = {};
+        for (const a of list) {
+          if (!grouped[a.cluster]) grouped[a.cluster] = [];
+          grouped[a.cluster].push(a);
+        }
+        // Events that arrived before this pull are newer; they win.
+        setAlertsByCluster((prev) => ({ ...grouped, ...prev }));
+      })
+      .catch(() => {});
+    const unlisten = disposeListener(
+      listen<ClusterAlertsEvent>("cluster-alerts", (e) =>
+        setAlertsByCluster((prev) => ({ ...prev, [e.payload.cluster]: e.payload.alerts }))
+      )
+    );
+    return () => {
+      cancelled = true;
+      unlisten();
+    };
+  }, []);
 
   // Per-cluster prefs (auto-start, per-node caps) mirrored from the config.
   const [prefsByName, setPrefsByName] = useState<Record<string, KindClusterPrefs>>({});
@@ -259,40 +343,91 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasRunning]);
 
-  // Track per-cluster samples for the card sparklines (capped ring buffer).
+  // Disk samples for the card sparklines (capped ring buffer), taken from the
+  // polled list. Rebuilt from the live list, so a deleted cluster's entry is
+  // dropped instead of lingering for the lifetime of the page.
   useEffect(() => {
     setHistory((prev) => {
-      // Rebuilt from the live list, so a deleted cluster's samples are dropped
-      // instead of accumulating for the lifetime of the page.
       const next: typeof prev = {};
       for (const c of clusters) {
         if (prev[c.name]) next[c.name] = prev[c.name];
       }
       for (const c of clusters) {
         if (!c.running || c.pod_count == null) continue;
-        const cur = next[c.name] ?? { pods: [], cpu: [], mem: [] };
+        const cur = next[c.name] ?? { pods: [], cpu: [], mem: [], disk: [] };
         next[c.name] = {
-          pods: [...cur.pods, c.running_pod_count ?? 0].slice(-40),
-          cpu: [...cur.cpu, c.cpu_percent ?? 0].slice(-40),
-          mem: [...cur.mem, c.mem_used_mb ?? 0].slice(-40),
+          ...cur,
+          disk: [...cur.disk, c.disk_size_bytes ?? 0].slice(-40),
         };
       }
       return next;
     });
   }, [clusters]);
 
-  // Pre-fill the create form from Settings → Kubernetes defaults.
+  // Backend history (pods, cpu, mem) for running clusters. Read by the ref so
+  // the interval below does not restart on every list refresh.
+  const clustersRef = useRef<KindCluster[]>([]);
+  useEffect(() => {
+    clustersRef.current = clusters;
+  }, [clusters]);
+
+  const [listLoadedOnce, setListLoadedOnce] = useState(false);
+  useEffect(() => {
+    if (!loading) setListLoadedOnce(true);
+  }, [loading]);
+
+  const historyInflight = useRef(false);
+  const refreshHistory = async () => {
+    if (historyInflight.current) return;
+    const running = clustersRef.current.filter((c) => c.running).map((c) => c.name);
+    if (running.length === 0) return;
+    historyInflight.current = true;
+    try {
+      const results = await Promise.allSettled(
+        running.map((name) => api.clusterHistory(name, "1h"))
+      );
+      setHistory((prev) => {
+        const next = { ...prev };
+        results.forEach((r, i) => {
+          const name = running[i];
+          if (r.status !== "fulfilled") return;
+          // A cluster deleted while the request was in flight gets no entry.
+          if (!clustersRef.current.some((c) => c.name === name)) return;
+          const series = historyToCardSeries(r.value);
+          next[name] = {
+            pods: series.pods,
+            cpu: series.cpu,
+            mem: series.mem,
+            disk: prev[name]?.disk ?? [],
+          };
+        });
+        return next;
+      });
+    } finally {
+      historyInflight.current = false;
+    }
+  };
+
+  // First pull once the list has loaded, then every HISTORY_REFRESH_MS while visible.
+  useEffect(() => {
+    if (!listLoadedOnce) return;
+    void refreshHistory();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void refreshHistory();
+    }, HISTORY_REFRESH_MS);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listLoadedOnce]);
+
+  // Pre-fill the create wizard from Settings → Kubernetes defaults.
   useEffect(() => {
     api
       .getAppConfig()
       .then((cfg) => {
-        const d = {
-          nodes: Math.min(5, Math.max(1, cfg.kind_default_nodes ?? 1)),
+        setCreateDefaults({
+          nodes: cfg.kind_default_nodes ?? 1,
           image: cfg.kind_default_image ?? "",
-        };
-        setFormDefaults(d);
-        setFormNodes(d.nodes);
-        setFormImage(d.image);
+        });
       })
       .catch(() => {});
   }, []);
@@ -351,32 +486,37 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     }
   };
 
-  const handleCreate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const name = formName.trim();
-    if (!name) return;
+  /** Creates from the wizard; `config` is a hand-edited kind YAML that wins over `spec`. */
+  const handleCreate = async (name: string, spec: ClusterSpec, config?: string) => {
     if (busyOp) return;
     try {
       setCreating(true);
       setBusyOp("create");
-      setLogLines([
-        { action: "create", name, line: `Creating cluster ${name}…` },
-      ]);
-      await api.createKindCluster(
-        name,
-        formImage.trim() || undefined,
-        formNodes
-      );
+      setLogLines([{ action: "create", name, line: `Creating cluster ${name}…` }]);
+      await api.createKindClusterAdvanced(name, spec, config);
       setCreateOpen(false);
-      setFormName("");
-      setFormImage(formDefaults.image);
-      setFormNodes(formDefaults.nodes);
       toast.success("Cluster ready", `kind cluster '${name}' is up.`);
       await loadAll();
     } catch (err) {
       toast.error("Create failed", String(err));
     } finally {
       setCreating(false);
+      setBusyOp(null);
+    }
+  };
+
+  /** Adds a worker to a running cluster; the kind output streams onto its card. */
+  const handleAddWorker = async (name: string) => {
+    if (busyOp) return;
+    try {
+      setBusyOp("node");
+      setLogLines([{ action: "node", name, line: `Adding a worker to ${name}…` }]);
+      const node = await api.addClusterWorker(name);
+      toast.success("Worker added", node);
+      await loadAll();
+    } catch (err) {
+      toast.error("Add worker failed", String(err));
+    } finally {
       setBusyOp(null);
     }
   };
@@ -460,16 +600,8 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   }, [view]);
   const [query, setQuery] = useState("");
 
-  // Bulk selection by cluster name; selections of vanished clusters are dropped.
-  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  // Progress of a Start all / Stop all run.
   const [bulk, setBulk] = useState<BulkProgress | null>(null);
-  useEffect(() => {
-    setSelected((prev) => {
-      const names = new Set(clusters.map((c) => c.name));
-      const next = new Set([...prev].filter((n) => names.has(n)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [clusters]);
 
   // Host access per cluster. Fetched only for running clusters, reused for
   // 30 s, so the 10 s poll does not turn into a TCP probe per card per tick.
@@ -525,31 +657,9 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     patchView({ status: "all", tag: null });
   };
 
-  const selectedClusters = clusters.filter((c) => selected.has(c.name));
-  const startable = selectedClusters.filter((c) => !c.running).map((c) => c.name);
-  const stoppable = selectedClusters.filter((c) => c.running).map((c) => c.name);
-  const visibleNames = visible.map((c) => c.name);
-  const visibleSelectedCount = visibleNames.filter((n) => selected.has(n)).length;
-  const allVisibleSelected = visibleNames.length > 0 && visibleSelectedCount === visibleNames.length;
-  const someVisibleSelected = visibleSelectedCount > 0;
-  const toggleAllVisible = () => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      for (const n of visibleNames) {
-        if (allVisibleSelected) next.delete(n);
-        else next.add(n);
-      }
-      return next;
-    });
-  };
-  const toggleSelected = (name: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  };
+  // Start all / Stop all act on every cluster, whatever the filters show.
+  const startable = clusters.filter((c) => !c.running).map((c) => c.name);
+  const stoppable = clusters.filter((c) => c.running).map((c) => c.name);
 
   /** Start or stop the given clusters, two at a time; failures are reported, not fatal. */
   const bulkRun = async (action: "start" | "stop", names: string[]) => {
@@ -658,14 +768,6 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     });
   };
 
-  const commandPreview = (() => {
-    const parts = ["kind", "create", "cluster", "--name", formName.trim() || "<name>"];
-    if (formImage.trim()) parts.push("--image", formImage.trim());
-    if (formNodes > 1) parts.push("--wait", "120s", "--nodes", String(formNodes));
-    return parts.join(" ");
-  })();
-
-  const showLog = logLines.length > 0;
   // Kind output lines whose cluster has no card yet (being created).
   const orphanLogLines = logLines.filter(
     (l) => !clusters.some((c) => c.name === l.name)
@@ -722,6 +824,17 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
             <RefreshCw className={loading ? "w-4 h-4 animate-spin" : "w-4 h-4"} />
           </Button>
 
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setRegistryOpen(true)}
+            title="Shared local registry on localhost:5001 for pushing images into clusters"
+            className="gap-2 rounded-none"
+          >
+            <Package className="w-4 h-4" />
+            <span>Registry</span>
+          </Button>
+
           {status?.installed && (
             <Button
               variant="primary"
@@ -766,7 +879,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                     <span>{installDetail ?? "Starting…"}</span>
                     <span>{installPct !== null ? `${installPct}%` : "…"}</span>
                   </div>
-                  <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                  <div className="h-1.5 rounded-none bg-zinc-800 overflow-hidden">
                     <div
                       className="h-full bg-blue-500 transition-all duration-200"
                       style={{ width: `${installPct ?? 5}%` }}
@@ -874,11 +987,6 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
               onSort={(k: SortKey) => patchView({ sort: k })}
               visibleCount={visible.length}
               totalCount={clusters.length}
-              selectedCount={selectedClusters.length}
-              allVisibleSelected={allVisibleSelected}
-              someVisibleSelected={someVisibleSelected}
-              onToggleAllVisible={toggleAllVisible}
-              onClearSelection={() => setSelected(new Set())}
               startableCount={startable.length}
               stoppableCount={stoppable.length}
               onBulkStart={() => bulkRun("start", startable)}
@@ -908,13 +1016,13 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                       prefs={prefsFor(c.name)}
                       access={access[c.name] ? access[c.name].data : undefined}
                       history={history[c.name]}
-                      selected={selected.has(c.name)}
+                      forwards={forwards.filter((f) => f.cluster === c.name)}
+                      alerts={alertsByCluster[c.name] ?? []}
                       busy={!!busyOp}
                       powerBusy={powerFor === c.name}
                       kindInstalled={!!status?.installed}
                       prefsLoaded={prefsLoaded}
                       logLines={logLines.filter((l) => l.name === c.name)}
-                      onToggleSelected={() => toggleSelected(c.name)}
                       onToggleAutoStart={() => toggleClusterAutoStart(c)}
                       onOpenMonitor={() => setDetailFor(c.name)}
                       onTogglePower={() => handleTogglePower(c)}
@@ -922,6 +1030,8 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
                       onApply={(tab) => setApplyFor({ cluster: c.name, tab })}
                       onPrefs={() => openPrefs(c.name)}
                       onCopyKubeconfig={() => handleKubeconfig(c.name)}
+                      onAddWorker={() => handleAddWorker(c.name)}
+                      onOpenSnapshots={() => setSnapshotsFor(c.name)}
                       onAddHostKubeconfig={() => hostKubeconfigAction(c, "add")}
                       onRemoveHostKubeconfig={() => hostKubeconfigAction(c, "remove")}
                       onOpenHostTerminal={() => openHostTerminal(c.name)}
@@ -1036,6 +1146,16 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
       </AnimatePresence>
 
       {/* kubectl shell and YAML / quick deploy, scoped to the cluster they were opened for */}
+      {snapshotsFor && (
+        <SnapshotsModal
+          cluster={snapshotsFor}
+          running={!!clusters.find((x) => x.name === snapshotsFor)?.running}
+          onClose={() => setSnapshotsFor(null)}
+          onChanged={() => {
+            void loadAll();
+          }}
+        />
+      )}
       {shellFor && <KubeShellModal cluster={shellFor} onClose={() => setShellFor(null)} />}
       {applyFor && (
         <YamlApplyModal
@@ -1046,151 +1166,20 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
         />
       )}
 
-      {/* Create cluster modal */}
-      <AnimatePresence>
-        {createOpen && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
-            onClick={() => !creating && setCreateOpen(false)}
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96, y: 8 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.97, y: 6 }}
-              transition={{ duration: 0.18, ease: "easeOut" }}
-              className="w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <form onSubmit={handleCreate}>
-                <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
-                  <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center">
-                      <Hexagon className="w-4 h-4 text-blue-400" />
-                    </div>
-                    <h3 className="text-sm font-semibold text-white">Create kind cluster</h3>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => !creating && setCreateOpen(false)}
-                    className="text-zinc-400 hover:text-white"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
+      {createOpen && (
+        <CreateClusterWizard
+          defaults={createDefaults}
+          busy={creating}
+          logLines={logLines}
+          existingNames={clusters.map((c) => c.name)}
+          onCreate={handleCreate}
+          onClose={() => setCreateOpen(false)}
+        />
+      )}
 
-                <div className="px-5 py-4 space-y-4">
-                  <div>
-                    <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                      Cluster name
-                    </label>
-                    <input
-                      type="text"
-                      autoFocus
-                      value={formName}
-                      onChange={(e) => setFormName(e.target.value)}
-                      placeholder="my-cluster"
-                      pattern="[A-Za-z0-9.\-]+"
-                      title="Letters, digits, '-' and '.' only"
-                      disabled={creating}
-                      className="w-full h-9 px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-blue-500 disabled:opacity-60"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                        Nodes
-                      </label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={5}
-                        value={formNodes}
-                        onChange={(e) =>
-                          setFormNodes(
-                            Math.min(5, Math.max(1, Number(e.target.value) || 1))
-                          )
-                        }
-                        disabled={creating}
-                        className="w-full h-9 px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-blue-500 disabled:opacity-60"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                        Node image{" "}
-                        <span className="text-zinc-600 font-normal">(optional)</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={formImage}
-                        onChange={(e) => setFormImage(e.target.value)}
-                        placeholder="kind's bundled default"
-                        disabled={creating}
-                        className="w-full h-9 px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-blue-500 disabled:opacity-60"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="rounded-lg bg-zinc-950 border border-zinc-800/80 px-3 py-2.5">
-                    <p className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">
-                      Command preview
-                    </p>
-                    <p className="font-mono text-xs text-zinc-400 break-all">
-                      {commandPreview}
-                    </p>
-                  </div>
-
-                  {creating && showLog && (
-                    <div className="rounded-lg bg-zinc-950 border border-zinc-800 px-3 py-2 max-h-32 overflow-y-auto font-mono text-[11px] space-y-0.5 select-text">
-                      {logLines.slice(-12).map((l, i) => (
-                        <div
-                          key={i}
-                          className={
-                            /error|failed|exit status/i.test(l.line)
-                              ? "text-rose-400"
-                              : "text-zinc-400"
-                          }
-                        >
-                          {l.line}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-zinc-800">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setCreateOpen(false)}
-                    disabled={creating}
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    type="submit"
-                    variant="primary"
-                    size="sm"
-                    disabled={creating || !formName.trim()}
-                    className="gap-2"
-                  >
-                    {creating ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Rocket className="w-4 h-4" />
-                    )}
-                    <span>{creating ? "Creating…" : "Create Cluster"}</span>
-                  </Button>
-                </div>
-              </form>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {registryOpen && (
+        <LocalRegistryModal clusters={clusters} onClose={() => setRegistryOpen(false)} />
+      )}
     </div>
   );
 };

@@ -1262,7 +1262,7 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
         {/* Compose projects are derived from container labels, not saved
             groups: the badge marks why their card has no rename/delete. */}
         {compose && (
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-none border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-sky-300">
             <Boxes className="w-3 h-3" />
             compose
           </span>
@@ -1360,7 +1360,7 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
                       pointer position, so the user sees the order change
                       before releasing. */}
                   {reorder && !reorder.unchanged && reorder.beforeKey === c.id && (
-                    <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
+                    <div className="h-0.5 rounded-none bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
                   )}
                   <MemberCard
                     c={c}
@@ -1376,7 +1376,7 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
                 </React.Fragment>
               ))}
               {reorder && !reorder.unchanged && reorder.beforeKey === null && (
-                <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
+                <div className="h-0.5 rounded-none bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
               )}
               {progressive.hasMore && (
                 <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />

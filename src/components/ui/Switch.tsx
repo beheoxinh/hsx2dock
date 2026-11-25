@@ -24,13 +24,13 @@ export const Switch: React.FC<{
     disabled={disabled}
     onClick={() => onChange(!checked)}
     className={cn(
-      "group inline-flex items-center gap-2 rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 disabled:cursor-not-allowed disabled:opacity-40",
+      "group inline-flex items-center gap-2 rounded-none focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 disabled:cursor-not-allowed disabled:opacity-40",
       className
     )}
   >
     <span
       className={cn(
-        "relative inline-flex h-4 w-7 shrink-0 items-center rounded-full border transition-colors",
+        "relative inline-flex h-4 w-7 shrink-0 items-center rounded-none border transition-colors",
         checked
           ? "border-emerald-400/70 bg-emerald-500/80"
           : "border-zinc-600 bg-zinc-700/60 group-hover:bg-zinc-600/70"
@@ -38,7 +38,7 @@ export const Switch: React.FC<{
     >
       <span
         className={cn(
-          "h-3 w-3 rounded-full bg-white shadow transition-transform",
+          "h-3 w-3 rounded-none bg-white shadow transition-transform",
           checked ? "translate-x-3" : "translate-x-0.5"
         )}
       />

@@ -3,8 +3,11 @@ import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
+  Copy,
   Layers,
   Download,
+  Loader2,
+  Package,
   Trash2,
   Search,
   Star,
@@ -88,6 +91,9 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [historyTarget, setHistoryTarget] = useState<string | null>(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushStatus, setPushStatus] = useState<PushProgressPayload | null>(null);
+  // Image being pushed to the local registry, and the ref of the last successful push.
+  const [localPushing, setLocalPushing] = useState<string | null>(null);
+  const [localPushed, setLocalPushed] = useState<string | null>(null);
   const pushTargetRef = useRef<string | null>(null);
   const [autoPrune, setAutoPrune] = useState(false);
   const [pruningAuto, setPruningAuto] = useState(false);
@@ -305,6 +311,35 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     }
   };
 
+  /** A tag that can be pushed as-is (dangling images have none). */
+  const namedTag = (img: ImageItem): string | undefined =>
+    img.tags.find((t) => t && !t.startsWith("sha256:") && !t.startsWith("<none>"));
+
+  /** Tags the image into localhost:5001 and pushes it there; the ref is shown above the list. */
+  const handlePushLocal = async (img: ImageItem) => {
+    const source = namedTag(img);
+    if (!source || localPushing) return;
+    setLocalPushing(source);
+    try {
+      const ref = await api.pushToLocalRegistry(source);
+      setLocalPushed(ref);
+      toast.success("Pushed to local registry", ref);
+    } catch (err) {
+      toast.error("Push to local registry failed", String(err));
+    } finally {
+      setLocalPushing(null);
+    }
+  };
+
+  const copyLocalRef = async (ref: string) => {
+    try {
+      await navigator.clipboard.writeText(ref);
+      toast.success("Reference copied", ref);
+    } catch (e) {
+      toast.error("Copy failed", String(e));
+    }
+  };
+
   const handleSearchHub = async () => {
     if (!imageToPull.trim()) return;
     try {
@@ -471,12 +506,12 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
             />
             <span className="whitespace-nowrap font-medium">Auto-clean Dangling</span>
             <div
-              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-none border-2 border-transparent transition-colors duration-200 ease-in-out ${
                 autoPrune ? "bg-amber-500" : "bg-zinc-700"
               }`}
             >
               <span
-                className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                className={`pointer-events-none inline-block h-3 w-3 transform rounded-none bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
                   autoPrune ? "translate-x-3" : "translate-x-0"
                 }`}
               />
@@ -514,6 +549,36 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
           </Button>
         </div>
       </div>
+
+      {localPushed && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 rounded-none">
+          <div className="min-w-0">
+            <p className="text-[11px] uppercase tracking-wider text-emerald-400">Pushed to local registry</p>
+            <p className="truncate font-mono text-xs text-zinc-200">{localPushed}</p>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="gap-1.5 rounded-none"
+              onClick={() => copyLocalRef(localPushed)}
+            >
+              <Copy className="w-3.5 h-3.5" />
+              Copy
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Dismiss"
+              aria-label="Dismiss"
+              onClick={() => setLocalPushed(null)}
+              className="h-8 w-8 rounded-none"
+            >
+              <X className="w-4 h-4" />
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Images List */}
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
@@ -595,6 +660,24 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
                     className="text-zinc-400 hover:text-purple-400 hover:bg-purple-500/10"
                   >
                     <FileText className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => handlePushLocal(img)}
+                    disabled={!namedTag(img) || localPushing !== null}
+                    title={
+                      namedTag(img)
+                        ? "Push to the local registry (localhost:5001)"
+                        : "Tag the image before pushing it to the local registry"
+                    }
+                    className="text-zinc-400 hover:text-emerald-400 hover:bg-emerald-500/10"
+                  >
+                    {localPushing !== null && localPushing === namedTag(img) ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Package className="w-4 h-4" />
+                    )}
                   </Button>
                   <Button
                     variant="ghost"
@@ -753,9 +836,9 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
                 </div>
 
                 {pullStatus.current && pullStatus.total ? (
-                  <div className="w-full bg-zinc-800 rounded-full h-2 overflow-hidden">
+                  <div className="w-full bg-zinc-800 rounded-none h-2 overflow-hidden">
                     <div
-                      className="bg-blue-500 h-2 rounded-full transition-all duration-200"
+                      className="bg-blue-500 h-2 rounded-none transition-all duration-200"
                       style={{
                         width: `${Math.min(
                           100,
@@ -914,9 +997,9 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
                   )}
                 </div>
                 {pushStatus.current && pushStatus.total ? (
-                  <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                  <div className="w-full bg-zinc-800 rounded-none h-1.5 overflow-hidden">
                     <div
-                      className="bg-amber-500 h-1.5 rounded-full transition-all"
+                      className="bg-amber-500 h-1.5 rounded-none transition-all"
                       style={{
                         width: `${Math.min(
                           100,

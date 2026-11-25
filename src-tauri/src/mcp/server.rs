@@ -72,6 +72,22 @@ fn ok(value: Value) -> CallToolResult {
     CallToolResult::structured(value)
 }
 
+/// An optional list of strings; anything else reads as empty.
+fn opt_strings(args: &Args, key: &str) -> Vec<String> {
+    match args.opt_value(key) {
+        Some(Value::Array(items)) => {
+            items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+        }
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s],
+        _ => Vec::new(),
+    }
+}
+
+/// An optional boolean flag (absent = false).
+fn opt_flag(args: &Args, key: &str) -> bool {
+    matches!(args.opt_value(key), Some(Value::Bool(true)))
+}
+
 fn fail(message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     CallToolResult::structured_error(json!({ "error": message }))
@@ -550,10 +566,28 @@ impl McpServer {
             "compose_list_projects" => {
                 done(crate::commands::compose::list_compose_projects_core(state).await)
             }
-            "compose_up" | "compose_down" => match args.req_str("file_path") {
+            "compose_up" => match args.req_str("file_path") {
                 Ok(path) => {
-                    let up = spec.name == "compose_up";
-                    done(crate::commands::compose::compose_lifecycle_core(&path, up).await)
+                    let req = crate::commands::compose::UpRequest {
+                        profiles: opt_strings(args, "profiles"),
+                        env_file: args.opt_str("env_file").ok().flatten(),
+                        options: crate::docker::compose::UpOptions {
+                            force_recreate: opt_flag(args, "force_recreate"),
+                            remove_orphans: opt_flag(args, "remove_orphans"),
+                            services: opt_strings(args, "services"),
+                        },
+                    };
+                    done(crate::commands::compose::compose_up_core(&path, req, None).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_down" => match args.req_str("file_path") {
+                Ok(path) => {
+                    let opts = crate::docker::compose::DownOptions {
+                        remove_volumes: opt_flag(args, "remove_volumes"),
+                        remove_orphans: opt_flag(args, "remove_orphans"),
+                    };
+                    done(crate::commands::compose::compose_down_core(&path, opts, None).await)
                 }
                 Err(e) => fail(e.to_string()),
             },
@@ -561,9 +595,56 @@ impl McpServer {
                 (Ok(path), Ok(tail)) => done(
                     crate::commands::compose::compose_logs_core(
                         &path,
-                        tail.unwrap_or(100) as usize,
+                        tail.unwrap_or(200) as usize,
+                        &opt_strings(args, "services"),
                     )
                     .await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "compose_service_action" => {
+                match (args.req_str("project"), args.req_str("service"), args.req_str("action"), args.opt_u64("replicas")) {
+                    (Ok(project), Ok(service), Ok(action), Ok(replicas)) => {
+                        let file = args.opt_str("file_path").ok().flatten();
+                        done(
+                            crate::commands::compose::compose_service_action_core(
+                                &project,
+                                file.as_deref(),
+                                &service,
+                                &action,
+                                replicas.map(|n| n.min(u32::MAX as u64) as u32),
+                                None,
+                            )
+                            .await,
+                        )
+                    }
+                    (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (.., Err(e)) => {
+                        fail(e.to_string())
+                    }
+                }
+            }
+            "compose_config" => match args.req_str("file_path") {
+                Ok(path) => {
+                    let content = args.opt_str("content").ok().flatten();
+                    let env = args.opt_str("env_file").ok().flatten();
+                    done(
+                        crate::commands::compose::compose_validate_core(&path, content, env.as_deref())
+                            .await,
+                    )
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_project_pin" | "compose_project_unpin" => match args.req_str("file_path") {
+                Ok(path) => {
+                    let pin = spec.name == "compose_project_pin";
+                    done(crate::commands::compose::compose_pin_core(state, &path, pin).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_scan" => match (args.req_str("dir"), args.opt_u64("depth")) {
+                (Ok(dir), Ok(depth)) => done(
+                    crate::commands::compose::compose_scan_core(&dir, depth.map(|d| d.min(6) as u32))
+                        .await,
                 ),
                 (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
             },
@@ -578,24 +659,262 @@ impl McpServer {
             "kind_get_status" => ok(json!(crate::docker::kind::kind_status(&state.kind))),
             "cluster_list" => done(kind::list_kind_clusters_core(state).await),
             "cluster_create" => {
-                match (
-                    args.req_str("name"),
-                    args.opt_str("image"),
-                    args.opt_u64("nodes"),
-                ) {
-                    (Ok(name), Ok(image), Ok(nodes)) => done_unit(
-                        kind::create_kind_cluster_core(
+                let parsed = (|| -> Result<_, crate::mcp::args::ArgError> {
+                    Ok((
+                        args.req_str("name")?,
+                        args.opt_str("image")?,
+                        args.opt_u64("nodes")?,
+                        args.opt_str("config")?,
+                    ))
+                })();
+                match parsed {
+                    Ok((name, image, nodes, config)) => {
+                        let spec = match args.opt_value("spec") {
+                            Some(v) => match serde_json::from_value::<
+                                crate::commands::kind_spec::ClusterSpec,
+                            >(v)
+                            {
+                                Ok(s) => s,
+                                Err(e) => return fail(format!("spec: {e}")),
+                            },
+                            None => crate::commands::kind_spec::ClusterSpec::simple(
+                                image,
+                                nodes.map(|n| n as u32),
+                            ),
+                        };
+                        done_unit(
+                            kind::create_kind_cluster_core(state, self.app_ref(), name, spec, config)
+                                .await,
+                        )
+                    }
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            "cluster_add_worker" => match args.req_str("cluster") {
+                Ok(cluster) => done(
+                    crate::commands::kind_nodes::add_cluster_worker_core(state, self.app_ref(), &cluster)
+                        .await,
+                ),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_remove_node" => match (args.req_str("cluster"), args.req_str("node")) {
+                (Ok(cluster), Ok(node)) => done_unit(
+                    crate::commands::kind_nodes::remove_cluster_node_core(
+                        state,
+                        self.app_ref(),
+                        &cluster,
+                        &node,
+                    )
+                    .await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_preview_config" => {
+                let spec = match args.opt_value("spec") {
+                    Some(v) => match serde_json::from_value::<crate::commands::kind_spec::ClusterSpec>(v) {
+                        Ok(s) => s,
+                        Err(e) => return fail(format!("spec: {e}")),
+                    },
+                    None => crate::commands::kind_spec::ClusterSpec::default(),
+                };
+                match args.opt_str("config") {
+                    Ok(config) => ok(json!(
+                        crate::commands::kind_spec::preview_cluster_config_core(state, &spec, config).await
+                    )),
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            "cluster_node_images" => ok(json!(
+                crate::commands::kind_spec::list_kind_node_images_core(state).await
+            )),
+            "local_registry_status" => done(crate::commands::kind_registry::registry_status_core(state).await),
+            "local_registry_start" => match crate::commands::kind_registry::ensure_registry_core(state).await {
+                Ok(()) => done(crate::commands::kind_registry::registry_status_core(state).await),
+                Err(e) => fail(e),
+            },
+            "local_registry_remove" => done_unit(
+                crate::commands::kind_registry::remove_registry_core(
+                    state,
+                    args.bool_or("delete_data", false).unwrap_or(false),
+                )
+                .await,
+            ),
+            "local_registry_push" => match args.req_str("image") {
+                Ok(image) => done(
+                    crate::commands::kind_registry::push_to_local_registry_core(
+                        state,
+                        self.app_ref(),
+                        &image,
+                    )
+                    .await,
+                ),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_connect_registry" => match args.req_str("cluster") {
+                Ok(cluster) => {
+                    let r = async {
+                        crate::commands::kind_registry::ensure_registry_core(state).await?;
+                        crate::commands::kind_registry::wire_cluster_core(state, &cluster).await
+                    }
+                    .await;
+                    done_unit(r)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            // ------------------------------------------- phase 3–5 cluster tools
+            "portforward_list" => match args.opt_str("cluster") {
+                Ok(c) => ok(json!(crate::commands::kind_portforward::list_port_forwards_core(c.as_deref()))),
+                Err(e) => fail(e.to_string()),
+            },
+            "portforward_start" => match camel_args::<crate::commands::kind_portforward::ForwardSpec>(args) {
+                Ok(spec) => done(crate::commands::kind_portforward::start_port_forward_core(self.state.clone(), spec).await),
+                Err(e) => fail(e),
+            },
+            "portforward_stop" => match args.req_str("id") {
+                Ok(id) => done_unit(crate::commands::kind_portforward::stop_port_forward_core(
+                    &id,
+                    args.bool_or("forget", false).unwrap_or(false),
+                )),
+                Err(e) => fail(e.to_string()),
+            },
+            "addon_list" => match args.req_str("cluster") {
+                Ok(c) => done(crate::commands::kind_addons::list_cluster_addons_core(state, &c).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "addon_install" | "addon_uninstall" => match (args.req_str("cluster"), args.req_str("addon")) {
+                (Ok(c), Ok(a)) => done_unit(
+                    crate::commands::kind_addons::addon_op_wait(state, self.app_ref(), &c, &a, spec.name == "addon_install").await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "dashboard_token" => match args.req_str("cluster") {
+                Ok(c) => done(crate::commands::kind_addons::dashboard_token_core(state, &c).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "ingress_list" => match args.req_str("cluster") {
+                Ok(c) => done(crate::commands::kind_addons::list_cluster_ingresses_core(state, &c).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "ingress_expose" => match (args.req_str("cluster"), args.req_str("host")) {
+                (Ok(c), Ok(h)) => done_unit(
+                    crate::commands::kind_addons::expose_ingress_host_core(
+                        state,
+                        &c,
+                        &h,
+                        args.bool_or("expose", true).unwrap_or(true),
+                    )
+                    .await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_link_service" => match camel_args::<crate::commands::kind_links::LinkRequest>(args) {
+                Ok(req) => done(crate::commands::kind_links::link_cluster_service_core(state, req).await),
+                Err(e) => fail(e),
+            },
+            "cluster_service_links" => match args.req_str("cluster") {
+                Ok(c) => done(crate::commands::kind_links::list_service_links_core(state, &c).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_unlink_service" | "cluster_check_link" => {
+                match (args.req_str("cluster"), args.req_str("namespace"), args.req_str("name")) {
+                    (Ok(c), Ok(ns), Ok(n)) => {
+                        if spec.name == "cluster_unlink_service" {
+                            done_unit(crate::commands::kind_links::unlink_cluster_service_core(state, &c, &ns, &n).await)
+                        } else {
+                            done(crate::commands::kind_links::check_service_link_core(state, &c, &ns, &n).await)
+                        }
+                    }
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+                }
+            }
+            "helm_list" => match args.req_str("cluster") {
+                Ok(c) => done(crate::commands::kind_helm::helm_list_releases_core(state, &c).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "helm_release" => match (args.req_str("cluster"), args.req_str("namespace"), args.req_str("name")) {
+                (Ok(c), Ok(ns), Ok(n)) => done(crate::commands::kind_helm::helm_release_detail_core(state, &c, &ns, &n).await),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+            },
+            "helm_install" => match camel_args::<crate::commands::kind_helm::HelmInstallRequest>(args) {
+                Ok(req) => done(crate::commands::kind_helm::helm_install_core(state, req).await),
+                Err(e) => fail(e),
+            },
+            "helm_rollback" => match (
+                args.req_str("cluster"),
+                args.req_str("namespace"),
+                args.req_str("name"),
+                args.opt_u64("revision"),
+            ) {
+                (Ok(c), Ok(ns), Ok(n), Ok(Some(r))) => done_unit(
+                    crate::commands::kind_helm::helm_rollback_core(state, &c, &ns, &n, r as u32).await,
+                ),
+                (_, _, _, Ok(None)) => fail("missing required argument 'revision'".to_string()),
+                (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => fail(e.to_string()),
+            },
+            "helm_uninstall" => match (args.req_str("cluster"), args.req_str("namespace"), args.req_str("name")) {
+                (Ok(c), Ok(ns), Ok(n)) => done_unit(crate::commands::kind_helm::helm_uninstall_core(state, &c, &ns, &n).await),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
+            },
+            "helm_repo_list" => done(crate::commands::kind_helm::helm_repo_list().await),
+            "helm_repo_add" => match (args.req_str("name"), args.req_str("url")) {
+                (Ok(n), Ok(u)) => done_unit(crate::commands::kind_helm::helm_repo_add_core(&n, &u).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "helm_repo_remove" => match args.req_str("name") {
+                Ok(n) => done_unit(crate::commands::kind_helm::helm_repo_remove(n).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "helm_repo_update" => done(crate::commands::kind_helm::helm_repo_update().await),
+            "helm_search" => match args.opt_str("query") {
+                Ok(q) => done(
+                    crate::commands::kind_helm::helm_search_core(
+                        q.as_deref().unwrap_or(""),
+                        args.bool_or("versions", false).unwrap_or(false),
+                    )
+                    .await,
+                ),
+                Err(e) => fail(e.to_string()),
+            },
+            "helm_show_values" => match (args.req_str("chart"), args.opt_str("version")) {
+                (Ok(c), Ok(v)) => done(crate::commands::kind_helm::helm_show_values(c, v).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_snapshot_list" => match args.opt_str("cluster") {
+                Ok(c) => done(crate::commands::kind_snapshots::list_cluster_snapshots_core(c.as_deref())),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_snapshot_create" => match (args.req_str("cluster"), args.opt_str("note")) {
+                (Ok(c), Ok(note)) => done(
+                    crate::commands::kind_snapshots::create_cluster_snapshot_core(state, self.app_ref(), &c, note).await,
+                ),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_snapshot_delete" => match (args.req_str("cluster"), args.req_str("id")) {
+                (Ok(c), Ok(id)) => done_unit(crate::commands::kind_snapshots::delete_cluster_snapshot_core(state, &c, &id).await),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_snapshot_restore" | "cluster_clone" => {
+                let new_name = if spec.name == "cluster_clone" { args.req_str("new_name").map(Some) } else { Ok(None) };
+                match (args.req_str("cluster"), args.req_str("id"), new_name) {
+                    (Ok(cluster), Ok(id), Ok(new_name)) => done(
+                        crate::commands::kind_snapshots::restore_cluster_snapshot_core(
                             state,
                             self.app_ref(),
-                            name,
-                            image,
-                            nodes.map(|n| n as u32),
+                            crate::commands::kind_snapshots::RestoreRequest { cluster, id, new_name },
                         )
                         .await,
                     ),
                     (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
                 }
             }
+            "cluster_alerts" => match args.opt_str("cluster") {
+                Ok(c) => ok(json!(crate::commands::kind_watch::scan_cluster_alerts(state, c.as_deref()).await)),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_history" => match (args.req_str("cluster"), args.opt_str("range")) {
+                (Ok(c), Ok(r)) => done(crate::commands::kind_watch::cluster_history_core(&c, r.as_deref().unwrap_or("1h"))),
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
             "cluster_delete" => match args.req_str("name") {
                 Ok(name) => {
                     done_unit(kind::delete_kind_cluster_core(state, self.app_ref(), name).await)
@@ -1623,4 +1942,28 @@ mod agent_path_tests {
         assert!(agent_path_allowed_in(&home.join("missing"), h).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+/// Deserialises a tool's snake_case arguments into a camelCase request type.
+fn camel_args<T: serde::de::DeserializeOwned>(args: &crate::mcp::args::Args) -> Result<T, String> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in args.raw() {
+        if v.is_null() {
+            continue;
+        }
+        let mut out = String::new();
+        let mut up = false;
+        for ch in k.chars() {
+            if ch == '_' {
+                up = true;
+            } else if up {
+                out.extend(ch.to_uppercase());
+                up = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        m.insert(out, v.clone());
+    }
+    serde_json::from_value(serde_json::Value::Object(m)).map_err(|e| format!("invalid arguments: {e}"))
 }

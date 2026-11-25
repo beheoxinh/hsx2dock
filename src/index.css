@@ -23,7 +23,7 @@
     --border: 240 3.7% 15.9%;
     --input: 240 3.7% 15.9%;
     --ring: 240 4.9% 83.9%;
-    --radius: 0.625rem;
+    --radius: 0;
   }
 }
 
@@ -39,7 +39,6 @@
 
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
-  border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {

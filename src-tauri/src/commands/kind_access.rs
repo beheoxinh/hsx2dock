@@ -75,6 +75,7 @@ fn host_port_free(port: u16) -> bool {
 
 /// `networking:` block for a new cluster's config, or empty when every port in
 /// the range is taken (kind then falls back to a random port).
+#[cfg(test)]
 pub(crate) fn networking_yaml(port: Option<u16>) -> String {
     match port {
         Some(p) => format!("networking:\n  apiServerAddress: \"127.0.0.1\"\n  apiServerPort: {p}\n"),
@@ -103,14 +104,14 @@ pub(crate) fn kubeadm_timeouts_patch(image: Option<&str>) -> &'static str {
     }
 }
 
-/// Picks a port and writes the config while holding the pick lock, so the
-/// next create sees this one's claim.
-pub(crate) fn write_config_with_api_port(
+/// Picks a free API port and writes the config while holding the pick lock,
+/// so the next create sees this one's claim. For any config: `render` gets the
+/// picked port (None when the range is exhausted) and returns the file text.
+pub(crate) fn write_config_with(
     paths: &KindPaths,
     config_path: &Path,
-    nodes_yaml: &str,
-    image: Option<&str>,
     bound: &HashSet<u16>,
+    render: impl FnOnce(Option<u16>) -> Result<String, String>,
 ) -> Result<Option<u16>, String> {
     let _pick = PORT_PICK.lock().unwrap_or_else(|e| e.into_inner());
     let mut taken = claimed_api_ports(paths);
@@ -122,14 +123,55 @@ pub(crate) fn write_config_with_api_port(
              (it may not be reachable from the host)"
         );
     }
-    let config_yaml = format!(
-        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n{}{}nodes:\n{nodes_yaml}",
-        networking_yaml(port),
-        kubeadm_timeouts_patch(image),
-    );
+    let config_yaml = render(port)?;
     std::fs::write(config_path, config_yaml)
         .map_err(|e| format!("failed to write kind cluster config: {e}"))?;
     Ok(port)
+}
+
+/// A free API server port for a cluster created outside kind (clone), with
+/// the same exclusions a new kind cluster gets.
+pub(crate) fn pick_free_api_port(paths: &KindPaths, bound: &HashSet<u16>) -> Option<u16> {
+    let _pick = PORT_PICK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = claimed_api_ports(paths);
+    taken.extend(bound);
+    pick_api_server_port(&taken, host_port_free)
+}
+
+/// Whether a host port can be bound on the loopback right now.
+pub(crate) fn host_port_is_free(port: u16) -> bool {
+    host_port_free(port)
+}
+
+/// Every host port published by any kind node container (running or not):
+/// a new cluster must not reuse them, or it fails to start later.
+pub(crate) async fn kind_published_ports(state: &AppState) -> HashSet<u16> {
+    let mut out = HashSet::new();
+    let Ok(client) = local_client(state).await else {
+        return out;
+    };
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("label".to_string(), vec!["io.x-k8s.kind.cluster".to_string()]);
+    let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let Ok(list) = client.docker().list_containers(Some(opts)).await else {
+        return out;
+    };
+    for c in list {
+        let Some(id) = c.id else { continue };
+        let Ok(info) = client.docker().inspect_container(&id, None).await else {
+            continue;
+        };
+        let bindings = info.host_config.and_then(|h| h.port_bindings).unwrap_or_default();
+        for b in bindings.into_values().flatten().flatten() {
+            if let Some(p) = b.host_port.and_then(|p| p.parse::<u16>().ok()) {
+                out.insert(p);
+            }
+        }
+    }
+    out
 }
 
 /// Whether pasta skips forwarding `port` (the host can't reach it).

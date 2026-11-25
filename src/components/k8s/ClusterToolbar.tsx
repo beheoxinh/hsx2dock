@@ -46,13 +46,7 @@ export interface ClusterToolbarProps {
   /** Visible cards / total clusters, shown when a filter hides some. */
   visibleCount: number;
   totalCount: number;
-  selectedCount: number;
-  /** Every visible card is selected. */
-  allVisibleSelected: boolean;
-  someVisibleSelected: boolean;
-  onToggleAllVisible: () => void;
-  onClearSelection: () => void;
-  /** Selected clusters that a bulk Start / Stop would act on. */
+  /** Clusters that Start all / Stop all would act on. */
   startableCount: number;
   stoppableCount: number;
   onBulkStart: () => void;
@@ -63,19 +57,18 @@ export interface ClusterToolbarProps {
 
 const chipClass = (active: boolean) =>
   cn(
-    "inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full border text-[11px] font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-blue-500",
+    "inline-flex items-center gap-1.5 h-6 px-2.5 rounded-none border text-[11px] font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-blue-500",
     active
       ? "bg-blue-500/15 border-blue-500/40 text-blue-200"
       : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
   );
 
 /**
- * One compact row above the list: search, status and tag chips, then select-all
- * and sort. Bulk Start / Stop appear only while something is selected.
+ * One compact row above the list: search, status and tag chips, then
+ * Start all / Stop all and sort.
  */
 export const ClusterToolbar: React.FC<ClusterToolbarProps> = (p) => {
   const running = p.bulkProgress !== null;
-  const filtered = p.visibleCount !== p.totalCount;
 
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -140,66 +133,36 @@ export const ClusterToolbar: React.FC<ClusterToolbarProps> = (p) => {
       )}
 
       <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 sm:ml-auto">
-        <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
-          <input
-            ref={(el) => {
-              if (el) el.indeterminate = p.someVisibleSelected && !p.allVisibleSelected;
-            }}
-            type="checkbox"
-            aria-label="Select all visible clusters"
-            checked={p.allVisibleSelected}
-            disabled={p.visibleCount === 0 || p.disabled}
-            onChange={p.onToggleAllVisible}
-            className="rounded border-zinc-700 w-4 h-4 accent-blue-500"
-          />
-          <span>All{filtered ? ` (${p.visibleCount}/${p.totalCount})` : ""}</span>
-        </label>
-
-        {p.selectedCount > 0 && (
-          <>
-            <span className="font-mono text-[11px] text-zinc-500">{p.selectedCount} selected</span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={p.onBulkStart}
-              disabled={p.disabled || running || p.startableCount === 0}
-              title={
-                p.startableCount === 0
-                  ? "No selected cluster is stopped"
-                  : `Start ${p.startableCount} stopped cluster${p.startableCount === 1 ? "" : "s"}`
-              }
-              className="gap-1.5 h-7"
-            >
-              <Play className="w-3.5 h-3.5" />
-              <span>Start {p.startableCount}</span>
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={p.onBulkStop}
-              disabled={p.disabled || running || p.stoppableCount === 0}
-              title={
-                p.stoppableCount === 0
-                  ? "No selected cluster is running"
-                  : `Stop ${p.stoppableCount} running cluster${p.stoppableCount === 1 ? "" : "s"} (data is kept)`
-              }
-              className="gap-1.5 h-7"
-            >
-              <Square className="w-3.5 h-3.5" />
-              <span>Stop {p.stoppableCount}</span>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={p.onClearSelection}
-              disabled={running}
-              title="Clear the selection"
-              className="h-7"
-            >
-              Clear
-            </Button>
-          </>
-        )}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={p.onBulkStart}
+          disabled={p.disabled || running || p.startableCount === 0}
+          title={
+            p.startableCount === 0
+              ? "Every cluster is already running"
+              : `Start ${p.startableCount} stopped cluster${p.startableCount === 1 ? "" : "s"}`
+          }
+          className="gap-1.5 h-7"
+        >
+          <Play className="w-3.5 h-3.5" />
+          <span>Start all</span>
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={p.onBulkStop}
+          disabled={p.disabled || running || p.stoppableCount === 0}
+          title={
+            p.stoppableCount === 0
+              ? "No cluster is running"
+              : `Stop ${p.stoppableCount} running cluster${p.stoppableCount === 1 ? "" : "s"} (data is kept)`
+          }
+          className="gap-1.5 h-7"
+        >
+          <Square className="w-3.5 h-3.5" />
+          <span>Stop all</span>
+        </Button>
 
         {p.bulkProgress && (
           <span

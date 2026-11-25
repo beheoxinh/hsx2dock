@@ -358,10 +358,35 @@ async fn kind_node_sizes(client: &crate::docker::client::DockerClient) -> NodeSi
             )
             .await;
             if let Ok(Ok(list)) = pass {
-                let map: NodeSizes = list
+                // The RW layer is tiny: images, snapshots and container logs
+                // live in the node's containerd state dir on the host (the
+                // d_type bind mount), so that dir is what "disk" must count.
+                let entries: Vec<(String, u64, Option<std::path::PathBuf>)> = list
                     .into_iter()
-                    .filter_map(|c| Some((c.id?, c.size_rw.unwrap_or(0).max(0) as u64)))
+                    .filter_map(|c| {
+                        let id = c.id?;
+                        let rw = c.size_rw.unwrap_or(0).max(0) as u64;
+                        let cluster = c.labels.as_ref().and_then(|l| l.get(CLUSTER_LABEL)).cloned();
+                        let state_dir = cluster.and_then(|name| {
+                            c.mounts.iter().flatten().find_map(|m| {
+                                if m.destination.as_deref() != Some("/var/lib/containerd") {
+                                    return None;
+                                }
+                                let src = m.source.as_deref()?;
+                                state_dir_from_mount(src, &name).map(|_| std::path::PathBuf::from(src))
+                            })
+                        });
+                        Some((id, rw, state_dir))
+                    })
                     .collect();
+                let map: NodeSizes = tokio::task::spawn_blocking(move || {
+                    entries
+                        .into_iter()
+                        .map(|(id, rw, dir)| (id, rw + dir.as_deref().map(dir_allocated_bytes).unwrap_or(0)))
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
                 *NODE_SIZES.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some((std::time::Instant::now(), map));
             }
@@ -369,6 +394,39 @@ async fn kind_node_sizes(client: &crate::docker::client::DockerClient) -> NodeSi
         });
     }
     last
+}
+
+/// Bytes allocated on disk under `root` (like `du -s`): symlinks are not
+/// followed, other filesystems are skipped, and entries the host user may not
+/// read (subuid-owned dirs inside image layers) are left out instead of
+/// failing the whole walk.
+fn dir_allocated_bytes(root: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(root) else {
+        return 0;
+    };
+    let dev = meta.dev();
+    let mut seen_inodes = std::collections::HashSet::new();
+    let mut total = meta.blocks() * 512;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else { continue };
+        for entry in read.flatten() {
+            let Ok(m) = entry.metadata() else { continue };
+            if m.dev() != dev {
+                continue;
+            }
+            // Hard links (shared snapshot files) are counted once.
+            if m.nlink() > 1 && !m.is_dir() && !seen_inodes.insert(m.ino()) {
+                continue;
+            }
+            total += m.blocks() * 512;
+            if m.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    total
 }
 
 /// Runs a card kubectl query with the short card budget.
@@ -869,8 +927,11 @@ pub async fn create_kind_cluster(
     name: String,
     image: Option<String>,
     nodes: Option<u32>,
+    spec: Option<super::kind_spec::ClusterSpec>,
+    config: Option<String>,
 ) -> Result<(), String> {
-    create_kind_cluster_core(&state, Some(&app), name, image, nodes).await
+    let spec = spec.unwrap_or_else(|| super::kind_spec::ClusterSpec::simple(image, nodes));
+    create_kind_cluster_core(&state, Some(&app), name, spec, config).await
 }
 
 /// App-free core of [`create_kind_cluster`], shared with the MCP server: with
@@ -879,9 +940,10 @@ pub(crate) async fn create_kind_cluster_core(
     state: &AppState,
     app: Option<&AppHandle>,
     name: String,
-    image: Option<String>,
-    nodes: Option<u32>,
+    spec: super::kind_spec::ClusterSpec,
+    raw_config: Option<String>,
 ) -> Result<(), String> {
+    use super::kind_spec::{config_uses_registry, finalize_config, spec_to_yaml, validate_spec};
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Cluster name is required".into());
@@ -906,23 +968,36 @@ pub(crate) async fn create_kind_cluster_core(
         return Err(format!("A cluster named '{name}' already exists"));
     }
 
-    let n = nodes.unwrap_or(1).clamp(1, 10);
-    let image = image
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // The wizard's spec, or a config the user edited in the preview. Either
+    // way it is finalized again below, which forces in the state mounts and
+    // the API port, so an edit cannot drop them.
+    let raw_config = raw_config.filter(|c| !c.trim().is_empty());
+    let user_config = match &raw_config {
+        Some(text) => text.clone(),
+        None => {
+            let errors = validate_spec(&spec, |p| std::path::Path::new(p).exists());
+            if !errors.is_empty() {
+                return Err(errors.join("; "));
+            }
+            spec_to_yaml(&spec)
+        }
+    };
+    let registry = spec.local_registry || config_uses_registry(&user_config);
+    // Dry run: node count and published host ports, before touching disk.
+    let probe = finalize_config(&user_config, |i| format!("/probe/node{i}"), None, registry)?;
+    let taken_by_kind = super::kind_access::kind_published_ports(state).await;
+    for port in &probe.host_ports {
+        if taken_by_kind.contains(port) {
+            return Err(format!("Host port {port} is already published by another cluster"));
+        }
+        if !super::kind_access::host_port_is_free(*port) {
+            return Err(format!("Host port {port} is already in use on this machine"));
+        }
+    }
+    if registry {
+        super::kind_registry::ensure_registry_core(state).await?;
+    }
 
-    // The node's containerd state lives on the engine's data root, and when
-    // that filesystem reports DT_UNKNOWN for every dirent (d_type-less ext4
-    // under fuse-overlayfs — see `ensure_snapshotter_compat`), containerd's
-    // overlayfs/erofs snapshotters refuse to load, the CRI plugin never
-    // registers, and kubeadm dies with "unknown service
-    // runtime.v1.RuntimeService". Bind-mounting a d_type-capable directory
-    // over /var/lib/containerd inside every node — the same fix the engine
-    // itself uses for its own containerd — keeps image layers and snapshotter
-    // state on a filesystem containerd accepts. Per-node dirs, or two nodes
-    // would share one content store on the host.
     let dtype_root = crate::docker::engine::dtype_compat_root().ok_or_else(|| {
         "no d_type-capable directory is available for the kind node containerd state".to_string()
     })?;
@@ -940,9 +1015,7 @@ pub(crate) async fn create_kind_cluster_core(
             )
         })?;
     }
-    let mut nodes_yaml = String::new();
-    for i in 0..n {
-        let role = if i == 0 { "control-plane" } else { "worker" };
+    for i in 0..probe.nodes {
         let node_state = cluster_state.join(format!("node{i}"));
         std::fs::create_dir_all(&node_state)
             .map_err(|e| format!("cannot create {}: {e}", node_state.display()))?;
@@ -953,28 +1026,23 @@ pub(crate) async fn create_kind_cluster_core(
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&node_state, std::fs::Permissions::from_mode(0o777));
         }
-        nodes_yaml.push_str(&format!("  - role: {role}"));
-        if let Some(img) = &image {
-            nodes_yaml.push_str(&format!("\n    image: {img}"));
-        }
-        nodes_yaml.push_str("\n    extraMounts:\n");
-        nodes_yaml.push_str(&format!("      - hostPath: {}\n", node_state.display()));
-        nodes_yaml.push_str("        containerPath: /var/lib/containerd\n");
-        nodes_yaml.push_str("        readOnly: false\n");
     }
     let config_path = cluster_config_path(paths, &name)
         .ok_or_else(|| "kind data directory is unavailable".to_string())?;
     // A fixed API port the host can reach (kind's random one lands in the
     // range the engine's network never forwards — see `kind_access`).
     let bound = super::kind_access::bound_api_ports(state).await;
-    let api_port =
-        super::kind_access::write_config_with_api_port(
-            paths,
-            &config_path,
-            &nodes_yaml,
-            image.as_deref(),
-            &bound,
-        )?;
+    let state_for = |i: usize| cluster_state.join(format!("node{i}")).display().to_string();
+    let api_port = super::kind_access::write_config_with(paths, &config_path, &bound, |port| {
+        finalize_config(&user_config, state_for, port, registry).map(|f| f.yaml)
+    });
+    let api_port = match api_port {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup_cluster_state(&name, &[]);
+            return Err(e);
+        }
+    };
     if let Some(p) = api_port {
         emit_kind_progress(
             app,
@@ -1012,6 +1080,18 @@ pub(crate) async fn create_kind_cluster_core(
         // kind ships nodes with on-failure:1 — pin them so a later engine
         // start cannot resurrect a cluster the user stopped.
         let _ = enforce_kind_restart_policy(state).await;
+        if registry {
+            emit_kind_progress(
+                app,
+                serde_json::json!({ "action": "create", "name": name, "line": "Connecting the local registry…" }),
+            );
+            if let Err(e) = super::kind_registry::wire_cluster_core(state, &name).await {
+                emit_kind_progress(
+                    app,
+                    serde_json::json!({ "action": "create", "name": name, "line": format!("Local registry: {e}") }),
+                );
+            }
+        }
     } else {
         // kind removes its nodes on a clean failure, but not when it was
         // killed on timeout, and never the node state dirs (image layers,
@@ -1104,6 +1184,9 @@ pub(crate) async fn delete_kind_cluster_core(
     let name = name.trim().to_string();
     check_cluster_name(&name)?;
     let _busy = ClusterBusy::claim(&name)?;
+    super::kind_portforward::stop_cluster_forwards(&name);
+    super::kind_watch::forget_cluster(&name);
+    super::k8s_tools::forget_cluster_kubeconfig(state, &name);
     let host = docker_host_for(state);
     let paths = &state.kind;
     if let Some(cfg) = cluster_config_path(paths, &name) {
@@ -1166,6 +1249,25 @@ pub(crate) fn check_cluster_name(name: &str) -> Result<(), String> {
 /// `mounted` are the state dirs the node containers actually used (see
 /// [`cluster_state_dirs`]): a cluster created before the app was renamed
 /// keeps its state under the legacy data dir, not the current compat root.
+/// Removes one node's containerd state dir — only when `dir` really is a
+/// `…/kind-nodes/<cluster>/node<N>` path (never the cluster's whole dir).
+pub(crate) fn remove_node_state(cluster: &str, dir: &std::path::Path) {
+    if check_cluster_name(cluster).is_err() {
+        return;
+    }
+    // `state_dir_from_mount` validates the node path and yields its cluster
+    // dir; only the node dir itself is removed here.
+    if state_dir_from_mount(&dir.to_string_lossy(), cluster).is_none() {
+        tracing::warn!("refusing to remove unexpected node state path {}", dir.display());
+        return;
+    }
+    if dir.is_dir() {
+        if let Err(e) = remove_state_dir(dir) {
+            tracing::warn!("could not clean kind node state {}: {e}", dir.display());
+        }
+    }
+}
+
 pub(crate) fn cleanup_cluster_state(name: &str, mounted: &[std::path::PathBuf]) {
     // The name becomes a path component of a recursive delete: `..` or `.`
     // would have wiped the engine's compat root or every cluster's state.
@@ -1307,7 +1409,9 @@ pub async fn start_kind_cluster(
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
-    set_cluster_power(Some(&app), &state, &name, true).await
+    set_cluster_power(Some(&app), &state, &name, true).await?;
+    super::kind_portforward::restore_cluster_forwards(state.inner().clone(), name.trim().to_string());
+    Ok(())
 }
 
 /// Stops every node container of a cluster (state persists; Start resumes it).
@@ -1329,6 +1433,9 @@ pub(crate) async fn set_cluster_power(
     let name = name.trim();
     check_cluster_name(name)?;
     let _busy = ClusterBusy::claim(name)?;
+    if !start {
+        super::kind_portforward::stop_cluster_forwards(name);
+    }
     if start {
         // Re-apply the cluster's per-node caps so a resumed cluster starts
         // under the same limits (docker keeps them across stop/start, but a
@@ -1412,6 +1519,17 @@ pub(crate) async fn set_cluster_power(
                 let err_str = e.to_string();
                 if err_str.contains("failed to create endpoint") && err_str.contains("on network kind") {
                     tracing::warn!("reconnecting node {id} to kind network due to stale endpoint: {err_str}");
+                    // Keep a pinned address (cloned clusters have one).
+                    let pinned = client
+                        .docker()
+                        .inspect_container(&id, None)
+                        .await
+                        .ok()
+                        .and_then(|i| i.network_settings)
+                        .and_then(|n| n.networks)
+                        .and_then(|mut n| n.remove("kind"))
+                        .and_then(|e| e.ipam_config)
+                        .filter(|c| c.ipv4_address.as_deref().is_some_and(|a| !a.is_empty()));
                     let _ = client.docker().disconnect_network(
                         "kind",
                         bollard::models::NetworkDisconnectRequest {
@@ -1423,7 +1541,10 @@ pub(crate) async fn set_cluster_power(
                         "kind",
                         bollard::models::NetworkConnectRequest {
                             container: id.clone(),
-                            endpoint_config: None,
+                            endpoint_config: pinned.map(|c| bollard::models::EndpointSettings {
+                                ipam_config: Some(c),
+                                ..Default::default()
+                            }),
                         },
                     ).await;
                     res = client.start_container(&id).await;
@@ -1453,6 +1574,9 @@ pub(crate) async fn set_cluster_power(
         serde_json::json!({ "action": action, "name": name, "line": summary }),
     );
     invalidate_kind_clusters_cache().await;
+    if start && changed > 0 {
+        super::kind_registry::start_for_cluster(state, name).await;
+    }
     Ok(())
 }
 
@@ -4097,6 +4221,20 @@ pub(crate) async fn get_workload_logs_core(
 #[cfg(test)]
 mod resource_view_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn allocated_bytes_counts_nested_files_once() {
+        let root = std::env::temp_dir().join(format!("hsx2dock-du-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/f"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::hard_link(root.join("a/b/f"), root.join("a/g")).unwrap();
+        let total = dir_allocated_bytes(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(total >= 64 * 1024, "{total}");
+        assert!(total < 2 * 64 * 1024 + 64 * 1024, "hard link counted twice: {total}");
+        assert_eq!(dir_allocated_bytes(std::path::Path::new("/nonexistent/x")), 0);
+    }
 
     #[test]
     fn state_dir_only_from_kind_node_mounts() {

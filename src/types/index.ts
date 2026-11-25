@@ -170,10 +170,79 @@ export interface ComposeService {
   ports: string;
 }
 
+export interface ComposePortSpec {
+  published: string;
+  target: number;
+  protocol: string;
+}
+
+/** A service as the compose file declares it (`compose config`). */
+export interface ComposeServiceSpec {
+  name: string;
+  image: string;
+  build: boolean;
+  depends_on: string[];
+  ports: ComposePortSpec[];
+  profiles: string[];
+  healthcheck: boolean;
+  replicas: number | null;
+  container_name: string;
+}
+
+export interface ComposeModel {
+  name: string;
+  services: ComposeServiceSpec[];
+  profiles: string[];
+}
+
+export type ComposeProjectSource = "settings" | "pinned" | "labels";
+
 export interface ComposeProjectInfo {
   name: string;
+  /** Compose file path; empty when unknown. */
   path: string;
+  /** One row per container of the project. */
   services: ComposeService[];
+  source?: ComposeProjectSource;
+  pinned?: boolean;
+  working_dir?: string;
+  declared?: ComposeServiceSpec[];
+  profiles?: string[];
+  /** The project's default `.env`, when it exists. */
+  env_file?: string;
+  config_error?: string;
+}
+
+export interface ComposeUpOptions {
+  profiles?: string[];
+  env_file?: string | null;
+  force_recreate?: boolean;
+  remove_orphans?: boolean;
+  services?: string[];
+}
+
+export interface ComposeDownOptions {
+  remove_volumes?: boolean;
+  remove_orphans?: boolean;
+}
+
+export type ComposeServiceAction = "start" | "stop" | "restart" | "up" | "recreate" | "scale";
+
+export interface ComposeValidation {
+  ok: boolean;
+  error: string;
+  model: ComposeModel | null;
+}
+
+export interface ComposeEnvFile {
+  path: string;
+  exists: boolean;
+  content: string;
+}
+
+export interface ComposeProgressPayload {
+  op_id: string;
+  line: string;
 }
 
 export interface DfReport {
@@ -324,6 +393,8 @@ export interface NotificationPrefs {
   kind_events: boolean;
   /** The window was closed into the tray (app + engine keep running). */
   tray_hidden: boolean;
+  /** Kubernetes incident alerts (cluster watcher). */
+  k8s_alerts?: K8sAlertPrefs;
 }
 
 /** `exec-output` payload streamed while an interactive exec session runs. */
@@ -1038,4 +1109,279 @@ export interface GroupOp {
 export interface ContainerOpsSnapshot {
   containers: ContainerOp[];
   groups: GroupOp[];
+}
+
+// ---------------------------------------------------------- advanced create
+
+export interface PortMappingSpec {
+  containerPort: number;
+  hostPort: number;
+  protocol: "TCP" | "UDP" | "SCTP";
+}
+
+export interface HostMountSpec {
+  hostPath: string;
+  containerPath: string;
+  readOnly: boolean;
+}
+
+/** Mirrors `kind_spec::ClusterSpec` (serde camelCase). */
+export interface ClusterSpec {
+  image: string | null;
+  controlPlanes: number;
+  workers: number;
+  ingress: boolean;
+  ingressHttpPort: number;
+  ingressHttpsPort: number;
+  portMappings: PortMappingSpec[];
+  mounts: HostMountSpec[];
+  podSubnet: string | null;
+  serviceSubnet: string | null;
+  featureGates: string[];
+  localRegistry: boolean;
+}
+
+export interface ClusterConfigPreview {
+  yaml: string;
+  finalYaml: string | null;
+  nodes: number;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface NodeImageOption {
+  image: string;
+  version: string;
+  local: boolean;
+  default: boolean;
+}
+
+export interface LocalRegistryStatus {
+  exists: boolean;
+  running: boolean;
+  host: string;
+  image: string;
+  connectedClusters: string[];
+  repositories: string[];
+}
+
+export interface ClusterPreset {
+  name: string;
+  description: string;
+  builtin: boolean;
+  spec: ClusterSpec;
+}
+
+// ---------------------------------------------------------------- Phase 3–5
+
+export interface K8sToolStatus {
+  name: string;
+  version: string;
+  installed: boolean;
+  path: string;
+}
+
+export interface PortForwardSpec {
+  cluster: string;
+  namespace: string;
+  /** svc | pod | deployment */
+  kind: "svc" | "pod" | "deployment";
+  name: string;
+  remotePort: number;
+  /** 0 = pick a free port. */
+  localPort?: number;
+  autoStart?: boolean;
+}
+
+export interface PortForwardInfo extends Required<PortForwardSpec> {
+  id: string;
+  /** starting | active | reconnecting | stopped | error */
+  status: string;
+  message: string | null;
+  restarts: number;
+  url: string;
+}
+
+export interface AddonStatus {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  /** not-installed | installing | uninstalling | progressing | ready | error */
+  state: string;
+  message: string | null;
+  detail: string | null;
+}
+
+export interface AddonProgressPayload {
+  cluster: string;
+  addon: string;
+  line: string;
+  done: boolean;
+  error: string | null;
+}
+
+export interface IngressUrl {
+  host: string;
+  url: string | null;
+  exposed: boolean;
+  note: string | null;
+}
+
+export interface IngressInfo {
+  namespace: string;
+  name: string;
+  class: string | null;
+  hosts: string[];
+  tls: boolean;
+  urls: IngressUrl[];
+}
+
+export interface ServiceLinkRequest {
+  sourceCluster: string;
+  sourceNamespace: string;
+  sourceService: string;
+  targetCluster: string;
+  targetNamespace: string;
+  name?: string | null;
+}
+
+export interface ServiceLinkPort {
+  name: string;
+  port: number;
+  remotePort: number;
+  protocol: string;
+}
+
+export interface ServiceLink {
+  namespace: string;
+  name: string;
+  /** cluster/namespace/service */
+  source: string;
+  address: string;
+  ports: ServiceLinkPort[];
+  mode: string;
+}
+
+export interface ServiceLinkCheck {
+  port: number;
+  ok: boolean;
+  message: string;
+}
+
+export interface HelmRelease {
+  name: string;
+  namespace: string;
+  revision: string;
+  updated: string;
+  status: string;
+  chart: string;
+  app_version: string;
+}
+
+export interface HelmRevision {
+  revision: number;
+  updated: string;
+  status: string;
+  chart: string;
+  app_version: string;
+  description: string;
+}
+
+export interface HelmReleaseDetail {
+  values: string;
+  allValues: string;
+  manifest: string;
+  notes: string;
+  history: HelmRevision[];
+}
+
+export interface HelmInstallRequest {
+  cluster: string;
+  namespace: string;
+  name: string;
+  chart: string;
+  version?: string | null;
+  values?: string | null;
+  upgrade?: boolean;
+  reuseValues?: boolean;
+}
+
+export interface HelmRepo {
+  name: string;
+  url: string;
+}
+
+export interface HelmChart {
+  name: string;
+  version: string;
+  app_version: string;
+  description: string;
+}
+
+export interface ClusterSnapshot {
+  id: string;
+  cluster: string;
+  created: string;
+  note: string | null;
+  nodeImage: string;
+  nodes: string[];
+  sizeBytes: number;
+}
+
+export interface SnapshotProgressPayload {
+  cluster: string;
+  line: string;
+  done: boolean;
+  error: string | null;
+}
+
+export type ClusterAlertKind =
+  | "crash-loop"
+  | "image-pull"
+  | "oom"
+  | "restart-spike"
+  | "node-not-ready"
+  | "api-down"
+  | "pvc-pending";
+
+export interface ClusterAlert {
+  key: string;
+  cluster: string;
+  kind: ClusterAlertKind;
+  severity: "error" | "warning";
+  namespace: string | null;
+  object: string;
+  message: string;
+  /** Unix seconds when first seen. */
+  since: number;
+}
+
+export interface ClusterAlertsEvent {
+  cluster: string;
+  alerts: ClusterAlert[];
+  fresh: ClusterAlert[];
+}
+
+export interface K8sAlertPrefs {
+  enabled: boolean;
+  crash_loop: boolean;
+  image_pull: boolean;
+  oom: boolean;
+  restart_spike: boolean;
+  node_not_ready: boolean;
+  api_down: boolean;
+  pvc_pending: boolean;
+  muted_clusters: string[];
+}
+
+export type HistoryRange = "1h" | "6h" | "24h" | "7d";
+
+export interface HistorySample {
+  /** Unix seconds. */
+  t: number;
+  cpuPercent: number;
+  memMb: number;
+  pods: number;
+  runningPods: number;
 }

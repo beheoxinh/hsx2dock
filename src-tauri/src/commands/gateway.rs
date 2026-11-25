@@ -70,6 +70,14 @@ pub async fn save_gateway_routes(
     state: State<'_, Arc<AppState>>,
     routes: Vec<GatewayRoute>,
 ) -> Result<(), String> {
+    save_gateway_routes_core(&state, routes).await
+}
+
+/// App-free core of [`save_gateway_routes`] (kind ingress exposure uses it).
+pub(crate) async fn save_gateway_routes_core(
+    state: &AppState,
+    routes: Vec<GatewayRoute>,
+) -> Result<(), String> {
     crate::docker::caddy::validate_routes(&routes).map_err(|e| e.to_string())?;
     let (http_port, https_port) = {
         // Save a copy, then swap: a failed write left memory holding routes

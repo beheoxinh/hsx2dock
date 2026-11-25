@@ -231,12 +231,12 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
             />
             <span className="whitespace-nowrap font-medium">Auto-clean Isolated</span>
             <div
-              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+              className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-none border-2 border-transparent transition-colors duration-200 ease-in-out ${
                 autoPrune ? "bg-emerald-500" : "bg-zinc-700"
               }`}
             >
               <span
-                className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                className={`pointer-events-none inline-block h-3 w-3 transform rounded-none bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
                   autoPrune ? "translate-x-3" : "translate-x-0"
                 }`}
               />

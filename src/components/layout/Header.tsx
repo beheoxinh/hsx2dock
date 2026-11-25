@@ -118,7 +118,7 @@ export const Header = React.memo<HeaderProps>(function Header({
             disabled={!onOpenClusters}
             title={health.detail}
             aria-label={`Kubernetes clusters: ${health.clusters.label}`}
-            className="rounded-full transition-opacity hover:opacity-80 disabled:cursor-default disabled:hover:opacity-100"
+            className="rounded-none transition-opacity hover:opacity-80 disabled:cursor-default disabled:hover:opacity-100"
           >
             <StatusBadge
               status={health.clusters.label}
