@@ -37,6 +37,7 @@ import type {
 } from "../types";
 import type { DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
+import { useProgressiveList } from "../hooks/useProgressiveList";
 
 interface ImagesPageProps {
   refreshKey?: number;
@@ -365,6 +366,8 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   });
 
   // Engine off → designed feature panel instead of fetch errors.
+  const progressive = useProgressiveList(filteredImages, search);
+
   if (daemonState !== "Running") {
     return (
       <EngineGate state={daemonState} resource="images">
@@ -470,10 +473,10 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
         {loading && images.length === 0 && <SkeletonList rows={5} actions={4} />}
         <AnimatePresence>
-          {filteredImages.map((img) => (
+          {progressive.visible.map((img) => (
             <motion.div
               key={img.id}
-              layout
+              layout={progressive.animate}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.98 }}
@@ -570,6 +573,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
             </motion.div>
           ))}
         </AnimatePresence>
+        {progressive.hasMore && <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />}
 
         {!loading && filteredImages.length === 0 && (
           <div className="py-16 text-center text-zinc-400">

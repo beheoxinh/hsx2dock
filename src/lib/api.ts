@@ -127,6 +127,8 @@ export const api = {
   toggleGateway: (enabled: boolean) => invoke<boolean>("toggle_gateway", { enabled }),
   trustGatewayCa: () => invoke<void>("trust_gateway_ca"),
   checkHostsSync: () => invoke<HostsSyncStatus>("check_hosts_sync"),
+  probeGatewayUpstreams: () =>
+    invoke<{ id: string; reachable: boolean }[]>("probe_gateway_upstreams"),
   syncHostsFile: () => invoke<void>("sync_hosts_file"),
   setGatewayAutoStart: (autoStart: boolean) =>
     invoke<void>("set_gateway_auto_start", { autoStart }),

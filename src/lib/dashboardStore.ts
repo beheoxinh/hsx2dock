@@ -290,6 +290,15 @@ export function resetDashboardEngineData() {
   persist();
 }
 
+/**
+ * Last known cluster list, for pages that want to paint before their own
+ * fetch answers (the Kubernetes page used to sit empty behind a spinner
+ * while the first list pass ran).
+ */
+export function peekDashboardClusters(): DashboardData["clusters"] {
+  return snapshot.clusters;
+}
+
 /** React binding. Components re-render whenever the snapshot changes. */
 export function useDashboardStore(): DashboardStoreSnapshot {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);

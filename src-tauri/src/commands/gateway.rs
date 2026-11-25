@@ -18,12 +18,20 @@ pub async fn get_gateway_status(
     let installed = paths.is_installed();
     let running = supervisor.is_running().await;
 
-    let config = state.config.read().await;
-    let http_port = config.gateway_http_port;
-    let https_port = config.gateway_https_port;
-    let routes = &config.gateway_routes;
-
-    let hosts_status = inspect_hosts_sync(routes);
+    // Copy out and drop the lock before touching /etc/hosts: the file read
+    // ran on an async worker with the config read lock held.
+    let (http_port, https_port, routes, auto_start) = {
+        let config = state.config.read().await;
+        (
+            config.gateway_http_port,
+            config.gateway_https_port,
+            config.gateway_routes.clone(),
+            config.gateway_auto_start,
+        )
+    };
+    let hosts_status = tokio::task::spawn_blocking(move || inspect_hosts_sync(&routes))
+        .await
+        .map_err(|e| e.to_string())?;
 
     let version = if installed {
         std::fs::read_to_string(paths.version_dir(&paths.active_version()).join("VERSION"))
@@ -33,8 +41,6 @@ pub async fn get_gateway_status(
     } else {
         None
     };
-
-    let auto_start = config.gateway_auto_start;
 
     Ok(CaddyInstallStatus {
         installed,
@@ -66,9 +72,13 @@ pub async fn save_gateway_routes(
 ) -> Result<(), String> {
     crate::docker::caddy::validate_routes(&routes).map_err(|e| e.to_string())?;
     let (http_port, https_port) = {
+        // Save a copy, then swap: a failed write left memory holding routes
+        // the disk never got, which the next unrelated save then persisted.
         let mut config = state.config.write().await;
-        config.gateway_routes = routes.clone();
-        config.save().await.map_err(|e| e.to_string())?;
+        let mut next = config.clone();
+        next.gateway_routes = routes.clone();
+        next.save().await.map_err(|e| e.to_string())?;
+        *config = next;
         (config.gateway_http_port, config.gateway_https_port)
     };
 
@@ -164,8 +174,20 @@ pub async fn set_gateway_auto_start(
     auto_start: bool,
 ) -> Result<(), String> {
     let mut config = state.config.write().await;
-    config.gateway_auto_start = auto_start;
-    config.save().await.map_err(|e| e.to_string())
+    let mut next = config.clone();
+    next.gateway_auto_start = auto_start;
+    next.save().await.map_err(|e| e.to_string())?;
+    *config = next;
+    Ok(())
+}
+
+/// Which enabled routes' upstreams accept a TCP connection right now.
+#[tauri::command]
+pub async fn probe_gateway_upstreams(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::docker::caddy::UpstreamProbe>, String> {
+    let routes = state.config.read().await.gateway_routes.clone();
+    Ok(crate::docker::caddy::probe_upstreams(&routes).await)
 }
 
 #[tauri::command]

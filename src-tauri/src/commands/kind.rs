@@ -246,7 +246,12 @@ async fn list_kind_clusters_uncached(state: &AppState) -> Result<Vec<KindCluster
     // Clusters are enriched concurrently: each one does inspects plus two
     // kubectl execs, and one booting cluster must not delay the others.
     let stats = state.cached_stats.read().await.clone();
-    let sizes = client.container_sizes().await.unwrap_or_default();
+    // Never `size=true` over every container here: that walked the RW layer
+    // of the whole engine on each 10s poll (a fresh client per pass meant its
+    // 60s cache never hit), and right after an image/volume prune the daemon
+    // answers it only once the prune releases the layer store, so the
+    // cluster list hung behind it. Node sizes come from a background pass.
+    let sizes = kind_node_sizes(&client).await;
     futures_util::future::join_all(list.iter_mut().map(|cluster| {
         let client = &client;
         let stats = &stats;
@@ -259,6 +264,82 @@ async fn list_kind_clusters_uncached(state: &AppState) -> Result<Vec<KindCluster
     .await;
     list.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(list)
+}
+
+/// How long a card's kubectl probe may take. The card is a glance: a slow
+/// API server reports "not ready" instead of holding every poller (Header,
+/// Dashboard, this page) behind the shared list lock for the 30s exec budget.
+const CARD_KUBECTL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// A fresh one-shot `docker stats` waits for two samples; cap it per node.
+const CARD_STATS_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+const NODE_SIZES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the background size pass itself, so a wedged daemon can't leave
+/// the refresh flag set forever.
+const NODE_SIZES_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+type NodeSizes = HashMap<String, u64>;
+static NODE_SIZES: std::sync::Mutex<Option<(std::time::Instant, NodeSizes)>> =
+    std::sync::Mutex::new(None);
+static NODE_SIZES_REFRESHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RW-layer sizes of kind node containers only, stale-while-revalidate: the
+/// list never waits on the size walk. A stale or missing entry starts one
+/// background refresh and the card shows the last known size meanwhile.
+async fn kind_node_sizes(client: &crate::docker::client::DockerClient) -> NodeSizes {
+    use std::sync::atomic::Ordering;
+    let (fresh, last) = {
+        let guard = NODE_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some((ts, map)) => (ts.elapsed() < NODE_SIZES_TTL, map.clone()),
+            None => (false, NodeSizes::new()),
+        }
+    };
+    if !fresh && !NODE_SIZES_REFRESHING.swap(true, Ordering::AcqRel) {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let filters: HashMap<String, Vec<String>> =
+                HashMap::from([("label".to_string(), vec![CLUSTER_LABEL.to_string()])]);
+            let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+                .all(true)
+                .size(true)
+                .filters(&filters)
+                .build();
+            let pass = tokio::time::timeout(
+                NODE_SIZES_BUDGET,
+                client.docker().list_containers(Some(opts)),
+            )
+            .await;
+            if let Ok(Ok(list)) = pass {
+                let map: NodeSizes = list
+                    .into_iter()
+                    .filter_map(|c| Some((c.id?, c.size_rw.unwrap_or(0).max(0) as u64)))
+                    .collect();
+                *NODE_SIZES.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((std::time::Instant::now(), map));
+            }
+            NODE_SIZES_REFRESHING.store(false, Ordering::Release);
+        });
+    }
+    last
+}
+
+/// Runs a card kubectl query with the short card budget.
+async fn card_kubectl(
+    client: &crate::docker::client::DockerClient,
+    node: &str,
+    args: &[&str],
+) -> Option<String> {
+    let mut cmd = vec![
+        "kubectl".to_string(),
+        "--kubeconfig=/etc/kubernetes/admin.conf".to_string(),
+        "--request-timeout=6s".to_string(),
+    ];
+    cmd.extend(args.iter().map(|a| a.to_string()));
+    tokio::time::timeout(CARD_KUBECTL_BUDGET, client.exec_capture(node, cmd))
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Fills the card-level monitoring fields (uptime, pods, live resource usage)
@@ -295,15 +376,22 @@ async fn enrich_cluster_card(
     let mut mem_limit_bytes = 0i64;
     let mut disk_size_bytes = 0u64;
     let mut published_ports: Vec<PublishedPort> = Vec::new();
-    for id in &ids {
-        let Ok(details) = client
+    // Nodes are inspected concurrently; a multi-node cluster paid one
+    // round-trip per node in series on every poll.
+    let inspected = futures_util::future::join_all(ids.iter().map(|id| async move {
+        let details = client
             .docker()
             .inspect_container(
                 id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
-        else {
+            .ok();
+        (id, details)
+    }))
+    .await;
+    for (id, details) in inspected {
+        let Some(details) = details else {
             continue;
         };
         // Inspect without `size=true` never carries SizeRw; the 60s-cached
@@ -390,7 +478,7 @@ async fn enrich_cluster_card(
     let mut cpu_pct = 0.0f64;
     let mut mem_mb = 0.0f64;
     let mut any_stats = false;
-    for id in &ids {
+    let samples = futures_util::future::join_all(ids.iter().map(|id| async move {
         // The background monitor already samples every running container
         // (with a correct CPU delta); only fall back to a fresh sample when
         // it has not caught up with a node yet.
@@ -398,61 +486,39 @@ async fn enrich_cluster_card(
             .get(id.as_str())
             .or_else(|| cached_stats.iter().find(|(k, _)| k.starts_with(id.as_str())).map(|(_, v)| v))
             .cloned();
-        let sample = match cached {
-            Some(s) => Ok(s),
-            None => client.container_stats(id).await,
-        };
-        if let Ok(s) = sample {
-            cpu_pct += s.cpu_percent;
-            mem_mb += s.mem_usage as f64 / (1024.0 * 1024.0);
-            any_stats = true;
+        match cached {
+            Some(s) => Some(s),
+            None => tokio::time::timeout(CARD_STATS_BUDGET, client.container_stats(id))
+                .await
+                .ok()
+                .and_then(Result::ok),
         }
+    }))
+    .await;
+    for s in samples.into_iter().flatten() {
+        cpu_pct += s.cpu_percent;
+        mem_mb += s.mem_usage as f64 / (1024.0 * 1024.0);
+        any_stats = true;
     }
     if any_stats {
         cluster.cpu_percent = Some(cpu_pct);
         cluster.mem_used_mb = Some(mem_mb);
     }
 
-    // Pod counts via the control-plane node's bundled kubectl.
+    // Pod counts and /readyz via the control-plane node's bundled kubectl,
+    // asked together: in series a slow API server cost both budgets.
     let cp = format!("{}-control-plane", cluster.name);
-    if let Ok(out) = client
-        .exec_capture(
-            &cp,
-            vec![
-                "kubectl".into(),
-                "--kubeconfig=/etc/kubernetes/admin.conf".into(),
-                "get".into(),
-                "pods".into(),
-                "-A".into(),
-                "--no-headers".into(),
-            ],
-        )
-        .await
-    {
+    let (pods, ready) = tokio::join!(
+        card_kubectl(client, &cp, &["get", "pods", "-A", "--no-headers"]),
+        card_kubectl(client, &cp, &["get", "--raw", "/readyz"]),
+    );
+    if let Some(out) = pods {
         let (total, running) = count_pods(&out);
         cluster.pod_count = Some(total);
         cluster.running_pod_count = Some(running);
-        // The pods query answering means discovery + core API are serving;
-        // /readyz is the authoritative check for the whole control plane.
-        cluster.api_ready = Some(
-            client
-                .exec_capture(
-                    &cp,
-                    vec![
-                        "kubectl".into(),
-                        "--kubeconfig=/etc/kubernetes/admin.conf".into(),
-                        "get".into(),
-                        "--raw".into(),
-                        "/readyz".into(),
-                    ],
-                )
-                .await
-                .is_ok(),
-        );
-    } else {
-        // API not answering (still booting or unhealthy) — Detail must stay shut.
-        cluster.api_ready = Some(false);
     }
+    // API not answering (still booting or unhealthy) — Detail must stay shut.
+    cluster.api_ready = Some(ready.is_some());
 }
 
 /// Total physical memory of the host in MiB, from `/proc/meminfo`.

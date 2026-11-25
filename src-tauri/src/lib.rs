@@ -35,6 +35,9 @@ const STATE_CONFIRM_TICKS: u8 = 2;
 
 /// Samples stats for `ids` with bounded concurrency and per-call timeouts,
 /// turning one-shot samples into a real CPU % against the previous sample.
+/// Containers sampled per 2s tick before the stats cadence slows down.
+const STATS_PER_TICK_BUDGET: usize = 60;
+
 async fn sample_stats(
     client: &crate::docker::client::DockerClient,
     ids: Vec<String>,
@@ -83,6 +86,7 @@ fn start_background_monitoring(app_handle: AppHandle) {
         let mut last_containers: Option<Vec<crate::docker::models::ContainerItem>> = None;
         let mut hidden_ticks: u32 = 0;
         let mut was_hidden = false;
+        let mut stats_tick: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() else {
@@ -236,6 +240,14 @@ fn start_background_monitoring(app_handle: AppHandle) {
                 .map(|c| c.id)
                 .collect();
 
+            // Many running containers: sample stats less often. Every tick
+            // fired one stats request per container, so 200 containers kept
+            // the daemon answering ~100 requests a second.
+            stats_tick = stats_tick.wrapping_add(1);
+            let stride = (running_ids.len() / STATS_PER_TICK_BUDGET).max(1) as u32;
+            if !running_ids.is_empty() && !stats_tick.is_multiple_of(stride) {
+                continue;
+            }
             if !running_ids.is_empty() {
                 let prev = state.cached_stats.read().await.clone();
                 let stats_map = sample_stats(&client, running_ids, &prev).await;
@@ -663,6 +675,7 @@ pub fn run() {
             commands::gateway::check_hosts_sync,
             commands::gateway::sync_hosts_file,
             commands::gateway::set_gateway_auto_start,
+            commands::gateway::probe_gateway_upstreams,
             commands::gateway::get_hosts_file_model,
             commands::gateway::save_raw_hosts,
             commands::gateway::clear_app_hosts,

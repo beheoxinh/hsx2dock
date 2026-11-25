@@ -169,6 +169,15 @@ impl DockerClient {
                 }
             }
         }
+        // Single flight: concurrent callers with a stale cache each started
+        // their own engine-wide size walk. The write lock makes them queue
+        // behind one pass and read its result.
+        let mut slot = self.sizes_cache.write().await;
+        if let Some((ts, ref map)) = *slot {
+            if ts.elapsed() < std::time::Duration::from_secs(60) {
+                return Ok(map.clone());
+            }
+        }
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(true)
             .size(true)
@@ -182,7 +191,7 @@ impl DockerClient {
                 Some((id, bytes))
             })
             .collect();
-        *self.sizes_cache.write().await = Some((std::time::Instant::now(), map.clone()));
+        *slot = Some((std::time::Instant::now(), map.clone()));
         Ok(map)
     }
 
@@ -643,8 +652,15 @@ impl DockerClient {
     /// Summaries of kind node containers — every one carries
     /// `io.x-k8s.kind.cluster`, whatever image it was created from.
     async fn kind_node_containers(&self) -> anyhow::Result<Vec<bollard::models::ContainerSummary>> {
+        // Filtered by the daemon: listing every container to keep a handful of
+        // nodes cost a full list on each image list/remove/prune.
+        let filters: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::from([(
+            "label".to_string(),
+            vec![crate::docker::kind::CLUSTER_LABEL.to_string()],
+        )]);
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(true)
+            .filters(&filters)
             .build();
         Ok(self
             .docker
@@ -938,16 +954,22 @@ impl DockerClient {
         // volumes can never be selected. In-use volumes fail to remove and are
         // skipped. Like `docker volume prune`, only anonymous volumes go: a
         // named volume (a stopped database's data) is never "unused" junk.
-        let mut removed = 0u64;
-        for volume in self.list_volumes().await? {
-            if volume.protected || !is_anonymous_volume(&volume.name) {
-                continue;
-            }
-            if self.remove_volume(&volume.name, false).await.is_ok() {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        use futures_util::StreamExt;
+        let candidates: Vec<String> = self
+            .list_volumes()
+            .await?
+            .into_iter()
+            .filter(|v| !v.protected && is_anonymous_volume(&v.name))
+            .map(|v| v.name)
+            .collect();
+        // A few removes in flight instead of one round-trip per volume.
+        let removed = futures_util::stream::iter(candidates)
+            .map(|name| async move { self.remove_volume(&name, false).await.is_ok() })
+            .buffer_unordered(6)
+            .filter(|ok| std::future::ready(*ok))
+            .count()
+            .await;
+        Ok(removed as u64)
     }
 
     pub async fn list_networks(&self) -> anyhow::Result<Vec<NetworkItem>> {

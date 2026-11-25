@@ -10,6 +10,7 @@ import { api } from "../lib/api";
 import { formatBytes } from "../lib/utils";
 import type { VolumeItem, DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
+import { useProgressiveList } from "../hooks/useProgressiveList";
 
 interface VolumesPageProps {
   refreshKey?: number;
@@ -159,6 +160,8 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
   );
 
   // Engine off → designed feature panel instead of fetch errors.
+  const progressive = useProgressiveList(filteredVolumes, search);
+
   if (daemonState !== "Running") {
     return (
       <EngineGate state={daemonState} resource="volumes">
@@ -248,10 +251,10 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
         {loading && volumes.length === 0 && <SkeletonList rows={4} actions={4} />}
         <AnimatePresence>
-          {filteredVolumes.map((vol) => (
+          {progressive.visible.map((vol) => (
             <motion.div
               key={vol.name}
-              layout
+              layout={progressive.animate}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.98 }}
@@ -351,6 +354,7 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
             </motion.div>
           ))}
         </AnimatePresence>
+        {progressive.hasMore && <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />}
 
         {!loading && filteredVolumes.length === 0 && (
           <div className="py-16 text-center text-zinc-400">

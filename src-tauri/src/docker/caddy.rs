@@ -401,6 +401,10 @@ pub struct CaddySupervisor {
     /// It cannot be re-probed on reload: the running Caddy holds the port, so
     /// the probe failed and every reload silently dropped `:80`.
     http_listener: std::sync::Mutex<Option<(u16, bool)>>,
+    /// Serialises start/stop/reload. Two quick route saves could post their
+    /// `/load`s out of order (the older config winning), and a reload racing
+    /// a start could hit the admin API of a Caddy that was being replaced.
+    ops: Mutex<()>,
 }
 
 /// `@id` stamped on the gateway server so the app only adopts a Caddy it
@@ -413,6 +417,7 @@ impl CaddySupervisor {
             child: Arc::new(Mutex::new(None)),
             paths: CaddyPaths::for_app(),
             http_listener: std::sync::Mutex::new(None),
+            ops: Mutex::new(()),
         }
     }
 
@@ -451,9 +456,10 @@ impl CaddySupervisor {
         https_port: u16,
         routes: &[GatewayRoute],
     ) -> Result<()> {
+        let _op = self.ops.lock().await;
         if self.is_running().await {
             // Apply updated configuration via API
-            return self.apply_routes(http_port, https_port, routes).await;
+            return self.load_config(http_port, https_port, routes).await;
         }
 
         let bin = self.paths.binary();
@@ -533,6 +539,7 @@ impl CaddySupervisor {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        let _op = self.ops.lock().await;
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
@@ -550,6 +557,16 @@ impl CaddySupervisor {
     }
 
     pub async fn apply_routes(
+        &self,
+        http_port: u16,
+        https_port: u16,
+        routes: &[GatewayRoute],
+    ) -> Result<()> {
+        let _op = self.ops.lock().await;
+        self.load_config(http_port, https_port, routes).await
+    }
+
+    async fn load_config(
         &self,
         http_port: u16,
         https_port: u16,
@@ -854,7 +871,19 @@ pub fn generate_caddy_json(
     let mut gateway_server = serde_json::json!({
         "@id": GATEWAY_ID,
         "listen": listen_addrs,
-        "routes": server_routes
+        "routes": server_routes,
+        // A stopped container used to answer with an empty 502 that looked
+        // like a gateway fault. Say which host failed and what to check.
+        "errors": {
+            "routes": [{
+                "handle": [{
+                    "handler": "static_response",
+                    "status_code": "{http.error.status_code}",
+                    "headers": { "Content-Type": ["text/html; charset=utf-8"] },
+                    "body": GATEWAY_ERROR_PAGE
+                }]
+            }]
+        }
     });
 
     if !can_bind_http {
@@ -887,6 +916,46 @@ pub fn generate_caddy_json(
     });
 
     Ok(serde_json::to_string(&config)?)
+}
+
+/// Served by the gateway when a route's upstream fails (most often: the
+/// container is stopped or no longer publishes the target port).
+const GATEWAY_ERROR_PAGE: &str = "<!doctype html><meta charset=utf-8><title>{http.error.status_code} \u{2014} {http.request.host}</title>\
+<body style=\"font:15px system-ui;background:#18181b;color:#e4e4e7;display:grid;place-items:center;height:100vh;margin:0\">\
+<div style=\"max-width:560px\"><h2 style=\"margin:0 0 8px\">{http.error.status_code} \u{00b7} {http.request.host}</h2>\
+<p>The HSX2Dock gateway is running, but the upstream for this route did not answer.</p>\
+<p style=\"color:#a1a1aa\">Check that the container is running and still publishes the target port \
+(Gateway page \u{2192} Upstream Target).</p></div></body>";
+
+/// One route's upstream reachability, for the Gateway page.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpstreamProbe {
+    pub id: String,
+    pub reachable: bool,
+}
+
+/// TCP-connects every enabled route's target concurrently (short timeout), so
+/// the UI can flag a route that would answer 502 before anyone opens it.
+pub async fn probe_upstreams(routes: &[GatewayRoute]) -> Vec<UpstreamProbe> {
+    let probes = routes.iter().filter(|r| r.enabled).map(|r| async move {
+        let target = r
+            .target
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .to_string();
+        let reachable = matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(600),
+                tokio::net::TcpStream::connect(target.as_str()),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        UpstreamProbe { id: r.id.clone(), reachable }
+    });
+    futures_util::future::join_all(probes).await
 }
 
 /// Host and normalised path of a route, as the matcher sees them.
@@ -1309,6 +1378,40 @@ mod tests {
         ])
         .is_err());
         assert!(validate_routes(&[route("1", "app.test", Some("/api"), "localhost:8080")]).is_ok());
+    }
+
+    #[test]
+    fn dead_upstreams_get_an_explanatory_error_page() {
+        let json = generate_caddy_json(80, 443, &[route("a", "app.local", None, "127.0.0.1:1")], false)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let handler = &v["apps"]["http"]["servers"]["gateway"]["errors"]["routes"][0]["handle"][0];
+        assert_eq!(handler["handler"], "static_response");
+        assert_eq!(handler["status_code"], "{http.error.status_code}");
+        assert!(handler["body"].as_str().unwrap().contains("{http.request.host}"));
+    }
+
+    #[tokio::test]
+    async fn upstream_probe_reports_listening_and_dead_targets() {
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut off = route("off", "off.local", None, "127.0.0.1:1");
+        off.enabled = false;
+        let probes = probe_upstreams(&[
+            route("up", "up.local", None, &format!("127.0.0.1:{live_port}")),
+            route("down", "down.local", None, &format!("127.0.0.1:{dead_port}")),
+            off,
+        ])
+        .await;
+        let by_id: std::collections::HashMap<_, _> =
+            probes.iter().map(|p| (p.id.as_str(), p.reachable)).collect();
+        assert_eq!(by_id.get("up"), Some(&true));
+        assert_eq!(by_id.get("down"), Some(&false));
+        assert!(!by_id.contains_key("off"), "disabled routes are not probed");
     }
 
     #[test]

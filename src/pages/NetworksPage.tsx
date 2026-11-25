@@ -10,6 +10,7 @@ import { api } from "../lib/api";
 import { truncateId } from "../lib/utils";
 import type { NetworkItem, DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
+import { useProgressiveList } from "../hooks/useProgressiveList";
 
 interface NetworksPageProps {
   refreshKey?: number;
@@ -106,6 +107,8 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
   );
 
   // Engine off → designed feature panel instead of fetch errors.
+  const progressive = useProgressiveList(filteredNetworks, search);
+
   if (daemonState !== "Running") {
     return (
       <EngineGate state={daemonState} resource="networks">
@@ -157,13 +160,13 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
       <div className="flex-1 overflow-y-auto space-y-3 pb-8">
         {loading && networks.length === 0 && <SkeletonList rows={4} actions={3} />}
         <AnimatePresence>
-          {filteredNetworks.map((net) => {
+          {progressive.visible.map((net) => {
             const isDefault = ["bridge", "host", "none"].includes(net.name);
 
             return (
               <motion.div
                 key={net.id}
-                layout
+                layout={progressive.animate}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.98 }}
@@ -227,6 +230,7 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
             );
           })}
         </AnimatePresence>
+        {progressive.hasMore && <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />}
 
         {!loading && filteredNetworks.length === 0 && (
           <div className="py-16 text-center text-zinc-400">

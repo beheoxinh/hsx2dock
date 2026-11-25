@@ -31,6 +31,7 @@ import {
   useContainerStore,
 } from "../lib/containerStore";
 import type { ContainerGroup, ContainerItem, ContainerStats, DaemonState } from "../types";
+import { useProgressiveList } from "../hooks/useProgressiveList";
 
 interface ContainersPageProps {
   onOpenDetails: (
@@ -253,6 +254,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
     [searchMatches, grouped]
   );
   const allGrouped = searchMatches.length > 0 && filteredContainers.length === 0;
+  const progressive = useProgressiveList(filteredContainers, search);
 
   // Engine off → designed feature panel instead of fetch errors.
   if (daemonState !== "Running") {
@@ -319,7 +321,7 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
         <div className="space-y-3">
           {/* Plain rows: a motion wrapper per card cost a layout animation
               for every container on every list change. */}
-          {filteredContainers.map((c) => (
+          {progressive.visible.map((c) => (
             <DraggableContainerCard
               key={c.id}
               container={c}
@@ -333,6 +335,9 @@ export const ContainersPage: React.FC<ContainersPageProps> = ({
               gatewayRoutes={routesById.get(c.id)}
             />
           ))}
+          {progressive.hasMore && (
+            <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />
+          )}
 
           {!loading && filteredContainers.length === 0 && (
             <div className="py-16 text-center text-zinc-400">

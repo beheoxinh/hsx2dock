@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
-import { setGatewayRoutes } from "../lib/containerStore";
+import { setGatewayRoutes, useContainerStore } from "../lib/containerStore";
+import { findMappedContainer, mappedTargetDrift } from "../lib/gatewayDrift";
 import {
   Globe,
   ShieldCheck,
@@ -42,8 +43,14 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
   const [status, setStatus] = useState<CaddyInstallStatus | null>(null);
   const [routes, setRoutes] = useState<GatewayRoute[]>([]);
   const [hostsSync, setHostsSync] = useState<HostsSyncStatus | null>(null);
-  const [allContainers, setAllContainers] = useState<ContainerItem[]>([]);
+  // Live from the shared store: a fetched-once copy kept showing a container
+  // as running (or stopped) until the page was reopened.
+  const containerStore = useContainerStore();
+  const allContainers: ContainerItem[] =
+    daemonState === "Running" ? containerStore.containers : [];
   const [loading, setLoading] = useState(true);
+  /** Route id → upstream answered a TCP connect on the last probe. */
+  const [upstreamUp, setUpstreamUp] = useState<Record<string, boolean>>({});
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
 
   // Modal State
@@ -101,17 +108,6 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
       setStatus(st);
       setRoutes(r);
       setHostsSync(hs);
-
-      if (daemonState === "Running") {
-        try {
-          const list = await api.listContainers(true);
-          setAllContainers(list);
-        } catch (e) {
-          console.error("Failed to fetch running containers:", e);
-        }
-      } else {
-        setAllContainers([]);
-      }
     } catch (err) {
       console.error("Failed to fetch gateway status:", err);
       toast.error("Failed to load Gateway state", String(err));
@@ -123,6 +119,69 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
   useEffect(() => {
     fetchData();
   }, [daemonState]);
+
+  // Probe every enabled route's upstream while the gateway runs, so a route
+  // that would answer 502 is visible here instead of only in the browser.
+  const gatewayRunning = Boolean(status?.running);
+  useEffect(() => {
+    if (!gatewayRunning) {
+      setUpstreamUp({});
+      return;
+    }
+    let cancelled = false;
+    let inflight = false;
+    const probe = async () => {
+      if (inflight || document.hidden) return;
+      inflight = true;
+      try {
+        const res = await api.probeGatewayUpstreams();
+        if (!cancelled) setUpstreamUp(Object.fromEntries(res.map((p) => [p.id, p.reachable])));
+      } catch {
+        /* keep the last answer */
+      } finally {
+        inflight = false;
+      }
+    };
+    void probe();
+    const t = window.setInterval(probe, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [gatewayRunning, routes, allContainers]);
+
+  /**
+   * Saves a full route list. The backend persists before reloading Caddy, so
+   * a reload failure still means the routes were saved: keep them in the UI
+   * instead of showing the old list. Any other failure re-reads the truth.
+   */
+  const commitRoutes = async (updated: GatewayRoute[]): Promise<boolean> => {
+    try {
+      await api.saveGatewayRoutes(updated);
+      setGatewayRoutes(updated);
+      setRoutes(updated);
+      return true;
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("Routes saved")) {
+        setGatewayRoutes(updated);
+        setRoutes(updated);
+      } else {
+        api.listGatewayRoutes().then(setRoutes).catch(() => {});
+      }
+      throw err;
+    }
+  };
+
+  const handleFixTarget = async (route: GatewayRoute, target: string) => {
+    const updated = routes.map((r) => (r.id === route.id ? { ...r, target } : r));
+    try {
+      await commitRoutes(updated);
+      toast.success("Target updated", `${route.domain} now proxies to ${target}.`);
+    } catch (err) {
+      toast.error("Could not update the target", String(err));
+    }
+  };
 
   const handleToggleGateway = async () => {
     if (!status) return;
@@ -188,9 +247,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
       r.id === routeId ? { ...r, enabled: !r.enabled } : r
     );
     try {
-      await api.saveGatewayRoutes(updated);
-      setGatewayRoutes(updated);
-      setRoutes(updated);
+      await commitRoutes(updated);
       toast.info("Route Updated", "Gateway route toggle saved.");
     } catch (err) {
       toast.error("Failed to update route", String(err));
@@ -200,9 +257,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
   const handleDeleteRoute = async (routeId: string) => {
     const updated = routes.filter((r) => r.id !== routeId);
     try {
-      await api.saveGatewayRoutes(updated);
-      setGatewayRoutes(updated);
-      setRoutes(updated);
+      await commitRoutes(updated);
       toast.success("Route Deleted", "Virtual domain mapping removed.");
       // Auto check hosts sync after deletion
       const hs = await api.checkHostsSync();
@@ -248,9 +303,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
     }
 
     try {
-      await api.saveGatewayRoutes(updated);
-      setGatewayRoutes(updated);
-      setRoutes(updated);
+      await commitRoutes(updated);
       setIsModalOpen(false);
       setEditingRoute(null);
       toast.success("Route Saved", `Mapping for ${cleanDomain} saved.`);
@@ -544,12 +597,13 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                   let containerRunning = false;
                   let targetContainer: ContainerItem | undefined;
                   if (isMapped) {
-                    targetContainer = allContainers.find((c) => {
-                      const cleanName = c.name.replace(/^\//, "");
-                      return cleanName === r.container_name || c.id === r.container_name || c.short_id === r.container_name;
-                    });
+                    targetContainer = findMappedContainer(r, allContainers);
                     containerRunning = targetContainer?.state === "running";
                   }
+                  const drift = isMapped
+                    ? mappedTargetDrift(r, targetContainer)
+                    : { drifted: false, suggestion: null };
+                  const reachable = r.enabled ? upstreamUp[r.id] : undefined;
 
                   const isInactive = isMapped && !containerRunning;
 
@@ -613,7 +667,39 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                         </div>
                       </td>
                       <td className="py-3 px-4 font-mono text-zinc-400">
-                        {r.target}
+                        <div className="flex flex-col gap-1">
+                          <span className="inline-flex items-center gap-1.5">
+                            {reachable !== undefined && (
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                  reachable ? "bg-emerald-400" : "bg-rose-500"
+                                }`}
+                                title={reachable ? "Upstream answers" : "Upstream not answering — the gateway returns 502"}
+                              />
+                            )}
+                            {r.target}
+                          </span>
+                          {drift.drifted && (
+                            <span className="inline-flex items-center gap-1.5 font-sans text-[10px] text-amber-300">
+                              <AlertTriangle className="w-3 h-3" />
+                              {drift.suggestion
+                                ? `container now publishes ${drift.suggestion.split(":").pop()}`
+                                : "port no longer published by the container"}
+                              {drift.suggestion && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleFixTarget(r, drift.suggestion!)}
+                                  className="px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200"
+                                >
+                                  Fix
+                                </button>
+                              )}
+                            </span>
+                          )}
+                          {!drift.drifted && reachable === false && (
+                            <span className="font-sans text-[10px] text-rose-400">not answering (502)</span>
+                          )}
+                        </div>
                       </td>
                       <td className="py-3 px-4">
                         <div className="flex flex-col">

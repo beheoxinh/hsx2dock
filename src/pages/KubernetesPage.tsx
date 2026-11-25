@@ -26,6 +26,7 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
 import { api, disposeListener, events } from "../lib/api";
+import { peekDashboardClusters } from "../lib/dashboardStore";
 import { formatBytes, formatDuration, formatRelativeTime } from "../lib/utils";
 import type {
   KindCluster,
@@ -99,7 +100,9 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   const modal = useModal();
   const toast = useToast();
   const [status, setStatus] = useState<KindInstallStatus | null>(null);
-  const [clusters, setClusters] = useState<KindCluster[]>([]);
+  // Seeded from the dashboard cache so the cards paint at once; the first
+  // pass below revalidates them.
+  const [clusters, setClusters] = useState<KindCluster[]>(peekDashboardClusters);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -225,27 +228,34 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     }
   };
 
+  // Each load gets a sequence number: a slow pass that started before a
+  // newer one (refresh clicked twice, engine restarted) must not overwrite it.
+  const loadSeq = useRef(0);
   const loadAll = async () => {
+    const seq = ++loadSeq.current;
+    setLoading(true);
+    // Install status is a local file read; show it without waiting for the
+    // cluster pass, which talks to Docker and every API server.
+    api
+      .kindStatus()
+      .then((st) => seq === loadSeq.current && setStatus(st))
+      .catch(() => {});
     try {
-      setLoading(true);
-      const [st, list] = await Promise.all([
-        api.kindStatus(),
-        api.listKindClusters(),
-      ]);
-      setStatus(st);
+      const list = await api.listKindClusters();
+      if (seq !== loadSeq.current) return;
       setClusters(list);
       setLoadError(null);
     } catch (e) {
-      setLoadError(String(e));
+      if (seq === loadSeq.current) setLoadError(String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
+    // Create/delete add or drop per-cluster prefs.
     loadPrefs();
   };
 
   useEffect(() => {
     loadAll();
-    loadPrefs();
   }, [refreshKey]);
 
   // Silent cluster refresh (no loading spinner) for the background card poll.
@@ -254,8 +264,11 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     // A slow kind/docker answer must not stack polls on top of each other.
     if (refreshInflight.current) return;
     refreshInflight.current = true;
+    const seq = loadSeq.current;
     try {
       const list = await api.listKindClusters();
+      // A full load started meanwhile owns the list now.
+      if (seq !== loadSeq.current) return;
       setClusters(list);
       setLoadError(null);
     } catch {
