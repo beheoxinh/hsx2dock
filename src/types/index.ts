@@ -808,6 +808,14 @@ export interface CaddyInstallStatus {
   trusted: boolean;
   hosts_synced: boolean;
   auto_start: boolean;
+  /** Mapped routes whose container is gone are removed in the background. */
+  auto_clear_orphans?: boolean;
+}
+
+/** Result of clearing mapped routes whose container no longer exists. */
+export interface PrunedGatewayRoutes {
+  removed: GatewayRoute[];
+  routes: GatewayRoute[];
 }
 
 export interface GatewayRoute {

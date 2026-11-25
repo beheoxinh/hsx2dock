@@ -11,6 +11,22 @@ import { truncateId } from "../lib/utils";
 import type { NetworkItem, DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
 import { useProgressiveList } from "../hooks/useProgressiveList";
+import { useListSort } from "../hooks/useListSort";
+import { SortControl } from "../components/ui/SortControl";
+import { sortItems } from "../lib/listSort";
+
+const NETWORK_SORT_KEYS = ["name", "driver", "subnet"] as const;
+type NetworkSortKey = (typeof NETWORK_SORT_KEYS)[number];
+const NETWORK_SORT_OPTIONS: { key: NetworkSortKey; label: string }[] = [
+  { key: "name", label: "name" },
+  { key: "driver", label: "driver" },
+  { key: "subnet", label: "subnet" },
+];
+const NETWORK_SORT_GETTERS = {
+  name: (n: NetworkItem) => n.name,
+  driver: (n: NetworkItem) => n.driver,
+  subnet: (n: NetworkItem) => n.subnet,
+};
 
 interface NetworksPageProps {
   refreshKey?: number;
@@ -99,15 +115,21 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
 
   // Kind networks and protected cluster topologies are managed via the Kubernetes tab.
   // Hide them from the user's networks list.
-  const filteredNetworks = networks.filter(
-    (n) =>
-      !n.protected &&
-      n.name !== "kind" &&
-      n.name.toLowerCase().includes(search.toLowerCase())
+  const [sort, setSort] = useListSort("networks", NETWORK_SORT_KEYS, { key: "name", dir: "asc" });
+  const filteredNetworks = sortItems(
+    networks.filter(
+      (n) =>
+        !n.protected &&
+        n.name !== "kind" &&
+        n.name.toLowerCase().includes(search.toLowerCase())
+    ),
+    NETWORK_SORT_GETTERS,
+    sort,
+    (n) => n.name
   );
 
   // Engine off → designed feature panel instead of fetch errors.
-  const progressive = useProgressiveList(filteredNetworks, search);
+  const progressive = useProgressiveList(filteredNetworks, `${search}|${sort.key}|${sort.dir}`);
 
   if (daemonState !== "Running") {
     return (
@@ -138,6 +160,8 @@ export const NetworksPage: React.FC<NetworksPageProps> = ({
               className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
             />
           </div>
+
+          <SortControl value={sort} options={NETWORK_SORT_OPTIONS} onChange={setSort} label="Sort networks" />
 
           <Button variant="outline" size="sm" onClick={handlePrune} className="gap-2">
             <Trash2 className="w-4 h-4 text-rose-400" />

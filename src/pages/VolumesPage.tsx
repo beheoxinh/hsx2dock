@@ -11,6 +11,24 @@ import { formatBytes } from "../lib/utils";
 import type { VolumeItem, DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
 import { useProgressiveList } from "../hooks/useProgressiveList";
+import { useListSort } from "../hooks/useListSort";
+import { SortControl } from "../components/ui/SortControl";
+import { sortItems } from "../lib/listSort";
+
+const VOLUME_SORT_KEYS = ["name", "size", "driver", "in_use"] as const;
+type VolumeSortKey = (typeof VOLUME_SORT_KEYS)[number];
+const VOLUME_SORT_OPTIONS: { key: VolumeSortKey; label: string }[] = [
+  { key: "name", label: "name" },
+  { key: "size", label: "size" },
+  { key: "driver", label: "driver" },
+  { key: "in_use", label: "in use" },
+];
+const VOLUME_SORT_GETTERS = {
+  name: (v: VolumeItem) => v.name,
+  size: (v: VolumeItem) => v.size,
+  driver: (v: VolumeItem) => v.driver,
+  in_use: (v: VolumeItem) => Boolean(v.in_use),
+};
 
 interface VolumesPageProps {
   refreshKey?: number;
@@ -168,12 +186,16 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
 
   // Kind-managed volumes belong to cluster nodes and are managed through Kubernetes.
   // Hide them from the user's volume list so core cluster state is kept out of sight.
-  const filteredVolumes = volumes.filter(
-    (v) => !v.protected && v.name.toLowerCase().includes(search.toLowerCase())
+  const [sort, setSort] = useListSort("volumes", VOLUME_SORT_KEYS, { key: "name", dir: "asc" });
+  const filteredVolumes = sortItems(
+    volumes.filter((v) => !v.protected && v.name.toLowerCase().includes(search.toLowerCase())),
+    VOLUME_SORT_GETTERS,
+    sort,
+    (v) => v.name
   );
 
   // Engine off → designed feature panel instead of fetch errors.
-  const progressive = useProgressiveList(filteredVolumes, search);
+  const progressive = useProgressiveList(filteredVolumes, `${search}|${sort.key}|${sort.dir}`);
 
   if (daemonState !== "Running") {
     return (
@@ -204,6 +226,8 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
               className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
             />
           </div>
+
+          <SortControl value={sort} options={VOLUME_SORT_OPTIONS} onChange={setSort} label="Sort volumes" />
 
           {/* Auto-prune Isolated Volumes Toggle */}
           <button

@@ -8,7 +8,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applySectionOrder,
   canonicalContainerIds,
+  cardDropIndex,
+  moveIdTo,
   containersEqual,
   dropIndexAt,
   groupOf,
@@ -175,4 +178,31 @@ test("routesByContainer matches by name or published port and stays stable", () 
   assert.deepEqual(first.get("a")?.map((r) => r.domain), ["web.test", "port.test"]);
   const second = routesByContainer([c], routes, first);
   assert.equal(second.get("a"), first.get("a"));
+});
+
+test("group cards: drop index from card midpoints, dragged card skipped", () => {
+  const ids = ["a", "b", "c"];
+  const rects = [
+    { top: 0, height: 100 },
+    { top: 110, height: 100 },
+    { top: 220, height: 100 },
+  ];
+  assert.equal(cardDropIndex(ids, rects, 10, "c"), 0);
+  assert.equal(cardDropIndex(ids, rects, 170, "a"), 1);
+  assert.equal(cardDropIndex(ids, rects, 400, "a"), 2);
+});
+
+test("group cards: moveIdTo moves within the list", () => {
+  assert.deepEqual(moveIdTo(["a", "b", "c"], "a", 2), ["b", "c", "a"]);
+  assert.deepEqual(moveIdTo(["a", "b", "c"], "c", 0), ["c", "a", "b"]);
+  assert.deepEqual(moveIdTo(["a", "b", "c"], "x", 0), ["a", "b", "c"]);
+});
+
+test("group cards: applySectionOrder refills section slots, appends unsaved", () => {
+  const g = (id: string) => ({ id });
+  const saved = [g("u1"), g("compose:x"), g("u2"), g("u3")];
+  const out = applySectionOrder(saved, [g("u3"), g("u1"), g("u2")]);
+  assert.deepEqual(out.map((x) => x.id), ["u3", "compose:x", "u1", "u2"]);
+  const withNew = applySectionOrder(saved, [g("compose:y"), g("compose:x")]);
+  assert.deepEqual(withNew.map((x) => x.id), ["u1", "compose:y", "u2", "u3", "compose:x"]);
 });

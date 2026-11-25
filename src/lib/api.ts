@@ -32,6 +32,7 @@ import type {
   CaddyInstallStatus,
   CaddyUpdateInfo,
   GatewayRoute,
+  PrunedGatewayRoutes,
   HostsSyncStatus,
   HostsFileModel,
   EngineDoctorReport,
@@ -167,6 +168,9 @@ export const api = {
   syncHostsFile: () => invoke<void>("sync_hosts_file"),
   setGatewayAutoStart: (autoStart: boolean) =>
     invoke<void>("set_gateway_auto_start", { autoStart }),
+  setGatewayAutoClearOrphans: (enabled: boolean) =>
+    invoke<void>("set_gateway_auto_clear_orphans", { enabled }),
+  clearOrphanGatewayRoutes: () => invoke<PrunedGatewayRoutes>("clear_orphan_gateway_routes"),
   getHostsFileModel: () => invoke<HostsFileModel>("get_hosts_file_model"),
   saveRawHosts: (newContent: string) => invoke<void>("save_raw_hosts", { newContent }),
   clearAppHosts: () => invoke<void>("clear_app_hosts"),
@@ -659,6 +663,10 @@ export const events = {
     listen<EngineInstallProgress>("engine-install-progress", (event) => {
       if (event.payload.target === "kind") cb(event.payload);
     }),
+
+  /** The background sweeper removed mapped routes whose container is gone. */
+  onGatewayRoutesPruned: (cb: (p: PrunedGatewayRoutes) => void): Promise<UnlistenFn> =>
+    listen<PrunedGatewayRoutes>("gateway-routes-pruned", (event) => cb(event.payload)),
 
   /** Tray quick actions ask the shell to switch pages (`tray-navigate`). */
   onTrayNavigate: (cb: (tab: string) => void): Promise<UnlistenFn> =>

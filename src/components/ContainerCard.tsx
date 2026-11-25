@@ -24,7 +24,7 @@ import {
 import { Card } from "./ui/Card";
 import { Button } from "./ui/Button";
 import { useToast } from "./ui/Toast";
-import { formatBytes, truncateId } from "../lib/utils";
+import { formatBytes, sortNames, truncateId } from "../lib/utils";
 import { portChips, type PortChip } from "../lib/portExposure";
 import { useContainerOp, type PendingOp } from "../lib/containerOps";
 import type { ContainerItem, ContainerStats } from "../types";
@@ -332,7 +332,7 @@ export const ContainerCard = React.memo<ContainerCardProps>(function ContainerCa
         <div className="flex items-center gap-1.5 flex-wrap min-w-0">
           {/* Network badge / Repair Network button if broken */}
           {c.broken_networks && c.broken_networks.length > 0 ? (
-            c.broken_networks.map((net) => (
+            sortNames(c.broken_networks).map((net) => (
               <button
                 key={`broken-${net}`}
                 type="button"
@@ -349,7 +349,7 @@ export const ContainerCard = React.memo<ContainerCardProps>(function ContainerCa
               </button>
             ))
           ) : c.networks && c.networks.length > 0 ? (
-            c.networks.map((net) => (
+            sortNames(c.networks).map((net) => (
               <span
                 key={net}
                 className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-500/10 border border-indigo-500/25 text-indigo-300 font-mono text-[10px] font-medium"

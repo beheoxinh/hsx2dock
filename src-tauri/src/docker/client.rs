@@ -394,6 +394,10 @@ impl DockerClient {
                         networks.push(net_name);
                     }
                 }
+                // The engine sends networks as a map; its order changes from
+                // one listing to the next, so the cards would reshuffle.
+                sort_names(&mut networks);
+                sort_names(&mut broken_networks);
 
                 ContainerItem {
                     short_id: id.chars().take(12).collect(),
@@ -1836,7 +1840,11 @@ fn container_details_from_inspect(
         .network_settings
         .as_ref()
         .and_then(|n| n.networks.clone())
-        .map(|nets| nets.keys().cloned().collect())
+        .map(|nets| {
+            let mut names: Vec<String> = nets.keys().cloned().collect();
+            sort_names(&mut names);
+            names
+        })
         .unwrap_or_default();
     ContainerDetails {
         short_id: id.chars().take(12).collect(),
@@ -2313,9 +2321,24 @@ fn normalize_ssh_uri(uri: &str) -> anyhow::Result<String> {
     Ok(format!("ssh://{trimmed}"))
 }
 
+/// A-Z, ignoring case (ties by exact bytes so the order is total).
+pub(crate) fn sort_names(names: &mut [String]) {
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_names_is_case_insensitive_a_to_z() {
+        let mut v: Vec<String> = ["hsc-net", "Bridge", "hsc-mocknet", "kind", "hsc-Net"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sort_names(&mut v);
+        assert_eq!(v, ["Bridge", "hsc-mocknet", "hsc-Net", "hsc-net", "kind"]);
+    }
     use crate::docker::models::{EnvVar, PortMapping};
 
     #[test]

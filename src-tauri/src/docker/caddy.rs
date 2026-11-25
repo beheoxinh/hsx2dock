@@ -33,6 +33,9 @@ pub struct CaddyInstallStatus {
     pub trusted: bool,
     pub hosts_synced: bool,
     pub auto_start: bool,
+    /// Mapped routes whose container is gone are removed automatically.
+    #[serde(default)]
+    pub auto_clear_orphans: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

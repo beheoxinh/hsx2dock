@@ -15,6 +15,11 @@ import {
   Square,
   FileText,
   Loader2,
+  GripVertical,
+  ArrowUpToLine,
+  ArrowDownToLine,
+  Search,
+  X,
 } from "lucide-react";
 import { GroupLogsModal } from "./groups/GroupLogsModal";
 import { Button } from "./ui/Button";
@@ -43,13 +48,29 @@ import {
 import { useStableCallback } from "../hooks/useStableCallback";
 import { formatBytes } from "../lib/utils";
 import {
+  applySectionOrder,
   canonicalContainerIds,
+  cardDropIndex,
   groupOf,
+  moveIdTo,
   moveMember,
   reorderMember,
 } from "../lib/containerGroups";
 import type { ContainerGroup, ContainerItem, ContainerStats, GroupOp } from "../types";
 import { useProgressiveList } from "../hooks/useProgressiveList";
+import { useListSort } from "../hooks/useListSort";
+import { sortItems } from "../lib/listSort";
+import { SortControl } from "./ui/SortControl";
+
+const GROUP_SORT_KEYS = ["custom", "name", "containers", "running"] as const;
+type GroupSortKey = (typeof GROUP_SORT_KEYS)[number];
+type GroupSection = "compose" | "user";
+const GROUP_SORT_OPTIONS: { key: GroupSortKey; label: string }[] = [
+  { key: "custom", label: "custom (drag)" },
+  { key: "name", label: "name" },
+  { key: "containers", label: "containers" },
+  { key: "running", label: "running" },
+];
 
 type DetailsTab = "logs" | "inspect" | "stats" | "terminal";
 type RouteLike = { domain: string; path?: string | null };
@@ -332,6 +353,25 @@ function loadExpandedGroups(): Record<string, boolean> {
   }
 }
 
+/** Isolated is shown above the other groups instead of below them. */
+const ISOLATED_ON_TOP_KEY = "hsx2dock.isolatedOnTop";
+
+function loadIsolatedOnTop(): boolean {
+  try {
+    return localStorage.getItem(ISOLATED_ON_TOP_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistIsolatedOnTop(onTop: boolean) {
+  try {
+    localStorage.setItem(ISOLATED_ON_TOP_KEY, onTop ? "1" : "0");
+  } catch {
+    /* storage disabled — the position just resets to the bottom */
+  }
+}
+
 function persistExpandedGroups(next: Record<string, boolean>) {
   try {
     localStorage.setItem(EXPANDED_STORAGE_KEY, JSON.stringify(next));
@@ -368,6 +408,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const modal = useModal();
   // Restored from the last session: a group the user opened stays open.
   const [expanded, setExpanded] = useState<Record<string, boolean>>(loadExpandedGroups);
+  const [isolatedOnTop, setIsolatedOnTop] = useState(loadIsolatedOnTop);
+  const toggleIsolatedPosition = useStableCallback(() =>
+    setIsolatedOnTop((cur) => {
+      persistIsolatedOnTop(!cur);
+      return !cur;
+    })
+  );
   const [localSizes, setSizes] = useState<Record<string, number>>({});
   // The page owns the app-wide size cache (primed at startup); self-polling is
   // only the fallback when no map is supplied.
@@ -843,6 +890,143 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     return map;
   }, [composeGroups, userGroups, membersOf]);
 
+  // Group cards are ordered by the toolbar choice; compose projects stay above
+  // user groups. Members inside a group keep their dragged order.
+  const [groupSort, setGroupSort] = useListSort("containerGroups", GROUP_SORT_KEYS, {
+    key: "custom",
+    dir: "asc",
+  });
+  const [sortedComposeGroups, sortedUserGroups] = useMemo(() => {
+    // Custom order is the saved list's order (set by dragging); a compose
+    // project never dragged has no saved entry and goes last, A→Z.
+    const position = new Map(groups.map((g, i) => [g.id, i]));
+    const getters = {
+      name: (g: ContainerGroup) => g.name,
+      custom: (g: ContainerGroup) => position.get(g.id),
+      containers: (g: ContainerGroup) => membersByGroupId.get(g.id)?.length ?? 0,
+      running: (g: ContainerGroup) =>
+        (membersByGroupId.get(g.id) ?? []).filter((c) => c.state === "running").length,
+    };
+    const byName = (g: ContainerGroup) => g.name;
+    return [
+      sortItems(composeGroups, getters, groupSort, byName),
+      sortItems(userGroups, getters, groupSort, byName),
+    ];
+  }, [composeGroups, userGroups, groups, membersByGroupId, groupSort]);
+
+  // Group name search; the container search above filters the cards inside.
+  const [groupQuery, setGroupQuery] = useState("");
+  const groupNeedle = groupQuery.trim().toLowerCase();
+  const shownComposeGroups = useMemo(
+    () =>
+      groupNeedle
+        ? sortedComposeGroups.filter((g) => g.name.toLowerCase().includes(groupNeedle))
+        : sortedComposeGroups,
+    [sortedComposeGroups, groupNeedle]
+  );
+  const shownUserGroups = useMemo(
+    () =>
+      groupNeedle
+        ? sortedUserGroups.filter((g) => g.name.toLowerCase().includes(groupNeedle))
+        : sortedUserGroups,
+    [sortedUserGroups, groupNeedle]
+  );
+
+  /**
+   * Saves a section's dragged order. Compose projects get an order entry if
+   * they had none; the list switches to the custom order so the result shows.
+   */
+  const commitGroupOrder = useStableCallback(async (section: GroupSection, orderedIds: string[]) => {
+    const latest = getContainerStore().groups;
+    const saved = new Map(latest.map((g) => [g.id, g]));
+    const source = new Map((section === "compose" ? composeGroups : userGroups).map((g) => [g.id, g]));
+    const ordered = orderedIds.flatMap((id) => {
+      const entry = saved.get(id);
+      if (entry) return [entry];
+      const g = source.get(id);
+      if (!g) return [];
+      return [section === "compose" ? persistedComposeGroup(g.name, g.container_ids, g.auto_start) : g];
+    });
+    setGroupSort({ key: "custom", dir: "asc" });
+    try {
+      await saveAll(applySectionOrder(latest, ordered));
+    } catch (err) {
+      toast.error("Could not save group order", String(err));
+    }
+  });
+
+  // Group cards are dragged by their grip with plain pointer events (HTML5
+  // drag-and-drop is unreliable in WebKitGTK), separately from the container
+  // drag layer: a group only moves within its own section.
+  const composeSectionRef = React.useRef<HTMLDivElement | null>(null);
+  const userSectionRef = React.useRef<HTMLDivElement | null>(null);
+  const [groupDrag, setGroupDrag] = useState<{ id: string; section: GroupSection; index: number } | null>(null);
+  const startGroupDrag = useStableCallback((id: string, section: GroupSection, e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const ids = (section === "compose" ? sortedComposeGroups : sortedUserGroups).map((g) => g.id);
+    const root = (section === "compose" ? composeSectionRef : userSectionRef).current;
+    const startY = e.clientY;
+    let active = false;
+    let index: number | null = null;
+    const rects = () =>
+      ids.map(
+        (gid) =>
+          root?.querySelector<HTMLElement>(`[data-group-card="${CSS.escape(gid)}"]`)?.getBoundingClientRect() ?? {
+            top: 0,
+            height: 0,
+          }
+      );
+    const onMove = (ev: PointerEvent) => {
+      if (!active) {
+        if (Math.abs(ev.clientY - startY) < 5) return;
+        active = true;
+        document.body.style.cursor = "grabbing";
+      }
+      const next = cardDropIndex(ids, rects(), ev.clientY, id);
+      index = next;
+      setGroupDrag((cur) => (cur && cur.id === id && cur.index === next ? cur : { id, section, index: next }));
+    };
+    const end = (commit: boolean) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("blur", onCancel);
+      window.removeEventListener("keydown", onKey);
+      document.body.style.cursor = "";
+      setGroupDrag(null);
+      if (!commit || !active || index === null) return;
+      const next = moveIdTo(ids, id, index);
+      if (next.some((x, i) => x !== ids[i])) void commitGroupOrder(section, next);
+    };
+    const onUp = () => end(true);
+    const onCancel = () => end(false);
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") end(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("blur", onCancel);
+    window.addEventListener("keydown", onKey);
+  });
+  const gripCompose = useStableCallback((id: string, e: React.PointerEvent) => startGroupDrag(id, "compose", e));
+  const gripUser = useStableCallback((id: string, e: React.PointerEvent) => startGroupDrag(id, "user", e));
+  const gripBlocked = groupNeedle
+    ? "Clear the group search to reorder groups"
+    : null;
+
+  /** Drop line position inside `section`: the id it sits before, or "end". */
+  const dropMarker = (section: GroupSection, list: ContainerGroup[]): string | null => {
+    if (!groupDrag || groupDrag.section !== section) return null;
+    const ids = list.map((g) => g.id);
+    const next = moveIdTo(ids, groupDrag.id, groupDrag.index);
+    if (!next.some((x, i) => x !== ids[i])) return null;
+    const without = ids.filter((x) => x !== groupDrag.id);
+    return without[groupDrag.index] ?? "end";
+  };
+
   /**
    * Moves a container into `groupId`, or out of every group when `groupId` is
    * null. A container lives in one group only, so this is a move, not an
@@ -981,6 +1165,21 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     )
   );
 
+  const isolatedCard = (
+    <IsolatedCard
+      isolated={isolated}
+      isOpen={isolatedOpen}
+      autoStart={isolatedAutoStart}
+      onTop={isolatedOnTop}
+      onToggle={toggleIsolated}
+      onAutoStart={toggleIsolatedAutoStart}
+      onMove={toggleIsolatedPosition}
+      onBulk={runIsolatedBulk}
+    >
+      {children}
+    </IsolatedCard>
+  );
+
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
@@ -990,9 +1189,36 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             Groups
           </span>
           <span className="truncate text-[11px] text-zinc-600">
-            drag a card into a group to move it · one group per container
+            drag a card into a group to move it · drag a group's grip to reorder groups
           </span>
         </div>
+        <div className="flex shrink-0 items-center gap-2">
+        <div className="relative w-48">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+          <input
+            type="text"
+            value={groupQuery}
+            onChange={(e) => setGroupQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setGroupQuery("");
+            }}
+            placeholder="Search groups..."
+            aria-label="Search groups by name"
+            className="h-9 w-full rounded-none border border-zinc-800 bg-zinc-900/90 pl-8 pr-7 text-xs text-white placeholder-zinc-500 focus:border-blue-500 focus:outline-none"
+          />
+          {groupQuery && (
+            <button
+              type="button"
+              onClick={() => setGroupQuery("")}
+              title="Clear group search"
+              aria-label="Clear group search"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-zinc-500 hover:text-zinc-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+        <SortControl value={groupSort} options={GROUP_SORT_OPTIONS} onChange={setGroupSort} label="Sort groups" />
         <Button
           variant="outline"
           size="sm"
@@ -1004,16 +1230,31 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           <Plus className="w-3.5 h-3.5" />
           New group
         </Button>
+        </div>
       </div>
 
       {/* Full-width stack: a group card holds its member cards, so it spans the
           list instead of sitting in a narrow grid cell. Compose projects come
           first — they are the containers the user is least likely to touch. */}
       <div className="space-y-3">
-        {composeGroups.map((g) => (
+        {isolatedOnTop && isolatedCard}
+
+        {groupNeedle && shownComposeGroups.length === 0 && shownUserGroups.length === 0 && (
+          <p className="border border-dashed border-zinc-800 px-3 py-2 text-xs text-zinc-500">
+            No group matches "{groupQuery.trim()}".
+          </p>
+        )}
+
+        {shownComposeGroups.length > 0 && (
+        <div ref={composeSectionRef} className="space-y-3">
+        {shownComposeGroups.map((g) => (
+          <React.Fragment key={g.id}>
+          {dropMarker("compose", shownComposeGroups) === g.id && <GroupDropLine />}
           <GroupCard
-            key={g.id}
             group={g}
+            onGripDown={shownComposeGroups.length > 1 ? gripCompose : undefined}
+            gripBlocked={gripBlocked}
+            dragging={groupDrag?.id === g.id}
             members={membersByGroupId.get(g.id) ?? EMPTY_MEMBERS}
             isOpen={!!expanded[g.id]}
             editing={null}
@@ -1035,12 +1276,22 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onContainerAction={onContainerAction}
             routesById={routesById}
           />
+          </React.Fragment>
         ))}
+        {dropMarker("compose", shownComposeGroups) === "end" && <GroupDropLine />}
+        </div>
+        )}
 
-        {userGroups.map((g) => (
+        {shownUserGroups.length > 0 && (
+        <div ref={userSectionRef} className="space-y-3">
+        {shownUserGroups.map((g) => (
+          <React.Fragment key={g.id}>
+          {dropMarker("user", shownUserGroups) === g.id && <GroupDropLine />}
           <GroupCard
-            key={g.id}
             group={g}
+            onGripDown={shownUserGroups.length > 1 ? gripUser : undefined}
+            gripBlocked={gripBlocked}
+            dragging={groupDrag?.id === g.id}
             members={membersByGroupId.get(g.id) ?? EMPTY_MEMBERS}
             isOpen={!!expanded[g.id]}
             editing={editing?.id === g.id ? editing.name : null}
@@ -1061,18 +1312,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             onContainerAction={onContainerAction}
             routesById={routesById}
           />
+          </React.Fragment>
         ))}
+        {dropMarker("user", shownUserGroups) === "end" && <GroupDropLine />}
+        </div>
+        )}
 
-        <IsolatedCard
-          isolated={isolated}
-          isOpen={isolatedOpen}
-          autoStart={isolatedAutoStart}
-          onToggle={toggleIsolated}
-          onAutoStart={toggleIsolatedAutoStart}
-          onBulk={runIsolatedBulk}
-        >
-          {children}
-        </IsolatedCard>
+        {!isolatedOnTop && isolatedCard}
       </div>
 
       {logsTarget && (
@@ -1115,7 +1361,16 @@ interface GroupCardProps {
   onRepairNetwork?: (container: ContainerItem) => void;
   onContainerAction: (container: ContainerItem, action: ContainerAction) => void;
   routesById?: Map<string, RouteLike[]>;
+  /** Starts dragging this card to reorder groups; absent when it cannot move. */
+  onGripDown?: (id: string, e: React.PointerEvent) => void;
+  /** Why reordering is off right now (a search is active), shown on the grip. */
+  gripBlocked?: string | null;
+  /** This card is the one being dragged. */
+  dragging?: boolean;
 }
+
+/** Where a dragged group card would land. */
+const GroupDropLine = () => <div className="h-0.5 bg-emerald-400/80 shadow-[0_0_8px] shadow-emerald-400/50" />;
 
 const GroupCard = React.memo<GroupCardProps>(function GroupCard({
   group: g,
@@ -1140,6 +1395,9 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
   onRepairNetwork,
   onContainerAction,
   routesById,
+  onGripDown,
+  gripBlocked,
+  dragging = false,
 }) {
   const onToggle = () => onToggleId(g.id);
   const onRenameStart = () => onRenameStartG(g);
@@ -1205,6 +1463,8 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
       ref={drop.ref}
       data-group-card={g.id}
       className={`rounded-2xl border bg-zinc-900/90 shadow-lg transition-colors duration-150 ${
+        dragging ? "opacity-50 " : ""
+      }${
         isOver
           ? "border-emerald-500/70 bg-emerald-500/5 ring-1 ring-emerald-500/40"
           : compose
@@ -1220,6 +1480,20 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
       }
     >
       <div className="flex items-center gap-2 px-4 pt-3 pb-2">
+        {onGripDown && (
+          <button
+            type="button"
+            data-no-drag
+            onPointerDown={gripBlocked ? undefined : (e) => onGripDown(g.id, e)}
+            disabled={!!gripBlocked}
+            title={gripBlocked ?? "Drag to reorder groups"}
+            aria-label={`Reorder group ${g.name}`}
+            style={{ touchAction: "none" }}
+            className="-ml-2 shrink-0 p-0.5 text-zinc-600 hover:text-zinc-300 enabled:cursor-grab disabled:opacity-40"
+          >
+            <GripVertical className="w-4 h-4" />
+          </button>
+        )}
         {hasMembers ? (
           <button
             type="button"
@@ -1418,8 +1692,12 @@ interface IsolatedCardProps {
   isolated: ContainerItem[];
   isOpen: boolean;
   autoStart: boolean;
+  /** Shown above the other groups rather than below. */
+  onTop: boolean;
   onToggle: () => void;
   onAutoStart: () => void;
+  /** Flips Isolated between the top and the bottom of the group list. */
+  onMove: () => void;
   onBulk: (action: "start" | "stop") => void;
   /** The ungrouped container cards, rendered inside this bucket. */
   children?: React.ReactNode;
@@ -1438,8 +1716,10 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
   isolated,
   isOpen,
   autoStart,
+  onTop,
   onToggle,
   onAutoStart,
+  onMove,
   onBulk,
   children,
 }) => {
@@ -1484,6 +1764,16 @@ const IsolatedCard: React.FC<IsolatedCardProps> = ({
         </button>
 
         <div className="flex shrink-0 items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onMove}
+            title={onTop ? "Shown above the groups — click to move it below" : "Shown below the groups — click to move it to the top"}
+            aria-label={onTop ? "Move Isolated below the groups" : "Move Isolated above the groups"}
+            className="mr-1 text-zinc-400 hover:text-white"
+          >
+            {onTop ? <ArrowDownToLine className="w-3.5 h-3.5" /> : <ArrowUpToLine className="w-3.5 h-3.5" />}
+          </Button>
           <Switch
             checked={autoStart}
             onChange={onAutoStart}

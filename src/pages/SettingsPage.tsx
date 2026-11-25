@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, RefreshCw, DownloadCloud, PackageCheck, Monitor, Cpu, Wrench, Boxes, Minimize2, Stethoscope, Globe } from "lucide-react";
+import { Terminal, Power, Save, FileCode2, Check, HardDrive, Palette, FolderEdit, AlertTriangle, ArrowRight, X, DownloadCloud, Monitor, Cpu, Wrench, Boxes, Minimize2, Stethoscope, Globe } from "lucide-react";
 import { Card } from "../components/ui/Card";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
@@ -8,51 +8,35 @@ import { EngineHealthCard } from "../components/settings/EngineHealthCard";
 import { RegistriesCard } from "../components/settings/RegistriesCard";
 import { NotificationsCard } from "../components/settings/NotificationsCard";
 import { KubernetesCard } from "../components/settings/KubernetesCard";
-import {
-  UpdateProgressPanel,
-  useUpdateRun,
-} from "../components/settings/UpdateProgressPanel";
+import { BinaryUpdatePanel } from "../components/settings/BinaryUpdatePanel";
+import { onBinaryInstalled, useBinaryUpdates } from "../lib/binaryUpdates";
+import { binaryStatus } from "../lib/binaryUpdateModel";
+import { useModal } from "../components/ui/ModalContext";
 import { api } from "../lib/api";
 import { invalidateTerminalSettings } from "../lib/terminalSettings";
 import type {
   AppConfig,
   CliBridgeStatus,
-  EngineUpdateInfo,
   CliResolution,
   CliShimStatus,
-  CliUpdateInfo,
-  ComposeUpdateInfo,
   CaddyInstallStatus,
-  CaddyUpdateInfo,
+  UpdateTarget,
 } from "../types";
-
-const humanError = (e: unknown): string => {
-  const s = String(e);
-  if (/403|forbidden|rate/i.test(s) && /github/i.test(s)) {
-    return "GitHub refused the request (rate limited). Try again later.";
-  }
-  if (/429/i.test(s)) return "GitHub rate limited. Try again later.";
-  if (/timeout|timed out/i.test(s)) return "Request timed out. Check your connection.";
-  if (/network|connect|dns/i.test(s)) return "Network error. Check your connection.";
-  return s;
-};
-
-// The Settings page remounts on navigation, and update checks are advisory:
-// one attempt per half hour is plenty. A failure backs off further and stays
-// silent — only an explicit click may surface an error.
-const AUTO_CHECK_TTL_MS = 30 * 60_000;
-const AUTO_FAIL_TTL_MS = 10 * 60_000;
-let composeCheckedAt = 0;
-let composeCheckOk = true;
-let engineCheckedAt = 0;
-let engineCheckOk = true;
-let cliCheckedAt = 0;
-let cliCheckOk = true;
-let caddyCheckedAt = 0;
-let caddyCheckOk = true;
 
 /** The four configuration domains, in the order the rail presents them. */
 type SettingsTab = "general" | "engine" | "tools" | "registry";
+
+/**
+ * The tab survives a remount (navigating away and back, an engine restart):
+ * an update running in the Engine tab must still be on screen afterwards.
+ */
+let lastSettingsTab: SettingsTab = "general";
+
+/** Binaries whose update panel lives on each tab, for the rail's dot. */
+const TAB_BINARIES: Partial<Record<SettingsTab, UpdateTarget[]>> = {
+  engine: ["engine", "kind"],
+  tools: ["cli", "compose", "caddy"],
+};
 
 const SETTINGS_TABS: {
   id: SettingsTab;
@@ -109,9 +93,15 @@ const ToggleRow: React.FC<{
   </button>
 );
 
-export const SettingsPage: React.FC = () => {
+export const SettingsPage: React.FC<{ refreshKey?: number }> = ({ refreshKey = 0 }) => {
   const toast = useToast();
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const modal = useModal();
+  const [tab, setTabState] = useState<SettingsTab>(() => lastSettingsTab);
+  const setTab = (next: SettingsTab) => {
+    lastSettingsTab = next;
+    setTabState(next);
+  };
+  const binaries = useBinaryUpdates();
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [cliStatus, setCliStatus] = useState<CliBridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
@@ -145,79 +135,16 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
-  // Engine update: what the official channel reports, plus in-flight state.
-  const [release, setRelease] = useState<EngineUpdateInfo | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [updating, setUpdating] = useState(false);
-  const { run: engineRun, reset: resetEngineRun } = useUpdateRun("engine");
-  const { run: cliRun, reset: resetCliRun } = useUpdateRun("cli");
-  const { run: composeRun, reset: resetComposeRun } = useUpdateRun("compose");
-  const { run: caddyRun, reset: resetCaddyRun } = useUpdateRun("caddy");
-
   // Caddy Gateway state
   const [caddyStatus, setCaddyStatus] = useState<CaddyInstallStatus | null>(null);
-  const [caddyUpdate, setCaddyUpdate] = useState<CaddyUpdateInfo | null>(null);
-  const [checkingCaddy, setCheckingCaddy] = useState(false);
-  const [updatingCaddy, setUpdatingCaddy] = useState(false);
   const [togglingCaddy, setTogglingCaddy] = useState(false);
   const [caddyHttpPort, setCaddyHttpPort] = useState<number>(80);
   const [caddyHttpsPort, setCaddyHttpsPort] = useState<number>(443);
   const [savingPorts, setSavingPorts] = useState(false);
 
-  const checkForEngineUpdate = async (announce?: boolean) => {
-    if (!announce) {
-      const ttl = engineCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
-      if (Date.now() - engineCheckedAt < ttl) return;
-    }
-    setChecking(true);
-    try {
-      const info = await api.checkEngineUpdate();
-      engineCheckedAt = Date.now();
-      engineCheckOk = true;
-      setRelease(info);
-      if (announce && !info.update_available) {
-        toast.success(
-          "Engine is up to date",
-          `Installed ${info.installed_version ?? "nothing"} · channel reports ${info.latest_version}`
-        );
-      }
-    } catch (e) {
-      engineCheckedAt = Date.now();
-      engineCheckOk = false;
-      // Background checks fail quietly: there is simply no update to show.
-      if (announce) toast.error("Update check failed", humanError(e));
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  const applyEngineUpdate = async () => {
-    if (!release) return;
-    setUpdating(true);
-    resetEngineRun();
-    try {
-      const version = await api.installEngineUpdate(release.latest_version);
-      toast.success("Engine updated", `Docker Engine ${version} is now active.`);
-      // Force a fresh probe: the cached "update available" answer belongs to
-      // the build we just replaced, and re-using it would leave a stale CTA.
-      engineCheckedAt = 0;
-      await checkForEngineUpdate();
-    } catch (e) {
-      toast.error("Engine update failed", String(e));
-    } finally {
-      setUpdating(false);
-    }
-  };
-
   const [cliResolution, setCliResolution] = useState<CliResolution | null>(null);
   const [shimStatus, setShimStatus] = useState<CliShimStatus | null>(null);
   const [shimBusy, setShimBusy] = useState(false);
-  const [cliUpdate, setCliUpdate] = useState<CliUpdateInfo | null>(null);
-  const [checkingCli, setCheckingCli] = useState(false);
-  const [updatingCli, setUpdatingCli] = useState(false);
-  const [compose, setCompose] = useState<ComposeUpdateInfo | null>(null);
-  const [checkingCompose, setCheckingCompose] = useState(false);
-  const [updatingCompose, setUpdatingCompose] = useState(false);
 
   const checkDockerCli = async (announce?: boolean) => {
     try {
@@ -227,59 +154,6 @@ export const SettingsPage: React.FC = () => {
     } catch (e) {
       if (announce) toast.error("CLI check failed", String(e));
       else console.warn("CLI check failed:", e);
-    }
-  };
-
-  // Bundled CLI updates are independent of the engine release: the `docker`
-  // binary is replaced in place while the daemon keeps running.
-  const checkCliForUpdate = async (announce?: boolean) => {
-    if (!announce) {
-      const ttl = cliCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
-      if (Date.now() - cliCheckedAt < ttl) return;
-    }
-    setCheckingCli(true);
-    try {
-      const info = await api.checkCliUpdate();
-      cliCheckedAt = Date.now();
-      cliCheckOk = true;
-      setCliUpdate(info);
-      if (announce) {
-        if (info.update_available) {
-          toast.info(
-            "Docker CLI update available",
-            `${info.latest_version} ready to install`
-          );
-        } else {
-          toast.success(
-            "Docker CLI is up to date",
-            `Bundled CLI: ${info.installed_version ?? "none"}`
-          );
-        }
-      }
-    } catch (e) {
-      cliCheckedAt = Date.now();
-      cliCheckOk = false;
-      // Background checks stay quiet; only an explicit click reports.
-      if (announce) toast.error("CLI update check failed", humanError(e));
-    } finally {
-      setCheckingCli(false);
-    }
-  };
-
-  const applyCliUpdate = async () => {
-    if (!cliUpdate?.update_available) return;
-    setUpdatingCli(true);
-    resetCliRun();
-    try {
-      const version = await api.installCliUpdate(cliUpdate.latest_version);
-      toast.success("Docker CLI updated", `Bundled CLI is now ${version}`);
-      cliCheckedAt = 0;
-      await checkCliForUpdate();
-      await checkDockerCli();
-    } catch (e) {
-      toast.error("Docker CLI update failed", String(e));
-    } finally {
-      setUpdatingCli(false);
     }
   };
 
@@ -300,55 +174,6 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
-  const checkCompose = async (announce?: boolean) => {
-    if (!announce) {
-      const ttl = composeCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
-      if (Date.now() - composeCheckedAt < ttl) return;
-    }
-    setCheckingCompose(true);
-    try {
-      const info = await api.checkComposeUpdate();
-      composeCheckedAt = Date.now();
-      composeCheckOk = true;
-      setCompose(info);
-      if (announce) {
-        if (info.update_available) {
-          toast.info("Compose update available", `${info.latest_version} ready to install`);
-        } else {
-          toast.success("Compose up to date", `Latest available: ${info.latest_version}`);
-        }
-      }
-    } catch (e) {
-      composeCheckedAt = Date.now();
-      composeCheckOk = false;
-      // A failed background check means "no update known", not an error state:
-      // stay quiet and keep whatever was shown before.
-      if (announce) toast.error("Compose check failed", humanError(e));
-    } finally {
-      setCheckingCompose(false);
-    }
-  };
-
-  const applyComposeUpdate = async () => {
-    if (!compose?.update_available) return;
-    setUpdatingCompose(true);
-    resetComposeRun();
-    try {
-      const version = compose.latest_version;
-      await api.installComposeUpdate(version);
-      toast.success("Docker Compose updated", `Now using ${version}`);
-      // Force a fresh probe: the cached "update available" answer belongs to
-      // the binary we just replaced, and re-using it would leave a stale CTA.
-      composeCheckedAt = 0;
-      await checkCompose();
-      await checkDockerCli();
-    } catch (e) {
-      toast.error("Compose update failed", String(e));
-    } finally {
-      setUpdatingCompose(false);
-    }
-  };
-
   const loadCaddyStatus = async () => {
     try {
       const st = await api.getGatewayStatus();
@@ -357,51 +182,6 @@ export const SettingsPage: React.FC = () => {
       setCaddyHttpsPort(st.https_port);
     } catch (e) {
       console.error("Failed to load Caddy status:", e);
-    }
-  };
-
-  const checkCaddy = async (announce?: boolean) => {
-    if (!announce) {
-      const ttl = caddyCheckOk ? AUTO_CHECK_TTL_MS : AUTO_FAIL_TTL_MS;
-      if (Date.now() - caddyCheckedAt < ttl) return;
-    }
-    setCheckingCaddy(true);
-    try {
-      const info = await api.checkCaddyUpdate();
-      caddyCheckedAt = Date.now();
-      caddyCheckOk = true;
-      setCaddyUpdate(info);
-      if (announce) {
-        if (info.update_available) {
-          toast.info("Caddy update available", `${info.latest_version} ready to install`);
-        } else {
-          toast.success("Caddy up to date", `Version: ${info.installed_version ?? "none"}`);
-        }
-      }
-    } catch (e) {
-      caddyCheckedAt = Date.now();
-      caddyCheckOk = false;
-      if (announce) toast.error("Caddy check failed", humanError(e));
-    } finally {
-      setCheckingCaddy(false);
-    }
-  };
-
-  const applyCaddyUpdate = async () => {
-    if (!caddyUpdate?.latest_version) return;
-    setUpdatingCaddy(true);
-    resetCaddyRun();
-    try {
-      const version = caddyUpdate.latest_version;
-      await api.installCaddyUpdate(version);
-      toast.success("Caddy updated", `Caddy binary is now v${version}`);
-      caddyCheckedAt = 0;
-      await checkCaddy();
-      await loadCaddyStatus();
-    } catch (e) {
-      toast.error("Caddy update failed", String(e));
-    } finally {
-      setUpdatingCaddy(false);
     }
   };
 
@@ -442,13 +222,37 @@ export const SettingsPage: React.FC = () => {
 
   useEffect(() => {
     loadSettings();
-    checkForEngineUpdate().catch(() => {});
     checkDockerCli().catch(() => {});
-    checkCompose().catch(() => {});
-    checkCliForUpdate().catch(() => {});
     loadCaddyStatus().catch(() => {});
-    checkCaddy().catch(() => {});
+    // Release checks are not fired here: each update panel checks (cached for
+    // 30 min) when its tab is first shown.
+    return onBinaryInstalled((target) => {
+      if (target === "caddy") void loadCaddyStatus();
+      else if (target !== "kind") void checkDockerCli();
+    });
   }, []);
+
+  // The engine started/stopped (an engine update does both): refresh what
+  // depends on it in place, without remounting or leaving the current tab.
+  const firstRefresh = React.useRef(true);
+  useEffect(() => {
+    if (firstRefresh.current) {
+      firstRefresh.current = false;
+      return;
+    }
+    checkDockerCli().catch(() => {});
+    loadCaddyStatus().catch(() => {});
+  }, [refreshKey]);
+
+  /** Engine updates stop the daemon: say what that means before starting. */
+  const confirmEngineUpdate = (version: string | null, installed: boolean) =>
+    installed
+      ? modal.showConfirm(
+          `Docker Engine stops while its binaries are replaced with ${version ?? "the latest release"}, then starts again. Running containers are stopped; those with a restart policy come back on their own. The update keeps its progress here even while the engine restarts.`,
+          "Update Docker Engine",
+          "warning"
+        )
+      : Promise.resolve(true);
 
   const handleToggleCliBridge = async (enabled: boolean) => {
     try {
@@ -529,6 +333,12 @@ export const SettingsPage: React.FC = () => {
           >
             {SETTINGS_TABS.map(({ id, label, icon: Icon }) => {
               const active = tab === id;
+              const kinds = (TAB_BINARIES[id] ?? []).map((t) => binaryStatus(binaries[t]).kind);
+              const dot = kinds.includes("updating")
+                ? { cls: "bg-sky-400 animate-pulse", hint: "An update is running" }
+                : kinds.includes("update")
+                  ? { cls: "bg-amber-400", hint: "Updates available" }
+                  : null;
               return (
                 <button
                   key={id}
@@ -549,6 +359,13 @@ export const SettingsPage: React.FC = () => {
                     }`}
                   />
                   {label}
+                  {dot && (
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${dot.cls}`}
+                      title={dot.hint}
+                      aria-label={dot.hint}
+                    />
+                  )}
                 </button>
               );
             })}
@@ -834,74 +651,21 @@ export const SettingsPage: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2 text-sm">
-                  {updating ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
-                      <span className="text-zinc-200">
-                        {engineRun?.label ?? "Starting…"}
-                      </span>
-                    </>
-                  ) : release?.update_available ? (
-                    <>
-                      <DownloadCloud className="w-4 h-4 text-sky-400" />
-                      <span className="text-zinc-200">
-                        Docker Engine{" "}
-                        <span className="font-mono text-sky-300">{release.latest_version}</span> is available
-                      </span>
-                    </>
-                  ) : release ? (
-                    <>
-                      <PackageCheck className="w-4 h-4 text-emerald-400" />
-                      <span className="text-zinc-200">
-                        {release.installed_version
-                          ? `Up to date · ${release.installed_version}`
-                          : `No engine installed · latest is ${release.latest_version}`}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-zinc-400">
-                      {checking ? "Checking for updates…" : "Update status unknown"}
-                    </span>
-                  )}
-                </div>
-                {release && !updating && (
-                  <p className="text-[11px] text-zinc-500 mt-1">
-                    Installed: {release.installed_version ?? "none"} · Latest: {release.latest_version}
-                    {release.update_available && release.latest_version !== release.pinned_version && (
-                      <> · checksums for this version come from Docker over TLS (not pinned)</>
-                    )}
-                  </p>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={checking || updating}
-                  onClick={() => checkForEngineUpdate(true)}
-                >
-                  <RefreshCw className={`w-4 h-4 ${checking ? "animate-spin" : ""}`} />
-                  <span>Check</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="primary"
-                  disabled={updating || checking || !release?.update_available}
-                  onClick={applyEngineUpdate}
-                >
-                  <DownloadCloud className="w-4 h-4" />
-                  <span>{release?.installed_version ? "Update Engine" : "Install Engine"}</span>
-                </Button>
-              </div>
-            </div>
-
-            {engineRun && (
-              <UpdateProgressPanel run={engineRun} onDismiss={resetEngineRun} />
-            )}
+            <BinaryUpdatePanel
+              target="engine"
+              name="Docker Engine"
+              icon={Power}
+              iconClass="text-amber-400"
+              autoCheck={tab === "engine"}
+              description={
+                binaries.engine.info?.updateAvailable &&
+                binaries.engine.info.latest !== binaries.engine.info.pinned
+                  ? "Checksums for this version come from Docker over TLS (not pinned in the app)."
+                  : "Rootless dockerd, containerd and runc bundled with the app."
+              }
+              impact="Stops the engine while it is replaced, then starts it again."
+              confirm={confirmEngineUpdate}
+            />
           </Card>
 
           {/* Engine Storage Location (Data Root) */}
@@ -971,7 +735,7 @@ export const SettingsPage: React.FC = () => {
             <EngineHealthCard />
           </Card>
 
-          <KubernetesCard />
+          <KubernetesCard visible={tab === "engine"} />
         </div>
 
         {/* Tools — the two command-line surfaces this app owns. */}
@@ -1033,52 +797,6 @@ export const SettingsPage: React.FC = () => {
 
                 {/* The system docker cannot be replaced without root, so this
                     updates the bundled copy only. */}
-                <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <div className="min-w-0">
-                    <p className="text-xs font-medium text-zinc-200">
-                      Bundled docker CLI
-                    </p>
-                    <p className="text-[11px] text-zinc-500 mt-0.5">
-                      {cliUpdate
-                        ? cliUpdate.installed_version
-                          ? cliUpdate.update_available
-                            ? `Update ${cliUpdate.installed_version} → ${cliUpdate.latest_version}`
-                            : `Up to date · ${cliUpdate.installed_version}`
-                          : "No bundled CLI — install Docker Engine first"
-                        : "Not checked yet"}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={checkingCli || updatingCli}
-                      onClick={() => checkCliForUpdate(true)}
-                    >
-                      <RefreshCw
-                        className={`w-4 h-4 ${checkingCli ? "animate-spin" : ""}`}
-                      />
-                      <span>Check</span>
-                    </Button>
-                    {cliUpdate?.update_available && cliUpdate.installed_version && (
-                      <Button
-                        type="button"
-                        variant="primary"
-                        size="sm"
-                        disabled={updatingCli}
-                        onClick={applyCliUpdate}
-                      >
-                        <DownloadCloud className="w-4 h-4" />
-                        <span>{updatingCli ? "Updating…" : "Update CLI"}</span>
-                      </Button>
-                    )}
-                  </div>
-                </div>
-
-                {cliRun && (
-                  <UpdateProgressPanel run={cliRun} onDismiss={resetCliRun} />
-                )}
               </div>
             ) : (
               <p className="text-xs text-zinc-500">Checking which docker CLI is available…</p>
@@ -1197,48 +915,43 @@ export const SettingsPage: React.FC = () => {
               </button>
             </div>
 
-            <div className="flex items-center justify-between gap-3 pt-1">
-              <div className="text-xs text-zinc-400">
-                {compose ? (
-                  <>
-                    Docker Compose: <span className="font-mono text-zinc-300">
-                      {compose.installed_version ?? "not installed"}
-                    </span>
-                    {compose.update_available && (
-                      <>
-                        {" "}· <span className="text-amber-300">{compose.latest_version} available</span>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  "Docker Compose: not checked"
-                )}
+          </Card>
+
+          {/* Bundled command-line binaries: one update panel each. */}
+          <Card className="space-y-3">
+            <div className="flex items-center gap-3 pb-3 border-b border-zinc-800">
+              <div className="p-2 bg-zinc-800/80 border border-zinc-700/50">
+                <DownloadCloud className="w-5 h-5 text-sky-400" />
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => checkCompose(true)}
-                  disabled={checkingCompose || updatingCompose}
-                  className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-xs font-medium text-zinc-200 transition-colors"
-                >
-                  {checkingCompose ? "Checking…" : "Check Compose"}
-                </button>
-                {/* Only offer the update when one actually exists. */}
-                {compose?.update_available && (
-                  <button
-                    type="button"
-                    onClick={applyComposeUpdate}
-                    disabled={updatingCompose || checkingCompose}
-                    className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-medium text-white transition-colors"
-                  >
-                    {updatingCompose ? "Updating…" : "Update Compose"}
-                  </button>
-                )}
+              <div className="flex-1">
+                <h3 className="font-semibold text-white">Bundled CLI tools</h3>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  The docker CLI and Compose plugin shipped with the app. A system-wide docker is
+                  never touched — it needs root.
+                </p>
               </div>
             </div>
-            {composeRun && (
-              <UpdateProgressPanel run={composeRun} onDismiss={resetComposeRun} />
-            )}
+            <BinaryUpdatePanel
+              target="cli"
+              name="Docker CLI"
+              icon={Terminal}
+              iconClass="text-emerald-400"
+              autoCheck={tab === "tools"}
+              description={cliResolution?.bundled_path ?? undefined}
+              blockedReason={
+                binaries.cli.info && !binaries.cli.info.installed
+                  ? "Install Docker Engine first — the bundled CLI comes with it."
+                  : null
+              }
+            />
+            <BinaryUpdatePanel
+              target="compose"
+              name="Docker Compose"
+              icon={FileCode2}
+              iconClass="text-purple-400"
+              autoCheck={tab === "tools"}
+              description="The compose plugin used by the Compose page and `docker compose`."
+            />
           </Card>
 
           {/* Caddy Gateway Binary & Reverse Proxy */}
@@ -1287,65 +1000,15 @@ export const SettingsPage: React.FC = () => {
               </div>
             </div>
 
-            {/* Version & Update row */}
-            <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-zinc-200">
-                    Caddy Binary Version
-                  </span>
-                  <span className="font-mono text-xs text-sky-300 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">
-                    {caddyStatus?.version ? `v${caddyStatus.version}` : "Not installed"}
-                  </span>
-                </div>
-                <p className="text-[11px] text-zinc-500 mt-1 truncate">
-                  {caddyStatus?.path ?? "Location: ~/.local/share/hsx2dock/versions/caddy"}
-                  {caddyUpdate?.update_available && (
-                    <span className="text-amber-400 ml-2 font-medium">
-                      · Update v{caddyUpdate.latest_version} available
-                    </span>
-                  )}
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={checkingCaddy || updatingCaddy}
-                  onClick={() => checkCaddy(true)}
-                >
-                  <RefreshCw
-                    className={`w-4 h-4 ${checkingCaddy ? "animate-spin" : ""}`}
-                  />
-                  <span>Check</span>
-                </Button>
-
-                {(!caddyStatus?.installed || caddyUpdate?.update_available) && (
-                  <Button
-                    type="button"
-                    variant="primary"
-                    size="sm"
-                    disabled={updatingCaddy}
-                    onClick={applyCaddyUpdate}
-                  >
-                    <DownloadCloud className="w-4 h-4" />
-                    <span>
-                      {updatingCaddy
-                        ? "Installing…"
-                        : caddyStatus?.installed
-                          ? "Update Caddy"
-                          : "Install Caddy"}
-                    </span>
-                  </Button>
-                )}
-              </div>
-            </div>
-
-            {caddyRun && (
-              <UpdateProgressPanel run={caddyRun} onDismiss={resetCaddyRun} />
-            )}
+            <BinaryUpdatePanel
+              target="caddy"
+              name="Caddy"
+              icon={Globe}
+              iconClass="text-sky-400"
+              autoCheck={tab === "tools"}
+              description={caddyStatus?.path ?? "~/.local/share/hsx2dock/versions/caddy"}
+              impact={caddyStatus?.running ? "The running gateway restarts on the new binary with its routes." : undefined}
+            />
 
             {/* Port Management */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">

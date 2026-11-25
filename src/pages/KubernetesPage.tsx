@@ -1,3 +1,4 @@
+import { installBinary } from "../lib/binaryUpdates";
 import { useModal } from "../components/ui/ModalContext";
 import { useToast } from "../components/ui/Toast";
 import React, { useEffect, useRef, useState } from "react";
@@ -477,7 +478,9 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
       setInstalling(true);
       setInstallPct(0);
       setInstallDetail(null);
-      await api.installKind();
+      // Through the shared store, so Settings shows the same run and an
+      // update there cannot start alongside this install.
+      await installBinary("kind");
     } catch (e) {
       setInstalling(false);
       setInstallPct(null);

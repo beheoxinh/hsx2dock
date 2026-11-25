@@ -330,7 +330,7 @@ const MainLayout: React.FC = () => {
                 {activeTab === "compose" && <ComposePage daemonState={daemonState} />}
                 {activeTab === "gateway" && <GatewayPage daemonState={daemonState} />}
                 {activeTab === "mcp" && <McpPage />}
-                {activeTab === "settings" && <SettingsPage />}
+                {activeTab === "settings" && <SettingsPage refreshKey={refreshKey} />}
               </Suspense>
               </ErrorBoundary>
             </motion.div>
@@ -399,6 +399,9 @@ const REFRESH_IN_PLACE = new Set([
   "volumes",
   "networks",
   "kubernetes",
+  // Settings holds the binary-update panels: an engine update restarts the
+  // daemon, and a remount there reset the tab and blinked the whole page.
+  "settings",
 ]);
 
 export const App: React.FC = () => {

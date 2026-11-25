@@ -19,13 +19,17 @@ import {
   Settings,
   Box,
   Compass,
+  Eraser,
 } from "lucide-react";
 import { HostsManagerModal } from "../components/gateway/HostsManagerModal";
 import { motion, AnimatePresence } from "framer-motion";
-import { api } from "../lib/api";
+import { api, events } from "../lib/api";
 import { useToast } from "../components/ui/Toast";
 import { Button } from "../components/ui/Button";
 import { SkeletonList } from "../components/ui/Skeleton";
+import { SortControl } from "../components/ui/SortControl";
+import { useListSort } from "../hooks/useListSort";
+import { sortItems } from "../lib/listSort";
 import type {
   CaddyInstallStatus,
   GatewayRoute,
@@ -33,6 +37,16 @@ import type {
   ContainerItem,
   DaemonState,
 } from "../types";
+
+const ROUTE_SORT_KEYS = ["domain", "type", "container", "status", "target"] as const;
+type RouteSortKey = (typeof ROUTE_SORT_KEYS)[number];
+const ROUTE_SORT_OPTIONS: { key: RouteSortKey; label: string }[] = [
+  { key: "domain", label: "domain" },
+  { key: "type", label: "type" },
+  { key: "container", label: "container" },
+  { key: "status", label: "status" },
+  { key: "target", label: "target" },
+];
 
 interface GatewayPageProps {
   daemonState: DaemonState;
@@ -119,6 +133,57 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
   useEffect(() => {
     fetchData();
   }, [daemonState]);
+
+  // The backend sweeper removes routes of deleted containers while the
+  // auto-clear toggle is on; mirror its result here.
+  useEffect(() => {
+    const un = events.onGatewayRoutesPruned((p) => {
+      setRoutes(p.routes);
+      setGatewayRoutes(p.routes);
+      toast.info(
+        "Orphaned routes cleared",
+        `${p.removed.length} route${p.removed.length === 1 ? "" : "s"} removed: ${p.removed
+          .map((r) => r.domain)
+          .join(", ")}`
+      );
+      api.checkHostsSync().then(setHostsSync).catch(() => {});
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  /**
+   * Mapped routes whose container no longer exists (deleted, not stopped).
+   * Only claimed once the container list is known: an empty list while the
+   * engine starts would mark every route.
+   */
+  const [routeSort, setRouteSort] = useListSort("gatewayRoutes", ROUTE_SORT_KEYS, {
+    key: "domain",
+    dir: "asc",
+  });
+  const sortedRoutes = sortItems(
+    routes,
+    {
+      domain: (r) => r.domain,
+      type: (r) => (r.container_name?.trim() ? "mapped" : "freeland"),
+      container: (r) => r.container_name?.trim() || r.group_name?.trim() || "",
+      // Live first: enabled and its container running, then idle, then off.
+      status: (r) => {
+        if (!r.enabled) return 2;
+        if (!r.container_name?.trim()) return 0;
+        return findMappedContainer(r, allContainers)?.state === "running" ? 0 : 1;
+      },
+      target: (r) => r.target,
+    },
+    routeSort,
+    (r) => `${r.domain}${r.path ?? ""}`
+  );
+
+  const orphanRoutes =
+    daemonState === "Running" && allContainers.length > 0
+      ? routes.filter((r) => r.container_name?.trim() && !findMappedContainer(r, allContainers))
+      : [];
 
   // Probe every enabled route's upstream while the gateway runs, so a route
   // that would answer 502 is visible here instead of only in the browser.
@@ -222,6 +287,43 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
       await fetchData();
     } catch (err) {
       toast.error("Sync Hosts Failed", String(err));
+    } finally {
+      setActionInProgress(null);
+    }
+  };
+
+  const handleToggleAutoClear = async () => {
+    if (!status) return;
+    const next = !status.auto_clear_orphans;
+    try {
+      await api.setGatewayAutoClearOrphans(next);
+      setStatus({ ...status, auto_clear_orphans: next });
+      toast.info(
+        "Auto-clear updated",
+        next
+          ? "Routes of deleted containers are removed automatically (after a 90s grace period)"
+          : "Routes of deleted containers are kept"
+      );
+    } catch (err) {
+      toast.error("Failed to update auto-clear", String(err));
+    }
+  };
+
+  const handleClearOrphans = async () => {
+    try {
+      setActionInProgress("orphans");
+      const res = await api.clearOrphanGatewayRoutes();
+      setRoutes(res.routes);
+      setGatewayRoutes(res.routes);
+      toast.success(
+        "Orphaned routes cleared",
+        res.removed.length
+          ? `Removed ${res.removed.map((r) => r.domain).join(", ")}`
+          : "No route points at a deleted container"
+      );
+      api.checkHostsSync().then(setHostsSync).catch(() => {});
+    } catch (err) {
+      toast.error("Could not clear orphaned routes", String(err));
     } finally {
       setActionInProgress(null);
     }
@@ -544,6 +646,44 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
             </p>
           </div>
 
+          <div className="flex items-center gap-2">
+          {routes.length > 1 && (
+            <SortControl value={routeSort} options={ROUTE_SORT_OPTIONS} onChange={setRouteSort} label="Sort routes" />
+          )}
+          {orphanRoutes.length > 0 && (
+            <button
+              type="button"
+              onClick={handleClearOrphans}
+              disabled={actionInProgress === "orphans"}
+              title={`Remove ${orphanRoutes.length} mapped route${orphanRoutes.length === 1 ? "" : "s"} whose container was deleted: ${orphanRoutes
+                .map((r) => `${r.domain} → ${r.container_name}`)
+                .join(", ")}`}
+              className="flex items-center gap-1.5 h-8 px-3 rounded-none border border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20 text-xs font-medium transition disabled:opacity-50"
+            >
+              <Eraser className="w-3.5 h-3.5" />
+              Clear {orphanRoutes.length} orphaned
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleToggleAutoClear}
+            disabled={!status}
+            title={
+              status?.auto_clear_orphans
+                ? "Auto-clear is ON: mapped routes whose container was deleted are removed after 90s (click to disable)"
+                : "Auto-clear is OFF: routes of deleted containers are kept (click to enable)"
+            }
+            className={`flex items-center gap-2 h-8 px-3 rounded-none border text-xs font-medium transition ${
+              status?.auto_clear_orphans
+                ? "bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20"
+                : "bg-zinc-900/90 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${status?.auto_clear_orphans ? "bg-amber-400" : "bg-zinc-600"}`}
+            />
+            Auto-clear orphans
+          </button>
           <Button
             size="sm"
             onClick={() => {
@@ -564,6 +704,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
             <Plus className="w-3.5 h-3.5" />
             Add Route
           </Button>
+          </div>
         </div>
 
         {loading && routes.length === 0 && <SkeletonList rows={3} actions={3} />}
@@ -589,7 +730,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-800/60 text-zinc-300">
-                {routes.map((r) => {
+                {sortedRoutes.map((r) => {
                   const url = `https://${r.domain}`;
                   const isMapped = Boolean(r.container_name && r.container_name.trim().length > 0);
 
@@ -715,7 +856,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                               </span>
                               {!containerRunning && (
                                 <span className="text-[10px] text-rose-400 font-medium">
-                                  ({targetContainer ? targetContainer.state : "offline"})
+                                  ({targetContainer ? targetContainer.state : allContainers.length > 0 ? "deleted" : "offline"})
                                 </span>
                               )}
                             </div>

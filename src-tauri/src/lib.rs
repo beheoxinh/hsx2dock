@@ -587,6 +587,8 @@ pub fn run() {
 
             // Cluster incident alerts and resource history.
             crate::commands::kind_watch::spawn_watcher(handle.clone());
+            // Gateway: drop mapped routes whose container is gone (opt-in).
+            crate::commands::gateway::spawn_orphan_route_sweeper(handle.clone());
 
             // Tray + desktop notifications. AppState is managed on the builder
             // so the tray can read daemon state immediately; a missing display
@@ -822,6 +824,8 @@ pub fn run() {
             commands::gateway::check_hosts_sync,
             commands::gateway::sync_hosts_file,
             commands::gateway::set_gateway_auto_start,
+            commands::gateway::set_gateway_auto_clear_orphans,
+            commands::gateway::clear_orphan_gateway_routes,
             commands::gateway::probe_gateway_upstreams,
             commands::gateway::get_hosts_file_model,
             commands::gateway::save_raw_hosts,

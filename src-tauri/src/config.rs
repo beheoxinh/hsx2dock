@@ -147,6 +147,10 @@ pub struct AppConfig {
     pub gateway_enabled: bool,
     #[serde(default)]
     pub gateway_auto_start: bool,
+    /// Remove mapped routes whose container no longer exists (after a grace
+    /// period, so a recreate with the same name keeps its route).
+    #[serde(default)]
+    pub gateway_auto_clear_orphans: bool,
     #[serde(default = "default_gateway_http_port")]
     pub gateway_http_port: u16,
     #[serde(default = "default_gateway_https_port")]
@@ -422,6 +426,7 @@ impl Default for AppConfig {
             auto_prune_isolated_volumes: false,
             gateway_enabled: false,
             gateway_auto_start: false,
+            gateway_auto_clear_orphans: false,
             gateway_http_port: default_gateway_http_port(),
             gateway_https_port: default_gateway_https_port(),
             gateway_routes: Vec::new(),
@@ -757,6 +762,7 @@ mod tests {
             auto_prune_isolated_volumes: false,
             gateway_enabled: false,
             gateway_auto_start: false,
+            gateway_auto_clear_orphans: false,
             gateway_http_port: default_gateway_http_port(),
             gateway_https_port: default_gateway_https_port(),
             gateway_routes: Vec::new(),

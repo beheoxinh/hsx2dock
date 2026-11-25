@@ -41,6 +41,9 @@ import type {
 import type { DaemonState } from "../types";
 import { EngineGate } from "../components/ui/EngineGate";
 import { useProgressiveList } from "../hooks/useProgressiveList";
+import { useListSort } from "../hooks/useListSort";
+import { SortControl } from "../components/ui/SortControl";
+import { sortItems } from "../lib/listSort";
 
 /**
  * Mirrors the backend's default tag: an untagged reference means `:latest`, so
@@ -61,6 +64,22 @@ interface ImagesPageProps {
   /** Engine state — the page renders an EngineGate panel unless Running. */
   daemonState?: DaemonState;
 }
+
+
+const IMAGE_SORT_KEYS = ["name", "size", "created"] as const;
+type ImageSortKey = (typeof IMAGE_SORT_KEYS)[number];
+const IMAGE_SORT_OPTIONS: { key: ImageSortKey; label: string }[] = [
+  { key: "name", label: "name" },
+  { key: "size", label: "size" },
+  { key: "created", label: "created" },
+];
+/** First real tag; untagged (`<none>`) images sort last by name. */
+const imageName = (img: ImageItem) => img.tags.find((t) => !t.startsWith("<none>")) ?? "";
+const IMAGE_SORT_GETTERS = {
+  name: imageName,
+  size: (img: ImageItem) => img.size,
+  created: (img: ImageItem) => img.created,
+};
 
 export const ImagesPage: React.FC<ImagesPageProps> = ({
   refreshKey,
@@ -96,6 +115,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
   const [localPushed, setLocalPushed] = useState<string | null>(null);
   const pushTargetRef = useRef<string | null>(null);
   const [autoPrune, setAutoPrune] = useState(false);
+  const [sort, setSort] = useListSort("images", IMAGE_SORT_KEYS, { key: "name", dir: "asc" });
   const [pruningAuto, setPruningAuto] = useState(false);
   const pendingPull = useRef<PullProgressPayload | null>(null);
   const pendingPush = useRef<PushProgressPayload | null>(null);
@@ -440,14 +460,19 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     }
   };
 
-  const filteredImages = images.filter((img) => {
-    const tagsStr = img.tags.join(" ").toLowerCase();
-    const q = search.toLowerCase();
-    return tagsStr.includes(q) || img.id.toLowerCase().includes(q);
-  });
+  const filteredImages = sortItems(
+    images.filter((img) => {
+      const tagsStr = img.tags.join(" ").toLowerCase();
+      const q = search.toLowerCase();
+      return tagsStr.includes(q) || img.id.toLowerCase().includes(q);
+    }),
+    IMAGE_SORT_GETTERS,
+    sort,
+    imageName
+  );
 
   // Engine off → designed feature panel instead of fetch errors.
-  const progressive = useProgressiveList(filteredImages, search);
+  const progressive = useProgressiveList(filteredImages, `${search}|${sort.key}|${sort.dir}`);
 
   if (daemonState !== "Running") {
     return (
@@ -479,6 +504,8 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
               className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
             />
           </div>
+
+          <SortControl value={sort} options={IMAGE_SORT_OPTIONS} onChange={setSort} label="Sort images" />
 
           {/* Auto-prune Dangling Toggle */}
           <button

@@ -296,6 +296,24 @@ Trạng thái: **chưa commit**. Code nằm trong working tree. Bản release đ
 - [ ] MCP: `compose_read_file`, `compose_save_file` (cần confirm), `compose_env_get`, `compose_env_set`.
 
 
+## Sắp xếp danh sách và dọn route Gateway (2026-11-26, chưa commit)
+- [x] Thứ tự network trên thẻ container cố định A→Z (backend `sort_names`, frontend `sortNames`).
+- [x] Helper chung `lib/listSort.ts` (natural, không phân biệt hoa thường, giá trị trống xếp cuối, tie-break theo tên), hook `useListSort` nhớ lựa chọn theo trình duyệt, component `SortControl` (key + chiều tăng/giảm).
+- [x] Áp dụng cho: group container (name, created, containers, running; compose vẫn nằm trên group của user; thứ tự thành viên trong group vẫn theo kéo thả), Images (name, size, created), Volumes (name, size, driver, in use), Networks (name, driver, subnet), Gateway routes (domain, type, container, status, target).
+- [x] Gateway › Auto-clear orphans: toggle lưu vào config (`gateway_auto_clear_orphans`), sweeper chạy mỗi 30s, xoá route mapped có container đã bị xoá sau 90s grace, bỏ qua khi engine lỗi hoặc danh sách container rỗng; event `gateway-routes-pruned` cập nhật UI và toast.
+- [x] Nút "Clear N orphaned" xoá ngay (không grace). Cột container ghi "deleted" thay cho "offline" khi container không còn.
+- [x] Group container: kéo thả để sắp xếp theo ý (tay nắm ở đầu card, chỉ trong cùng khu compose hoặc khu group của user), thứ tự lưu vào config; sort mặc định "custom (drag)". Ô tìm group theo tên cạnh dropdown sort; kéo thả tắt khi đang tìm.
+- [ ] Kiểm tra bằng mắt trên UI: SortControl trên 5 danh sách, toggle và nút Clear trong Gateway, kéo thả group.
+- [ ] Test live sweeper: tạo container + route mapped, xoá container, chờ ~2 phút, route biến mất.
+
+## Thiết kế lại update binary trong Settings (2026-11-26, chưa commit)
+- [x] Nguyên nhân Settings nháy và nhảy về tab General khi update engine: `engine-state-changed` tăng `refreshKey`, Settings không nằm trong `REFRESH_IN_PLACE` nên bị remount (mất tab, mất tiến độ, `config` null nên trang trắng). Đã thêm `settings` vào `REFRESH_IN_PLACE`, Settings nhận `refreshKey` để tự nạp lại CLI/Caddy status tại chỗ, tab đang mở được giữ ở module state.
+- [x] Store chung `lib/binaryUpdates.ts` (sống qua remount): check có cache 30 phút (lỗi 10 phút), không check trùng, mỗi binary chỉ 1 lần cài, nhận `engine-install-progress` một lần cho cả app. Model thuần `lib/binaryUpdateModel.ts` + test.
+- [x] Panel chung `BinaryUpdatePanel` cho Engine, Docker CLI, Compose, Caddy, kind: badge trạng thái, installed → latest, "checked N min ago", nút Check / Update / Install, tiến độ + log nhúng ngay dưới. Chỉ tự check khi tab của nó đang mở.
+- [x] Dấu chấm trên tab Settings: xanh nhấp nháy khi đang update, vàng khi có bản mới. Update engine có hộp xác nhận nói rõ engine sẽ dừng rồi khởi động lại.
+- [x] Cài kind từ trang Kubernetes cũng đi qua store chung, nên không chạy song song với update trong Settings.
+- [ ] Kiểm tra live: update engine thật, xem tiến độ không bị mất khi engine restart.
+
 ## Ghi chú khác
 - Node kind dừng với exit 137 khi tắt engine. Nên xem lại tín hiệu dừng (SIGRTMIN+3) và grace period.
 - Follow-up: container publish port ngẫu nhiên hoặc ephemeral không tới được từ host (giới hạn của pasta).

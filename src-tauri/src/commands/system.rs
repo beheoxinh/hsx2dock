@@ -286,6 +286,8 @@ fn preserve_owned_fields(incoming: &mut AppConfig, live: &AppConfig) {
     incoming.kind_cluster_prefs = live.kind_cluster_prefs.clone(); // per-cluster prefs
     incoming.gateway_routes = live.gateway_routes.clone(); // gateway commands
     incoming.gateway_enabled = live.gateway_enabled;
+    incoming.gateway_auto_start = live.gateway_auto_start; // set_gateway_auto_start
+    incoming.gateway_auto_clear_orphans = live.gateway_auto_clear_orphans; // set_gateway_auto_clear_orphans
     incoming.gateway_http_port = live.gateway_http_port;
     incoming.gateway_https_port = live.gateway_https_port;
     incoming.mcp_read_only = live.mcp_read_only; // mcp_set_read_only

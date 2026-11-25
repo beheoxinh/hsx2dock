@@ -109,6 +109,48 @@ export function dropIndexAt(
   return index;
 }
 
+/**
+ * Index among `ids` (without `draggedId`) at which a card dragged to viewport
+ * `y` lands, using each card's vertical midpoint. `rects` holds the cards'
+ * boxes in display order, dragged card included.
+ */
+export function cardDropIndex(
+  ids: readonly string[],
+  rects: readonly { top: number; height: number }[],
+  y: number,
+  draggedId: string
+): number {
+  let index = 0;
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i] === draggedId) continue;
+    const r = rects[i];
+    if (r && y >= r.top + r.height / 2) index++;
+  }
+  return index;
+}
+
+/** `ids` with `id` moved to `index` of the list without it; same list when nothing moves. */
+export function moveIdTo(ids: readonly string[], id: string, index: number): string[] {
+  const without = ids.filter((x) => x !== id);
+  if (without.length === ids.length) return [...ids];
+  const at = Math.max(0, Math.min(index, without.length));
+  return [...without.slice(0, at), id, ...without.slice(at)];
+}
+
+/**
+ * Writes a section's new display order into the saved group list. The slots
+ * the section's saved entries occupy are refilled in the new order; entries
+ * of the section that were never saved (a compose project without an order
+ * entry) are appended. Everything else keeps its place.
+ */
+export function applySectionOrder<T extends { id: string }>(saved: readonly T[], ordered: readonly T[]): T[] {
+  const ids = new Set(ordered.map((g) => g.id));
+  const queue = [...ordered];
+  const out: T[] = [];
+  for (const g of saved) out.push(ids.has(g.id) ? queue.shift()! : g);
+  return [...out, ...queue];
+}
+
 /** Removes every token that points at a container which no longer exists. */
 export function pruneMissingMembers(
   groups: ContainerGroup[],

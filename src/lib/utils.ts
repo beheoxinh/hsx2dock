@@ -44,3 +44,13 @@ export function truncateId(id: string, len = 12): string {
   if (!id) return "";
   return id.length > len ? id.substring(0, len) : id;
 }
+
+/**
+ * Names A-Z, ignoring case, numbers in natural order (`net2` before `net10`).
+ * Returns a new array; `undefined` gives `[]`.
+ */
+export function sortNames(names: readonly string[] | undefined): string[] {
+  return [...(names ?? [])].sort(
+    (a, b) => a.localeCompare(b, "en", { sensitivity: "base", numeric: true }) || (a < b ? -1 : a > b ? 1 : 0)
+  );
+}
