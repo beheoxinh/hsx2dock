@@ -1158,11 +1158,13 @@ pub fn update_body_from_limits(
     if limits.is_empty() {
         return Err("No resource limits were provided".to_string());
     }
-    let mut body = bollard::models::ContainerUpdateBody::default();
-    body.memory = limits.memory_bytes()?;
-    body.nano_cpus = limits.nano_cpus()?;
-    body.cpu_shares = limits.cpu_shares_value()?;
-    body.pids_limit = limits.pids_limit_value()?;
+    let mut body = bollard::models::ContainerUpdateBody {
+        memory: limits.memory_bytes()?,
+        nano_cpus: limits.nano_cpus()?,
+        cpu_shares: limits.cpu_shares_value()?,
+        pids_limit: limits.pids_limit_value()?,
+        ..Default::default()
+    };
     let cpuset = limits.cpuset_cpus.trim();
     if !cpuset.is_empty() {
         body.cpuset_cpus = Some(cpuset.to_string());
@@ -2053,7 +2055,6 @@ mod tests {
                 key: "FOO".into(),
                 value: "bar".into(),
             }],
-            ..Default::default()
         };
         let preview = opts.command_preview();
         assert!(preview.contains("-f Dockerfile"), "{preview}");

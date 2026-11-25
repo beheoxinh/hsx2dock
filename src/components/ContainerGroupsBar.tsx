@@ -49,6 +49,7 @@ import {
   reorderMember,
 } from "../lib/containerGroups";
 import type { ContainerGroup, ContainerItem, ContainerStats, GroupOp } from "../types";
+import { useProgressiveList } from "../hooks/useProgressiveList";
 
 type DetailsTab = "logs" | "inspect" | "stats" | "terminal";
 type RouteLike = { domain: string; path?: string | null };
@@ -469,9 +470,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   };
 
   const toggleAutoStart = async (g: ContainerGroup) => {
+    // Read at call time: two edits in quick succession must not both
+    // start from the list this render closed over.
+    const latest = getContainerStore().groups;
     try {
       await saveAll(
-        groups.map((x) =>
+        latest.map((x) =>
           x.id === g.id ? { ...x, auto_start: !x.auto_start } : x
         )
       );
@@ -481,10 +485,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   };
 
   const toggleComposeAutoStart = async (g: ContainerGroup) => {
+    // Read at call time: two edits in quick succession must not both
+    // start from the list this render closed over.
+    const latest = getContainerStore().groups;
     const project = g.id.slice("compose:".length);
-    const existing = groups.find((x) => x.id === g.id);
+    const existing = latest.find((x) => x.id === g.id);
     const nextAutoStart = !g.auto_start;
-    const others = groups.filter((x) => x.id !== g.id);
+    const others = latest.filter((x) => x.id !== g.id);
     try {
       const nextGroup = existing
         ? { ...existing, auto_start: nextAutoStart }
@@ -499,9 +506,12 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
   const isolatedAutoStart = !!isolatedGroup?.auto_start;
 
   const toggleIsolatedAutoStart = async () => {
+    // Read at call time: two edits in quick succession must not both
+    // start from the list this render closed over.
+    const latest = getContainerStore().groups;
     const nextAutoStart = !isolatedAutoStart;
-    const existing = groups.find((x) => x.id === "__isolated__");
-    const others = groups.filter((x) => x.id !== "__isolated__");
+    const existing = latest.find((x) => x.id === "__isolated__");
+    const others = latest.filter((x) => x.id !== "__isolated__");
     try {
       const nextGroup: ContainerGroup = existing
         ? { ...existing, auto_start: nextAutoStart }
@@ -851,6 +861,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
           x.name === payload.id
       );
       if (!target) return;
+      // Read at call time: two edits in quick succession must not both
+      // start from the list this render closed over.
+      const latest = getContainerStore().groups;
       const map = canonicalContainerIds(containers);
 
       // A compose member is owned by its project. Reordering inside it is a
@@ -878,7 +891,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         try {
           // The synthetic compose group is persisted alongside real ones; it is
           // not shown as an editable card, it only carries the member order.
-          const others = groups.filter((g) => g.id !== ownId);
+          const others = latest.filter((g) => g.id !== ownId);
           await saveAll([
             ...others,
             persistedComposeGroup(target.compose_project, nextIds),
@@ -898,11 +911,11 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         return;
       }
 
-      const from = groupOf(groups, map, target.id);
+      const from = groupOf(latest, map, target.id);
       if ((from?.id ?? null) === groupId) {
         // Same group: this is a reorder, not a move.
         if (groupId && preview && !preview.unchanged) {
-          const current = groups.find((g) => g.id === groupId);
+          const current = latest.find((g) => g.id === groupId);
           if (current) {
             const ordered = current.container_ids
               .map((token) => map.get(token))
@@ -916,7 +929,7 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
             ];
             try {
               await saveAll(
-                reorderMember(groups, map, target.id, groupId, nextIds)
+                reorderMember(latest, map, target.id, groupId, nextIds)
               );
             } catch (err) {
               toast.error("Could not reorder group", String(err));
@@ -927,13 +940,13 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
         return;
       }
       try {
-        await saveAll(moveMember(groups, map, target.id, groupId));
+        await saveAll(moveMember(latest, map, target.id, groupId));
         // Show the result of the drop: a collapsed group would otherwise
         // swallow the card with no visible feedback.
         if (groupId) setGroupExpanded(groupId, true);
         const label = target.name.replace(/^\//, "");
         const dest = groupId
-          ? groups.find((g) => g.id === groupId)?.name ?? "group"
+          ? latest.find((g) => g.id === groupId)?.name ?? "group"
           : "Isolated";
         toast.success("Container moved", `${label} → ${dest}`);
       } catch (err) {
@@ -1171,6 +1184,10 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
   // every pointermove — keep the accessors stable so they do not re-register.
   const stackRef = React.useRef<HTMLDivElement | null>(null);
   const orderedIds = React.useMemo(() => members.map((c) => c.id), [members]);
+  // A group of 100+ members mounted every card (with live stats) on open.
+  // Render pages as the user scrolls; reorder hit-testing still sees the full
+  // order, and a drop below the last mounted card lands before the next one.
+  const progressive = useProgressiveList(members, g.id, 40);
   const getElements = React.useCallback(
     () =>
       stackRef.current
@@ -1337,7 +1354,7 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
         {hasMembers ? (
           isOpen ? (
             <div ref={stackRef} className="space-y-2">
-              {members.map((c) => (
+              {progressive.visible.map((c) => (
                 <React.Fragment key={c.id}>
                   {/* Where the dragged card would land. Rendered from live
                       pointer position, so the user sees the order change
@@ -1360,6 +1377,9 @@ const GroupCard = React.memo<GroupCardProps>(function GroupCard({
               ))}
               {reorder && !reorder.unchanged && reorder.beforeKey === null && (
                 <div className="h-0.5 rounded-full bg-indigo-400/80 shadow-[0_0_8px] shadow-indigo-400/50" />
+              )}
+              {progressive.hasMore && (
+                <div ref={progressive.sentinelRef} className="h-8" aria-hidden="true" />
               )}
             </div>
           ) : (

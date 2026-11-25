@@ -42,14 +42,61 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// The argument every destructive tool must be called with, set to `true`.
+pub const CONFIRM_ARG: &str = "confirm";
+
+/// Why a call is refused before it runs, if it is: read-only mode blocks every
+/// tool that is not a read, and a destructive tool needs `confirm: true` — a
+/// `destructiveHint` alone is only advice a client may ignore.
+pub fn access_refusal(access: Access, read_only_mode: bool, confirmed: bool) -> Option<String> {
+    if read_only_mode && access != Access::Read {
+        return Some(
+            "the MCP server is in read-only mode (Hsx2Dock → MCP); only read tools are allowed"
+                .into(),
+        );
+    }
+    if access == Access::Destructive && !confirmed {
+        return Some(format!(
+            "this tool is destructive: ask the user first, then call it again with \
+             `{CONFIRM_ARG}: true`"
+        ));
+    }
+    None
+}
+
 impl ToolSpec {
     pub fn is_read_only(&self) -> bool {
         self.access == Access::Read
     }
 
+    /// The input schema as advertised: a destructive tool gains the required
+    /// `confirm` argument that [`access_refusal`] checks.
+    pub fn advertised_schema(&self) -> Map<String, Value> {
+        let mut schema = self.input_schema.as_object().cloned().unwrap_or_default();
+        if self.access == Access::Destructive {
+            if let Some(Value::Object(props)) = schema.get_mut("properties") {
+                props.insert(
+                    CONFIRM_ARG.into(),
+                    json!({
+                        "type": "boolean",
+                        "const": true,
+                        "description": "Must be true. Set it only after the user agreed to this destructive action."
+                    }),
+                );
+            }
+            match schema.get_mut("required") {
+                Some(Value::Array(required)) => required.push(json!(CONFIRM_ARG)),
+                _ => {
+                    schema.insert("required".into(), json!([CONFIRM_ARG]));
+                }
+            }
+        }
+        schema
+    }
+
     /// The `Tool` value sent in `tools/list`.
     pub fn to_tool(&self) -> rmcp::model::Tool {
-        let schema = self.input_schema.as_object().cloned().unwrap_or_default();
+        let schema = self.advertised_schema();
         rmcp::model::Tool::new(self.name, self.description, schema)
             .with_title(self.title.to_string())
             .with_annotations(rmcp::model::ToolAnnotations::from_raw(
@@ -182,7 +229,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             title: "Stop engine",
             description: "Stop the bundled Docker engine. Running containers stop with it. Returns \
                           the resulting status.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: true,
             input_schema: no_args(),
         },
@@ -191,7 +238,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             title: "Toggle engine",
             description: "Start the engine if stopped, stop it if running. Returns the resulting \
                           status. Prefer engine_start or engine_stop when the desired state is known.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: true,
             input_schema: no_args(),
         },
@@ -241,7 +288,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             description: "Merge the given fields into the application configuration and persist \
                           them. Only the keys you pass are changed. Use `engine_get_config` first \
                           to discover the shape.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: false,
             input_schema: obj(&[(
                 "config",
@@ -1341,7 +1388,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             title: "Save endpoint",
             description: "Create or update a Docker endpoint. Does not switch to it — call \
                           `endpoint_set_active` afterwards.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: false,
             input_schema: obj(&[(
                 "endpoint",
@@ -1356,7 +1403,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
             description: "Switch every subsequent tool call to the given endpoint. Pass `local` for \
                           the bundled engine. Engine lifecycle and repair tools are unavailable \
                           while a remote endpoint is active.",
-            access: Access::Write,
+            access: Access::Destructive,
             engine_only: false,
             input_schema: obj(&[(
                 "id",
@@ -1749,6 +1796,46 @@ mod tests {
                 "{name} removes data and must be Destructive"
             );
         }
+    }
+
+    #[test]
+    fn engine_config_and_endpoint_switches_need_confirmation() {
+        // Stopping the engine stops every container; a config write or an
+        // endpoint switch redirects everything after it.
+        for name in [
+            "engine_stop",
+            "engine_toggle",
+            "engine_set_config",
+            "endpoint_set_active",
+            "endpoint_save",
+        ] {
+            assert_eq!(find(name).unwrap().access, Access::Destructive, "{name}");
+        }
+    }
+
+    #[test]
+    fn destructive_tools_advertise_a_required_confirm_argument() {
+        for t in tools() {
+            let schema = Value::Object(t.advertised_schema());
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let has = required.contains(&CONFIRM_ARG)
+                && schema["properties"][CONFIRM_ARG]["type"] == "boolean";
+            assert_eq!(has, t.access == Access::Destructive, "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn access_refusal_enforces_read_only_mode_and_confirmation() {
+        assert_eq!(access_refusal(Access::Read, false, false), None);
+        assert_eq!(access_refusal(Access::Read, true, false), None);
+        assert_eq!(access_refusal(Access::Write, false, false), None);
+        assert!(access_refusal(Access::Write, true, true).is_some());
+        assert!(access_refusal(Access::Destructive, false, false).is_some());
+        assert_eq!(access_refusal(Access::Destructive, false, true), None);
+        assert!(access_refusal(Access::Destructive, true, true).is_some());
     }
 
     #[test]

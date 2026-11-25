@@ -24,6 +24,7 @@ pub struct RegistryStatus {
     pub host: String,
     pub username: String,
     pub insecure: bool,
+    pub allow_http: bool,
     /// Whether a secret is stored — never the secret itself.
     pub has_password: bool,
     /// True for the login new pushes default to.
@@ -41,6 +42,9 @@ pub struct RegistryInput {
     /// the stored secret.
     pub password: String,
     pub insecure: bool,
+    /// See [`RegistryConfig::allow_http`].
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -75,6 +79,7 @@ fn to_status(cfg: &RegistryConfig, default_id: &str) -> RegistryStatus {
         host: cfg.host.clone(),
         username: cfg.username.clone(),
         insecure: cfg.insecure,
+        allow_http: cfg.allow_http,
         has_password: !cfg.auth.is_empty(),
         is_default: !default_id.is_empty() && cfg.id == default_id,
     }
@@ -82,7 +87,7 @@ fn to_status(cfg: &RegistryConfig, default_id: &str) -> RegistryStatus {
 
 /// Resolves the login new operations should use: the explicit default when it
 /// still exists, else the first saved login. Returns `None` with no logins.
-pub fn default_registry<'a>(cfg: &'a crate::config::AppConfig) -> Option<&'a RegistryConfig> {
+pub fn default_registry(cfg: &crate::config::AppConfig) -> Option<&RegistryConfig> {
     if !cfg.default_registry.is_empty() {
         if let Some(found) = cfg.registries.iter().find(|r| r.id == cfg.default_registry) {
             return Some(found);
@@ -141,7 +146,14 @@ pub async fn test_registry_auth(input: RegistryInput) -> Result<RegistryTestResu
         return Err("Registry host is required".into());
     }
     let started = Instant::now();
-    let outcome = probe_registry(&host, &input.username, &input.password, input.insecure).await;
+    let outcome = probe_registry(
+        &host,
+        &input.username,
+        &input.password,
+        input.insecure,
+        input.allow_http,
+    )
+    .await;
     Ok(RegistryTestResult {
         ok: outcome.0,
         message: outcome.1,
@@ -153,16 +165,17 @@ pub async fn test_registry_auth(input: RegistryInput) -> Result<RegistryTestResu
 /// real registry host — `docker.io/v2/` would hit the marketing site and
 /// report a bogus success.
 ///
-/// Basic-auth credentials must never travel in clear text to a remote host, so
-/// plain HTTP is offered only for a loopback registry (a local dev registry).
-/// A remote self-signed registry is still reachable over HTTPS with `insecure`.
-pub fn probe_urls(host: &str, insecure: bool) -> Vec<String> {
+/// Basic-auth credentials must not travel in clear text to a remote host by
+/// accident, so plain HTTP is offered for a loopback registry with `insecure`
+/// (a local dev registry), and for a remote one only with the explicit
+/// `allow_http` opt-in. A self-signed registry stays on HTTPS with `insecure`.
+pub fn probe_urls(host: &str, insecure: bool, allow_http: bool) -> Vec<String> {
     let effective = match host {
         "docker.io" | "index.docker.io" => "registry-1.docker.io",
         other => other,
     };
     let mut urls = vec![format!("https://{effective}/v2/")];
-    if insecure && is_loopback_host(effective) {
+    if (insecure && is_loopback_host(effective)) || (allow_http && effective == host) {
         urls.push(format!("http://{effective}/v2/"));
     }
     urls
@@ -192,6 +205,7 @@ async fn probe_registry(
     username: &str,
     password: &str,
     insecure: bool,
+    allow_http: bool,
 ) -> (bool, String) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
@@ -202,7 +216,7 @@ async fn probe_registry(
         Err(e) => return (false, format!("Failed to build HTTP client: {e}")),
     };
 
-    let urls = probe_urls(host, insecure);
+    let urls = probe_urls(host, insecure, allow_http);
 
     let mut last_error = String::from("no URL attempted");
     for url in urls {
@@ -352,6 +366,7 @@ pub(crate) async fn save_registry_auth_core(
         username,
         auth,
         insecure: input.insecure,
+        allow_http: input.allow_http,
     };
 
     // Save a copy first: on a write error memory must keep the old logins.
@@ -361,8 +376,24 @@ pub(crate) async fn save_registry_auth_core(
         None => next.registries.push(entry),
     }
     next.save().await.map_err(|e| e.to_string())?;
+    crate::docker::engine::set_insecure_registries(insecure_registry_hosts(&next.registries));
     *cfg = next;
     Ok(())
+}
+
+/// Hosts the engine must reach over plain HTTP (`--insecure-registry`): every
+/// login that opted in with `allow_http`, deduplicated. Applied on the next
+/// engine start.
+pub fn insecure_registry_hosts(registries: &[RegistryConfig]) -> Vec<String> {
+    let mut hosts: Vec<String> = registries
+        .iter()
+        .filter(|r| r.allow_http)
+        .map(|r| normalize_host(&r.host))
+        .filter(|h| !h.is_empty() && !matches!(h.as_str(), "docker.io" | "index.docker.io"))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 #[tauri::command]
@@ -388,6 +419,7 @@ pub(crate) async fn remove_registry_auth_core(state: &AppState, id: &str) -> Res
         next.default_registry.clear();
     }
     next.save().await.map_err(|e| e.to_string())?;
+    crate::docker::engine::set_insecure_registries(insecure_registry_hosts(&next.registries));
     *cfg = next;
     Ok(())
 }
@@ -410,28 +442,58 @@ mod tests {
     #[test]
     fn probe_urls_map_docker_hub_to_the_real_registry_host() {
         assert_eq!(
-            probe_urls("docker.io", false),
+            probe_urls("docker.io", false, false),
             vec!["https://registry-1.docker.io/v2/".to_string()]
         );
         assert_eq!(
-            probe_urls("ghcr.io", false),
+            probe_urls("ghcr.io", false, false),
             vec!["https://ghcr.io/v2/".to_string()]
         );
-        // A remote registry never gets plain HTTP, Basic auth or not.
+        // `insecure` alone never gives a remote registry plain HTTP.
         assert_eq!(
-            probe_urls("harbor.lan:8443", true),
+            probe_urls("harbor.lan:8443", true, false),
             vec!["https://harbor.lan:8443/v2/".to_string()]
         );
-        // Plain HTTP is only tried for a loopback registry.
+        // Plain HTTP is tried for a loopback registry with `insecure`...
         assert_eq!(
-            probe_urls("localhost:5000", true),
+            probe_urls("localhost:5000", true, false),
             vec![
                 "https://localhost:5000/v2/".to_string(),
                 "http://localhost:5000/v2/".to_string(),
             ]
         );
-        assert_eq!(probe_urls("127.0.0.1:5000", true).len(), 2);
-        assert_eq!(probe_urls("localhost:5000", false).len(), 1);
+        assert_eq!(probe_urls("127.0.0.1:5000", true, false).len(), 2);
+        assert_eq!(probe_urls("localhost:5000", false, false).len(), 1);
+        // ...and for a remote one only with the explicit opt-in.
+        assert_eq!(
+            probe_urls("harbor.lan:5000", false, true),
+            vec![
+                "https://harbor.lan:5000/v2/".to_string(),
+                "http://harbor.lan:5000/v2/".to_string(),
+            ]
+        );
+        // Docker Hub is never probed over HTTP.
+        assert_eq!(probe_urls("docker.io", false, true).len(), 1);
+    }
+
+    #[test]
+    fn insecure_registry_hosts_lists_only_opted_in_logins() {
+        let reg = |host: &str, allow_http: bool| RegistryConfig {
+            id: host.into(),
+            name: host.into(),
+            host: host.into(),
+            username: "u".into(),
+            auth: String::new(),
+            insecure: false,
+            allow_http,
+        };
+        let hosts = insecure_registry_hosts(&[
+            reg("ghcr.io", false),
+            reg("HTTP://Harbor.LAN:5000/", true),
+            reg("harbor.lan:5000", true),
+            reg("docker.io", true),
+        ]);
+        assert_eq!(hosts, vec!["harbor.lan:5000".to_string()]);
     }
 
     #[test]
@@ -443,6 +505,7 @@ mod tests {
             username: "octocat".into(),
             auth: encode_auth("octocat", "s3cr3t:with:colons"),
             insecure: false,
+            allow_http: false,
         };
         let creds = cfg.credentials();
         assert_eq!(creds.username.as_deref(), Some("octocat"));
@@ -459,6 +522,7 @@ mod tests {
             username: "user".into(),
             auth: encode_auth("user", "pw"),
             insecure: false,
+            allow_http: false,
         };
         assert_eq!(
             cfg.credentials().serveraddress.as_deref(),
@@ -475,6 +539,7 @@ mod tests {
             username: "user".into(),
             auth: "not-base64!!".into(),
             insecure: false,
+            allow_http: false,
         };
         assert_eq!(
             cfg.credentials().password.as_deref(),
@@ -492,6 +557,7 @@ mod tests {
             username: "user".into(),
             auth: encode_auth("user", "pw"),
             insecure: false,
+            allow_http: false,
         };
         let mut cfg = AppConfig {
             registries: vec![reg("first"), reg("second")],

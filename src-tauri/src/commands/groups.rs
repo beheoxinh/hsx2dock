@@ -19,6 +19,10 @@ use crate::docker::models::ContainerItem;
 use crate::ops::BULK_CONCURRENCY;
 use crate::state::AppState;
 
+/// How long a container's applied restart policy is trusted before the
+/// enforcement pass inspects it again.
+const RESTART_POLICY_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Synthetic id of the bucket holding every ungrouped container.
 pub const ISOLATED_GROUP_ID: &str = "__isolated__";
 
@@ -159,7 +163,12 @@ pub async fn enforce_groups_restart_policy(
             .filter_map(|c| {
                 let on = auto_start_for(groups, &allowed, c)?;
                 let target = if on { "unless-stopped" } else { "no" };
-                (seen.get(&c.id).map(String::as_str) != Some(target)).then(|| (c.id.clone(), target))
+                // A remembered policy is re-checked after a while: `docker
+                // update --restart` from a terminal changes it behind the app.
+                let known = seen.get(&c.id).is_some_and(|(p, at)| {
+                    p == target && at.elapsed() < RESTART_POLICY_RECHECK
+                });
+                (!known).then(|| (c.id.clone(), target))
             })
             .collect()
     };
@@ -196,9 +205,10 @@ pub async fn enforce_groups_restart_policy(
         // Ids of removed containers would otherwise accumulate forever.
         let live: HashSet<&str> = containers.iter().map(|c| c.id.as_str()).collect();
         seen.retain(|id, _| live.contains(id.as_str()));
+        let now = std::time::Instant::now();
         for (id, policy) in results {
             if let Some(p) = policy {
-                seen.insert(id, p);
+                seen.insert(id, (p, now));
             }
         }
     }

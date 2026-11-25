@@ -149,8 +149,30 @@ pub async fn save_app_config(
 /// App-free core of [`save_app_config`], shared with the MCP server.
 pub(crate) async fn save_app_config_core(
     state: &Arc<AppState>,
-    mut config: AppConfig,
+    config: AppConfig,
 ) -> Result<(), String> {
+    // Settings, Images, Volumes and Kubernetes each save the whole config
+    // from a copy they fetched earlier. Anything another command owns and may
+    // have changed since (groups, routes, endpoints, registries, ...) is taken
+    // from the live config under the write lock, so a stale copy cannot undo
+    // it.
+    save_config_from_live(state, move |live| {
+        let mut config = config;
+        preserve_owned_fields(&mut config, live);
+        Ok(config)
+    })
+    .await
+}
+
+/// Builds the next config from the live one and saves it, all under the
+/// config write lock: the merge, save and swap happen as one step, so nothing
+/// changed in between can be lost.
+async fn save_config_from_live(
+    state: &Arc<AppState>,
+    build: impl FnOnce(&AppConfig) -> Result<AppConfig, String>,
+) -> Result<(), String> {
+    let mut live = state.config.write().await;
+    let mut config = build(&live)?;
     // Turning off "Auto startup on boot" also clears its dependent switch, so
     // the persisted config never carries a setting the UI cannot show.
     config.normalize();
@@ -158,13 +180,6 @@ pub(crate) async fn save_app_config_core(
     // written, fail the save rather than pretend the toggle took effect.
     crate::autostart::apply(config.auto_start_on_boot, config.start_minimized)
         .map_err(|e| format!("Could not update the autostart entry: {e}"))?;
-    // Settings, Images, Volumes and Kubernetes each save the whole config
-    // from a copy they fetched earlier. Anything another command owns and may
-    // have changed since (groups, routes, endpoints, registries, ...) is taken
-    // from the live config under the write lock, so a stale copy cannot undo
-    // it. The merge, save and swap happen as one step.
-    let mut live = state.config.write().await;
-    preserve_owned_fields(&mut config, &live);
     config.save().await.map_err(|e| e.to_string())?;
     // Sync data_root immediately to engine paths so subsequent daemon restarts take effect without restarting the app
     state.engine.set_data_root(Some(&config.data_root));
@@ -192,6 +207,72 @@ pub(crate) async fn save_app_config_core(
     crate::commands::mcp::reconcile_http_server(state).await
 }
 
+/// Saves only the given top-level fields, merged into the live config under
+/// one lock. Pages that own a single toggle use this instead of re-reading and
+/// re-sending the whole config, which loses any change made in between.
+#[tauri::command]
+pub async fn patch_app_config(
+    state: State<'_, Arc<AppState>>,
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    patch_app_config_core(state.inner(), patch).await
+}
+
+pub(crate) async fn patch_app_config_core(
+    state: &Arc<AppState>,
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    // Merged into the live config under the write lock, so a patch can never
+    // write back a value another command changed a moment earlier.
+    save_config_from_live(state, move |live| merge_config_patch(live, patch)).await
+}
+
+/// Pure part of [`patch_app_config_core`]: unknown keys are an error, not
+/// silently dropped, so a renamed field cannot turn a save into a no-op.
+fn merge_config_patch(
+    current: &AppConfig,
+    patch: serde_json::Map<String, serde_json::Value>,
+) -> Result<AppConfig, String> {
+    let mut value = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let fields = value
+        .as_object_mut()
+        .ok_or("the config does not serialize to an object")?;
+    for (key, v) in patch {
+        if !fields.contains_key(&key) {
+            return Err(format!("unknown config field '{key}'"));
+        }
+        fields.insert(key, v);
+    }
+    serde_json::from_value(value).map_err(|e| format!("invalid config value: {e}"))
+}
+
+#[cfg(test)]
+mod config_patch_tests {
+    use super::merge_config_patch;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn a_patch_changes_only_its_fields_and_rejects_unknown_ones() {
+        let base = AppConfig {
+            auto_prune_isolated_volumes: true,
+            ..AppConfig::default()
+        };
+        let mut patch = serde_json::Map::new();
+        patch.insert("auto_prune_dangling_images".into(), serde_json::json!(true));
+        let next = merge_config_patch(&base, patch).unwrap();
+        assert!(next.auto_prune_dangling_images);
+        assert!(next.auto_prune_isolated_volumes, "untouched field kept");
+
+        let mut bad = serde_json::Map::new();
+        bad.insert("no_such_field".into(), serde_json::json!(1));
+        assert!(merge_config_patch(&base, bad).is_err());
+
+        let mut wrong_type = serde_json::Map::new();
+        wrong_type.insert("auto_prune_dangling_images".into(), serde_json::json!("yes"));
+        assert!(merge_config_patch(&base, wrong_type).is_err());
+    }
+}
+
 /// Copies the fields that dedicated commands own from `live` into `incoming`.
 fn preserve_owned_fields(incoming: &mut AppConfig, live: &AppConfig) {
     incoming.schema_version = live.schema_version;
@@ -206,6 +287,7 @@ fn preserve_owned_fields(incoming: &mut AppConfig, live: &AppConfig) {
     incoming.gateway_enabled = live.gateway_enabled;
     incoming.gateway_http_port = live.gateway_http_port;
     incoming.gateway_https_port = live.gateway_https_port;
+    incoming.mcp_read_only = live.mcp_read_only; // mcp_set_read_only
 }
 
 /// Reads the configured engine caps and, when our engine is running, pushes
@@ -1214,7 +1296,7 @@ fn run_cmd_version(bin: &std::path::Path, args: &[&str]) -> Option<String> {
 fn clean_containerd_version(s: &str) -> String {
     // e.g. "containerd github.com/containerd/containerd/v2 v2.4.2 b7a252..." -> "v2.4.2"
     for part in s.split_whitespace() {
-        if part.starts_with('v') && part.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) {
+        if part.starts_with('v') && part.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
             return part.to_string();
         }
     }

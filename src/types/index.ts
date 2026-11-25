@@ -270,6 +270,8 @@ export interface McpStatus {
   tokenPath: string;
   stdioPath: string;
   toolCount: number;
+  /** Only read tools may be called (and are listed). */
+  readOnly: boolean;
   resourceCount: number;
   promptCount: number;
   serverName: string;
@@ -627,6 +629,8 @@ export interface RegistryStatus {
   host: string;
   username: string;
   insecure: boolean;
+  /** Plain-HTTP registry: the engine gets `--insecure-registry` for it. */
+  allow_http: boolean;
   /** Whether a secret is stored — never the secret itself. */
   has_password: boolean;
   /** True for the login new pushes default to. */
@@ -641,6 +645,7 @@ export interface RegistryInput {
   /** Plain password/token; empty on edit keeps the stored secret. */
   password: string;
   insecure: boolean;
+  allow_http: boolean;
 }
 
 export interface RegistryTestResult {

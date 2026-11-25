@@ -27,6 +27,11 @@ const MONITOR_STATS_TIMEOUT: Duration = Duration::from_secs(4);
 /// How many stats requests the monitor keeps in flight. With 200 running
 /// containers the old `join_all` fired 200 requests at dockerd every 2s.
 const MONITOR_STATS_CONCURRENCY: usize = 12;
+/// Wall-clock budget for one tick's whole stats pass. Without it 60 slow
+/// containers (12 in flight, 4s each) held a tick for 20s, and with it the
+/// engine-state detection that shares the loop. Containers that miss the
+/// budget keep their previous sample until a later tick reaches them.
+const MONITOR_STATS_BUDGET: Duration = Duration::from_millis(2500);
 /// Consecutive identical readings required before an engine state change is
 /// believed. A busy daemon can refuse one socket connect, and a fake
 /// Running→Stopped→Running flap used to re-run auto-start (which stops every
@@ -44,6 +49,7 @@ async fn sample_stats(
     prev: &HashMap<String, crate::docker::models::ContainerStats>,
 ) -> HashMap<String, crate::docker::models::ContainerStats> {
     use futures_util::stream::{self, StreamExt};
+    let wanted = ids.clone();
     let futs: Vec<_> = ids
         .into_iter()
         .map(|id| {
@@ -59,16 +65,27 @@ async fn sample_stats(
         .collect();
     let results: Vec<Option<(String, crate::docker::models::ContainerStats)>> = stream::iter(futs)
         .buffer_unordered(MONITOR_STATS_CONCURRENCY)
+        .take_until(tokio::time::sleep(MONITOR_STATS_BUDGET))
         .collect()
         .await;
-    results
+    let mut fresh: HashMap<String, crate::docker::models::ContainerStats> = results
         .into_iter()
         .flatten()
         .map(|(id, mut s)| {
             s.cpu_percent = prev.get(&id).map(|p| s.cpu_percent_since(p)).unwrap_or(0.0);
             (id, s)
         })
-        .collect()
+        .collect();
+    // A running container the budget or a timeout skipped keeps its last
+    // sample instead of blinking out of the tray and the list.
+    for id in &wanted {
+        if !fresh.contains_key(id) {
+            if let Some(p) = prev.get(id) {
+                fresh.insert(id.clone(), p.clone());
+            }
+        }
+    }
+    fresh
 }
 
 fn start_background_monitoring(app_handle: AppHandle) {
@@ -224,7 +241,7 @@ fn start_background_monitoring(app_handle: AppHandle) {
                 hidden_ticks = hidden_ticks.wrapping_add(1);
                 // When hidden to tray, only refresh cached_stats every ~14s
                 // (matching tray REFRESH_INTERVAL) and skip WebView IPC emits.
-                if hidden_ticks % 7 != 0 {
+                if !hidden_ticks.is_multiple_of(7) {
                     continue;
                 }
             } else if was_hidden {
@@ -262,6 +279,11 @@ fn start_background_monitoring(app_handle: AppHandle) {
                 continue;
             }
             if !running_ids.is_empty() {
+                // Start each pass at a different container so the budget
+                // never starves the same tail of the list.
+                let mut running_ids = running_ids;
+                let len = running_ids.len();
+                running_ids.rotate_left((stats_tick as usize).wrapping_mul(MONITOR_STATS_CONCURRENCY) % len);
                 let prev = state.cached_stats.read().await.clone();
                 let stats_map = sample_stats(&client, running_ids, &prev).await;
                 // Keep app_state's cached_stats current for tray & background
@@ -386,15 +408,49 @@ pub fn run() {
                 state.ops.attach(handle.clone());
             }
 
+            // SIGTERM (logout, `systemctl stop`, `kill`), SIGINT and SIGHUP
+            // take the same path as Quit, so the engine is shut down cleanly
+            // (see the `RunEvent::Exit` handler) instead of the default action
+            // killing the app and leaving the daemon to die with it. Later
+            // signals are absorbed while that shutdown runs.
+            #[cfg(unix)]
+            {
+                let exit_handle = handle.clone();
+                crate::runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                        signal(SignalKind::terminate()),
+                        signal(SignalKind::interrupt()),
+                        signal(SignalKind::hangup()),
+                    ) else {
+                        tracing::warn!("could not install termination signal handlers");
+                        return;
+                    };
+                    let name = tokio::select! {
+                        _ = term.recv() => "SIGTERM",
+                        _ = int.recv() => "SIGINT",
+                        _ = hup.recv() => "SIGHUP",
+                    };
+                    tracing::info!("{name} received; quitting");
+                    exit_handle.exit(0);
+                });
+            }
+
             // Check auto-start engine daemon
             if let Some(state) = handle.try_state::<std::sync::Arc<AppState>>() {
                 // Seed the process-wide CLI preference from the saved config so
                 // the first compose/docker invocation resolves the same binary
                 // the Settings card will report.
                 {
-                    let mode = crate::runtime::runtime()
-                        .block_on(async { state.config.read().await.cli_mode.clone() });
+                    let (mode, insecure) = crate::runtime::runtime().block_on(async {
+                        let cfg = state.config.read().await;
+                        (
+                            cfg.cli_mode.clone(),
+                            crate::commands::registries::insecure_registry_hosts(&cfg.registries),
+                        )
+                    });
                     docker::engine::set_cli_mode(&mode);
+                    docker::engine::set_insecure_registries(insecure);
                 }
                 // The shim hardcodes the engine socket and DOCKER_CONFIG paths.
                 // Rewrite it on every launch so it follows the current layout
@@ -670,6 +726,7 @@ pub fn run() {
             // MCP front-end (Settings → MCP)
             commands::mcp::mcp_status,
             commands::mcp::mcp_set_enabled,
+            commands::mcp::mcp_set_read_only,
             commands::mcp::mcp_rotate_token,
             commands::mcp::mcp_token,
             commands::mcp::mcp_catalogue,
@@ -690,6 +747,7 @@ pub fn run() {
             system::diagnose_engine,
             system::repair_engine,
             system::get_embedded_binaries,
+            system::patch_app_config,
             // Gateway (Caddy reverse proxy & hosts manager)
             commands::gateway::get_gateway_status,
             commands::gateway::list_gateway_routes,
@@ -718,11 +776,22 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                // Graceful cleanup: stop Caddy gateway when app exits
+                // The gateway, then the engine. The engine would otherwise die
+                // with the app (PR_SET_PDEATHSIG) without dockerd getting the
+                // chance to stop containers with their own stop signal.
                 if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
                     let supervisor = state.caddy.clone();
-                    let _ = crate::runtime::runtime().block_on(async move {
+                    let engine = state.engine.clone();
+                    crate::runtime::runtime().block_on(async move {
                         let _ = supervisor.stop().await;
+                        if engine.child_pid().is_some() {
+                            tracing::info!("stopping the engine before exit");
+                            match crate::runtime::engine_op(move || engine.stop()).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => tracing::warn!("engine shutdown on exit failed: {e}"),
+                                Err(e) => tracing::warn!("engine shutdown on exit failed: {e}"),
+                            }
+                        }
                     });
                 }
             }

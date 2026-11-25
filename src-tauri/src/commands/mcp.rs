@@ -36,6 +36,8 @@ pub struct McpStatus {
     /// Absolute path of the stdio binary, if it was found on this install.
     pub stdio_path: String,
     pub tool_count: usize,
+    /// Only read tools may be called (and are listed).
+    pub read_only: bool,
     pub resource_count: usize,
     pub prompt_count: usize,
     pub server_name: String,
@@ -87,6 +89,7 @@ async fn status_of(state: &AppState, config: &AppConfig) -> McpStatus {
         token_path: token_file_path(),
         stdio_path: stdio_binary_path(),
         tool_count: crate::mcp::tools::catalogue().len(),
+        read_only: config.mcp_read_only,
         resource_count: crate::mcp::resources::catalogue().len(),
         prompt_count: crate::mcp::prompts::catalogue().len(),
         server_name: crate::mcp::SERVER_NAME.to_string(),
@@ -166,25 +169,14 @@ pub(crate) async fn save_mcp_settings(
     port: u16,
 ) -> Result<(), String> {
     let port = if port == 0 { default_mcp_port() } else { port };
-    let (was_enabled, was_port) = {
-        let cfg = state.config.read().await;
-        (cfg.mcp_enabled, cfg.mcp_port)
-    };
-    {
-        let mut cfg = state.config.write().await;
-        cfg.mcp_enabled = enabled;
-        cfg.mcp_port = port;
-    }
-    // Re-run the normal save so autostart, the shim and engine caps stay in
-    // step with everything else the UI writes.
-    let snapshot = state.config.read().await.clone();
-    if let Err(e) = crate::commands::system::save_app_config_core(state, snapshot).await {
-        // Roll the flags back so the file and the server do not disagree.
-        let mut cfg = state.config.write().await;
-        cfg.mcp_enabled = was_enabled;
-        cfg.mcp_port = was_port;
-        return Err(e);
-    }
+    // The change goes into a copy that the normal save writes and only then
+    // swaps in (keeping autostart, the shim and engine caps in step). A failed
+    // save leaves memory, the file and the listener as they were — nothing to
+    // roll back.
+    let mut next = state.config.read().await.clone();
+    next.mcp_enabled = enabled;
+    next.mcp_port = port;
+    crate::commands::system::save_app_config_core(state, next).await?;
     apply_mcp_enabled(state, enabled).await
 }
 
@@ -199,6 +191,23 @@ pub async fn mcp_set_enabled(
         None => state.config.read().await.mcp_port,
     };
     save_mcp_settings(state.inner(), enabled, port).await?;
+    let config = state.config.read().await.clone();
+    Ok(status_of(state.inner(), &config).await)
+}
+
+/// Switches MCP read-only mode. Applies to the next call on both transports
+/// (the stdio binary reads the same config file on each launch).
+#[tauri::command]
+pub async fn mcp_set_read_only(
+    state: State<'_, Arc<AppState>>,
+    read_only: bool,
+) -> Result<McpStatus, String> {
+    state
+        .update_config(|cfg| {
+            cfg.mcp_read_only = read_only;
+            Ok(())
+        })
+        .await?;
     let config = state.config.read().await.clone();
     Ok(status_of(state.inner(), &config).await)
 }

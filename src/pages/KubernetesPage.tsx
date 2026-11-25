@@ -191,8 +191,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   const toggleEngineAutoStart = async (next: boolean) => {
     try {
       setAutoStartBusy(true);
-      const cfg = await api.getAppConfig();
-      await api.saveAppConfig({ ...cfg, kind_auto_start: next });
+      await api.patchAppConfig({ kind_auto_start: next });
       setEngineAutoStart(next);
       const marked = Object.values(prefsByName).filter((p) => p.autoStart).length;
       toast.success(

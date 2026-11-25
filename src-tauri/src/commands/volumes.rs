@@ -162,7 +162,7 @@ pub(crate) async fn remove_volume_core(
         );
     }
     client
-        .remove_volume(&name, force)
+        .remove_volume(name, force)
         .await
         .map_err(|e| e.to_string())
 }

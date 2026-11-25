@@ -482,12 +482,9 @@ export const SettingsPage: React.FC = () => {
 
     try {
       setSaving(true);
-      // Registries and endpoints are managed by their own cards and saved
-      // independently — re-read the latest config so this save only touches
-      // the fields this form actually owns and never clobbers them.
-      const latest = await api.getAppConfig();
-      const merged: AppConfig = {
-        ...latest,
+      // Only the fields this form owns are sent; the backend merges them into
+      // the live config, so cards that saved in the meantime are not undone.
+      const fields: Partial<AppConfig> = {
         cli_bridge_enabled: config.cli_bridge_enabled,
         cli_mode: config.cli_mode,
         auto_start_daemon: config.auto_start_daemon,
@@ -504,8 +501,8 @@ export const SettingsPage: React.FC = () => {
         ),
         engine_cpu_cores: (config.engine_cpu_cores ?? "").trim(),
       };
-      await api.saveAppConfig(merged);
-      setConfig(merged);
+      await api.patchAppConfig(fields);
+      setConfig({ ...config, ...fields });
       invalidateTerminalSettings();
       setSaved(true);
       await checkDockerCli().catch(() => {});

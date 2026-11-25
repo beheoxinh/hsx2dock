@@ -37,7 +37,8 @@ endpoints) plus kind/Kubernetes clusters.
 Conventions:
 - Containers are addressed by id or name; a unique name prefix works.
 - `*_list` / `*_get` / `*_inspect` tools are read-only.
-- Tools that stop, remove, prune or repair are destructive; confirm intent first.
+- Destructive tools (remove, prune, exec, apply…) require `confirm: true`; ask \
+the user before setting it. In read-only mode only read tools are listed.
 - Engine lifecycle and self-repair tools only apply to the bundled engine. If a \
 remote endpoint is active they fail by design — call `endpoint_list` and \
 `endpoint_set_active` to switch back first.

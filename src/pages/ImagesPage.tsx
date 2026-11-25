@@ -351,11 +351,7 @@ export const ImagesPage: React.FC<ImagesPageProps> = ({
     const next = !autoPrune;
     setAutoPrune(next);
     try {
-      const current = await api.getAppConfig();
-      await api.saveAppConfig({
-        ...current,
-        auto_prune_dangling_images: next,
-      });
+      await api.patchAppConfig({ auto_prune_dangling_images: next });
       toast.success(
         next ? "Auto-prune Dangling Enabled" : "Auto-prune Dangling Disabled",
         next ? "Dangling/untagged images will be cleaned automatically" : "Automatic cleaning turned off"

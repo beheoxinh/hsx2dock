@@ -59,7 +59,7 @@ pub struct AppState {
     pub restart_policy_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Restart policy last seen/applied per container id, so a group edit
     /// does not inspect every container on the engine again.
-    pub restart_policy_seen: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pub restart_policy_seen: Arc<std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>>,
 }
 
 /// How long a successful ping vouches for the cached client.

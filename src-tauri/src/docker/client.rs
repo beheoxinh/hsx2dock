@@ -10,11 +10,14 @@ use super::models::{
     VolumeMount,
 };
 
+/// A value cached with the moment it was fetched, shared across clones.
+type TimedCache<T> = std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, T)>>>;
+
 #[derive(Clone)]
 pub struct DockerClient {
     docker: Docker,
-    network_cache: std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, Vec<NetworkItem>)>>>,
-    sizes_cache: std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, std::collections::HashMap<String, u64>)>>>,
+    network_cache: TimedCache<Vec<NetworkItem>>,
+    sizes_cache: TimedCache<std::collections::HashMap<String, u64>>,
 }
 
 /// A stopped container is a prune candidate unless it is a kind node — those
@@ -238,15 +241,19 @@ impl DockerClient {
             anyhow::bail!("engine started this exec detached");
         };
         let mut out: Vec<u8> = Vec::new();
+        let mut truncated = false;
         while let Some(frame) = output.next().await {
             match frame {
                 Ok(LogOutput::StdOut { message })
                 | Ok(LogOutput::StdErr { message })
                 | Ok(LogOutput::Console { message }) => {
                     // Bounded: a runaway command must not grow app memory
-                    // without limit.
-                    if out.len() < EXEC_OUTPUT_CAP {
+                    // without limit. The stream is still drained so the exec
+                    // finishes and reports its exit code.
+                    if out.len() + message.len() <= EXEC_OUTPUT_CAP {
                         out.extend_from_slice(&message);
+                    } else {
+                        truncated = true;
                     }
                 }
                 Ok(_) => {}
@@ -261,6 +268,15 @@ impl DockerClient {
                     String::from_utf8_lossy(&out).trim()
                 );
             }
+        }
+        // A cut-off payload is not a smaller answer: half a JSON listing fails
+        // to parse with no hint why. Say what happened instead.
+        if truncated {
+            anyhow::bail!(
+                "output exceeded the {} MiB capture limit; narrow the command \
+                 (a namespace, a selector, --tail)",
+                EXEC_OUTPUT_CAP / (1024 * 1024)
+            );
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
@@ -367,12 +383,12 @@ impl DockerClient {
                 if let Some(ns) = c.network_settings.and_then(|n| n.networks) {
                     for (net_name, net_cfg) in ns {
                         let net_id = net_cfg.network_id.unwrap_or_default();
-                        // If NetworkID is non-empty and not present in live networks, or network name is missing
-                        if !networks_known {
-                            // Unknown, not broken.
-                        } else if !net_id.is_empty() && !live_net_ids.contains(&net_id) {
-                            broken_networks.push(net_name.clone());
-                        } else if !live_net_names.contains(&net_name) && net_name != "bridge" && net_name != "host" && net_name != "none" {
+                        // Broken: its NetworkID is gone from the live networks, or
+                        // (no id) its name is. Unknown when the list failed.
+                        let builtin = matches!(net_name.as_str(), "bridge" | "host" | "none");
+                        let id_gone = !net_id.is_empty() && !live_net_ids.contains(&net_id);
+                        let name_gone = !live_net_names.contains(&net_name) && !builtin;
+                        if networks_known && (id_gone || name_gone) {
                             broken_networks.push(net_name.clone());
                         }
                         networks.push(net_name);
@@ -596,12 +612,12 @@ impl DockerClient {
                 net_rx: stat
                     .networks
                     .as_ref()
-                    .map(|n| n.iter().map(|(_, s)| s.rx_bytes.unwrap_or(0)).sum())
+                    .map(|n| n.values().map(|s| s.rx_bytes.unwrap_or(0)).sum())
                     .unwrap_or(0),
                 net_tx: stat
                     .networks
                     .as_ref()
-                    .map(|n| n.iter().map(|(_, s)| s.tx_bytes.unwrap_or(0)).sum())
+                    .map(|n| n.values().map(|s| s.tx_bytes.unwrap_or(0)).sum())
                     .unwrap_or(0),
                 cpu_total,
                 system_total,
@@ -612,12 +628,28 @@ impl DockerClient {
     }
 
     pub async fn container_logs(&self, id: &str, tail: &str, timestamps: bool) -> anyhow::Result<String> {
-        let opts = bollard::query_parameters::LogsOptionsBuilder::default()
+        self.container_logs_since(id, tail, timestamps, None).await
+    }
+
+    /// [`Self::container_logs`] limited to lines at or after `since` (unix
+    /// seconds). Lets a live view poll only what is new instead of re-reading
+    /// the whole tail every refresh.
+    pub async fn container_logs_since(
+        &self,
+        id: &str,
+        tail: &str,
+        timestamps: bool,
+        since: Option<i64>,
+    ) -> anyhow::Result<String> {
+        let mut builder = bollard::query_parameters::LogsOptionsBuilder::default()
             .stdout(true)
             .stderr(true)
             .tail(tail)
-            .timestamps(timestamps)
-            .build();
+            .timestamps(timestamps);
+        if let Some(since) = since.filter(|s| *s > 0) {
+            builder = builder.since(i32::try_from(since).unwrap_or(i32::MAX));
+        }
+        let opts = builder.build();
         let mut out = String::new();
         let mut stream = self.docker.logs(id, Some(opts));
         while let Some(chunk) = stream.next().await {
@@ -1697,9 +1729,16 @@ impl DockerClient {
         Ok(res.id)
     }
 
-    /// Fetch the last `tail` lines of a container's logs (decoded text).
-    pub async fn logs_tail(&self, id: &str, tail: &str, timestamps: bool) -> anyhow::Result<String> {
-        self.container_logs(id, tail, timestamps).await
+    /// Fetch the last `tail` lines of a container's logs (decoded text),
+    /// optionally only those at or after `since` (unix seconds).
+    pub async fn logs_tail(
+        &self,
+        id: &str,
+        tail: &str,
+        timestamps: bool,
+        since: Option<i64>,
+    ) -> anyhow::Result<String> {
+        self.container_logs_since(id, tail, timestamps, since).await
     }
 
     /// Stream container logs line-by-line; `follow=true` keeps the

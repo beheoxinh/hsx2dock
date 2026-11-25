@@ -11,9 +11,10 @@ use crate::docker::models::DaemonState;
 
 /// A socket path is usable when it exists and accepts a unix connection.
 /// A stale socket file (e.g. left over from a hard-killed engine) must not
-/// count as a live daemon.
+/// count as a live daemon. Shares the engine's non-blocking probe: a blocking
+/// connect waits on a full listen backlog, and this is called from async code.
 pub fn is_usable_socket(path: &Path) -> bool {
-    path.exists() && std::os::unix::net::UnixStream::connect(path).is_ok()
+    crate::docker::engine::is_usable_socket(path)
 }
 
 /// State derived purely from socket reachability.

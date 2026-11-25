@@ -59,7 +59,7 @@ pub(crate) async fn remove_network_core(state: &AppState, id: &str) -> Result<()
                 .to_string(),
         );
     }
-    client.remove_network(&id).await.map_err(|e| e.to_string())
+    client.remove_network(id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

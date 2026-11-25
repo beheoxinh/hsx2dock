@@ -153,6 +153,24 @@ export const McpPage: React.FC = () => {
     }
   };
 
+  const toggleReadOnly = async (next: boolean) => {
+    try {
+      setBusy(true);
+      const s = await api.mcpSetReadOnly(next);
+      setStatus(s);
+      toastSuccess(
+        next ? "MCP is read-only" : "MCP can change things again",
+        next
+          ? "Agents can list and inspect, nothing else."
+          : "Destructive tools still need the agent to pass confirm: true."
+      );
+    } catch (e) {
+      toastError("Could not change read-only mode", String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const rotate = async () => {
     try {
       setBusy(true);
@@ -317,6 +335,23 @@ user's request matches one of those jobs.`;
               cannot spawn a child process.
             </p>
             {status?.running && <CopyBlock label="Endpoint" body={status.url} />}
+          </div>
+
+          <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/50 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium text-white text-sm">Read-only mode</span>
+              <Switch
+                checked={!!status?.readOnly}
+                disabled={busy}
+                onChange={toggleReadOnly}
+                label="Allow agents to read only"
+              />
+            </div>
+            <p className="text-xs text-zinc-400">
+              Applies to both transports. Agents can list and inspect but cannot start, stop,
+              create or remove anything. With it off, destructive tools still refuse unless the
+              agent passes <span className="font-mono text-zinc-300">confirm: true</span>.
+            </p>
           </div>
         </div>
       </Section>

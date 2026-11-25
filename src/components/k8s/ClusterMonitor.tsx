@@ -183,6 +183,22 @@ export const ClusterMonitor: React.FC<{
   const [namespaceList, setNamespaceList] = useState<K8sNamespaceInfo[]>([]);
   // Node name while a cordon/uncordon/drain request is in flight.
   const [nodeBusy, setNodeBusy] = useState<string | null>(null);
+  // Workloads with a scale or rolling restart in flight. The ref is the guard
+  // (a double click lands before React re-renders); the state disables buttons.
+  const workloadOpsRef = useRef<Set<string>>(new Set());
+  const [workloadOps, setWorkloadOps] = useState<Set<string>>(() => new Set());
+  const workloadKey = (kind: string, ns: string, name: string) =>
+    `${kind.toLowerCase()}/${ns}/${name}`;
+  const claimWorkload = (key: string) => {
+    if (workloadOpsRef.current.has(key)) return false;
+    workloadOpsRef.current.add(key);
+    setWorkloadOps(new Set(workloadOpsRef.current));
+    return true;
+  };
+  const releaseWorkload = (key: string) => {
+    workloadOpsRef.current.delete(key);
+    setWorkloadOps(new Set(workloadOpsRef.current));
+  };
 
   // Pod / workload logs viewer (workloadKind set → aggregated workload logs).
   const [logsFor, setLogsFor] = useState<
@@ -669,16 +685,22 @@ export const ClusterMonitor: React.FC<{
   };
 
   const handleRestart = async (w: K8sWorkloadInfo) => {
+    const key = workloadKey(w.kind, w.namespace, w.name);
+    if (!claimWorkload(key)) return;
     try {
       await api.restartWorkload(cluster, w.kind.toLowerCase(), w.namespace, w.name);
       toast.success("Rolling restart started", `${w.kind} ${w.namespace}/${w.name}`);
     } catch (e) {
       toast.error("Restart failed", String(e));
+    } finally {
+      releaseWorkload(key);
     }
   };
 
   const handleScaleSubmit = async () => {
     if (!scaleFor) return;
+    const key = workloadKey(scaleFor.kind, scaleFor.ns, scaleFor.name);
+    if (!claimWorkload(key)) return;
     try {
       await api.scaleWorkload(
         cluster,
@@ -695,6 +717,8 @@ export const ClusterMonitor: React.FC<{
       api.getClusterWorkloads(cluster).then(forCluster(setWorkloads)).catch(() => {});
     } catch (e) {
       toast.error("Scale failed", String(e));
+    } finally {
+      releaseWorkload(key);
     }
   };
 
@@ -1505,6 +1529,7 @@ export const ClusterMonitor: React.FC<{
                             variant="ghost"
                             size="icon"
                             title="Rolling restart"
+                            disabled={workloadOps.has(workloadKey(w.kind, w.namespace, w.name))}
                             onClick={() => handleRestart(w)}
                             className="h-6 w-6 text-zinc-400 hover:text-white"
                           >
@@ -2506,7 +2531,15 @@ export const ClusterMonitor: React.FC<{
               <Button variant="ghost" size="sm" onClick={() => setScaleFor(null)}>
                 Cancel
               </Button>
-              <Button variant="primary" size="sm" onClick={handleScaleSubmit}>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleScaleSubmit}
+                disabled={
+                  !!scaleFor &&
+                  workloadOps.has(workloadKey(scaleFor.kind, scaleFor.ns, scaleFor.name))
+                }
+              >
                 Scale
               </Button>
             </div>

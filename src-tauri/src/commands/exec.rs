@@ -244,7 +244,7 @@ async fn ensure_running_for_debug(state: &AppState, id: &str) -> Result<(), Stri
         if state_info.as_ref().and_then(|s| s.running).unwrap_or(false) {
             return Ok(());
         }
-        let status = state_info.as_ref().and_then(|s| s.status.clone());
+        let status = state_info.as_ref().and_then(|s| s.status);
         if status == Some(ContainerStateStatusEnum::EXITED)
             || status == Some(ContainerStateStatusEnum::DEAD)
         {

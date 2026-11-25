@@ -66,10 +66,9 @@ export const NotificationsCard: React.FC = () => {
     setPrefs(next);
     try {
       setBusy(true);
-      // Re-read before writing: the Settings form may have saved other fields
-      // since this card mounted, and we must not clobber them.
-      const latest = await api.getAppConfig();
-      await api.saveAppConfig({ ...latest, notifications: next });
+      // Only this field: the Settings form may have saved others since this
+      // card mounted, and they must not be clobbered.
+      await api.patchAppConfig({ notifications: next });
       toast.success(
         next[key] ? "Notifications enabled" : "Notifications muted",
         ROWS.find((r) => r.key === key)?.label ?? ""

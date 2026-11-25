@@ -179,6 +179,27 @@ fn binary_in(dir: &Path) -> PathBuf {
     p
 }
 
+/// GitHub's own sha256 of a release asset (`"digest": "sha256:<hex>"` in the
+/// releases API), or `None` for releases published before GitHub recorded it.
+async fn github_asset_digest(version: &str, asset: &str) -> Result<Option<String>> {
+    let url = format!(
+        "https://api.github.com/repos/kubernetes-sigs/kind/releases/tags/v{version}"
+    );
+    let body = crate::docker::engine::http_get(&url).await?.text().await?;
+    let json: serde_json::Value = serde_json::from_str(&body).context("decode GitHub release JSON")?;
+    Ok(asset_digest_from_release(&json, asset))
+}
+
+fn asset_digest_from_release(release: &serde_json::Value, asset: &str) -> Option<String> {
+    release["assets"]
+        .as_array()?
+        .iter()
+        .find(|a| a["name"].as_str() == Some(asset))?["digest"]
+        .as_str()?
+        .strip_prefix("sha256:")
+        .map(str::to_string)
+}
+
 /// Download + verify + install the pinned kind binary.
 pub async fn install_kind<F>(paths: &KindPaths, on_progress: F) -> Result<PathBuf>
 where
@@ -259,7 +280,23 @@ where
     // publishes `<asset>.sha256sum` next to the binary.
     let expected = match expected_sha256(os, arch) {
         Some(sha) if version == KIND_VERSION => sha.to_string(),
-        _ => fetch_kind_checksum(&version, &asset).await?,
+        _ => {
+            let published = fetch_kind_checksum(&version, &asset).await?;
+            // The `.sha256sum` file sits next to the binary, so on its own it
+            // only proves the two came from the same place. GitHub records its
+            // own digest of every uploaded asset; a disagreement means one of
+            // them was swapped and the install stops. An API that cannot be
+            // reached (rate limit, offline mirror) is not fatal.
+            match github_asset_digest(&version, &asset).await {
+                Ok(Some(api)) if !api.eq_ignore_ascii_case(&published) => bail!(
+                    "kind v{version}: the published checksum ({published}) does not match \
+                     GitHub's digest of the asset ({api}); not installing"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("could not cross-check kind v{version} with GitHub: {e:#}"),
+            }
+            published
+        }
     };
     if let Err(e) = verify(&staging, &expected) {
         let _ = std::fs::remove_file(&staging);
@@ -406,6 +443,21 @@ pub async fn check_kind_update(paths: &KindPaths) -> Result<KindUpdateInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn github_asset_digest_is_read_for_the_named_asset_only() {
+        let release = serde_json::json!({ "assets": [
+            { "name": "kind-linux-arm64", "digest": "sha256:aaa" },
+            { "name": "kind-linux-amd64", "digest": "sha256:bbb" },
+            { "name": "kind-darwin-amd64" }
+        ]});
+        assert_eq!(
+            super::asset_digest_from_release(&release, "kind-linux-amd64").as_deref(),
+            Some("bbb")
+        );
+        assert_eq!(super::asset_digest_from_release(&release, "kind-darwin-amd64"), None);
+        assert_eq!(super::asset_digest_from_release(&release, "missing"), None);
+    }
+
     use super::*;
     use crate::docker::engine::sha256_file;
 

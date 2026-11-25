@@ -89,11 +89,7 @@ export const VolumesPage: React.FC<VolumesPageProps> = ({
     const next = !autoPrune;
     setAutoPrune(next);
     try {
-      const current = await api.getAppConfig();
-      await api.saveAppConfig({
-        ...current,
-        auto_prune_isolated_volumes: next,
-      });
+      await api.patchAppConfig({ auto_prune_isolated_volumes: next });
       toast.success(
         next ? "Auto-clean Isolated Enabled" : "Auto-clean Isolated Disabled",
         next ? "Unused/alone volumes will be cleaned automatically" : "Automatic cleaning turned off"

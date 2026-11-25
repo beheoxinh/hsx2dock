@@ -25,6 +25,16 @@ fn main() {
     let runtime = hsx2dock_lib::runtime::runtime();
     let result: Result<(), String> = runtime.block_on(async {
         let state = Arc::new(hsx2dock_lib::state::AppState::new().await);
+        // Same process-wide settings the GUI seeds at launch: an engine this
+        // process starts must resolve the same CLI and trust the same
+        // plain-HTTP registries.
+        {
+            let cfg = state.config.read().await;
+            hsx2dock_lib::docker::engine::set_cli_mode(&cfg.cli_mode);
+            hsx2dock_lib::docker::engine::set_insecure_registries(
+                hsx2dock_lib::commands::registries::insecure_registry_hosts(&cfg.registries),
+            );
+        }
         hsx2dock_lib::mcp::stdio::serve(state).await
     });
 

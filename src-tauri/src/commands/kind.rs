@@ -3858,8 +3858,10 @@ pub(crate) async fn get_resource_events_core(
         // Some apiservers reject a field selector on events with
         // "the server could not find the requested resource" (notably while
         // the cluster is still settling). Listing the namespace and filtering
-        // here gives the same answer without the server-side selector.
-        Err(_) => {
+        // here gives the same answer without the server-side selector. Any
+        // other failure (a timeout, an unreachable cluster) is returned as is:
+        // retrying it without the selector would only double the wait.
+        Err(e) if selector_unsupported(&e) => {
             let mut all = kubectl_json(
                 state,
                 &cluster,
@@ -3876,10 +3878,20 @@ pub(crate) async fn get_resource_events_core(
             }
             all
         }
+        Err(e) => return Err(e),
     };
     let mut events = parse_events(&v);
     events.sort_by_key(|e| e.last_timestamp.unwrap_or(0));
     Ok(events)
+}
+
+/// Whether a kubectl error is the apiserver refusing the events field selector
+/// (as opposed to a timeout or an unreachable cluster).
+fn selector_unsupported(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("could not find the requested resource")
+        || e.contains("field label not supported")
+        || e.contains("is not a known field selector")
 }
 
 /// Aggregated logs of a workload (`kubectl logs deployment/name` picks one of
@@ -3933,6 +3945,21 @@ pub(crate) async fn get_workload_logs_core(
 #[cfg(test)]
 mod resource_view_tests {
     use super::*;
+
+    #[test]
+    fn events_fallback_only_on_an_unsupported_selector() {
+        assert!(selector_unsupported(
+            "Error from server (BadRequest): Unable to find \"events\" that match label selector \"\", field selector \"involvedObject.uid=x\": field label not supported: involvedObject.uid"
+        ));
+        assert!(selector_unsupported(
+            "error: the server could not find the requested resource"
+        ));
+        assert!(selector_unsupported("\"regarding.uid\" is not a known field selector"));
+        // A timeout or an unreachable cluster must surface, not be retried
+        // as an unfiltered (and possibly huge) namespace-wide listing.
+        assert!(!selector_unsupported("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused"));
+        assert!(!selector_unsupported("kubectl timed out after 20s"));
+    }
 
     #[test]
     fn yaml_kind_allowlist_accepts_singular_and_plural_only() {
@@ -5168,8 +5195,10 @@ mod auto_start_tests {
 
     #[test]
     fn names_are_sorted_and_unmarked_clusters_skipped() {
-        let mut cfg = AppConfig::default();
-        cfg.kind_auto_start = true;
+        let mut cfg = AppConfig {
+            kind_auto_start: true,
+            ..AppConfig::default()
+        };
         cfg.kind_cluster_prefs.insert("zeta".into(), prefs(true));
         cfg.kind_cluster_prefs.insert("alpha".into(), prefs(true));
         cfg.kind_cluster_prefs.insert("mid".into(), prefs(false));

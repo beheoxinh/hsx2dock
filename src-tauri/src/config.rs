@@ -129,6 +129,10 @@ pub struct AppConfig {
     /// Port for the loopback HTTP transport. `0` = pick a free port on start.
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Refuse every MCP tool that is not read-only, on both transports.
+    /// Settable from the app only: an agent's `engine_set_config` keeps it.
+    #[serde(default)]
+    pub mcp_read_only: bool,
     /// Automatically prune dangling / untagged images when viewing the Images page or on background tick.
     #[serde(default)]
     pub auto_prune_dangling_images: bool,
@@ -248,6 +252,11 @@ pub struct RegistryConfig {
     /// Accept self-signed TLS certs (personal Harbor installs).
     #[serde(default)]
     pub insecure: bool,
+    /// Explicit opt-in: the registry speaks plain HTTP only. The engine is
+    /// started with `--insecure-registry=<host>` and the login test may fall
+    /// back to `http://`. Credentials then travel in clear text.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 impl RegistryConfig {
@@ -354,6 +363,7 @@ impl Default for AppConfig {
             kind_cluster_prefs: Default::default(),
             mcp_enabled: false,
             mcp_port: default_mcp_port(),
+            mcp_read_only: false,
             auto_prune_dangling_images: false,
             auto_prune_isolated_volumes: false,
             gateway_enabled: false,
@@ -567,9 +577,11 @@ mod tests {
         assert!(!cfg.start_minimized);
 
         // Start-minimized only makes sense as a companion of autostart.
-        let mut cfg = AppConfig::default();
-        cfg.auto_start_on_boot = true;
-        cfg.start_minimized = true;
+        let mut cfg = AppConfig {
+            auto_start_on_boot: true,
+            start_minimized: true,
+            ..AppConfig::default()
+        };
         cfg.normalize();
         assert!(cfg.start_minimized);
 
@@ -685,6 +697,7 @@ mod tests {
             kind_cluster_prefs: Default::default(),
             mcp_enabled: false,
             mcp_port: default_mcp_port(),
+            mcp_read_only: false,
             auto_prune_dangling_images: false,
             auto_prune_isolated_volumes: false,
             gateway_enabled: false,
@@ -762,8 +775,10 @@ mod tests {
         assert_eq!(legacy.engine_cpu_limit().unwrap(), 0.0);
 
         // Garbage CPU input errors instead of panicking or being ignored.
-        let mut bad = AppConfig::default();
-        bad.engine_cpu_cores = "lots".into();
+        let mut bad = AppConfig {
+            engine_cpu_cores: "lots".into(),
+            ..AppConfig::default()
+        };
         assert!(bad.engine_cpu_limit().is_err());
         bad.engine_cpu_cores = "-2".into();
         assert!(bad.engine_cpu_limit().is_err());

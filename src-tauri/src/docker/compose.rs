@@ -70,7 +70,7 @@ pub async fn project_action(project: &str, subcommand: &str) -> anyhow::Result<S
         let args = ["compose", "-p", project.as_str(), subcommand.as_str()];
         let paths = crate::docker::engine::EnginePaths::new();
         let mut cmd = crate::docker::engine::docker_command_resolved(&paths);
-        cmd.args(&args);
+        cmd.args(args);
         let out = output_with_timeout(cmd, LIFECYCLE_TIMEOUT)?;
         finish_output("compose", out)
     })

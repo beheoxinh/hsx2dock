@@ -145,12 +145,17 @@ pub struct EngineManager {
 
 struct Inner {
     child: Option<Child>,
+    /// Exclusive `flock` on `engine.lock`, held for as long as this process
+    /// owns the running engine. The GUI and the standalone `hsx2dock-mcp`
+    /// binary each have an `EngineManager`; without this, one of them would
+    /// take the other's live engine for a stale leftover and kill it.
+    lock: Option<File>,
 }
 
 impl EngineManager {
     pub fn new(paths: EnginePaths) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { child: None })),
+            inner: Arc::new(Mutex::new(Inner { child: None, lock: None })),
             paths: Arc::new(std::sync::RwLock::new(paths)),
         }
     }
@@ -242,6 +247,7 @@ impl EngineManager {
             Ok(Some(status)) => {
                 tracing::warn!("engine process exited unexpectedly: {status}");
                 guard.child = None;
+                guard.lock = None;
                 false
             }
             Ok(None) => {
@@ -268,6 +274,13 @@ impl EngineManager {
     pub fn start(&self) -> Result<()> {
         match self.start_once() {
             Ok(()) => Ok(()),
+            // The scope is a refinement, never a requirement: if starting
+            // through it failed, start the plain way and stay with that.
+            Err(e) if systemd_scope_available() && scope_start_failed(&self.paths()) => {
+                tracing::warn!("engine start in a systemd scope failed ({e:#}); retrying without it");
+                SCOPE_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.start()
+            }
             Err(e) => {
                 // Self-heal the one environmental failure a fresh install can
                 // hit: on SELinux-enforcing hosts (Fedora), the stock `pasta`
@@ -291,10 +304,14 @@ impl EngineManager {
         if !self.is_installed() {
             bail!("engine is not installed yet");
         }
+        let paths = self.paths();
+        // Ownership first: only the lock holder may treat a pidfile as stale.
+        let Some(lock) = acquire_engine_lock(&paths)? else {
+            // Another Hsx2Dock process owns the engine and it is up — share it.
+            return Ok(());
+        };
         // Reap anything left over from a hard-killed previous run.
         self.kill_stale()?;
-
-        let paths = self.paths();
 
         // Rootless networking needs a user-space net helper. Without one,
         // rootlesskit dies with an opaque "no such file or directory" long
@@ -364,7 +381,7 @@ impl EngineManager {
         // driver's resolv.conf alone).
         let (dns_servers, dns_search) = host_dns_upstreams();
 
-        let mut cmd = Command::new(bin.join("rootlesskit"));
+        let mut cmd = engine_command(&bin.join("rootlesskit"), &paths.runtime_dir);
         cmd.arg("--state-dir")
             .arg(&paths.rootless_state)
             .arg(format!("--net={net}"))
@@ -392,8 +409,12 @@ impl EngineManager {
             .arg("--userland-proxy=false")
             .arg("--feature")
             .arg("containerd-snapshotter=false")
+            .args(
+                insecure_registries()
+                    .iter()
+                    .map(|h| format!("--insecure-registry={h}")),
+            )
             .env("DOCKER_IGNORE_BR_NETFILTER_ERROR", "1")
-            .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
             .env("PATH", prefixed_path(&bin))
             .env("DM_DNS_SERVERS", dns_servers.join(" "))
             .env("DM_DNS_SEARCH", dns_search.join(" "))
@@ -419,7 +440,11 @@ impl EngineManager {
         let pid = child.id();
         // Replacing the handle must not drop an unreaped child (a zombie). It is
         // normally gone already, since is_running() clears an exited handle.
-        let previous = self.inner_lock().child.replace(child);
+        let previous = {
+            let mut guard = self.inner_lock();
+            guard.lock = Some(lock);
+            guard.child.replace(child)
+        };
         if let Some(mut old) = previous {
             if matches!(old.try_wait(), Ok(None)) {
                 signal(old.id(), libc::SIGKILL);
@@ -447,6 +472,7 @@ impl EngineManager {
             if exited {
                 let mut guard = self.inner_lock();
                 guard.child = None;
+                guard.lock = None;
                 let _ = fs::remove_file(&paths.pid_file);
                 bail!(
                     "engine exited during startup; see {} for details",
@@ -455,7 +481,11 @@ impl EngineManager {
             }
             if Instant::now() >= deadline {
                 // Still alive but never opened the socket — kill, reap, report.
-                let taken = self.inner_lock().child.take();
+                let taken = {
+                    let mut guard = self.inner_lock();
+                    guard.lock = None;
+                    guard.child.take()
+                };
                 if let Some(mut c) = taken {
                     signal(c.id(), libc::SIGKILL);
                     let _ = c.wait();
@@ -471,24 +501,71 @@ impl EngineManager {
         }
     }
 
-    /// SIGTERM → wait up to 15s → SIGKILL → reap. Never leaves a zombie.
+    /// Clean shutdown: dockerd first, with a single SIGTERM and time to stop
+    /// every container with its own stop signal and timeout; then whatever is
+    /// left of rootlesskit. SIGKILL only as a last resort. Never leaves a
+    /// zombie.
+    ///
+    /// Signalling rootlesskit first is not equivalent: both of its processes
+    /// forward the signal, and dockerd aborts its cleanup on the third one,
+    /// killing databases mid-write (see `RESOLV_WRAPPER`).
     pub fn stop(&self) -> Result<()> {
-        let child = self.inner_lock().child.take();
+        let paths = self.paths();
+        let (child, lock) = {
+            let mut guard = self.inner_lock();
+            (guard.child.take(), guard.lock.take())
+        };
+        if child.is_none() && lock.is_none() && engine_lock_held_elsewhere(&paths) {
+            bail!(
+                "the engine is owned by another Hsx2Dock process (the app or another \
+                 hsx2dock-mcp); stop it from there"
+            );
+        }
+        let dockerd_pid = pidfile_process(&paths.dockerd_pid_file(), &["dockerd"]);
+        if let Some(pid) = dockerd_pid {
+            signal(pid as u32, libc::SIGTERM);
+            let deadline = Instant::now() + DOCKERD_SHUTDOWN_GRACE;
+            while pid_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if pid_alive(pid) {
+                tracing::warn!(
+                    "dockerd did not exit within {}s; killing it",
+                    DOCKERD_SHUTDOWN_GRACE.as_secs()
+                );
+                // Never a second SIGTERM (directly, via rootlesskit's wrapper or
+                // the pidfile fallback below): dockerd answers repeated ones
+                // with a forced shutdown anyway, after more waiting.
+                signal(pid as u32, libc::SIGKILL);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while pid_alive(pid) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            } else {
+                tracing::info!("dockerd shut down cleanly");
+            }
+        }
         if let Some(mut child) = child {
-            signal(child.id(), libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            // rootlesskit exits on its own once dockerd is gone; the signal is
+            // only for a supervisor whose daemon never started.
+            let grace = if dockerd_pid.is_some() { 5 } else { 0 };
+            let deadline = Instant::now() + Duration::from_secs(grace);
+            let mut signalled = false;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(200))
+                        std::thread::sleep(Duration::from_millis(100))
                     }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
+                    Ok(None) if !signalled => {
+                        signal(child.id(), libc::SIGTERM);
+                        signalled = true;
+                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    Err(_) => {
+                    Ok(None) if Instant::now() < deadline + Duration::from_secs(10) => {
+                        std::thread::sleep(Duration::from_millis(100))
+                    }
+                    _ => {
                         let _ = child.kill();
                         let _ = child.wait();
                         break;
@@ -496,11 +573,10 @@ impl EngineManager {
                 }
             }
         }
-        // SIGKILL to rootlesskit does not reach the dockerd it spawned, so the
-        // daemon is stopped through its own pidfile (checked by process name).
-        let paths = self.paths();
+        // A daemon that outlived its supervisor (or ignored the first signal).
         stop_pidfile_process(&paths.dockerd_pid_file(), &["dockerd"], Duration::from_secs(5));
         let _ = fs::remove_file(&paths.pid_file);
+        drop(lock);
         Ok(())
     }
 
@@ -520,20 +596,172 @@ impl EngineManager {
     }
 }
 
+/// Whether a failed start failed in `systemd-run` itself (no user bus, the
+/// scope refused) rather than in the engine. Only that falls back to a start
+/// without the scope; an engine error (no pasta, a health timeout) must not
+/// silently give up the scope for the rest of the session.
+fn scope_start_failed(paths: &EnginePaths) -> bool {
+    let log = fs::read_to_string(&paths.log_file).unwrap_or_default();
+    scope_error_in_log(&log)
+}
+
+fn scope_error_in_log(log: &str) -> bool {
+    log.lines().take(20).any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("transient scope")
+            || l.contains("scope bus")
+            || l.contains("failed to create bus connection")
+            || (l.contains("systemd-run") && l.contains("fail"))
+    })
+}
+
+fn engine_lock_path(paths: &EnginePaths) -> PathBuf {
+    paths
+        .pid_file
+        .parent()
+        .map(|d| d.join("engine.lock"))
+        .unwrap_or_else(|| PathBuf::from("engine.lock"))
+}
+
+/// Non-blocking exclusive `flock`. `Ok(None)` when another process holds it.
+/// The file is opened close-on-exec (std's default), so the engine children
+/// never inherit the lock and it dies with this process.
+fn try_engine_lock(path: &Path) -> Result<Option<File>> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| format!("lock {}", path.display()));
+        }
+    }
+    Ok(Some(file))
+}
+
+fn engine_lock_held_elsewhere(paths: &EnginePaths) -> bool {
+    matches!(try_engine_lock(&engine_lock_path(paths)), Ok(None))
+}
+
+/// Takes engine ownership for a start. `Ok(None)` means another process owns
+/// a live engine (its socket answers), which this one should simply use. While
+/// that owner is still starting, waits for it to finish or give up.
+fn acquire_engine_lock(paths: &EnginePaths) -> Result<Option<File>> {
+    let path = engine_lock_path(paths);
+    let deadline = Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECS + 10);
+    loop {
+        if let Some(lock) = try_engine_lock(&path)? {
+            return Ok(Some(lock));
+        }
+        if is_usable_socket(&paths.socket) {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            bail!("another Hsx2Dock process is starting the engine and has not finished");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The command that runs `rootlesskit`: inside its own transient systemd scope
+/// when the user manager is reachable, else directly.
+///
+/// The scope keeps the engine out of the app's cgroup. Stopping the app's unit
+/// (logout, `systemctl --user stop`) signals every process in that cgroup at
+/// once — containerd and the shims included — and a containerd that dies
+/// before dockerd leaves dockerd unable to stop a single container. In its own
+/// scope with `KillMode=none` only the app is signalled, and its exit handler
+/// shuts the engine down in order. `systemd-run --scope` execs in place, so
+/// the spawned pid is still rootlesskit and `PR_SET_PDEATHSIG` still applies.
+///
+/// The engine's `XDG_RUNTIME_DIR` is our own subdirectory. systemd-run finds
+/// the user manager through the real one, so it keeps that and hands the
+/// engine its own through `env` (which, like systemd-run, execs in place).
+fn engine_command(rootlesskit: &Path, runtime_dir: &Path) -> Command {
+    if systemd_scope_available() {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--collect"])
+            // Unique per start: a restart must not collide with the previous
+            // scope before systemd has collected it.
+            .arg(format!(
+                "--unit=hsx2dock-engine-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default()
+            ))
+            .args(["-p", "KillMode=none", "--", "env"])
+            .arg(format!("XDG_RUNTIME_DIR={}", runtime_dir.display()))
+            .arg(rootlesskit);
+        cmd
+    } else {
+        let mut cmd = Command::new(rootlesskit);
+        cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+        cmd
+    }
+}
+
+/// Set after a start through the scope failed: later starts spawn directly.
+static SCOPE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `systemd-run --user --scope` works here (probed once).
+fn systemd_scope_available() -> bool {
+    if SCOPE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !cfg!(target_os = "linux") || which("systemd-run").is_none() {
+            return false;
+        }
+        let ok = Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            tracing::info!("no systemd user scope available; the engine shares the app's cgroup");
+        }
+        ok
+    })
+}
+
+/// How long `stop` lets dockerd stop its containers. dockerd itself gives each
+/// container its stop timeout (10s unless configured), in parallel, so this
+/// only bites for a container configured with a longer one.
+const DOCKERD_SHUTDOWN_GRACE: Duration = Duration::from_secs(45);
+
+/// The live pid named in `pid_file`, if its `comm` is one of `names` — a pid
+/// recycled since the file was written is never returned.
+fn pidfile_process(pid_file: &Path, names: &[&str]) -> Option<i32> {
+    let pid = fs::read_to_string(pid_file).ok()?.trim().parse::<i32>().ok()?;
+    proc_comm(pid)
+        .is_some_and(|comm| names.contains(&comm.as_str()))
+        .then_some(pid)
+}
+
 /// Asks the process named in `pid_file` to exit: SIGTERM, up to `grace` to
 /// comply, then SIGKILL. Does nothing unless the pid's `comm` is one of
 /// `names`, so a pid recycled since the file was written is never signalled.
 /// Returns whether a matching process was found.
 fn stop_pidfile_process(pid_file: &Path, names: &[&str], grace: Duration) -> bool {
-    let Ok(raw) = fs::read_to_string(pid_file) else {
+    let Some(pid) = pidfile_process(pid_file, names) else {
         return false;
     };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
-        return false;
-    };
-    if !proc_comm(pid).is_some_and(|comm| names.contains(&comm.as_str())) {
-        return false;
-    }
     signal(pid as u32, libc::SIGTERM);
     let deadline = Instant::now() + grace;
     while pid_alive(pid) && Instant::now() < deadline {
@@ -1002,7 +1230,7 @@ pub fn dir_supports_d_type(dir: &Path) -> Option<bool> {
             }
             off += d_reclen;
         }
-        return Some(saw_real_type);
+        Some(saw_real_type)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1466,7 +1694,24 @@ const RESOLV_WRAPPER: &str = r#"if [ -n "$DM_DNS_SERVERS" ]; then
         if [ -n "$DM_DNS_SEARCH" ]; then printf 'search %s\n' "$DM_DNS_SEARCH"; fi
     } > /etc/resolv.conf || true
 fi
-exec "$@""#;
+# dockerd gives up on a clean shutdown after a third SIGINT/SIGTERM ("Forcing
+# docker daemon shutdown without cleanup") and its containers die mid-write.
+# One stop can deliver several: rootlesskit's parent and child each forward the
+# signal, and a systemd unit stop signals every process in the cgroup. So the
+# daemon runs as a child here and receives at most one forwarded signal.
+"$@" &
+child=$!
+forward() {
+    [ -n "$forwarded" ] && return
+    forwarded=1
+    kill -TERM "$child" 2>/dev/null
+}
+trap forward TERM INT HUP
+while :; do
+    wait "$child"
+    rc=$?
+    kill -0 "$child" 2>/dev/null || exit "$rc"
+done"#;
 
 /// Pick a rootless network driver: host `pasta`, else host `slirp4netns`, else
 /// the copy we ship alongside the engine. `pasta` is preferred — it is built
@@ -1535,15 +1780,27 @@ pub fn apply_cgroup_limits(pid: u32, memory_mb: u64, cpu_cores: f64) -> Result<S
         .map(str::trim)
         .filter(|p| !p.is_empty() && *p != "/")
         .ok_or_else(|| "the process is not running under a writable cgroup v2 scope".to_string())?;
-    let dir = std::path::PathBuf::from("/sys/fs/cgroup")
-        .join(cg_rel.trim_start_matches('/'))
-        .join("hsx2dock-engine");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create cgroup {}: {e}", dir.display()))?;
-
-    // Move the engine (and, by inheritance, its whole process tree) in.
-    std::fs::write(dir.join("cgroup.procs"), pid.to_string())
-        .map_err(|e| format!("cannot move engine pid {pid} into {}: {e}", dir.display()))?;
+    // An engine in its own systemd scope (see `engine_command`) is capped
+    // there; moving it back under the app would undo what the scope is for.
+    let engine_cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_string()))
+        .filter(|p| p.contains("hsx2dock-engine-") && p.ends_with(".scope"));
+    let dir = match engine_cgroup {
+        Some(scope) => std::path::PathBuf::from("/sys/fs/cgroup").join(scope.trim_start_matches('/')),
+        None => {
+            let dir = std::path::PathBuf::from("/sys/fs/cgroup")
+                .join(cg_rel.trim_start_matches('/'))
+                .join("hsx2dock-engine");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create cgroup {}: {e}", dir.display()))?;
+            // Move the engine (and, by inheritance, its whole process tree) in.
+            std::fs::write(dir.join("cgroup.procs"), pid.to_string()).map_err(|e| {
+                format!("cannot move engine pid {pid} into {}: {e}", dir.display())
+            })?;
+            dir
+        }
+    };
 
     // Always (re)write both controllers so dropping a limit back to
     // "unlimited" clears a cap left over from a previous start.
@@ -1669,6 +1926,26 @@ pub fn set_cli_mode(mode: &str) {
     }
 }
 
+/// Registry hosts the engine reaches over plain HTTP, from the logins that
+/// opted in with `allow_http`. Process-wide like [`CLI_MODE`]: every start
+/// path (boot, Settings, data-root move, restart) builds the dockerd command
+/// in `start_once`, which has no `AppState`.
+static INSECURE_REGISTRIES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Record the plain-HTTP registry hosts; takes effect on the next engine start.
+pub fn set_insecure_registries(hosts: Vec<String>) {
+    if let Ok(mut guard) = INSECURE_REGISTRIES.write() {
+        *guard = hosts;
+    }
+}
+
+fn insecure_registries() -> Vec<String> {
+    INSECURE_REGISTRIES
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 /// The current CLI preference; `"auto"` until something sets it.
 pub fn cli_mode() -> String {
     CLI_MODE
@@ -1761,6 +2038,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl InstallProgress {
+    #[allow(clippy::too_many_arguments)] // one private constructor behind named helpers
     fn build(
         target: &'static str,
         version: &str,
@@ -3404,6 +3682,30 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_systemd_run_errors_fall_back_from_the_scope() {
+        assert!(scope_error_in_log(
+            "Failed to connect to user scope bus via local transport: No such file or directory\n"
+        ));
+        assert!(scope_error_in_log("Failed to start transient scope unit: Access denied\n"));
+        assert!(!scope_error_in_log(
+            "[rootlesskit:parent] error: failed to setup network &{pasta}: exec: \"pasta\": executable file not found\n"
+        ));
+        assert!(!scope_error_in_log(""));
+    }
+
+    #[test]
+    fn engine_lock_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("hsx2-engine-lock-{}", std::process::id()));
+        let path = dir.join("engine.lock");
+        let first = try_engine_lock(&path).unwrap();
+        assert!(first.is_some(), "a free lock is taken");
+        assert!(try_engine_lock(&path).unwrap().is_none(), "a held lock is refused");
+        drop(first);
+        assert!(try_engine_lock(&path).unwrap().is_some(), "dropping releases it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

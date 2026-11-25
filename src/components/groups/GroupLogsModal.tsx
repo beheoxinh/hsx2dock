@@ -16,6 +16,7 @@ import { Button } from "../ui/Button";
 import { useToast } from "../ui/Toast";
 import { api } from "../../lib/api";
 import type { ContainerItem } from "../../types";
+import { mergeLogChunk, nextSince, parseDockerTime, type LogBuffer } from "../../lib/logMerge";
 
 interface GroupLogsModalProps {
   isOpen: boolean;
@@ -38,6 +39,10 @@ interface LogLine {
 const LOG_FETCH_TIMEOUT_MS = 15_000;
 /** Newest lines kept on screen; the DOM and the parse stay bounded. */
 const MAX_RENDERED_LINES = 1000;
+/** Lines kept per member between refreshes; the live view grows up to this. */
+const MAX_BUFFERED_LINES = 1000;
+/** Upper bound for one incremental read (a burst between two refreshes). */
+const INCREMENTAL_TAIL = "1000";
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -136,7 +141,13 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [logsByContainer, setLogsByContainer] = useState<Record<string, string>>({});
+  const [logsByContainer, setLogsByContainer] = useState<Record<string, LogBuffer>>({});
+  const [errorsByContainer, setErrorsByContainer] = useState<Record<string, string>>({});
+  // Mirror of the buffers for the fetch pass, which must read the newest
+  // `since` without re-creating its callback on every merge.
+  const buffersRef = useRef<Record<string, LogBuffer>>({});
+  // Bumped on every reset; a pass that started before it is discarded.
+  const generationRef = useRef(0);
   const [autoScroll, setAutoScroll] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -154,34 +165,65 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
   // members a pass can outlast the 4s refresh, and overlapping passes would
   // race each other's results. Each call has a deadline, so one hung member
   // cannot keep the pass (and the inflight flag) open forever.
+  //
+  // The first pass reads the last `tail` lines; later passes ask each member
+  // only for lines since the newest second already shown, so a refresh moves
+  // a few new lines instead of re-reading and re-parsing the whole tail.
   const fetchInflight = useRef(false);
   const fetchAllLogs = useCallback(async () => {
     if (containers.length === 0 || fetchInflight.current) return;
     fetchInflight.current = true;
     try {
       setLoading(true);
+      const generation = generationRef.current;
+      const before = buffersRef.current;
       const results = await Promise.allSettled(
-        containers.map((c) =>
-          withTimeout(api.getContainerLogs(c.id, tail, true), LOG_FETCH_TIMEOUT_MS)
-        )
+        containers.map((c) => {
+          const since = nextSince(before[c.id]);
+          return withTimeout(
+            since === undefined
+              ? api.getContainerLogs(c.id, tail, true)
+              : api.getContainerLogs(c.id, INCREMENTAL_TAIL, true, since),
+            LOG_FETCH_TIMEOUT_MS
+          );
+        })
       );
-      const next: Record<string, string> = {};
+      if (generation !== generationRef.current) return;
+      const current = buffersRef.current;
+      const next: Record<string, LogBuffer> = {};
+      const errors: Record<string, string> = {};
+      let changed = Object.keys(current).length !== containers.length;
       results.forEach((res, idx) => {
         const c = containers[idx];
+        const prev = current[c.id];
         if (res.status === "fulfilled") {
-          next[c.id] = res.value;
+          // An incremental read that hit its cap may have skipped lines
+          // between the previous view and this chunk: say so in the stream.
+          let chunk = res.value;
+          if (prev && chunk.split("\n").filter((l) => l.trim()).length >= Number(INCREMENTAL_TAIL)) {
+            chunk = `[… more than ${INCREMENTAL_TAIL} new lines since the last refresh; older ones skipped …]\n${chunk}`;
+          }
+          next[c.id] = mergeLogChunk(prev, chunk, MAX_BUFFERED_LINES);
         } else {
-          next[c.id] = `[Error loading logs: ${String(res.reason)}]`;
+          // Keep what is on screen; the error shows only for a member that
+          // never loaded.
+          if (prev) next[c.id] = prev;
+          errors[c.id] = String(res.reason);
         }
+        if (next[c.id] !== prev) changed = true;
       });
-      // Unchanged logs keep the old object so the parsed/aggregated view is
-      // not rebuilt every 4s for nothing.
-      setLogsByContainer((prev) => {
-        const keys = Object.keys(next);
+      // Unchanged buffers keep the old object so the parsed/aggregated view
+      // is not rebuilt every 4s for nothing.
+      if (changed && (Object.keys(next).length > 0 || Object.keys(current).length > 0)) {
+        buffersRef.current = next;
+        setLogsByContainer(next);
+      }
+      setErrorsByContainer((prev) => {
+        const keys = Object.keys(errors);
         const same =
           keys.length === Object.keys(prev).length &&
-          keys.every((k) => prev[k] === next[k]);
-        return same ? prev : next;
+          keys.every((k) => prev[k] === errors[k]);
+        return same ? prev : errors;
       });
     } catch (err) {
       console.error("Failed to load group logs", err);
@@ -190,6 +232,28 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
       setLoading(false);
     }
   }, [containers, tail]);
+
+  // A new tail size or a different member set starts from a fresh tail.
+  const memberKey = containers.map((c) => c.id).join(",");
+  useEffect(() => {
+    generationRef.current += 1;
+    buffersRef.current = {};
+    setLogsByContainer({});
+    setErrorsByContainer({});
+  }, [memberKey, tail]);
+
+  // A reset that landed while a pass was in flight was skipped by that
+  // pass's guard; fetch again once it is done so the view refills.
+  useEffect(() => {
+    if (
+      isOpen &&
+      !loading &&
+      Object.keys(logsByContainer).length === 0 &&
+      Object.keys(errorsByContainer).length === 0
+    ) {
+      void fetchAllLogs();
+    }
+  }, [isOpen, loading, logsByContainer, errorsByContainer, fetchAllLogs]);
 
   // Initial fetch and auto-refresh timer
   useEffect(() => {
@@ -216,13 +280,18 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
         return;
       }
 
-      const raw = logsByContainer[c.id];
-      if (!raw) return;
+      const buffer = logsByContainer[c.id];
+      const error = errorsByContainer[c.id];
+      const rawLines = buffer
+        ? buffer.lines
+        : error
+        ? [`[Error loading logs: ${error}]`]
+        : null;
+      if (!rawLines) return;
 
       const cName = c.name.replace(/^\//, "");
       const color = containerColors[c.id]?.hex || "#94a3b8";
 
-      const rawLines = raw.split("\n");
       rawLines.forEach((line, idx) => {
         if (!line.trim()) return;
 
@@ -234,7 +303,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
         const spaceIdx = line.indexOf(" ");
         if (spaceIdx > 19 && line.slice(0, 4).match(/^\d{4}$/)) {
           const possibleDate = line.slice(0, spaceIdx);
-          const t = Date.parse(possibleDate);
+          const t = parseDockerTime(possibleDate);
           if (!isNaN(t)) {
             rawTime = t;
             // Format nice time string: HH:mm:ss.SSS
@@ -265,7 +334,7 @@ export const GroupLogsModal: React.FC<GroupLogsModalProps> = ({
     });
 
     return lines;
-  }, [containers, logsByContainer, selectedContainerIds, containerColors]);
+  }, [containers, logsByContainer, errorsByContainer, selectedContainerIds, containerColors]);
 
   // Filter lines by search term
   const filteredLines = useMemo(() => {

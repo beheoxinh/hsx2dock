@@ -100,6 +100,8 @@ export const api = {
   pruneSystem: () => invoke<number>("prune_system"),
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
   saveAppConfig: (config: AppConfig) => invoke<void>("save_app_config", { config }),
+  /** Saves only these fields, merged into the live config on the backend. */
+  patchAppConfig: (patch: Partial<AppConfig>) => invoke<void>("patch_app_config", { patch }),
 
   // MCP front-end (Settings → MCP, and the MCP page)
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
@@ -107,6 +109,7 @@ export const api = {
   mcpSetEnabled: (enabled: boolean, port?: number) =>
     invoke<McpStatus>("mcp_set_enabled", { enabled, port }),
   mcpRotateToken: () => invoke<McpStatus>("mcp_rotate_token"),
+  mcpSetReadOnly: (readOnly: boolean) => invoke<McpStatus>("mcp_set_read_only", { readOnly }),
   /** Returns the bearer token itself — call only when the user asks to see it. */
   mcpToken: () => invoke<string>("mcp_token"),
   mcpCatalogue: () => invoke<McpToolInfo[]>("mcp_catalogue"),
@@ -181,8 +184,8 @@ export const api = {
   removeContainer: (id: string, force: boolean = false) => invoke<void>("remove_container", { id, force }),
   renameContainer: (id: string, newName: string) => invoke<void>("rename_container", { id, newName }),
   inspectContainer: (id: string) => invoke<ContainerDetails>("inspect_container", { id }),
-  getContainerLogs: (id: string, tail: string = "200", timestamps?: boolean) =>
-    invoke<string>("get_container_logs", { id, tail, timestamps }),
+  getContainerLogs: (id: string, tail: string = "200", timestamps?: boolean, since?: number) =>
+    invoke<string>("get_container_logs", { id, tail, timestamps, since }),
   getContainerStats: (id: string) => invoke<ContainerStats>("get_container_stats", { id }),
   getContainerSizes: () => invoke<Record<string, number>>("get_container_sizes"),
   runContainer: (config: RunConfig) => invoke<string>("run_container", { config }),

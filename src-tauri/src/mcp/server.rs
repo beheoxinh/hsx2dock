@@ -116,6 +116,89 @@ fn unavailable_on_error<T: serde::Serialize>(key: &str, result: Result<T, String
     }
 }
 
+/// Directories (under home unless absolute) an agent may not use as, or
+/// inside, a build context: a build sends the whole context to the daemon, and
+/// a `COPY` then puts it in an image the agent can read back.
+const AGENT_DENIED_DIRS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".password-store",
+    ".local/share/keyrings",
+    ".mozilla",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/hsx2dock",
+    ".config/gcloud",
+    ".config/gh",
+    "/etc",
+    "/root",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+];
+
+/// Whether an agent may read `path` as a build context. The path is resolved
+/// first (symlinks, `..`), so a link into a denied directory is caught. The
+/// filesystem root and the home directory itself are refused as too broad.
+fn agent_path_allowed(path: &std::path::Path) -> Result<(), String> {
+    let home = dirs::home_dir();
+    agent_path_allowed_in(path, home.as_deref())
+}
+
+fn agent_path_allowed_in(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve '{}': {e}", path.display()))?;
+    let refuse = || {
+        Err(format!(
+            "'{}' is off limits to agents (credentials or system files); pick a project directory",
+            path.display()
+        ))
+    };
+    if resolved.parent().is_none() || home.is_some_and(|h| resolved == h) {
+        return refuse();
+    }
+    for denied in AGENT_DENIED_DIRS {
+        let dir = if denied.starts_with('/') {
+            std::path::PathBuf::from(denied)
+        } else if let Some(h) = home {
+            h.join(denied)
+        } else {
+            continue;
+        };
+        // Inside a denied dir, or a context that would contain one.
+        if resolved.starts_with(&dir) || dir.starts_with(&resolved) {
+            return refuse();
+        }
+    }
+    Ok(())
+}
+
+/// [`agent_path_allowed`] for the context and the Dockerfile of a build.
+fn agent_build_paths_allowed(req: &BuildOptions) -> Result<(), String> {
+    let context = std::path::Path::new(&req.context_dir);
+    agent_path_allowed(context)?;
+    if !req.dockerfile.trim().is_empty() {
+        let dockerfile = std::path::Path::new(&req.dockerfile);
+        let full = if dockerfile.is_absolute() {
+            dockerfile.to_path_buf()
+        } else {
+            context.join(dockerfile)
+        };
+        if full.exists() {
+            agent_path_allowed(&full)?;
+        }
+    }
+    Ok(())
+}
+
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
@@ -137,9 +220,12 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        // In read-only mode only what may actually be called is listed.
+        let read_only_mode = self.read_only_mode().await;
         Ok(ListToolsResult::with_all_items(
             super::tools::catalogue()
                 .iter()
+                .filter(|t| !read_only_mode || t.is_read_only())
                 .map(ToolSpec::to_tool)
                 .collect(),
         ))
@@ -226,7 +312,18 @@ impl ServerHandler for McpServer {
                 None,
             ));
         };
-        let args = Args::new(request.arguments);
+        // `confirm` is consumed here, not passed on: it is a gate, not an
+        // argument of the tool itself.
+        let mut raw = request.arguments;
+        let confirmed = raw
+            .as_mut()
+            .and_then(|m| m.remove(super::tools::CONFIRM_ARG))
+            .is_some_and(|v| v.as_bool() == Some(true));
+        let read_only_mode = self.read_only_mode().await;
+        if let Some(reason) = super::tools::access_refusal(spec.access, read_only_mode, confirmed) {
+            return Ok(CallToolResponse::Complete(fail(reason)));
+        }
+        let args = Args::new(raw);
 
         // Enforced, not advisory: a tool that touches the bundled engine's own
         // files must not run against a remote endpoint.
@@ -399,14 +496,21 @@ impl McpServer {
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e.to_string()),
             },
             "image_build" => match object_arg::<BuildOptions>(args, "req") {
-                Ok(req) => done_unit(
-                    crate::commands::images::build_image_core(state, self.app_ref(), req).await,
-                ),
+                Ok(req) => match agent_build_paths_allowed(&req) {
+                    Ok(()) => done_unit(
+                        crate::commands::images::build_image_core(state, self.app_ref(), req)
+                            .await,
+                    ),
+                    Err(e) => fail(e),
+                },
                 Err(e) => fail(e),
             },
             "image_cancel_build" => done_unit(self.cancel_build()),
             "image_validate_build_context" => match args.req_str("path") {
-                Ok(path) => done(crate::commands::images::validate_build_context_core(&path)),
+                Ok(path) => done(
+                    agent_path_allowed(std::path::Path::new(&path))
+                        .and_then(|()| crate::commands::images::validate_build_context_core(&path)),
+                ),
                 Err(e) => fail(e.to_string()),
             },
             "image_preview_build_command" => match object_arg::<BuildOptions>(args, "req") {
@@ -946,6 +1050,7 @@ impl McpServer {
                         "host": r.host,
                         "username": r.username,
                         "insecure": r.insecure,
+                        "allow_http": r.allow_http,
                         "has_password": !r.auth.is_empty(),
                     })
                 })
@@ -959,12 +1064,43 @@ impl McpServer {
     /// cannot skip the autostart entry, the data-root sync, the shim refresh or
     /// the engine-limits pass — and so the two paths cannot drift apart.
     ///
-    /// The MCP settings are the one exception: a config write from an agent can
-    /// flip `mcp_enabled` or `mcp_port`, so the listener is reconciled here.
-    /// Without this, an agent could leave the config saying "enabled" while
-    /// nothing is listening until the next app launch.
-    async fn save_config(&self, config: AppConfig) -> Result<(), String> {
+    /// The MCP settings are the one exception: they are kept as they are. An
+    /// agent must not be able to switch off read-only mode, move the listener
+    /// or turn it off under its own feet — those stay the user's call in the app.
+    async fn save_config(&self, mut config: AppConfig) -> Result<(), String> {
+        // The stdio server's memory may predate a change made in the app; the
+        // save path copies these fields from memory, so refresh them first.
+        self.sync_mcp_settings_from_disk().await;
+        {
+            let current = self.state.config.read().await;
+            config.mcp_enabled = current.mcp_enabled;
+            config.mcp_port = current.mcp_port;
+            config.mcp_read_only = current.mcp_read_only;
+        }
         crate::commands::system::save_app_config_core(&self.state, config).await
+    }
+
+    /// The user's MCP settings as saved on disk, copied into this process's
+    /// config. The stdio server is its own process and loaded the config once;
+    /// a switch the user flips in the app must reach it on the next call. An
+    /// unreadable file leaves memory as it is.
+    async fn sync_mcp_settings_from_disk(&self) {
+        let Some(path) = AppConfig::config_path().filter(|p| p.exists()) else {
+            return;
+        };
+        let Ok(disk) = AppConfig::load_from(&path).await else {
+            return;
+        };
+        let mut cfg = self.state.config.write().await;
+        cfg.mcp_enabled = disk.mcp_enabled;
+        cfg.mcp_port = disk.mcp_port;
+        cfg.mcp_read_only = disk.mcp_read_only;
+    }
+
+    /// Read-only mode as currently saved (see [`Self::sync_mcp_settings_from_disk`]).
+    async fn read_only_mode(&self) -> bool {
+        self.sync_mcp_settings_from_disk().await;
+        self.state.config.read().await.mcp_read_only
     }
 
     async fn cli_bridge_status(&self) -> crate::commands::system::CliBridgeStatus {
@@ -1413,5 +1549,34 @@ mod tests {
             .find(|r| r.uri == "hsx2dock://guide")
             .expect("the guide is the first thing an agent reads");
         assert_eq!(guide.mime_type, "text/markdown");
+    }
+}
+
+#[cfg(test)]
+mod agent_path_tests {
+    use super::agent_path_allowed_in;
+
+    #[test]
+    fn credential_and_system_dirs_are_refused_but_projects_are_not() {
+        let tmp = std::env::temp_dir().join(format!("hsx2-agent-path-{}", std::process::id()));
+        let home = tmp.join("home");
+        let project = home.join("code/app");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&ssh).unwrap();
+        let link = home.join("code/sneaky");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let h = Some(home.as_path());
+
+        assert!(agent_path_allowed_in(&project, h).is_ok());
+        assert!(agent_path_allowed_in(&ssh, h).is_err(), "credentials dir");
+        assert!(agent_path_allowed_in(&link, h).is_err(), "symlink into credentials");
+        assert!(agent_path_allowed_in(&home, h).is_err(), "home itself is too broad");
+        assert!(agent_path_allowed_in(&home.join("code/.."), h).is_err(), "dot-dot to home");
+        assert!(agent_path_allowed_in(std::path::Path::new("/"), h).is_err());
+        assert!(agent_path_allowed_in(std::path::Path::new("/etc"), h).is_err());
+        assert!(agent_path_allowed_in(&home.join("missing"), h).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

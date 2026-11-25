@@ -99,9 +99,7 @@ export const KubernetesCard: React.FC = () => {
   const handleSave = async () => {
     try {
       setSaving(true);
-      const latest = await api.getAppConfig();
-      await api.saveAppConfig({
-        ...latest,
+      await api.patchAppConfig({
         kind_default_nodes: nodes,
         kind_default_image: image.trim(),
         kind_auto_start: autoStart,

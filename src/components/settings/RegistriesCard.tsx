@@ -36,6 +36,7 @@ interface DraftState {
   /** Empty on edit = keep the stored secret. */
   password: string;
   insecure: boolean;
+  allowHttp: boolean;
 }
 
 const EMPTY_DRAFT: DraftState = {
@@ -45,6 +46,7 @@ const EMPTY_DRAFT: DraftState = {
   username: "",
   password: "",
   insecure: false,
+  allowHttp: false,
 };
 
 /**
@@ -96,6 +98,7 @@ export const RegistriesCard: React.FC = () => {
       username: reg.username,
       password: "",
       insecure: reg.insecure,
+      allowHttp: reg.allow_http,
     });
     setTested(null);
   };
@@ -107,6 +110,7 @@ export const RegistriesCard: React.FC = () => {
     username: d.username.trim(),
     password: d.password,
     insecure: d.insecure,
+    allow_http: d.allowHttp,
   });
 
   const validateDraft = (): string | null => {
@@ -266,6 +270,12 @@ export const RegistriesCard: React.FC = () => {
                         insecure TLS
                       </span>
                     )}
+                    {reg.allow_http && (
+                      <span className="flex shrink-0 items-center gap-1 rounded border border-rose-500/30 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-rose-400">
+                        <ShieldAlert className="h-3 w-3" />
+                        plain HTTP
+                      </span>
+                    )}
                   </div>
                   <div className="truncate font-mono text-[11px] text-zinc-500">
                     {reg.host} · {reg.username}
@@ -406,8 +416,27 @@ export const RegistriesCard: React.FC = () => {
               }}
               className="rounded border-zinc-700 bg-zinc-900"
             />
-            Allow self-signed certificates or plain HTTP
-            <span className="text-zinc-600">(personal Harbor behind a LAN cert)</span>
+            Allow self-signed certificates
+            <span className="text-zinc-600">(personal Harbor behind a LAN cert; plain HTTP for localhost)</span>
+          </label>
+
+          <label className="flex items-start gap-2 text-xs text-zinc-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={draft.allowHttp}
+              onChange={(e) => {
+                setDraft({ ...draft, allowHttp: e.target.checked });
+                setTested(null);
+              }}
+              className="mt-0.5 rounded border-zinc-700 bg-zinc-900"
+            />
+            <span>
+              This registry only speaks plain HTTP
+              <span className="block text-zinc-600">
+                The password travels unencrypted. The engine trusts this host as an
+                insecure registry from its next restart.
+              </span>
+            </span>
           </label>
 
           {tested && (

@@ -1581,7 +1581,7 @@ mod tests {
         let mut opaque = 0usize;
         let mut badge_colored = 0usize;
         let mut glyph_white = 0usize;
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             if px[3] > 200 {
                 opaque += 1;
                 if px[0] >= 205 && px[1] >= 220 && px[2] >= 235 {
@@ -1623,12 +1623,12 @@ mod tests {
         assert_eq!(px(63, 63)[3], 0, "bottom-right corner stays transparent");
         // The glyph silhouette survives: white pixels inside the blue squircle.
         let white = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .filter(|p| p[3] == 255 && p[0] >= 205 && p[1] >= 220 && p[2] >= 235)
             .count();
         assert!(white > 400, "glyph must be visible in white, got {white}");
         let blue = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .filter(|p| p[3] == 255 && p[2] > p[0].saturating_add(100))
             .count();
         assert!(blue > 1200, "squircle must be filled with the state colour, got {blue}");

@@ -626,12 +626,18 @@ impl CaddySupervisor {
     }
 }
 
+impl Default for CaddySupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub async fn is_admin_api_live() -> bool {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build();
     if let Ok(c) = client {
-        c.get("http://127.0.0.1:2019/config/").send().await.map_or(false, |r| r.status().is_success())
+        c.get("http://127.0.0.1:2019/config/").send().await.is_ok_and(|r| r.status().is_success())
     } else {
         false
     }
@@ -648,7 +654,7 @@ pub async fn is_gateway_live() -> bool {
     c.get(format!("http://127.0.0.1:2019/id/{GATEWAY_ID}"))
         .send()
         .await
-        .map_or(false, |r| r.status().is_success())
+        .is_ok_and(|r| r.status().is_success())
 }
 
 pub fn is_port_available(port: u16) -> bool {
@@ -1019,7 +1025,7 @@ pub fn validate_routes(routes: &[GatewayRoute]) -> Result<()> {
             .trim_end_matches('/');
         let port_ok = target
             .rsplit_once(':')
-            .map(|(h, p)| !h.is_empty() && p.parse::<u16>().map_or(false, |n| n > 0))
+            .map(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0))
             .unwrap_or(false);
         if !port_ok || target.contains('/') || target.chars().any(char::is_whitespace) {
             bail!("Target '{}' of {host} must be host:port, e.g. 127.0.0.1:8080", r.target.trim());
@@ -1083,7 +1089,7 @@ pub fn inspect_hosts_sync(routes: &[GatewayRoute]) -> HostsSyncStatus {
     block_domains.dedup();
 
     for d in &custom_domains {
-        let pattern = format!("{d}");
+        let pattern = d.to_string();
         if hosts_content.lines().any(|line| {
             let l = line.trim();
             !l.starts_with('#') && l.split_whitespace().skip(1).any(|host| host == pattern)
