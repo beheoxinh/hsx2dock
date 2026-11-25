@@ -911,6 +911,8 @@ export interface K8sServiceInfo {
   type: string;
   clusterIp: string;
   ports: string;
+  /** `spec.selector` as `k=v,k2=v2`; "" when the service has none. */
+  selector: string;
   created: number | null;
 }
 
@@ -971,6 +973,44 @@ export interface KindClusterPrefs {
   nodeCpuM: number;
   /** Per-node memory cap in MiB (0 = unlimited). */
   nodeMemoryMb: number;
+  /** Card accent colour `#rrggbb` ("" = default). */
+  color?: string;
+  /** Free-form labels for filtering the cluster list (max 8). */
+  tags?: string[];
+}
+
+/** How a kind cluster is reached from the host (`get_cluster_access`). */
+export interface ClusterAccess {
+  /** `kind-<cluster>`: context, cluster and user name in kubeconfigs. */
+  context: string;
+  /** Host port of the API server. */
+  apiPort: number | null;
+  /** A TCP connect from the host to the API port succeeded. */
+  apiReachable: boolean;
+  /** Port is in the never-forwarded ephemeral range: recreate the cluster. */
+  ephemeralPort: boolean;
+  /** Path of the user's kubeconfig ($KUBECONFIG or ~/.kube/config). */
+  hostKubeconfig: string;
+  inHostKubeconfig: boolean;
+  /** The user's current context is this cluster. */
+  hostCurrent: boolean;
+  /** kubectl is on the host PATH. */
+  hostKubectl: boolean;
+}
+
+/** `kubectl diff` of a manifest against the live cluster. */
+export interface ManifestDiff {
+  /** Unified diff ("" when nothing would change). */
+  diff: string;
+  changed: boolean;
+}
+
+/** Logs of every pod behind a label selector. */
+export interface SelectorLogs {
+  /** Selector used (resolved from the workload when one was given). */
+  selector: string;
+  /** Lines `<RFC3339 ts> [pod/<pod>/<container>] <msg>`, oldest first. */
+  lines: string;
 }
 
 /** Phase of a container lifecycle operation tracked by the backend. */

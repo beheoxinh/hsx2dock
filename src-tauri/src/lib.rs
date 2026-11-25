@@ -690,6 +690,13 @@ pub fn run() {
             kind::install_metrics_server,
             kind::metrics_server_status,
             kind::detect_pod_shell,
+            kind_access::get_cluster_access,
+            kind_access::export_kubeconfig_to_host,
+            kind_access::remove_kubeconfig_from_host,
+            kind_access::open_cluster_terminal,
+            kind_access::diff_cluster_yaml,
+            kind_access::apply_cluster_yaml,
+            kind_access::get_selector_logs,
             // Registries
             registries::list_registries,
             registries::test_registry_auth,

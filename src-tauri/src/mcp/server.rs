@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 use super::args::Args;
 use super::tools::{Access, ToolSpec};
 use crate::commands::kind;
+use crate::commands::kind_access;
 use crate::config::AppConfig;
 use crate::docker::models::{BuildOptions, DaemonState, EndpointInput, ResourceLimits, RunConfig};
 use crate::state::AppState;
@@ -835,9 +836,52 @@ impl McpServer {
             },
             "cluster_apply_yaml" => match (args.req_str("cluster"), args.req_str("yaml")) {
                 (Ok(cluster), Ok(yaml)) => {
-                    done(kind::apply_yaml_core(state, &cluster, &yaml).await)
+                    done(kind_access::apply_cluster_yaml_core(state, &cluster, &yaml).await)
                 }
                 (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_diff_yaml" => match (args.req_str("cluster"), args.req_str("yaml")) {
+                (Ok(cluster), Ok(yaml)) => {
+                    done(kind_access::diff_cluster_yaml_core(state, &cluster, &yaml).await)
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "cluster_selector_logs" => {
+                let parsed = (|| -> Result<_, crate::mcp::args::ArgError> {
+                    Ok((
+                        args.req_str("cluster")?,
+                        args.req_str("namespace")?,
+                        args.opt_str("selector")?,
+                        args.opt_str("workload_kind")?.zip(args.opt_str("workload_name")?),
+                        args.opt_u64("tail")?.map(|t| t.min(u32::MAX as u64) as u32),
+                        args.opt_str("since_time")?,
+                    ))
+                })();
+                match parsed {
+                    Ok((cluster, ns, selector, workload, tail, since)) => done(
+                        kind_access::get_selector_logs_core(
+                            state, &cluster, &ns, selector, workload, tail, since,
+                        )
+                        .await,
+                    ),
+                    Err(e) => fail(e.to_string()),
+                }
+            }
+            "cluster_access" => match args.req_str("cluster") {
+                Ok(cluster) => done(kind_access::get_cluster_access_core(state, &cluster).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_export_kubeconfig_to_host" => match args.req_str("cluster") {
+                Ok(cluster) => {
+                    done(kind_access::export_kubeconfig_to_host_core(state, &cluster).await)
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "cluster_remove_kubeconfig_from_host" => match args.req_str("cluster") {
+                Ok(cluster) => {
+                    done(kind_access::remove_kubeconfig_from_host_core(state, &cluster).await)
+                }
+                Err(e) => fail(e.to_string()),
             },
             "cluster_get_cluster_prefs" => match args.req_str("cluster") {
                 Ok(cluster) => ok(json!(kind::get_cluster_prefs_core(state, &cluster).await)),

@@ -5,19 +5,12 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Hexagon,
   Plus,
-  Trash2,
-  Search,
   X,
   Download,
-  Copy,
   Loader2,
   RefreshCw,
   AlertTriangle,
   Rocket,
-  Play,
-  Square,
-  Settings2,
-  Activity,
   ArrowLeft,
 } from "lucide-react";
 import { Card } from "../components/ui/Card";
@@ -25,10 +18,31 @@ import { Button } from "../components/ui/Button";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { Switch } from "../components/ui/Switch";
 import { ClusterMonitor } from "../components/k8s/ClusterMonitor";
+import { ClusterCard } from "../components/k8s/ClusterCard";
+import { ClusterToolbar, type BulkProgress } from "../components/k8s/ClusterToolbar";
+import { ClusterPrefsDialog } from "../components/k8s/ClusterPrefsDialog";
+import { YamlApplyModal } from "../components/k8s/YamlApplyModal";
+import { KubeShellModal } from "../components/k8s/KubeShellModal";
 import { api, disposeListener, events } from "../lib/api";
 import { peekDashboardClusters } from "../lib/dashboardStore";
-import { formatBytes, formatDuration, formatRelativeTime } from "../lib/utils";
+import {
+  browserStorage,
+  collectTags,
+  filterClusters,
+  isAccessStale,
+  normalizeColor,
+  normalizeTags,
+  readListView,
+  settleWithConcurrency,
+  sortClusters,
+  statusCounts,
+  writeListView,
+  type ListView,
+  type SortKey,
+  type StatusFilter,
+} from "../lib/k8sClusterList";
 import type {
+  ClusterAccess,
   KindCluster,
   KindClusterPrefs,
   KindInstallStatus,
@@ -45,53 +59,6 @@ interface KubernetesPageProps {
   openCluster?: string | null;
 }
 
-/** A single-series inline sparkline (change over time) drawn as a thin line. */
-const Sparkline: React.FC<{
-  data: number[];
-  color: string;
-  max?: number;
-  className?: string;
-}> = ({ data, color, max, className }) => {
-  if (data.length < 2) {
-    return <div className={`h-8 ${className ?? ""}`} aria-hidden="true" />;
-  }
-  const hi = max ?? Math.max(...data, 1);
-  const lo = Math.min(...data, 0);
-  const span = hi - lo || 1;
-  const w = 100;
-  const h = 32;
-  const step = w / (data.length - 1);
-  const pts = data.map((v, i) => {
-    const x = i * step;
-    const y = h - ((v - lo) / span) * h;
-    return `${x.toFixed(2)},${y.toFixed(2)}`;
-  });
-  return (
-    <svg
-      viewBox={`0 0 ${w} ${h}`}
-      preserveAspectRatio="none"
-      className={`h-8 w-full ${className ?? ""}`}
-      aria-hidden="true"
-    >
-      <polyline
-        points={`0,${h} ${pts.join(" ")} ${w},${h}`}
-        fill={color}
-        fillOpacity="0.12"
-        stroke="none"
-      />
-      <polyline
-        points={pts.join(" ")}
-        fill="none"
-        stroke={color}
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
-  );
-};
-
 export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   refreshKey,
   daemonState = "Running",
@@ -103,7 +70,6 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   // Seeded from the dashboard cache so the cards paint at once; the first
   // pass below revalidates them.
   const [clusters, setClusters] = useState<KindCluster[]>(peekDashboardClusters);
-  const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -166,10 +132,12 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
   };
   const savePrefs = async () => {
     if (!prefsEdit) return;
-    const trimmed = {
+    const trimmed: KindClusterPrefs = {
       autoStart: prefsEdit.autoStart,
       nodeCpuM: Math.max(0, Math.round(prefsEdit.nodeCpuM || 0)),
       nodeMemoryMb: Math.max(0, Math.round(prefsEdit.nodeMemoryMb || 0)),
+      color: normalizeColor(prefsEdit.color),
+      tags: normalizeTags(prefsEdit.tags ?? []),
     };
     try {
       setPrefsSaving(true);
@@ -460,6 +428,7 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
     if (busyOp) return;
     try {
       setBusyOp("power");
+      setPowerFor(c.name);
       setLogLines([
         {
           action: c.running ? "stop" : "start",
@@ -479,12 +448,215 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
       toast.error("Cluster action failed", String(err));
     } finally {
       setBusyOp(null);
+      setPowerFor(null);
     }
   };
 
-  const filtered = clusters.filter((c) =>
-    c.name.toLowerCase().includes(search.trim().toLowerCase())
+  // List view: sort and filters are remembered per browser; the search text is not.
+  const [view, setView] = useState<ListView>(() => readListView(browserStorage()));
+  const patchView = (patch: Partial<ListView>) => setView((v) => ({ ...v, ...patch }));
+  useEffect(() => {
+    writeListView(browserStorage(), view);
+  }, [view]);
+  const [query, setQuery] = useState("");
+
+  // Bulk selection by cluster name; selections of vanished clusters are dropped.
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [bulk, setBulk] = useState<BulkProgress | null>(null);
+  useEffect(() => {
+    setSelected((prev) => {
+      const names = new Set(clusters.map((c) => c.name));
+      const next = new Set([...prev].filter((n) => names.has(n)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [clusters]);
+
+  // Host access per cluster. Fetched only for running clusters, reused for
+  // 30 s, so the 10 s poll does not turn into a TCP probe per card per tick.
+  const [access, setAccess] = useState<Record<string, { data: ClusterAccess | null; at: number }>>({});
+  const accessInflight = useRef(new Set<string>());
+  const refreshAccess = (name: string) => {
+    if (accessInflight.current.has(name)) return;
+    accessInflight.current.add(name);
+    api
+      .getClusterAccess(name)
+      .then((data) => setAccess((p) => ({ ...p, [name]: { data, at: Date.now() } })))
+      .catch(() => setAccess((p) => ({ ...p, [name]: { data: null, at: Date.now() } })))
+      .finally(() => accessInflight.current.delete(name));
+  };
+  useEffect(() => {
+    const now = Date.now();
+    const live = new Set<string>();
+    for (const c of clusters) {
+      if (!c.running) continue;
+      live.add(c.name);
+      if (isAccessStale(access[c.name]?.at, now)) refreshAccess(c.name);
+    }
+    // A stopped cluster's entry is dropped, so its next start fetches afresh
+    // instead of showing the answer from before it stopped.
+    setAccess((prev) => {
+      const gone = Object.keys(prev).filter((n) => !live.has(n));
+      if (gone.length === 0) return prev;
+      const next = { ...prev };
+      for (const n of gone) delete next[n];
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusters, access]);
+
+  const [powerFor, setPowerFor] = useState<string | null>(null);
+  const [shellFor, setShellFor] = useState<string | null>(null);
+  const [applyFor, setApplyFor] = useState<{ cluster: string; tab: "yaml" | "quick" } | null>(null);
+  const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null);
+
+  const allTags = collectTags(clusters.map((c) => prefsByName[c.name]));
+  const counts = statusCounts(clusters);
+  const visible = sortClusters(
+    filterClusters(clusters, (name) => prefsByName[name], {
+      query,
+      status: view.status,
+      tag: view.tag,
+    }),
+    view.sort
   );
+  const filtersActive = query.trim() !== "" || view.status !== "all" || view.tag !== null;
+  const clearFilters = () => {
+    setQuery("");
+    patchView({ status: "all", tag: null });
+  };
+
+  const selectedClusters = clusters.filter((c) => selected.has(c.name));
+  const startable = selectedClusters.filter((c) => !c.running).map((c) => c.name);
+  const stoppable = selectedClusters.filter((c) => c.running).map((c) => c.name);
+  const visibleNames = visible.map((c) => c.name);
+  const visibleSelectedCount = visibleNames.filter((n) => selected.has(n)).length;
+  const allVisibleSelected = visibleNames.length > 0 && visibleSelectedCount === visibleNames.length;
+  const someVisibleSelected = visibleSelectedCount > 0;
+  const toggleAllVisible = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const n of visibleNames) {
+        if (allVisibleSelected) next.delete(n);
+        else next.add(n);
+      }
+      return next;
+    });
+  };
+  const toggleSelected = (name: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  /** Start or stop the given clusters, two at a time; failures are reported, not fatal. */
+  const bulkRun = async (action: "start" | "stop", names: string[]) => {
+    if (busyOp || names.length === 0) return;
+    setBusyOp("bulk");
+    let failed = 0;
+    setBulk({ action, done: 0, total: names.length, failed: 0 });
+    try {
+      const results = await settleWithConcurrency(
+        names,
+        2,
+        async (name) => {
+          try {
+            if (action === "start") await api.startKindCluster(name);
+            else await api.stopKindCluster(name);
+          } catch (e) {
+            failed++;
+            setBulk((b) => (b ? { ...b, failed } : b));
+            throw e;
+          }
+        },
+        (done, total) => setBulk((b) => (b ? { ...b, done, total } : b))
+      );
+      const errors = results.flatMap((r) => (r.ok ? [] : [r]));
+      const okCount = names.length - errors.length;
+      if (errors.length === 0) {
+        toast.success(
+          `Bulk ${action} finished`,
+          `${okCount} cluster${okCount === 1 ? "" : "s"} ${action === "start" ? "started" : "stopped"}.`
+        );
+      } else {
+        toast.error(
+          `${errors.length} of ${names.length} could not be ${action === "start" ? "started" : "stopped"}`,
+          errors
+            .slice(0, 3)
+            .map((r) => `${r.item}: ${String(r.error)}`)
+            .join("; ")
+        );
+      }
+    } finally {
+      setBulk(null);
+      setBusyOp(null);
+      await loadAll();
+    }
+  };
+
+  /** Merge into / remove from the user's ~/.kube/config, after a confirm. */
+  const hostKubeconfigAction = async (c: KindCluster, mode: "add" | "remove") => {
+    if (busyOp) return;
+    const path = access[c.name]?.data?.hostKubeconfig ?? "~/.kube/config";
+    const backup = `${path}.hsx2dock.bak`;
+    const confirmed = await modal.showConfirm(
+      mode === "add"
+        ? `This edits your kubeconfig (${path}): the kind-${c.name} context is merged in and becomes the current context. A backup is kept at ${backup}.`
+        : `This edits your kubeconfig (${path}): the kind-${c.name} entries are removed. A backup is kept at ${backup}.`,
+      mode === "add" ? "Add to ~/.kube/config" : "Remove from ~/.kube/config",
+      mode === "add" ? "warning" : "danger"
+    );
+    if (!confirmed) return;
+    try {
+      setBusyOp("host-kubeconfig");
+      const msg =
+        mode === "add"
+          ? await api.exportKubeconfigToHost(c.name)
+          : await api.removeKubeconfigFromHost(c.name);
+      toast.success(mode === "add" ? "Added to kubeconfig" : "Removed from kubeconfig", msg);
+      refreshAccess(c.name);
+    } catch (err) {
+      toast.error(
+        mode === "add" ? "Could not add to kubeconfig" : "Could not remove from kubeconfig",
+        String(err)
+      );
+    } finally {
+      setBusyOp(null);
+    }
+  };
+
+  const openHostTerminal = async (name: string) => {
+    try {
+      const msg = await api.openClusterTerminal(name);
+      toast.info("Host terminal opened", msg);
+    } catch (err) {
+      toast.error("Could not open terminal", String(err));
+    }
+  };
+
+  const copyContext = async (name: string) => {
+    const ctx = `kind-${name}`;
+    try {
+      await navigator.clipboard.writeText(ctx);
+      toast.success("Context copied", ctx);
+    } catch (e) {
+      toast.error("Copy failed", String(e));
+    }
+  };
+
+  const openPrefs = (name: string) => {
+    const p = prefsFor(name);
+    setPrefsEdit({
+      name,
+      autoStart: p.autoStart,
+      nodeCpuM: p.nodeCpuM,
+      nodeMemoryMb: p.nodeMemoryMb,
+      color: p.color ?? "",
+      tags: p.tags ?? [],
+    });
+  };
 
   const commandPreview = (() => {
     const parts = ["kind", "create", "cluster", "--name", formName.trim() || "<name>"];
@@ -687,377 +859,124 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
             </div>
           )}
 
-          {/* Search */}
+          {/* Toolbar: search, filters, sort, bulk actions */}
           {clusters.length > 0 && (
-        <div className="relative w-64">
-          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
-          <input
-            type="text"
-            placeholder="Search clusters..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-full h-9 pl-9 pr-4 rounded-xl bg-zinc-900 border border-zinc-800 text-sm text-white placeholder-zinc-400 focus:outline-none focus:border-blue-500"
-          />
-        </div>
-      )}
-
-      {/* Cluster grid */}
-      <div className="grid grid-cols-1 gap-4">
-        <AnimatePresence mode="popLayout">
-          {filtered.map((c) => (
-            <motion.div
-              key={c.name}
-              layout
-              initial={{ opacity: 0, scale: 0.97 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              transition={{ duration: 0.16 }}
-            >
-              <Card className="p-5 hover:border-zinc-700 transition-colors">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center shrink-0">
-                      <Hexagon className="w-4 h-4 text-blue-400" />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="font-semibold text-white truncate" title={c.name}>
-                        {c.name}
-                      </p>
-                      <div className="flex items-center gap-2 mt-1">
-                        <StatusBadge
-                          status={c.running ? "Running" : "Stopped"}
-                          pulse={c.running}
-                        />
-                        {c.running && c.api_ready === false && (
-                          <span
-                            title="The API server is still starting — monitoring opens as soon as /readyz passes"
-                            className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30"
-                          >
-                            API starting…
-                          </span>
-                        )}
-                        {c.has_kubeconfig && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/60 font-mono">
-                            kubeconfig
-                          </span>
-                        )}
-                        {(prefsFor(c.name).nodeCpuM > 0 ||
-                          prefsFor(c.name).nodeMemoryMb > 0) && (
-                          <span
-                            title="Per-node resource caps"
-                            className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 font-mono"
-                          >
-                            {prefsFor(c.name).nodeCpuM > 0
-                              ? `${(prefsFor(c.name).nodeCpuM / 1000).toFixed(1)} cpu`
-                              : ""}
-                            {prefsFor(c.name).nodeCpuM > 0 &&
-                            prefsFor(c.name).nodeMemoryMb > 0
-                              ? " · "
-                              : ""}
-                            {prefsFor(c.name).nodeMemoryMb > 0
-                              ? `${prefsFor(c.name).nodeMemoryMb} MB`
-                              : ""}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                  <Switch
-                    checked={prefsFor(c.name).autoStart}
-                    onChange={() => toggleClusterAutoStart(c)}
-                    disabled={!!busyOp || !prefsLoaded}
-                    label="Auto-start"
-                    title="Start this cluster when the Docker engine comes up (the master Auto-start switch above must also be on)"
-                    className="mt-0.5 shrink-0"
-                  />
-                </div>
-
-                <p className="mt-2 text-xs text-zinc-500">
-                  {c.running ? "Uptime" : c.last_started_at ? "Last run" : "Age"}{" "}
-                  <span className="font-mono text-zinc-300">
-                    {c.running
-                      ? formatDuration(c.uptime_seconds)
-                      : c.last_started_at
-                        ? formatRelativeTime(c.last_started_at)
-                        : c.created
-                          ? formatRelativeTime(c.created)
-                          : "—"}
-                  </span>
-                  <span className="mx-2 text-zinc-700">·</span>
-                  Nodes{" "}
-                  <span className="font-mono text-zinc-300">
-                    {c.running_nodes}/{c.node_count}
-                  </span>
-                  {c.disk_size_bytes != null && c.disk_size_bytes > 0 && (
-                    <>
-                      <span className="mx-2 text-zinc-700">·</span>
-                      Disk{" "}
-                      <span className="font-mono text-zinc-300">
-                        {formatBytes(c.disk_size_bytes)}
-                      </span>
-                    </>
-                  )}
-                </p>
-
-                {/* Forwarded / Published Ports */}
-                {c.published_ports && c.published_ports.length > 0 && (
-                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px]">
-                    <span className="text-zinc-500 font-medium">Forwarded:</span>
-                    {c.published_ports.map((p, idx) => {
-                      const hostPart = p.host_port ? `${p.host_ip ? `${p.host_ip}:` : ""}${p.host_port}` : "—";
-                      const isHttp = p.protocol === "tcp" && (p.host_port === 80 || p.host_port === 443 || p.host_port >= 1024);
-                      const url = isHttp
-                        ? `http://${p.host_ip && p.host_ip !== "0.0.0.0" && p.host_ip !== "::" ? p.host_ip : "localhost"}:${p.host_port}`
-                        : null;
-                      return url ? (
-                        <a
-                          key={idx}
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/25 text-sky-300 font-mono text-[10px] hover:bg-sky-500/20 hover:border-sky-500/40 transition-colors"
-                          title={`Open ${url} in browser (maps to node :${p.container_port}/${p.protocol})`}
-                        >
-                          <span>{hostPart}</span>
-                          <span className="text-sky-400/60">→</span>
-                          <span className="text-zinc-400">{p.container_port}/{p.protocol}</span>
-                        </a>
-                      ) : (
-                        <span
-                          key={idx}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-800/80 border border-zinc-700/60 text-zinc-300 font-mono text-[10px]"
-                          title={`Host port ${hostPart} forwards to node container :${p.container_port}/${p.protocol}`}
-                        >
-                          <span>{hostPart}</span>
-                          <span className="text-zinc-500">→</span>
-                          <span className="text-zinc-400">{p.container_port}/{p.protocol}</span>
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Live section — resource charts (left → right) + logs. */}
-                {c.running && (
-                  <div className="mt-3 space-y-2.5">
-                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-2.5">
-                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
-                        <p className="text-[11px] text-zinc-500 truncate">
-                          Pods running
-                          {c.pod_count != null
-                            ? ` (${c.running_pod_count ?? 0}/${c.pod_count})`
-                            : ""}
-                        </p>
-                        <p className="text-white text-sm font-mono font-medium">
-                          {c.pod_count != null ? c.running_pod_count ?? 0 : "—"}
-                        </p>
-                        <Sparkline
-                          data={history[c.name]?.pods ?? []}
-                          color="#34d399"
-                          max={Math.max(1, c.pod_count ?? 1)}
-                        />
-                      </div>
-                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
-                        <p className="text-[11px] text-zinc-500 truncate">
-                          CPU {c.cpu_percent != null ? "% of host" : ""}
-                        </p>
-                        <p className="text-white text-sm font-mono font-medium">
-                          {c.cpu_percent != null ? `${c.cpu_percent.toFixed(1)}%` : "—"}
-                        </p>
-                        <Sparkline data={history[c.name]?.cpu ?? []} color="#60a5fa" />
-                      </div>
-                      <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 px-3 py-2.5 min-w-0">
-                        <p className="text-[11px] text-zinc-500 truncate">
-                          Memory
-                          {c.mem_used_mb != null && c.mem_limit_mb
-                            ? ` of ${Math.round(c.mem_limit_mb)} MiB cap`
-                            : ""}
-                        </p>
-                        <p className="text-white text-sm font-mono font-medium">
-                          {c.mem_used_mb != null ? `${Math.round(c.mem_used_mb)} MiB` : "—"}
-                        </p>
-                        <Sparkline data={history[c.name]?.mem ?? []} color="#a78bfa" />
-                      </div>
-                    </div>
-
-                    {/* Per-cluster kind output — streams while an operation runs. */}
-                    {logLines.some((l) => l.name === c.name) && (
-                      <div className="rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
-                        <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800/80 bg-zinc-900/50">
-                          <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
-                            kind output — {c.name}
-                          </span>
-                          <div className="flex items-center gap-3">
-                            <button
-                              onClick={async () => {
-                                const text = logLines
-                                  .filter((l) => l.name === c.name)
-                                  .map((l) => l.line)
-                                  .join("\n");
-                                if (!text) return;
-                                try {
-                                  await navigator.clipboard.writeText(text);
-                                  toast.success(
-                                    "Kind output copied",
-                                    `${logLines.filter((l) => l.name === c.name).length} line(s) on the clipboard.`
-                                  );
-                                } catch (e) {
-                                  toast.error("Copy failed", String(e));
-                                }
-                              }}
-                              className="text-[11px] text-zinc-500 hover:text-zinc-300"
-                            >
-                              Copy
-                            </button>
-                            <button
-                              onClick={() =>
-                                setLogLines((prev) => prev.filter((l) => l.name !== c.name))
-                              }
-                              className="text-[11px] text-zinc-500 hover:text-zinc-300"
-                            >
-                              Clear
-                            </button>
-                          </div>
-                        </div>
-                        <div
-                          ref={logRef}
-                          className="px-3.5 py-2.5 max-h-40 overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5 select-text"
-                        >
-                          {logLines
-                            .filter((l) => l.name === c.name)
-                            .map((l, i) => (
-                              <div
-                                key={i}
-                                className={
-                                  /error|failed|exit status/i.test(l.line)
-                                    ? "text-rose-400"
-                                    : "text-zinc-400"
-                                }
-                              >
-                                {l.line}
-                              </div>
-                            ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <div className="mt-4 flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setDetailFor(c.name)}
-                    disabled={
-                      !!busyOp || !c.running || c.api_ready === false
-                    }
-                    title={
-                      !c.running
-                        ? "Start the cluster to open monitoring"
-                        : c.api_ready === false
-                          ? "Waiting for the API server to become ready"
-                          : "Open the full monitoring screen for this cluster"
-                    }
-                    className="gap-1.5"
-                  >
-                    <Activity className="w-3.5 h-3.5" />
-                    <span>Details</span>
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => handleTogglePower(c)}
-                    disabled={!!busyOp || !status?.installed}
-                    title={
-                      c.running
-                        ? "Stop all node containers (data is kept)"
-                        : "Start this cluster's node containers"
-                    }
-                    className="gap-1.5"
-                  >
-                    {busyOp === "power" ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : c.running ? (
-                      <Square className="w-3.5 h-3.5" />
-                    ) : (
-                      <Play className="w-3.5 h-3.5" />
-                    )}
-                    <span>{c.running ? "Stop" : "Start"}</span>
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => handleKubeconfig(c.name)}
-                    disabled={!!busyOp || !status?.installed || !c.has_kubeconfig}
-                    title="Copy KUBECONFIG path for this cluster"
-                    className="gap-1.5"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Kubeconfig</span>
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => {
-                      const p = prefsFor(c.name);
-                      setPrefsEdit({
-                        name: c.name,
-                        autoStart: p.autoStart,
-                        nodeCpuM: p.nodeCpuM,
-                        nodeMemoryMb: p.nodeMemoryMb,
-                      });
-                    }}
-                    disabled={!!busyOp}
-                    title="Cluster auto-start & per-node resource caps"
-                    className="text-zinc-400 hover:text-white"
-                  >
-                    <Settings2 className="w-4 h-4" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => handleDelete(c.name)}
-                    disabled={!!busyOp}
-                    title="Delete Cluster"
-                    className="text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                </div>
-              </Card>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
-
-      {/* Empty state */}
-      {!loading && filtered.length === 0 && (
-        <div className="py-16 text-center text-zinc-400">
-          <Hexagon className="w-10 h-10 mx-auto text-zinc-400 mb-3" />
-          <p className="font-medium text-white">
-            {clusters.length === 0 ? "No kind clusters yet" : "No clusters match your search"}
-          </p>
-          <p className="text-xs text-zinc-500 mt-1">
-            {clusters.length === 0
-              ? status?.installed
-                ? "Create your first local Kubernetes cluster — nodes run as containers in this app's engine."
-                : "Install the kind binary above to get started."
-              : "Try a different search term."}
-          </p>
-          {clusters.length === 0 && status?.installed && (
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => setCreateOpen(true)}
+            <ClusterToolbar
+              query={query}
+              onQuery={setQuery}
+              status={view.status}
+              onStatus={(st: StatusFilter) => patchView({ status: st })}
+              counts={counts}
+              tag={view.tag}
+              onTag={(t) => patchView({ tag: t })}
+              tags={allTags}
+              sort={view.sort}
+              onSort={(k: SortKey) => patchView({ sort: k })}
+              visibleCount={visible.length}
+              totalCount={clusters.length}
+              selectedCount={selectedClusters.length}
+              allVisibleSelected={allVisibleSelected}
+              someVisibleSelected={someVisibleSelected}
+              onToggleAllVisible={toggleAllVisible}
+              onClearSelection={() => setSelected(new Set())}
+              startableCount={startable.length}
+              stoppableCount={stoppable.length}
+              onBulkStart={() => bulkRun("start", startable)}
+              onBulkStop={() => bulkRun("stop", stoppable)}
+              bulkProgress={bulk}
               disabled={!!busyOp}
-              className="mt-4 gap-2"
-            >
-              <Rocket className="w-4 h-4" />
-              <span>Create your first cluster</span>
-            </Button>
+            />
           )}
-        </div>
-      )}
+
+          {/* Cluster grid */}
+          {visible.length > 0 && (
+            <div className="grid grid-cols-1 gap-4">
+              <AnimatePresence mode="popLayout">
+                {visible.map((c) => (
+                  <motion.div
+                    key={c.name}
+                    layout
+                    initial={{ opacity: 0, scale: 0.97 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    transition={{ duration: 0.16 }}
+                    className="relative"
+                    style={{ zIndex: menuOpenFor === c.name ? 30 : undefined }}
+                  >
+                    <ClusterCard
+                      cluster={c}
+                      prefs={prefsFor(c.name)}
+                      access={access[c.name] ? access[c.name].data : undefined}
+                      history={history[c.name]}
+                      selected={selected.has(c.name)}
+                      busy={!!busyOp}
+                      powerBusy={powerFor === c.name}
+                      kindInstalled={!!status?.installed}
+                      prefsLoaded={prefsLoaded}
+                      logLines={logLines.filter((l) => l.name === c.name)}
+                      onToggleSelected={() => toggleSelected(c.name)}
+                      onToggleAutoStart={() => toggleClusterAutoStart(c)}
+                      onOpenMonitor={() => setDetailFor(c.name)}
+                      onTogglePower={() => handleTogglePower(c)}
+                      onOpenShell={() => setShellFor(c.name)}
+                      onApply={(tab) => setApplyFor({ cluster: c.name, tab })}
+                      onPrefs={() => openPrefs(c.name)}
+                      onCopyKubeconfig={() => handleKubeconfig(c.name)}
+                      onAddHostKubeconfig={() => hostKubeconfigAction(c, "add")}
+                      onRemoveHostKubeconfig={() => hostKubeconfigAction(c, "remove")}
+                      onOpenHostTerminal={() => openHostTerminal(c.name)}
+                      onCopyContext={() => copyContext(c.name)}
+                      onDelete={() => handleDelete(c.name)}
+                      onClearLog={() => setLogLines((prev) => prev.filter((l) => l.name !== c.name))}
+                      onMenuOpenChange={(open) => setMenuOpenFor(open ? c.name : null)}
+                    />
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+            </div>
+          )}
+
+          {/* Empty state: no clusters at all */}
+          {!loading && clusters.length === 0 && (
+            <div className="py-16 text-center text-zinc-400">
+              <Hexagon className="w-10 h-10 mx-auto text-zinc-400 mb-3" />
+              <p className="font-medium text-white">No kind clusters yet</p>
+              <p className="text-xs text-zinc-500 mt-1">
+                {status?.installed
+                  ? "Create your first local Kubernetes cluster — nodes run as containers in this app's engine."
+                  : "Install the kind binary above to get started."}
+              </p>
+              {status?.installed && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => setCreateOpen(true)}
+                  disabled={!!busyOp}
+                  className="mt-4 gap-2"
+                >
+                  <Rocket className="w-4 h-4" />
+                  <span>Create your first cluster</span>
+                </Button>
+              )}
+            </div>
+          )}
+
+          {/* Empty state: filters hide everything */}
+          {clusters.length > 0 && visible.length === 0 && (
+            <div className="py-12 text-center text-zinc-400">
+              <p className="font-medium text-white">No clusters match</p>
+              <p className="text-xs text-zinc-500 mt-1">
+                {filtersActive
+                  ? "Try a different search, or clear the filters."
+                  : "Nothing to show."}
+              </p>
+              {filtersActive && (
+                <Button variant="outline" size="sm" onClick={clearFilters} className="mt-4">
+                  Clear filters
+                </Button>
+              )}
+            </div>
+          )}
 
         </>
       )}
@@ -1098,116 +1017,34 @@ export const KubernetesPage: React.FC<KubernetesPageProps> = ({
         </div>
       )}
 
-      {/* Cluster prefs modal (auto-start + per-node caps) */}
+      {/* Cluster settings: colour, tags, auto-start, per-node caps */}
       <AnimatePresence>
         {prefsEdit && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-          >
-            <motion.div
-              initial={{ scale: 0.95, y: 8 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 8 }}
-              className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900 shadow-2xl"
-            >
-              <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
-                <div>
-                  <span className="text-sm font-semibold text-white">
-                    Cluster settings: {prefsEdit.name}
-                  </span>
-                  <p className="text-[11px] text-zinc-500 mt-0.5">
-                    Auto-start & per-node caps keep clusters from starving the host.
-                  </p>
-                </div>
-                <button
-                  onClick={() => setPrefsEdit(null)}
-                  className="text-zinc-400 hover:text-white"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="px-5 py-4 space-y-4">
-                <label className="flex items-center justify-between gap-3 text-sm text-zinc-200">
-                  <span>
-                    Auto-start with engine
-                    <span className="block text-[11px] text-zinc-500">
-                      Honoured when the master Auto-start switch on the page is on.
-                    </span>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={prefsEdit.autoStart}
-                    onChange={(e) =>
-                      setPrefsEdit({ ...prefsEdit, autoStart: e.target.checked })
-                    }
-                    className="rounded border-zinc-700 w-4 h-4"
-                  />
-                </label>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-zinc-400 mb-1">
-                      CPU per node (cores, 0 = unlimited)
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      step={0.5}
-                      value={prefsEdit.nodeCpuM / 1000}
-                      onChange={(e) =>
-                        setPrefsEdit({
-                          ...prefsEdit,
-                          nodeCpuM: Math.max(0, Math.round((Number(e.target.value) || 0) * 1000)),
-                        })
-                      }
-                      className="h-9 w-full px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-indigo-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-zinc-400 mb-1">
-                      Memory per node (MB, 0 = unlimited)
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      value={prefsEdit.nodeMemoryMb}
-                      onChange={(e) =>
-                        setPrefsEdit({
-                          ...prefsEdit,
-                          nodeMemoryMb: Math.max(0, Number(e.target.value) || 0),
-                        })
-                      }
-                      className="h-9 w-full px-3 rounded-xl bg-zinc-950 border border-zinc-800 text-sm text-white focus:outline-none focus:border-indigo-500"
-                    />
-                  </div>
-                </div>
-                <p className="text-[11px] text-zinc-600">
-                  Caps apply immediately (running nodes update via docker update) and
-                  re-apply on every start. The auto-start master switch and stagger
-                  delay live in Settings → Kubernetes.
-                </p>
-              </div>
-              <div className="flex justify-end gap-2 px-5 py-4 border-t border-zinc-800">
-                <Button variant="ghost" size="sm" onClick={() => setPrefsEdit(null)}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={savePrefs}
-                  disabled={prefsSaving}
-                  className="gap-2"
-                >
-                  {prefsSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                  Save
-                </Button>
-              </div>
-            </motion.div>
-          </motion.div>
+          <ClusterPrefsDialog
+            draft={{
+              ...prefsEdit,
+              color: prefsEdit.color ?? "",
+              tags: prefsEdit.tags ?? [],
+            }}
+            knownTags={allTags}
+            saving={prefsSaving}
+            onChange={(next) => setPrefsEdit(next)}
+            onSave={savePrefs}
+            onClose={() => setPrefsEdit(null)}
+          />
         )}
       </AnimatePresence>
+
+      {/* kubectl shell and YAML / quick deploy, scoped to the cluster they were opened for */}
+      {shellFor && <KubeShellModal cluster={shellFor} onClose={() => setShellFor(null)} />}
+      {applyFor && (
+        <YamlApplyModal
+          cluster={applyFor.cluster}
+          initialTab={applyFor.tab}
+          onClose={() => setApplyFor(null)}
+          onApplied={() => refreshClusters()}
+        />
+      )}
 
       {/* Create cluster modal */}
       <AnimatePresence>

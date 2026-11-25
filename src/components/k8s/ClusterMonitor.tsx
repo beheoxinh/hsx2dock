@@ -12,6 +12,7 @@ import {
   FileText,
   Folder,
   Hexagon,
+  Layers,
   Loader2,
   Package,
   Plus,
@@ -28,8 +29,12 @@ import { Button } from "../ui/Button";
 import { useModal } from "../ui/ModalContext";
 import { useToast } from "../ui/Toast";
 import { InteractiveTerminal } from "../terminal/InteractiveTerminal";
+import { YamlApplyModal } from "./YamlApplyModal";
+import { SelectorLogsModal } from "./SelectorLogsModal";
+import { KubeShellModal } from "./KubeShellModal";
 import { api } from "../../lib/api";
 import { formatBytes, formatRelativeTime } from "../../lib/utils";
+import { stripServerFields } from "../../lib/k8sYaml";
 import type {
   K8sClusterSummary,
   K8sConfigInfo,
@@ -232,6 +237,22 @@ export const ClusterMonitor: React.FC<{
   >(null);
   // "ns/name" while a shell probe is in flight (prevents double-clicks).
   const [terminalBusy, setTerminalBusy] = useState<string | null>(null);
+  // Apply YAML / quick deploy, selector logs, and the kubectl shell.
+  /** Bumped after an apply so an open YAML viewer shows the new state. */
+  const [yamlReload, setYamlReload] = useState(0);
+  const [applyFor, setApplyFor] = useState<
+    { tab: "yaml" | "quick"; yaml?: string; title?: string } | null
+  >(null);
+  const [selectorLogsFor, setSelectorLogsFor] = useState<
+    {
+      ns: string;
+      title: string;
+      selector?: string;
+      workloadKind?: string;
+      workloadName?: string;
+    } | null
+  >(null);
+  const [kubeShellOpen, setKubeShellOpen] = useState(false);
 
   useEffect(() => {
     setTab("overview");
@@ -258,6 +279,9 @@ export const ClusterMonitor: React.FC<{
     setTerminalFor(null);
     setMsStatus(null);
     setNodeBusy(null);
+    setApplyFor(null);
+    setSelectorLogsFor(null);
+    setKubeShellOpen(false);
   }, [cluster]);
 
   useEffect(() => {
@@ -621,7 +645,7 @@ export const ClusterMonitor: React.FC<{
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [yamlFor?.kind, yamlFor?.ns, yamlFor?.name, cluster]);
+  }, [yamlFor?.kind, yamlFor?.ns, yamlFor?.name, cluster, yamlReload]);
 
   useEffect(() => {
     if (!eventsFor) return;
@@ -858,6 +882,38 @@ export const ClusterMonitor: React.FC<{
               {summary.ready ? "healthy" : "degraded"} · {summary.gitVersion || "?"}
             </span>
           )}
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              title="Apply a YAML manifest to this cluster"
+              className="h-7 gap-1.5 px-2.5 text-[11px]"
+              onClick={() => setApplyFor({ tab: "yaml" })}
+            >
+              <FileCode2 className="h-3.5 w-3.5" />
+              Apply YAML
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              title="Generate a Deployment and Service and apply them"
+              className="h-7 gap-1.5 px-2.5 text-[11px]"
+              onClick={() => setApplyFor({ tab: "quick" })}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Quick deploy
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              title="Open a shell in the control-plane node with kubectl ready"
+              className="h-7 gap-1.5 px-2.5 text-[11px]"
+              onClick={() => setKubeShellOpen(true)}
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              kubectl shell
+            </Button>
+          </div>
           <span>auto-refresh 6s</span>
         </div>
       </div>
@@ -1547,6 +1603,25 @@ export const ClusterMonitor: React.FC<{
                           >
                             <FileText className="h-3.5 w-3.5" />
                           </Button>
+                          {(wk === "deployment" || wk === "statefulset" || wk === "daemonset") && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              title="Logs (all pods)"
+                              aria-label="Logs for all pods of workload"
+                              onClick={() =>
+                                setSelectorLogsFor({
+                                  ns: w.namespace,
+                                  title: `${w.kind}/${w.namespace}/${w.name} · all pods`,
+                                  workloadKind: wk,
+                                  workloadName: w.name,
+                                })
+                              }
+                              className="h-6 w-6 text-zinc-400 hover:text-emerald-300"
+                            >
+                              <Layers className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
                           <Button
                             variant="ghost"
                             size="icon"
@@ -1692,6 +1767,27 @@ export const ClusterMonitor: React.FC<{
                       {s.created ? formatRelativeTime(s.created) : "-"}
                     </td>
                     <td className="px-3 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title={
+                          s.selector
+                            ? `Logs of all pods behind this service (${s.selector})`
+                            : "This service has no pod selector"
+                        }
+                        aria-label="View logs of the service's pods"
+                        disabled={!s.selector}
+                        onClick={() =>
+                          setSelectorLogsFor({
+                            ns: s.namespace,
+                            selector: s.selector,
+                            title: `Service ${s.name}`,
+                          })
+                        }
+                        className="h-6 w-6 text-zinc-400 hover:text-emerald-300 disabled:opacity-30"
+                      >
+                        <Layers className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"
@@ -2281,6 +2377,22 @@ export const ClusterMonitor: React.FC<{
               </div>
               <div className="flex items-center gap-1">
                 <Button
+                  variant="outline"
+                  size="sm"
+                  title="Edit this manifest and apply it"
+                  disabled={!yamlText || yamlLoading}
+                  onClick={() =>
+                    setApplyFor({
+                      tab: "yaml",
+                      yaml: stripServerFields(yamlText),
+                      title: `Edit ${yamlFor.kind}/${yamlFor.name}`,
+                    })
+                  }
+                  className="mr-1 h-7 px-2.5 text-[11px]"
+                >
+                  Edit
+                </Button>
+                <Button
                   variant="ghost"
                   size="icon"
                   title="Copy YAML"
@@ -2434,6 +2546,38 @@ export const ClusterMonitor: React.FC<{
             </div>
           </div>
         </div>
+      )}
+
+      {/* YAML apply / quick deploy */}
+      {applyFor && (
+        <YamlApplyModal
+          cluster={cluster}
+          initialYaml={applyFor.yaml}
+          initialTab={applyFor.tab}
+          title={applyFor.title}
+          onClose={() => setApplyFor(null)}
+          onApplied={() => {
+            slowRefresh();
+            setYamlReload((n) => n + 1);
+          }}
+        />
+      )}
+
+      {/* Selector logs (all pods of a workload or a label selector) */}
+      {selectorLogsFor && (
+        <SelectorLogsModal
+          cluster={cluster}
+          namespace={selectorLogsFor.ns}
+          selector={selectorLogsFor.selector}
+          workloadKind={selectorLogsFor.workloadKind}
+          workloadName={selectorLogsFor.workloadName}
+          title={selectorLogsFor.title}
+          onClose={() => setSelectorLogsFor(null)}
+        />
+      )}
+
+      {kubeShellOpen && (
+        <KubeShellModal cluster={cluster} onClose={() => setKubeShellOpen(false)} />
       )}
 
       {/* Pod terminal modal */}

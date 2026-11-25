@@ -67,6 +67,9 @@ import type {
   K8sIngressInfo,
   K8sPvInfo,
   KindClusterPrefs,
+  ClusterAccess,
+  ManifestDiff,
+  SelectorLogs,
   ContainerGroup,
 } from "../types";
 
@@ -307,6 +310,44 @@ export const api = {
   ) => invoke<string>("get_resource_yaml", { cluster, kind, namespace, name }),
   getResourceEvents: (cluster: string, namespace: string, name: string) =>
     invoke<K8sEventInfo[]>("get_resource_events", { cluster, namespace, name }),
+  /** Host reachability + kubeconfig state of a cluster. */
+  getClusterAccess: (cluster: string) =>
+    invoke<ClusterAccess>("get_cluster_access", { cluster }),
+  /** Merge into ~/.kube/config (backed up, becomes current context). */
+  exportKubeconfigToHost: (cluster: string) =>
+    invoke<string>("export_kubeconfig_to_host", { cluster }),
+  removeKubeconfigFromHost: (cluster: string) =>
+    invoke<string>("remove_kubeconfig_from_host", { cluster }),
+  /** Opens a host terminal window with KUBECONFIG set to the cluster. */
+  openClusterTerminal: (cluster: string) =>
+    invoke<string>("open_cluster_terminal", { cluster }),
+  /** Server-side dry-run diff; nothing is changed. */
+  diffClusterYaml: (cluster: string, yaml: string) =>
+    invoke<ManifestDiff>("diff_cluster_yaml", { cluster, yaml }),
+  /** `kubectl apply -f -`; returns kubectl's output. Max 90 KiB. */
+  applyClusterYaml: (cluster: string, yaml: string) =>
+    invoke<string>("apply_cluster_yaml", { cluster, yaml }),
+  /** Logs of all pods matching a selector, or a workload's selector. */
+  getSelectorLogs: (
+    cluster: string,
+    namespace: string,
+    opts: {
+      selector?: string;
+      workloadKind?: string;
+      workloadName?: string;
+      tail?: number;
+      sinceTime?: string;
+    }
+  ) =>
+    invoke<SelectorLogs>("get_selector_logs", {
+      cluster,
+      namespace,
+      selector: opts.selector,
+      workloadKind: opts.workloadKind,
+      workloadName: opts.workloadName,
+      tail: opts.tail,
+      sinceTime: opts.sinceTime,
+    }),
   getWorkloadLogs: (
     cluster: string,
     kind: string,

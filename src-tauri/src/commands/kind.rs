@@ -734,6 +734,10 @@ pub(crate) async fn run_kind_streaming(
         tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
             let mut tail: std::collections::VecDeque<String> = Default::default();
+            // kind prints its `ERROR: …` summary and then kubeadm's whole
+            // output plus a Go stack trace, so the summary is long gone from
+            // the tail by the time kind exits. Keep it aside.
+            let mut summary: Option<String> = None;
             while let Ok(Some(raw)) = lines.next_line().await {
                 let Some(line) = clean_kind_line(&raw) else {
                     continue;
@@ -741,12 +745,17 @@ pub(crate) async fn run_kind_streaming(
                 if let Some(app) = &app {
                     let _ = app.emit(&event, serde_json::json!({ "line": line }));
                 }
+                if summary.is_none() && line.starts_with("ERROR:") {
+                    summary = Some(line.clone());
+                }
                 if tail.len() == KIND_ERROR_TAIL {
                     tail.pop_front();
                 }
                 tail.push_back(line);
             }
-            tail.into()
+            let mut tail: Vec<String> = tail.into();
+            tail.extend(summary);
+            tail
         })
     }
 
@@ -791,7 +800,13 @@ pub(crate) async fn run_kind_streaming(
         let detail = output_tail
             .iter()
             .rev()
-            .find(|l| l.contains("ERROR") || l.contains("error") || l.contains("failed"))
+            .find(|l| l.starts_with("ERROR:"))
+            .or_else(|| {
+                output_tail
+                    .iter()
+                    .rev()
+                    .find(|l| l.contains("ERROR") || l.contains("error") || l.contains("failed"))
+            })
             .or_else(|| output_tail.last())
             .map(|l| format!(": {l}"))
             .unwrap_or_default();
@@ -912,6 +927,19 @@ pub(crate) async fn create_kind_cluster_core(
         "no d_type-capable directory is available for the kind node containerd state".to_string()
     })?;
     let cluster_state = dtype_root.join("kind-nodes").join(&name);
+    // No node of this name exists (checked above), so anything here is the
+    // containerd state of an earlier cluster that was not cleaned up. Booting
+    // on it makes kubelet restart stale static pods and `kubeadm init` time
+    // out, so it has to go — and if it cannot, refuse instead.
+    if cluster_state.exists() {
+        remove_state_dir(&cluster_state).map_err(|e| {
+            format!(
+                "Leftover node state from an earlier '{name}' cluster could not be removed ({e}). \
+                 Delete {} and try again.",
+                cluster_state.display()
+            )
+        })?;
+    }
     let mut nodes_yaml = String::new();
     for i in 0..n {
         let role = if i == 0 { "control-plane" } else { "worker" };
@@ -934,12 +962,25 @@ pub(crate) async fn create_kind_cluster_core(
         nodes_yaml.push_str("        containerPath: /var/lib/containerd\n");
         nodes_yaml.push_str("        readOnly: false\n");
     }
-    let config_yaml =
-        format!("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n{nodes_yaml}");
     let config_path = cluster_config_path(paths, &name)
         .ok_or_else(|| "kind data directory is unavailable".to_string())?;
-    std::fs::write(&config_path, config_yaml)
-        .map_err(|e| format!("failed to write kind cluster config: {e}"))?;
+    // A fixed API port the host can reach (kind's random one lands in the
+    // range the engine's network never forwards — see `kind_access`).
+    let bound = super::kind_access::bound_api_ports(state).await;
+    let api_port =
+        super::kind_access::write_config_with_api_port(
+            paths,
+            &config_path,
+            &nodes_yaml,
+            image.as_deref(),
+            &bound,
+        )?;
+    if let Some(p) = api_port {
+        emit_kind_progress(
+            app,
+            serde_json::json!({ "action": "create", "name": name, "line": format!("API server on 127.0.0.1:{p}") }),
+        );
+    }
 
     // The node layout lives in the config file now (`--config` conflicts with
     // `--nodes`/`--image`); `--wait` is CLI-only, so keep it as a flag.
@@ -976,7 +1017,7 @@ pub(crate) async fn create_kind_cluster_core(
         // killed on timeout, and never the node state dirs (image layers,
         // often gigabytes) or the config file written above.
         let _ = delete_cluster_containers(state, &name).await;
-        cleanup_cluster_state(&name);
+        cleanup_cluster_state(&name, &[]);
         let _ = std::fs::remove_file(&config_path);
     }
     invalidate_kind_clusters_cache().await;
@@ -1068,6 +1109,7 @@ pub(crate) async fn delete_kind_cluster_core(
     if let Some(cfg) = cluster_config_path(paths, &name) {
         let _ = std::fs::remove_file(cfg);
     }
+    let mounted = cluster_state_dirs(state, &name).await;
     if !paths.is_installed() {
         // Fall back to removing the node containers directly so a stale
         // cluster can still be cleaned up without the binary.
@@ -1076,7 +1118,7 @@ pub(crate) async fn delete_kind_cluster_core(
             if let Some(app) = app {
                 crate::tray::notify_kind_event(app, false, &name);
             }
-            cleanup_cluster_state(&name);
+            cleanup_cluster_state(&name, &mounted);
             invalidate_kind_clusters_cache().await;
         }
         return result;
@@ -1091,7 +1133,7 @@ pub(crate) async fn delete_kind_cluster_core(
         if let Some(app) = app {
             crate::tray::notify_kind_event(app, false, &name);
         }
-        cleanup_cluster_state(&name);
+        cleanup_cluster_state(&name, &mounted);
         invalidate_kind_clusters_cache().await;
     }
     result
@@ -1120,19 +1162,108 @@ pub(crate) fn check_cluster_name(name: &str) -> Result<(), String> {
 /// Removes the d_type-compat bind-mount dirs a created cluster left behind.
 /// Best-effort: image layers can be gigabytes, and a failure here must not
 /// fail the delete itself (the containers are already gone).
-pub(crate) fn cleanup_cluster_state(name: &str) {
+///
+/// `mounted` are the state dirs the node containers actually used (see
+/// [`cluster_state_dirs`]): a cluster created before the app was renamed
+/// keeps its state under the legacy data dir, not the current compat root.
+pub(crate) fn cleanup_cluster_state(name: &str, mounted: &[std::path::PathBuf]) {
     // The name becomes a path component of a recursive delete: `..` or `.`
     // would have wiped the engine's compat root or every cluster's state.
     if check_cluster_name(name).is_err() {
         return;
     }
+    let mut dirs: Vec<std::path::PathBuf> = mounted.to_vec();
     if let Some(root) = crate::docker::engine::dtype_compat_root() {
-        let dir = root.join("kind-nodes").join(name);
+        dirs.push(root.join("kind-nodes").join(name));
+    }
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
         if dir.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
+            if let Err(e) = remove_state_dir(&dir) {
                 tracing::warn!("could not clean kind node state {}: {e}", dir.display());
             }
         }
+    }
+}
+
+/// The per-cluster state dir (`…/kind-nodes/<name>`) behind a node's
+/// `/var/lib/containerd` bind mount, or `None` for any other source. The
+/// strict shape check matters: the result is deleted recursively, so a
+/// hand-edited mount must never point this at an arbitrary directory.
+fn state_dir_from_mount(source: &str, name: &str) -> Option<std::path::PathBuf> {
+    let node = std::path::Path::new(source);
+    if !node.is_absolute()
+        || node.components().any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let leaf = node.file_name()?.to_str()?;
+    let idx = leaf.strip_prefix("node")?;
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let cluster = node.parent()?;
+    if cluster.file_name()?.to_str()? != name {
+        return None;
+    }
+    let kind_nodes = cluster.parent()?;
+    if kind_nodes.file_name()?.to_str()? != "kind-nodes" {
+        return None;
+    }
+    Some(cluster.to_path_buf())
+}
+
+/// State dirs mounted into this cluster's node containers. Read before the
+/// nodes are deleted; empty when the engine cannot be asked.
+pub(crate) async fn cluster_state_dirs(state: &AppState, name: &str) -> Vec<std::path::PathBuf> {
+    let Ok(client) = local_client(state).await else {
+        return Vec::new();
+    };
+    let mut filters = HashMap::new();
+    filters.insert("label".to_string(), vec![format!("{CLUSTER_LABEL}={name}")]);
+    let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let Ok(containers) = client.docker().list_containers(Some(opts)).await else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<std::path::PathBuf> = containers
+        .iter()
+        .flat_map(|c| c.mounts.iter().flatten())
+        .filter(|m| m.destination.as_deref() == Some("/var/lib/containerd"))
+        .filter_map(|m| state_dir_from_mount(m.source.as_deref()?, name))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Deletes a node's containerd state dir. A plain recursive delete is not
+/// enough: overlayfs leaves `work/work` dirs with mode 000, and image layers
+/// hold files owned by the rootless engine's subuids, which the host user
+/// cannot unlink. Both are removable as root of a user namespace mapped like
+/// the engine's (`unshare --map-auto --map-root-user`, uid 0 → us, 1.. →
+/// subuids), so that is the fallback.
+fn remove_state_dir(dir: &std::path::Path) -> Result<(), String> {
+    let first = match std::fs::remove_dir_all(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => e,
+    };
+    let out = std::process::Command::new("unshare")
+        .args(["--map-auto", "--map-root-user", "rm", "-rf", "--one-file-system", "--"])
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(_) if !dir.exists() => Ok(()),
+        Ok(o) => Err(format!(
+            "{first}; user-namespace delete failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("{first}; unshare is unavailable: {e}")),
     }
 }
 
@@ -1605,7 +1736,7 @@ fn cached_kubectl_read(key: &str) -> Option<serde_json::Value> {
 }
 
 /// Drops every cached read of `cluster` (after a write, or a delete).
-fn forget_kubectl_reads(cluster: &str) {
+pub(crate) fn forget_kubectl_reads(cluster: &str) {
     let prefix = format!("{cluster}\0");
     kubectl_read_cache()
         .lock()
@@ -3475,6 +3606,7 @@ pub(crate) async fn set_cluster_prefs_core(
     if cluster.is_empty() {
         return Err("Cluster name is required".into());
     }
+    let prefs = normalize_cluster_prefs(prefs)?;
     {
         // Save a copy first so a failed write leaves memory matching disk.
         let mut cfg = state.config.write().await;
@@ -3488,6 +3620,26 @@ pub(crate) async fn set_cluster_prefs_core(
         tracing::info!("applied node caps to {capped} container(s) of '{cluster}'");
     }
     Ok(())
+}
+
+/// Validates the card colour and tidies the tags (trimmed, deduplicated,
+/// at most 8 of at most 24 characters).
+pub(crate) fn normalize_cluster_prefs(mut prefs: KindClusterPrefs) -> Result<KindClusterPrefs, String> {
+    prefs.color = prefs.color.trim().to_ascii_lowercase();
+    let hex = prefs.color.strip_prefix('#').unwrap_or("");
+    if !prefs.color.is_empty() && !(hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(format!("colour '{}' is not #rrggbb", prefs.color));
+    }
+    let mut tags: Vec<String> = Vec::new();
+    for t in prefs.tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let t: String = t.chars().take(24).collect();
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+    tags.truncate(8);
+    prefs.tags = tags;
+    Ok(prefs)
 }
 
 /// CPU/memory-caps every node container of `cluster` via `docker update`.
@@ -3947,6 +4099,56 @@ mod resource_view_tests {
     use super::*;
 
     #[test]
+    fn state_dir_only_from_kind_node_mounts() {
+        let legacy = "/home/u/.local/share/docker-manager/dtype-compat/kind-nodes/mycluster/node0";
+        assert_eq!(
+            state_dir_from_mount(legacy, "mycluster").unwrap(),
+            std::path::PathBuf::from("/home/u/.local/share/docker-manager/dtype-compat/kind-nodes/mycluster")
+        );
+        assert!(state_dir_from_mount(legacy, "other").is_none());
+        assert!(state_dir_from_mount("/home/u/data/mycluster/node0", "mycluster").is_none());
+        assert!(state_dir_from_mount("/x/kind-nodes/mycluster/nodeX", "mycluster").is_none());
+        assert!(state_dir_from_mount("/x/kind-nodes/mycluster/node", "mycluster").is_none());
+        assert!(state_dir_from_mount("/x/kind-nodes/mycluster/../node0", "mycluster").is_none());
+        assert!(state_dir_from_mount("kind-nodes/mycluster/node0", "mycluster").is_none());
+        assert!(state_dir_from_mount("/lib/modules", "mycluster").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_with_mode_000_subdirs_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("hsx2dock-state-{}", std::process::id()));
+        let work = root.join("node0/snapshots/1/work/work");
+        std::fs::create_dir_all(work.join("inner")).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = remove_state_dir(&root);
+        if root.exists() {
+            // No user namespaces here (some sandboxes): restore and clean up.
+            let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(res.is_err());
+            return;
+        }
+        assert!(res.is_ok());
+        assert!(remove_state_dir(&root).is_ok(), "a missing dir is already clean");
+    }
+
+    #[test]
+    fn cluster_prefs_colour_and_tags_are_normalised() {
+        let p = normalize_cluster_prefs(KindClusterPrefs {
+            color: " #A1B2C3 ".into(),
+            tags: vec![" dev ".into(), "dev".into(), "".into(), "x".repeat(40)],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(p.color, "#a1b2c3");
+        assert_eq!(p.tags, vec!["dev".to_string(), "x".repeat(24)]);
+        assert!(normalize_cluster_prefs(KindClusterPrefs { color: "red".into(), ..Default::default() }).is_err());
+        assert!(normalize_cluster_prefs(KindClusterPrefs::default()).is_ok());
+    }
+
+    #[test]
     fn events_fallback_only_on_an_unsupported_selector() {
         assert!(selector_unsupported(
             "Error from server (BadRequest): Unable to find \"events\" that match label selector \"\", field selector \"involvedObject.uid=x\": field label not supported: involvedObject.uid"
@@ -4165,6 +4367,8 @@ pub struct K8sServiceInfo {
     pub kind: String,
     pub cluster_ip: String,
     pub ports: String,
+    /// `spec.selector` as `k=v,k2=v2` (sorted); "" for selector-less services.
+    pub selector: String,
     pub created: Option<i64>,
 }
 
@@ -4219,7 +4423,20 @@ pub(crate) fn parse_services(json: &serde_json::Value) -> Vec<K8sServiceInfo> {
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let selector = s
+                .pointer("/spec/selector")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    let mut pairs: Vec<String> = m
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+                        .collect();
+                    pairs.sort();
+                    pairs.join(",")
+                })
+                .unwrap_or_default();
             Some(K8sServiceInfo {
+                selector,
                 name: meta.get("name")?.as_str()?.to_string(),
                 namespace: meta
                     .get("namespace")

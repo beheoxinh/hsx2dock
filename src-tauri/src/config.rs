@@ -183,6 +183,12 @@ pub struct KindClusterPrefs {
     /// Per-node memory cap in MiB (`0`/unset = unlimited).
     #[serde(default)]
     pub node_memory_mb: u32,
+    /// Accent colour of the cluster card (`#rrggbb`, empty = default).
+    #[serde(default)]
+    pub color: String,
+    /// Free-form labels to filter the cluster list by.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// A named set of containers that can be started/stopped together, optionally

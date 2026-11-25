@@ -6,6 +6,7 @@ pub mod gateway;
 pub mod groups;
 pub mod images;
 pub mod kind;
+pub mod kind_access;
 pub mod mcp;
 pub mod networks;
 pub mod registries;

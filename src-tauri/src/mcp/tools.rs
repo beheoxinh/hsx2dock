@@ -1331,6 +1331,66 @@ pub fn catalogue() -> Vec<ToolSpec> {
             ]),
         },
         ToolSpec {
+            name: "cluster_diff_yaml",
+            title: "Diff YAML against cluster",
+            description: "Show what applying a manifest would change in a kind cluster \
+                          (`kubectl diff`: a server-side dry run, nothing is changed). Returns a \
+                          unified diff and whether anything differs.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("yaml", string(), true, "Manifest contents (at most 90 KiB)"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_selector_logs",
+            title: "Logs by label selector",
+            description: "Logs of every pod matching a label selector (or the selector of a \
+                          workload) in one namespace, all containers, each line \
+                          `<timestamp> [pod/<pod>/<container>] <message>`, sorted by time.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("cluster", string(), true, "Cluster name"),
+                ("namespace", string(), true, "Namespace"),
+                ("selector", string(), false, "Label selector, e.g. `app=web,tier!=db`"),
+                ("workload_kind", string(), false, "deployment, statefulset, daemonset, replicaset or job — used when no selector is given"),
+                ("workload_name", string(), false, "Workload name, with workload_kind"),
+                ("tail", integer(), false, "Lines per container (default 200)"),
+                ("since_time", string(), false, "Only lines at or after this RFC 3339 time"),
+            ]),
+        },
+        ToolSpec {
+            name: "cluster_access",
+            title: "Cluster host access",
+            description: "How a kind cluster is reached from the host: its API server port, \
+                          whether that port answers, whether the user's kubeconfig holds its \
+                          context, and whether kubectl is installed.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[("cluster", string(), true, "Cluster name")]),
+        },
+        ToolSpec {
+            name: "cluster_export_kubeconfig_to_host",
+            title: "Add cluster to host kubeconfig",
+            description: "Merge a kind cluster's context into the user's kubeconfig \
+                          ($KUBECONFIG or ~/.kube/config) and make it the current context. \
+                          The file is backed up to <file>.hsx2dock.bak first.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[("cluster", string(), true, "Cluster name")]),
+        },
+        ToolSpec {
+            name: "cluster_remove_kubeconfig_from_host",
+            title: "Remove cluster from host kubeconfig",
+            description: "Remove a kind cluster's context, cluster and user entries from the \
+                          user's kubeconfig (backed up to <file>.hsx2dock.bak first).",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[("cluster", string(), true, "Cluster name")]),
+        },
+        ToolSpec {
             name: "cluster_get_cluster_prefs",
             title: "Get cluster preferences",
             description: "The stored preferences for a kind cluster: whether it auto-starts with the \

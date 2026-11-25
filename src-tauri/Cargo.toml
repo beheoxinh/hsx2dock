@@ -65,3 +65,4 @@ rmcp = { version = "3.7", default-features = false, features = [
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tauri-plugin-single-instance = "2.5.4"
+yaml-rust2 = "0.8"
