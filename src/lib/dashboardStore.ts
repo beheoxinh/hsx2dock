@@ -201,11 +201,25 @@ export function primeDashboardStore(force = false): Promise<void> {
 
   if (cold) commit({ loading: true });
 
+  if (statusDue) {
+    // `system df` walks every layer and volume (seconds with many containers).
+    // It lands on its own so engine info and the cluster list never wait for it.
+    api
+      .getDiskUsage(force)
+      .then((diskUsage) => {
+        if (startedEpoch !== epoch) return;
+        const changed = changedDashboardFields(snapshot, { diskUsage });
+        if (Object.keys(changed).length === 0) return;
+        commit(changed);
+        persist();
+      })
+      .catch(() => {});
+  }
+
   const run = (async () => {
     const statusPromise = statusDue
       ? Promise.allSettled([
           api.getEngineInfo(),
-          api.getDiskUsage(),
           api.kindStatus(),
           api.getEmbeddedBinaries(),
           api.listKindClusters(),
@@ -223,9 +237,8 @@ export function primeDashboardStore(force = false): Promise<void> {
     const patch: DashboardDataPatch = {};
 
     if (statusR) {
-      const [infoR, dfR, kindR, binR, clusterR] = statusR;
+      const [infoR, kindR, binR, clusterR] = statusR;
       if (infoR.status === "fulfilled") patch.engineInfo = infoR.value;
-      if (dfR.status === "fulfilled") patch.diskUsage = dfR.value;
       if (kindR.status === "fulfilled") patch.kindStatus = kindR.value;
       if (binR.status === "fulfilled") patch.embeddedBinaries = binR.value;
       if (clusterR.status === "fulfilled") patch.clusters = clusterR.value;

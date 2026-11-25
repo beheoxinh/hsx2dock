@@ -95,7 +95,8 @@ export const api = {
   getEmbeddedBinaries: () => invoke<EmbeddedBinaryInfo[]>("get_embedded_binaries"),
   toggleEngine: () => invoke<DaemonState>("toggle_engine"),
   getEngineInfo: () => invoke<EngineInfo | null>("get_engine_info"),
-  getDiskUsage: () => invoke<DfReport>("get_disk_usage"),
+  /** `fresh` bypasses the backend's 30s cache (after a prune or a manual refresh). */
+  getDiskUsage: (fresh = false) => invoke<DfReport>("get_disk_usage", { fresh }),
   pruneSystem: () => invoke<number>("prune_system"),
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
   saveAppConfig: (config: AppConfig) => invoke<void>("save_app_config", { config }),

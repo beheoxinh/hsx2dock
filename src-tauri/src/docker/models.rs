@@ -783,8 +783,10 @@ impl EnvVar {
 pub enum MountKind {
     /// A host path, e.g. `/srv/data`.
     #[default]
+    #[serde(alias = "bind")]
     Bind,
     /// A named volume managed by Docker, e.g. `pgdata`.
+    #[serde(alias = "volume")]
     Volume,
 }
 
@@ -813,6 +815,8 @@ pub struct VolumeMount {
     /// Host path (bind) or volume name (volume).
     pub source: String,
     pub target: String,
+    // MCP callers routinely leave this out; a missing flag means read-write.
+    #[serde(default)]
     pub read_only: bool,
 }
 

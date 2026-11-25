@@ -866,8 +866,7 @@ impl McpServer {
     }
 
     async fn disk_usage(&self) -> Result<crate::docker::models::DfReport, String> {
-        let client = self.state.get_client().await?;
-        client.system_df().await.map_err(|e| e.to_string())
+        crate::commands::system::disk_usage_core(&self.state, false).await
     }
 
     async fn prune_system(&self) -> Result<u64, String> {

@@ -23,10 +23,9 @@ pub async fn list_compose_projects(
 pub(crate) async fn list_compose_projects_core(
     state: &AppState,
 ) -> Result<Vec<ComposeProjectInfo>, String> {
-    let config = state.config.read().await;
-    let file = compose::resolve_compose_file(&config.compose_file);
-
-    if let Ok(f) = file {
+    let configured = state.config.read().await.compose_file.clone();
+    let mut projects = Vec::new();
+    if let Ok(f) = compose::resolve_compose_file(&configured) {
         if let Ok(services) = compose::ps(&f).await {
             let name = f
                 .parent()
@@ -34,14 +33,116 @@ pub(crate) async fn list_compose_projects_core(
                 .and_then(|n| n.to_str())
                 .unwrap_or("default")
                 .to_string();
-            return Ok(vec![ComposeProjectInfo {
+            projects.push(ComposeProjectInfo {
                 name,
                 path: f.display().to_string(),
                 services,
-            }]);
+            });
         }
     }
-    Ok(vec![])
+    // Projects started from anywhere (the app's compose groups, a terminal)
+    // are known by their container labels; the configured file used to be
+    // the only source, so every other project was invisible here.
+    if let Ok(client) = state.get_client().await {
+        if let Ok(containers) = client.list_containers(true).await {
+            for p in projects_from_containers(&containers) {
+                if projects.iter().any(|q| q.name == p.name) {
+                    continue;
+                }
+                let path = compose_config_file(&client, &p.services).await;
+                projects.push(ComposeProjectInfo { path, ..p });
+            }
+        }
+    }
+    Ok(projects)
+}
+
+/// Groups containers carrying a compose project label into projects, one
+/// service row per container, sorted by project then service.
+fn projects_from_containers(
+    containers: &[crate::docker::models::ContainerItem],
+) -> Vec<ComposeProjectInfo> {
+    let mut by_project: std::collections::BTreeMap<String, Vec<compose::ComposeService>> =
+        Default::default();
+    for c in containers {
+        let Some(project) = c.compose_project.as_ref().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let health = ["unhealthy", "healthy", "health: starting"]
+            .into_iter()
+            .find(|h| c.status.contains(&format!("({h})")))
+            .map(|h| h.trim_start_matches("health: ").to_string())
+            .unwrap_or_default();
+        by_project.entry(project.clone()).or_default().push(compose::ComposeService {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            service: c.compose_service.clone().unwrap_or_default(),
+            image: c.image.clone(),
+            state: c.state.clone(),
+            health,
+            ports: c.ports.clone(),
+        });
+    }
+    by_project
+        .into_iter()
+        .map(|(name, mut services)| {
+            services.sort_by(|a, b| a.service.cmp(&b.service));
+            ComposeProjectInfo { name, path: String::new(), services }
+        })
+        .collect()
+}
+
+/// The compose file a project was started from, read from one of its
+/// containers (`com.docker.compose.project.config_files`, first entry).
+async fn compose_config_file(
+    client: &crate::docker::client::DockerClient,
+    services: &[compose::ComposeService],
+) -> String {
+    let Some(first) = services.first() else {
+        return String::new();
+    };
+    client
+        .docker()
+        .inspect_container(&first.id, None)
+        .await
+        .ok()
+        .and_then(|d| d.config?.labels?.get("com.docker.compose.project.config_files").cloned())
+        .and_then(|files| files.split(',').next().map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docker::models::ContainerItem;
+
+    fn item(name: &str, project: Option<&str>, service: &str, status: &str) -> ContainerItem {
+        ContainerItem {
+            id: format!("id-{name}"),
+            name: name.into(),
+            state: "running".into(),
+            status: status.into(),
+            compose_project: project.map(str::to_string),
+            compose_service: Some(service.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn label_projects_group_containers_and_read_health() {
+        let list = vec![
+            item("b-api", Some("shop"), "api", "Up 2 minutes (healthy)"),
+            item("lone", None, "x", "Up"),
+            item("b-db", Some("shop"), "db", "Up 1 minute (health: starting)"),
+            item("c-web", Some("blog"), "web", "Up 3 minutes (unhealthy)"),
+        ];
+        let projects = projects_from_containers(&list);
+        let names: Vec<_> = projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["blog", "shop"]);
+        assert_eq!(projects[0].services[0].health, "unhealthy");
+        let shop: Vec<_> = projects[1].services.iter().map(|s| (s.service.as_str(), s.health.as_str())).collect();
+        assert_eq!(shop, [("api", "healthy"), ("db", "starting")]);
+    }
 }
 
 #[tauri::command]

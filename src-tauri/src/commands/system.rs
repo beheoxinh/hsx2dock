@@ -60,9 +60,51 @@ pub async fn get_engine_info(
 }
 
 #[tauri::command]
-pub async fn get_disk_usage(state: State<'_, Arc<AppState>>) -> Result<DfReport, String> {
+pub async fn get_disk_usage(
+    state: State<'_, Arc<AppState>>,
+    fresh: Option<bool>,
+) -> Result<DfReport, String> {
+    disk_usage_core(&state, fresh.unwrap_or(false)).await
+}
+
+/// How long one `system df` answer is reused. dockerd walks every volume and
+/// layer for it — 13s with ~30 containers on fuse-overlayfs — so the
+/// dashboard, tray and MCP must not each start their own walk.
+const DISK_USAGE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+type DiskUsageCache = Option<(std::time::Instant, Option<String>, DfReport)>;
+static DISK_USAGE: std::sync::Mutex<DiskUsageCache> = std::sync::Mutex::new(None);
+static DISK_USAGE_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `system df`, cached per endpoint for [`DISK_USAGE_TTL`] and single-flight:
+/// concurrent callers wait for the one walk in progress and share its result.
+/// `fresh` skips the cache (after a prune, or an explicit refresh).
+pub(crate) async fn disk_usage_core(state: &AppState, fresh: bool) -> Result<DfReport, String> {
+    let endpoint = state.config.read().await.active_endpoint.clone();
+    let cached = |max_age: std::time::Duration| {
+        let guard = DISK_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|(at, ep, _)| *ep == endpoint && at.elapsed() < max_age)
+            .map(|(_, _, df)| df.clone())
+    };
+    if !fresh {
+        if let Some(df) = cached(DISK_USAGE_TTL) {
+            return Ok(df);
+        }
+    }
+    let started = std::time::Instant::now();
+    let _turn = DISK_USAGE_FLIGHT.lock().await;
+    // Someone else finished a walk while we queued: that one is newer than
+    // our request, so it answers even a `fresh` call.
+    if let Some(df) = cached(started.elapsed()) {
+        return Ok(df);
+    }
     let client = state.get_client().await?;
-    client.system_df().await.map_err(|e| e.to_string())
+    let df = client.system_df().await.map_err(|e| e.to_string())?;
+    *DISK_USAGE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((std::time::Instant::now(), endpoint, df.clone()));
+    Ok(df)
 }
 
 #[tauri::command]
