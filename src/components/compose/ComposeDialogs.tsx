@@ -1,5 +1,19 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { FilePlus2, FolderSearch, Globe, Loader2, Play, Power, Scaling, Search } from "lucide-react";
+import {
+  BellRing,
+  Download,
+  FilePlus2,
+  FolderSearch,
+  Globe,
+  Hammer,
+  Loader2,
+  PackageCheck,
+  Play,
+  Power,
+  Scaling,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { Button } from "../ui/Button";
 import { Switch } from "../ui/Switch";
 import { useToast } from "../ui/Toast";
@@ -7,8 +21,17 @@ import { DialogShell, inputClass, openUrl } from "./composeUi";
 import { api } from "../../lib/api";
 import { setGatewayRoutes } from "../../lib/containerStore";
 import { defaultDomain, publishedPorts, type ComposeServiceRow } from "../../lib/composeProject";
-import { cn } from "../../lib/utils";
-import type { ComposeDownOptions, ComposeProjectInfo, ComposeUpOptions, GatewayRoute } from "../../types";
+import { ALERT_KIND_LABEL } from "../../lib/composeAlerts";
+import { cn, formatRelativeTime } from "../../lib/utils";
+import type {
+  ComposeAlert,
+  ComposeBuildOptions,
+  ComposeDownOptions,
+  ComposePullOptions,
+  ComposeProjectInfo,
+  ComposeUpOptions,
+  GatewayRoute,
+} from "../../types";
 
 // ---------------------------------------------------------------------------
 // Add / import project
@@ -75,7 +98,7 @@ export const AddProjectDialog: React.FC<{
             placeholder="~/projects/shop  or  /srv/app/docker-compose.yml"
             className={cn(inputClass, "font-mono")}
           />
-          <Button size="sm" variant="primary" onClick={() => void add(path)} disabled={!path.trim() || adding !== null}>
+          <Button className="rounded-none" size="sm" variant="primary" onClick={() => void add(path)} disabled={!path.trim() || adding !== null}>
             {adding === path ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FilePlus2 className="h-3.5 w-3.5" />}
             Add
           </Button>
@@ -110,7 +133,7 @@ export const AddProjectDialog: React.FC<{
               </option>
             ))}
           </select>
-          <Button size="sm" onClick={() => void scan()} disabled={scanning || !scanDir.trim()}>
+          <Button className="rounded-none" size="sm" onClick={() => void scan()} disabled={scanning || !scanDir.trim()}>
             {scanning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderSearch className="h-3.5 w-3.5" />}
             Scan
           </Button>
@@ -159,6 +182,8 @@ export const UpDialog: React.FC<{
   const [envFile, setEnvFile] = useState("");
   const [forceRecreate, setForceRecreate] = useState(false);
   const [removeOrphans, setRemoveOrphans] = useState(false);
+  // Merge the override file (compose.override.yaml) unless told otherwise; on by default like a plain up.
+  const [mergeOverride, setMergeOverride] = useState(true);
   const available = project.profiles ?? [];
 
   const toggleProfile = (p: string) =>
@@ -172,10 +197,10 @@ export const UpDialog: React.FC<{
       onClose={onClose}
       footer={
         <>
-          <Button size="sm" variant="ghost" onClick={onClose}>
+          <Button className="rounded-none" size="sm" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button
+          <Button className="rounded-none"
             size="sm"
             variant="primary"
             onClick={() =>
@@ -184,6 +209,8 @@ export const UpDialog: React.FC<{
                 env_file: envFile.trim() || null,
                 force_recreate: forceRecreate,
                 remove_orphans: removeOrphans,
+                // Only sent when an override file exists; otherwise the backend has nothing to skip.
+                ...(project.override_file ? { skip_override: !mergeOverride } : {}),
               })
             }
           >
@@ -237,6 +264,23 @@ export const UpDialog: React.FC<{
           />
           <p className="mt-1 text-[11px] text-zinc-500">Relative to the project folder, e.g. <code>.env.staging</code>.</p>
         </div>
+        {project.override_file && (
+          <label
+            className="flex cursor-pointer items-start gap-2 border border-amber-500/30 bg-amber-500/5 px-3 py-2"
+            title="The override file is merged on top of the compose file, as docker compose does by default"
+          >
+            <input
+              type="checkbox"
+              checked={mergeOverride}
+              onChange={(e) => setMergeOverride(e.target.checked)}
+              className="mt-0.5 h-3.5 w-3.5 rounded-none accent-amber-500"
+            />
+            <span className="text-xs text-zinc-300">
+              Merge <code className="font-mono text-amber-200">{project.override_file}</code>
+              <span className="block text-[11px] text-zinc-500">Uncheck to run with the base compose file only.</span>
+            </span>
+          </label>
+        )}
         <div className="space-y-2">
           <Switch
             checked={forceRecreate}
@@ -273,10 +317,10 @@ export const DownDialog: React.FC<{
       onClose={onClose}
       footer={
         <>
-          <Button size="sm" variant="ghost" onClick={onClose}>
+          <Button className="rounded-none" size="sm" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button
+          <Button className="rounded-none"
             size="sm"
             variant="danger"
             onClick={() => onSubmit({ remove_volumes: removeVolumes, remove_orphans: removeOrphans })}
@@ -328,17 +372,17 @@ export const ScaleDialog: React.FC<{
       className="max-w-sm"
       footer={
         <>
-          <Button size="sm" variant="ghost" onClick={onClose}>
+          <Button className="rounded-none" size="sm" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" variant="primary" disabled={!valid || n === current} onClick={() => onSubmit(n)}>
+          <Button className="rounded-none" size="sm" variant="primary" disabled={!valid || n === current} onClick={() => onSubmit(n)}>
             Scale to {valid ? n : "?"}
           </Button>
         </>
       }
     >
       <div className="flex items-center gap-2">
-        <Button size="sm" variant="outline" onClick={() => setValue(String(Math.max(0, (valid ? n : current) - 1)))}>
+        <Button className="rounded-none" size="sm" variant="outline" onClick={() => setValue(String(Math.max(0, (valid ? n : current) - 1)))}>
           −
         </Button>
         <input
@@ -349,7 +393,7 @@ export const ScaleDialog: React.FC<{
           className={cn(inputClass, "w-20 text-center font-mono")}
           aria-label="Replica count"
         />
-        <Button size="sm" variant="outline" onClick={() => setValue(String(Math.min(100, (valid ? n : current) + 1)))}>
+        <Button className="rounded-none" size="sm" variant="outline" onClick={() => setValue(String(Math.min(100, (valid ? n : current) + 1)))}>
           +
         </Button>
       </div>
@@ -447,10 +491,10 @@ export const ExposeDialog: React.FC<{
       onClose={onClose}
       footer={
         <>
-          <Button size="sm" variant="ghost" onClick={onClose}>
+          <Button className="rounded-none" size="sm" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" variant="primary" disabled={port === null || !validDomain || saving} onClick={() => void save()}>
+          <Button className="rounded-none" size="sm" variant="primary" disabled={port === null || !validDomain || saving} onClick={() => void save()}>
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Globe className="h-3.5 w-3.5" />}
             {taken ? "Replace route" : "Expose"}
           </Button>
@@ -520,6 +564,266 @@ export const ExposeDialog: React.FC<{
     </DialogShell>
   );
 };
+
+// ---------------------------------------------------------------------------
+// Pull and build
+// ---------------------------------------------------------------------------
+
+export const PullDialog: React.FC<{
+  project: ComposeProjectInfo;
+  onClose: () => void;
+  onSubmit: (options: ComposePullOptions) => void;
+}> = ({ project, onClose, onSubmit }) => {
+  const [ignoreFailures, setIgnoreFailures] = useState(false);
+  // Services with an image to pull; build-only services have nothing to pull.
+  const images = (project.declared ?? []).filter((s) => s.image).map((s) => s.name);
+  return (
+    <DialogShell
+      title={`Pull images for ${project.name}`}
+      subtitle="docker compose pull"
+      icon={<Download className="h-4 w-4" />}
+      onClose={onClose}
+      footer={
+        <>
+          <Button size="sm" variant="ghost" className="rounded-none" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
+            className="rounded-none"
+            onClick={() => onSubmit({ ignore_failures: ignoreFailures })}
+          >
+            <Download className="h-3.5 w-3.5" />
+            Pull
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <p className="text-xs text-zinc-400">
+          {images.length > 0 ? (
+            <>
+              Pulls {images.length} image{images.length === 1 ? "" : "s"}:{" "}
+              <span className="font-mono text-zinc-300">{images.join(", ")}</span>
+            </>
+          ) : (
+            "Pulls every image the compose file declares."
+          )}
+        </p>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={ignoreFailures}
+            onChange={(e) => setIgnoreFailures(e.target.checked)}
+            className="h-3.5 w-3.5 rounded-none accent-blue-500"
+          />
+          Ignore failures
+          <span className="text-[11px] text-zinc-500">(keep going when one image cannot be pulled)</span>
+        </label>
+      </div>
+    </DialogShell>
+  );
+};
+
+export const BuildDialog: React.FC<{
+  project: ComposeProjectInfo;
+  onClose: () => void;
+  onSubmit: (options: ComposeBuildOptions) => void;
+}> = ({ project, onClose, onSubmit }) => {
+  const [noCache, setNoCache] = useState(false);
+  const [pull, setPull] = useState(false);
+  const builds = (project.declared ?? []).filter((s) => s.build).map((s) => s.name);
+  return (
+    <DialogShell
+      title={`Build ${project.name}`}
+      subtitle="docker compose build"
+      icon={<Hammer className="h-4 w-4" />}
+      onClose={onClose}
+      footer={
+        <>
+          <Button size="sm" variant="ghost" className="rounded-none" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
+            className="rounded-none"
+            onClick={() => onSubmit({ no_cache: noCache, pull })}
+          >
+            <Hammer className="h-3.5 w-3.5" />
+            Build
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <p className="text-xs text-zinc-400">
+          Builds <span className="font-mono text-zinc-300">{builds.join(", ") || "the services with a build section"}</span>.
+        </p>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={noCache}
+            onChange={(e) => setNoCache(e.target.checked)}
+            className="h-3.5 w-3.5 rounded-none accent-blue-500"
+          />
+          No cache
+          <span className="text-[11px] text-zinc-500">(rebuild every layer)</span>
+        </label>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={pull}
+            onChange={(e) => setPull(e.target.checked)}
+            className="h-3.5 w-3.5 rounded-none accent-blue-500"
+          />
+          Pull base images
+          <span className="text-[11px] text-zinc-500">(take newer FROM images)</span>
+        </label>
+      </div>
+    </DialogShell>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+export const ExportDialog: React.FC<{
+  project: ComposeProjectInfo;
+  onClose: () => void;
+  onDone: () => void;
+}> = ({ project, onClose, onDone }) => {
+  const toast = useToast();
+  const [dest, setDest] = useState("");
+  const [includeEnv, setIncludeEnv] = useState(false);
+  // Secrets are masked unless the user explicitly turns it off; an archive is easy to share by accident.
+  const [maskSecrets, setMaskSecrets] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const archive = await api.composeExport(project.path, dest.trim() || null, includeEnv, maskSecrets);
+      toast.success("Project exported", archive);
+      onDone();
+    } catch (e) {
+      toast.error("Export failed", String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <DialogShell
+      title={`Export ${project.name}`}
+      subtitle="Pack the compose file into an archive"
+      icon={<PackageCheck className="h-4 w-4" />}
+      onClose={onClose}
+      footer={
+        <>
+          <Button size="sm" variant="ghost" className="rounded-none" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="primary" className="rounded-none" disabled={busy} onClick={() => void run()}>
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <PackageCheck className="h-3.5 w-3.5" />}
+            Export
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div>
+          <label className="mb-1.5 block text-[11px] uppercase tracking-wider text-zinc-500" htmlFor="compose-export-dest">
+            Destination folder
+          </label>
+          <input
+            id="compose-export-dest"
+            value={dest}
+            onChange={(e) => setDest(e.target.value)}
+            placeholder="~/hsx2dock-backups/projects (default)"
+            className={cn(inputClass, "font-mono")}
+          />
+        </div>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={includeEnv}
+            onChange={(e) => setIncludeEnv(e.target.checked)}
+            className="h-3.5 w-3.5 rounded-none accent-blue-500"
+          />
+          Include .env
+          <span className="text-[11px] text-zinc-500">{project.env_file ? "" : "(this project has no .env)"}</span>
+        </label>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={maskSecrets}
+            disabled={!includeEnv}
+            onChange={(e) => setMaskSecrets(e.target.checked)}
+            className="h-3.5 w-3.5 rounded-none accent-blue-500 disabled:opacity-40"
+          />
+          Mask secrets
+          <span className="text-[11px] text-zinc-500">(passwords and tokens in .env become placeholders)</span>
+        </label>
+        {includeEnv && !maskSecrets && (
+          <p className="border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+            The archive will contain real passwords and tokens. Keep it somewhere private.
+          </p>
+        )}
+      </div>
+    </DialogShell>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+export const AlertsDialog: React.FC<{
+  project: string;
+  alerts: ComposeAlert[];
+  onClear: () => void;
+  onClose: () => void;
+}> = ({ project, alerts, onClear, onClose }) => (
+  <DialogShell
+    title={`Alerts for ${project}`}
+    subtitle="Unhealthy, crashed and restart-looping services"
+    icon={<BellRing className="h-4 w-4 text-rose-400" />}
+    onClose={onClose}
+    footer={
+      <>
+        <Button size="sm" variant="ghost" className="rounded-none" onClick={onClose}>
+          Close
+        </Button>
+        <Button size="sm" variant="outline" className="rounded-none" onClick={onClear} disabled={alerts.length === 0}>
+          <Trash2 className="h-3.5 w-3.5" />
+          Clear
+        </Button>
+      </>
+    }
+  >
+    {alerts.length === 0 ? (
+      <p className="py-6 text-center text-xs text-zinc-500">No alerts.</p>
+    ) : (
+      <ul className="divide-y divide-zinc-800 border border-zinc-800">
+        {alerts.map((a, i) => (
+          <li key={`${a.container}|${a.kind}|${a.time}|${i}`} className="px-3 py-2">
+            <div className="flex items-baseline gap-2">
+              <span className="border border-rose-500/40 bg-rose-500/10 px-1 text-[10px] uppercase tracking-wider text-rose-300">
+                {ALERT_KIND_LABEL[a.kind] ?? a.kind}
+              </span>
+              <span className="truncate font-mono text-[11px] text-zinc-300">{a.service}</span>
+              <span className="ml-auto shrink-0 font-mono text-[10px] text-zinc-500">{formatRelativeTime(a.time)}</span>
+            </div>
+            <p className="mt-1 text-xs text-zinc-400">{a.message}</p>
+          </li>
+        ))}
+      </ul>
+    )}
+  </DialogShell>
+);
 
 export const SearchBox: React.FC<{ value: string; onChange: (v: string) => void; placeholder: string }> = ({
   value,

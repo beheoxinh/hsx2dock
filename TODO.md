@@ -264,36 +264,46 @@ Trạng thái: **chưa commit**. Code nằm trong working tree. Bản release đ
 - [x] Tab Env: mỗi dòng có id ổn định (`uid`), nên xoá hoặc thêm dòng không làm lệch trạng thái ẩn/hiện. Revert ẩn lại mọi giá trị.
 - [x] Drawer và lựa chọn project dùng key `name|path`. Trạng thái busy vẫn theo tên project, vì cùng tên nghĩa là cùng một bộ container.
 
-### C3 — Tính năng mở rộng (đề xuất, chưa chọn)
-#### C3.1 Pull và build (lần trước chưa chọn)
-- [ ] `compose pull` theo project hoặc theo service, có tiến trình trong panel.
-- [ ] `compose build` (có tuỳ chọn `--no-cache` và `--pull`), stream log build.
-- [ ] Badge "image có bản mới" khi digest local khác registry.
+### C3 — Tính năng mở rộng (2026-11-26, đã làm, chưa commit)
+#### C3.1 Pull và build
+- [x] `compose pull` theo project (menu ⋯, tuỳ chọn ignore failures) hoặc theo service (tab Services), output stream vào panel tiến trình.
+- [x] `compose build` với `--no-cache` và `--pull`, theo project hoặc theo service.
+- [x] Badge "N image updates" trên card và badge theo service: so RepoDigests local với registry (dùng credential đã lưu, cache 15 phút, timeout 20s). Bấm badge để pull đúng các service đó.
 
 #### C3.2 Tạo project mới
-- [ ] Wizard tạo `compose.yaml` từ template (web + db, wordpress, postgres + pgadmin…). Chọn thư mục, ghi file, ghim, Up.
-- [ ] Chuyển một nhóm container đang chạy sang compose: sinh YAML từ inspect.
+- [x] Nút "New project": 6 template (nginx, web + postgres, wordpress + mariadb, postgres + pgadmin, redis, node build + watch), `.env` có mật khẩu ngẫu nhiên, sửa YAML trước khi tạo, ghim, Up now.
+- [x] Từ một container group: sinh YAML từ inspect (bỏ giá trị trùng image, volume và network ngoài là `external`), cảnh báo phải dừng container gốc trước khi Up.
+- [x] Import archive đã export.
 
 #### C3.3 Nhiều file và override
-- [ ] Hỗ trợ nhiều `-f` (`compose.yaml` + `compose.override.yaml`), chọn file khi Up. Editor có tab cho từng file.
-- [ ] Xem config đã merge (`compose config`) ở chế độ chỉ đọc.
+- [x] Tự nhận `compose.override.yaml` cạnh file chuẩn và thêm vào `-f`. Up dialog có checkbox "Merge <override>". Card có badge override. Tab Compose file chọn base hoặc override; validate override cùng base.
+- [x] Tab "Merged config" chỉ đọc (`compose config`).
 
 #### C3.4 Theo dõi sâu hơn
-- [ ] Thay polling 5s bằng event stream của Docker (container start/stop/die/health_status) theo label `com.docker.compose.project`.
-- [ ] Lịch sử CPU/RAM theo project (ring buffer như kind-history), sparkline trên card.
-- [ ] Thông báo desktop khi service unhealthy, exit ≠ 0 hoặc restart liên tục (dùng lại cơ chế cảnh báo của Giai đoạn 5).
-- [ ] Chi tiết healthcheck: lần chạy gần nhất, output, số lần fail.
+- [x] Event stream Docker theo label compose: trang refresh khi có event (debounce 600ms), polling dự phòng 30s.
+- [x] Lịch sử CPU/RAM 60 mẫu mỗi project, sparkline trên card.
+- [x] Cảnh báo crash (exit ≠ 0), restart loop (3 lần trong 5 phút), unhealthy: badge đỏ trên card, toast, thông báo desktop (Settings › Notifications › Compose alerts, có mute theo project).
+- [x] Chi tiết healthcheck trong tab Services: status, failing streak, test, interval/timeout/retries, các lần chạy gần nhất và output.
 
 #### C3.5 Editor
-- [ ] Tô màu cú pháp YAML (CodeMirror 6 hoặc highlight nhẹ), gập khối, tìm kiếm.
-- [ ] Gợi ý key compose theo JSON schema chính thức.
-- [ ] Tự reload khi file bị sửa bên ngoài (file watcher). Cảnh báo xung đột nếu đang có bản nháp.
+- [x] CodeMirror 6: tô màu YAML, gập khối, tìm kiếm, lint dòng lỗi, gợi ý key và giá trị compose.
+- [x] Poll file mỗi 3s: tự reload khi không có bản nháp, có banner xung đột khi đang sửa.
 
 #### C3.6 Khác
-- [ ] `compose watch` (dev mode, sync file) bật/tắt theo project.
-- [ ] Xuất và nhập project (YAML, `.env` tuỳ chọn, ẩn secret).
-- [ ] Volume của project: dung lượng, backup/restore volume trước khi `down -v`.
-- [ ] MCP: `compose_read_file`, `compose_save_file` (cần confirm), `compose_env_get`, `compose_env_set`.
+- [x] `compose watch` bật/tắt theo project (chỉ khi có `develop.watch`), badge "watching", dừng hết khi thoát app.
+- [x] Export project (tar.gz, `.env` tuỳ chọn, ẩn secret) vào `~/hsx2dock-backups/projects`.
+- [x] Tab Volumes: dung lượng, ai đang dùng, backup ra `~/hsx2dock-backups/volumes`, restore (bị chặn khi container đang chạy dùng volume).
+- [x] MCP: `compose_read_file`, `compose_save_file` (confirm, validate trước khi ghi), `compose_env_get` (ẩn secret trừ khi `reveal`), `compose_env_set` (confirm). Đã test live qua `hsx2dock-mcp`.
+
+#### Kind
+- [x] Settings › Kubernetes › "Unused node state": liệt kê thư mục state của cluster không còn tồn tại (không bị mount, không có cluster trùng tên, cũ hơn 15 phút), xoá có xác nhận, backend kiểm tra lại trước khi xoá.
+
+#### Còn lại
+- [ ] Kiểm tra bằng mắt trên UI: các tab drawer mới (Volumes, Merged, chọn file override), badge trên card, New project, Export, health details, Compose alerts trong Notifications, Unused node state.
+- [x] Test live trên engine (project test 4 service): pull, build `--pull`, Up qua MCP có merge override (`FROM_OVERRIDE=yes`), `compose watch` sync file vào container, backup và restore volume bằng đúng lệnh helper của app, thông báo desktop cho crash, unhealthy và restart loop (mỗi loại đúng một lần).
+- [ ] Chưa test live bước xoá nội dung volume trước khi restore (`find /data ... rm`), chỉ test restore vào volume rỗng.
+- [ ] Op pull/build/volume mở từ drawer hiện ở dải output riêng trong drawer, chưa hiện trong panel tiến trình của trang.
+- [ ] Menu ⋯ dùng `ClusterOverflowMenu` và `Button` mặc định còn bo góc (`rounded-lg`).
 
 
 ## Sắp xếp danh sách và dọn route Gateway (2026-11-26, chưa commit)
@@ -314,8 +324,16 @@ Trạng thái: **chưa commit**. Code nằm trong working tree. Bản release đ
 - [x] Cài kind từ trang Kubernetes cũng đi qua store chung, nên không chạy song song với update trong Settings.
 - [ ] Kiểm tra live: update engine thật, xem tiến độ không bị mất khi engine restart.
 
+## Rà soát hiệu năng và rò rỉ (2026-11-26, chưa commit)
+- [x] dockerd ngốn ~12% CPU khi app idle. Nguyên nhân: `containers/json?size=true` (đo bằng strace) chạy mỗi 60s, mỗi lần ~12s CPU và RSS dockerd tăng ~350 MB trên fuse-overlayfs. Đã đổi `container_sizes` và kích thước node kind sang cache 5 phút, trả kết quả cũ ngay và tính lại trong nền. ContainerGroupsBar hỏi size mỗi 120s thay vì 30s.
+- [x] Backend: AlertRules có prune; `is_watching` không còn nuốt sự kiện `compose-watch-ended`; cache digest registry có loại entry hết hạn; Volumes của project gọi dockerd một lần thay vì N+1; port-forward lỗi có thể Start lại; sweeper Gateway chỉ log khi lỗi đổi; kind history ghi file ngoài lock; `forget_cluster` xoá `api_failures`; log MCP không còn in hai lần; khoá chống bind trùng port MCP.
+- [x] Frontend: ComposeProjectCard dùng memo, callback ổn định, chỉ nhận số liệu CPU/RAM thay vì cả bản đồ stats; output tiến trình gom theo animation frame; `listKindClusters` dùng chung một lần gọi (TTL 8s, xoá cache khi tạo hoặc xoá cluster); ClusterMonitor 6s → 12s; HealthDetails không chồng request; Dashboard không render khi cửa sổ ẩn; ConfigTab chỉ poll file khi tab đang mở; GatewayPage không probe lại mỗi lần render.
+- [x] App ngốn 12–15% CPU khi idle trên Dashboard. Nguyên nhân: skeleton "Collecting samples…" của 3 biểu đồ nhấp nháy mãi khi không có container nào chạy (không bao giờ có mẫu stats), WebKitGTK vẽ lại cửa sổ 60 khung hình/giây. Tìm ra bằng diagnostic tạm `document.getAnimations()` (đã gỡ). Giờ hiện "No running containers" tĩnh; `Skeleton` có prop `pulse`. Bỏ luôn các chấm nhấp nháy vô hạn: Gateway "Active", Settings › Gateway, ClusterMonitor "ready", icon "watching" của Compose. Sau sửa: app 0,1%, webview 0%, dockerd 0,6% khi idle.
+- [x] Đã kiểm tra: mọi `listen()` đều được huỷ đúng, kể cả khi unmount trước khi listen xong; xterm, CodeMirror và ResizeObserver được dọn; các store module-level đều có giới hạn.
+- [ ] Còn lại (thấp): Dashboard vẫn render lại mỗi 2s khi đang hiển thị (nên tách chart thành component memo); MergedTab render mọi dòng vào DOM; `alertsByCluster` và `prefsByName` trên trang Kubernetes không bị cắt khi xoá cluster; vòng monitor vẫn gọi `containers/json` mỗi 2s (rẻ, có thể chuyển sang event stream).
+
 ## Ghi chú khác
 - Node kind dừng với exit 137 khi tắt engine. Nên xem lại tín hiệu dừng (SIGRTMIN+3) và grace period.
 - Follow-up: container publish port ngẫu nhiên hoặc ephemeral không tới được từ host (giới hạn của pasta).
 - Repo chưa sạch `cargo fmt` từ trước (compose.rs, kind.rs…). Không format lại trong đợt này.
-- Kubernetes Giai đoạn 1–5 đã xong (xem phần kiểm tra ở trên). Việc Compose còn lại nằm ở mục C2 và C3.
+- Kubernetes Giai đoạn 1–5 đã xong (xem phần kiểm tra ở trên). Compose C3 đã làm; phần còn kiểm tra nằm cuối mục C3.

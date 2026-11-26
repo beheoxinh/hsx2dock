@@ -40,6 +40,13 @@ pub struct ComposeProjectInfo {
     /// Why the file could not be read or resolved, if it could not.
     #[serde(default)]
     pub config_error: String,
+    /// The override file merged on top of `path` (compose's default
+    /// `compose.override.yaml`), when there is one.
+    #[serde(default)]
+    pub override_file: String,
+    /// A `compose watch` session started by the app is running.
+    #[serde(default)]
+    pub watching: bool,
 }
 
 /// One streamed output line of a running compose operation.
@@ -51,7 +58,7 @@ struct ProgressLine {
 
 /// A sink that forwards each line as a `compose-progress` event, or none
 /// when the caller did not ask for progress.
-fn progress_sink(app: &AppHandle, op_id: Option<String>) -> Option<LineSink> {
+pub(crate) fn progress_sink(app: &AppHandle, op_id: Option<String>) -> Option<LineSink> {
     let op_id = op_id.filter(|id| !id.is_empty())?;
     let app = app.clone();
     Some(Box::new(move |line: &str| {
@@ -62,7 +69,7 @@ fn progress_sink(app: &AppHandle, op_id: Option<String>) -> Option<LineSink> {
     }))
 }
 
-fn err(e: anyhow::Error) -> String {
+pub(crate) fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
@@ -70,7 +77,7 @@ fn err(e: anyhow::Error) -> String {
 // Discovery
 // ---------------------------------------------------------------------------
 
-type ModelKey = (PathBuf, Option<SystemTime>, Option<SystemTime>);
+type ModelKey = (PathBuf, Option<SystemTime>, Option<SystemTime>, Option<(PathBuf, Option<SystemTime>)>);
 
 /// `compose config` costs a CLI round trip, so each file's model is kept
 /// until the file or its `.env` changes.
@@ -81,9 +88,13 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-async fn cached_model(file: &Path) -> Result<ComposeModel, String> {
+pub(crate) async fn cached_model(file: &Path) -> Result<ComposeModel, String> {
     let env = compose::env_path(file, None).ok();
-    let key: ModelKey = (file.to_path_buf(), mtime(file), env.as_deref().and_then(mtime));
+    let over = compose::override_file_for(file).map(|o| {
+        let t = mtime(&o);
+        (o, t)
+    });
+    let key: ModelKey = (file.to_path_buf(), mtime(file), env.as_deref().and_then(mtime), over);
     if let Some((k, v)) = MODEL_CACHE.lock().ok().and_then(|c| c.get(file).cloned()) {
         if k == key {
             return v;
@@ -113,6 +124,10 @@ async fn describe_file(file: &Path, info: &mut ComposeProjectInfo) {
             info.env_file = env.display().to_string();
         }
     }
+    info.override_file = compose::override_file_for(file)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    info.watching = crate::commands::compose_watch::is_watching(file);
     match cached_model(file).await {
         Ok(model) => {
             if info.name.is_empty() {
@@ -348,17 +363,22 @@ pub struct UpRequest {
     pub profiles: Vec<String>,
     /// Env file relative to the project directory (default: compose's own).
     pub env_file: Option<String>,
+    /// Leave the default override file (`compose.override.yaml`) out.
+    pub skip_override: bool,
     #[serde(flatten)]
     pub options: UpOptions,
 }
 
-fn file_target(file_path: &str, env_file: Option<&str>, profiles: Vec<String>) -> Result<Target, String> {
+pub(crate) fn file_target(file_path: &str, env_file: Option<&str>, profiles: Vec<String>) -> Result<Target, String> {
     let file = compose::resolve_compose_file(file_path).map_err(err)?;
     let env_file = match env_file.map(str::trim).filter(|e| !e.is_empty()) {
         Some(name) => Some(compose::env_path(&file, Some(name)).map_err(err)?),
         None => None,
     };
-    Ok(Target { file: Some(file), env_file, profiles, ..Default::default() })
+    // `-f` switches compose's own override lookup off; add it back so the
+    // app runs the project exactly like `docker compose up` in its folder.
+    let extra_files = compose::override_file_for(&file).into_iter().collect();
+    Ok(Target { file: Some(file), extra_files, env_file, profiles, ..Default::default() })
 }
 
 #[tauri::command]
@@ -377,7 +397,10 @@ pub(crate) async fn compose_up_core(
     req: UpRequest,
     sink: Option<LineSink>,
 ) -> Result<String, String> {
-    let target = file_target(file_path, req.env_file.as_deref(), req.profiles)?;
+    let mut target = file_target(file_path, req.env_file.as_deref(), req.profiles)?;
+    if req.skip_override {
+        target.extra_files.clear();
+    }
     let verb = compose::up_args(&req.options).map_err(err)?;
     compose::run(target, verb, sink).await.map_err(err)
 }
@@ -567,7 +590,8 @@ pub(crate) async fn compose_validate_core(
         Some(t) => t,
         None => compose::read_text(&file).map_err(err)?.unwrap_or_default(),
     };
-    Ok(match compose::validate_text(&file, text, env).await {
+    let stack = edit_stack(&file);
+    Ok(match compose::validate_in_stack(&file, text, env, &stack).await {
         Ok(model) => ComposeValidation { ok: true, error: String::new(), model: Some(model) },
         Err(e) => ComposeValidation { ok: false, error: err(e), model: None },
     })
@@ -582,11 +606,32 @@ pub async fn compose_save_file(
     original: String,
 ) -> Result<(), String> {
     let file = compose::resolve_compose_file(&file_path).map_err(err)?;
-    let check = compose::validate_text(&file, content.clone(), None).await;
+    let stack = edit_stack(&file);
+    let check = compose::validate_in_stack(&file, content.clone(), None, &stack).await;
     if let Err(e) = check {
         return Err(format!("not saved, the file does not validate: {}", err(e)));
     }
     compose::write_text_checked(&file, &content, Some(&original)).map_err(err)
+}
+
+/// The `-f` stack an edited file is validated in: an override file is only
+/// meaningful merged onto its base, and a base is checked with its override.
+fn edit_stack(file: &Path) -> Vec<PathBuf> {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name.contains(".override.") {
+        if let Some(dir) = file.parent() {
+            if let Some(base) = compose::compose_file_in(dir) {
+                if compose::override_file_for(&base).as_deref() == Some(file) {
+                    return vec![base, file.to_path_buf()];
+                }
+            }
+        }
+        return Vec::new();
+    }
+    match compose::override_file_for(file) {
+        Some(o) => vec![file.to_path_buf(), o],
+        None => Vec::new(),
+    }
 }
 
 #[derive(Clone, Serialize)]

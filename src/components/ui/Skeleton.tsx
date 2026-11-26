@@ -6,13 +6,14 @@ import { cn } from "../../lib/utils";
  * pulse stays in step across a page, and `prefers-reduced-motion` users get a
  * static block instead of a shimmer (see `index.css`).
  */
-export const Skeleton: React.FC<React.HTMLAttributes<HTMLDivElement>> = ({
+export const Skeleton: React.FC<React.HTMLAttributes<HTMLDivElement> & { pulse?: boolean }> = ({
   className,
+  pulse = true,
   ...props
 }) => (
   <div
     aria-hidden="true"
-    className={cn("skeleton animate-pulse rounded-md bg-zinc-800/70", className)}
+    className={cn("skeleton rounded-md bg-zinc-800/70", pulse && "animate-pulse", className)}
     {...props}
   />
 );
@@ -113,14 +114,17 @@ export const ChartSkeleton: React.FC<{
   /** Caption centred over the plot, e.g. "Collecting samples…". */
   hint?: string;
   className?: string;
-}> = ({ hint, className }) => {
+  /** false = a still placeholder. A pulse repaints the webview every frame
+   *  (~10% CPU on WebKitGTK), so it must only run while data is on its way. */
+  pulse?: boolean;
+}> = ({ hint, className, pulse = true }) => {
   // Several charts can render at once; a shared gradient id would collide.
   const fillId = React.useId();
   return (
     <div aria-hidden="true" className={cn("flex h-full w-full gap-2", className)}>
       <div className="flex w-11 shrink-0 flex-col justify-between py-[2px]">
         {Array.from({ length: 3 }, (_, i) => (
-          <Skeleton key={i} className={cn("h-2", i === 2 ? "w-3" : "w-8")} />
+          <Skeleton key={i} pulse={pulse} className={cn("h-2", i === 2 ? "w-3" : "w-8")} />
         ))}
       </div>
       <div className="relative min-w-0 flex-1 overflow-hidden">
@@ -143,7 +147,7 @@ export const ChartSkeleton: React.FC<{
         <svg
           viewBox="0 0 100 40"
           preserveAspectRatio="none"
-          className="absolute inset-x-0 bottom-0 h-3/4 w-full animate-pulse text-zinc-700/40"
+          className={cn("absolute inset-x-0 bottom-0 h-3/4 w-full text-zinc-700/40", pulse && "animate-pulse")}
         >
           <defs>
             <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">

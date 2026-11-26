@@ -39,6 +39,8 @@ import type {
 } from "../types";
 
 const ROUTE_SORT_KEYS = ["domain", "type", "container", "status", "target"] as const;
+/** Stable empty list: a fresh [] per render would re-run the upstream probe effect (its deps include this list). */
+const NO_CONTAINERS: ContainerItem[] = [];
 type RouteSortKey = (typeof ROUTE_SORT_KEYS)[number];
 const ROUTE_SORT_OPTIONS: { key: RouteSortKey; label: string }[] = [
   { key: "domain", label: "domain" },
@@ -61,7 +63,7 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
   // as running (or stopped) until the page was reopened.
   const containerStore = useContainerStore();
   const allContainers: ContainerItem[] =
-    daemonState === "Running" ? containerStore.containers : [];
+    daemonState === "Running" ? containerStore.containers : NO_CONTAINERS;
   const [loading, setLoading] = useState(true);
   /** Route id → upstream answered a TCP connect on the last probe. */
   const [upstreamUp, setUpstreamUp] = useState<Record<string, boolean>>({});
@@ -451,7 +453,8 @@ export const GatewayPage: React.FC<GatewayPageProps> = ({ daemonState }) => {
                 HTTPS Gateway & Local Proxy
                 {status?.running && (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-none text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    {/* Static on purpose: an endless pulse repaints the webview every frame. */}
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                     Active
                   </span>
                 )}

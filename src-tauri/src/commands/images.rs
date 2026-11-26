@@ -525,7 +525,7 @@ fn build_auth_key(host: &str) -> String {
 
 /// The saved login for the registry `host` names. Matched on the same key as
 /// the build's registry map, so `index.docker.io/...` finds the Docker Hub login.
-async fn saved_credentials(
+pub(crate) async fn saved_credentials(
     state: &AppState,
     host: &str,
 ) -> Option<bollard::auth::DockerCredentials> {

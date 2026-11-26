@@ -86,7 +86,7 @@ export const IconAction: React.FC<{
     title={title}
     aria-label={title}
     className={cn(
-      "h-8 w-8 text-zinc-300",
+      "h-8 w-8 rounded-none text-zinc-300",
       danger && "hover:text-rose-300 hover:border-rose-500/50",
       className
     )}

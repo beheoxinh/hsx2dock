@@ -103,12 +103,19 @@ pub async fn mcp_status(state: State<'_, Arc<AppState>>) -> Result<McpStatus, St
     Ok(status_of(state.inner(), &config).await)
 }
 
+/// Serialises every start/stop of the HTTP listener. The startup hook, a config
+/// save and a Settings toggle can reach [`apply_mcp_enabled`] at the same time;
+/// without this, two of them could both see "not running" and race to bind the
+/// port, the loser failing with a spurious bind error.
+static MCP_LISTENER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Starts or stops the loopback HTTP server to match `enabled`.
 ///
 /// Enabling creates a token on first use and persists it; disabling stops the
 /// listener but keeps the token, so re-enabling does not invalidate every
 /// agent already configured.
 pub(crate) async fn apply_mcp_enabled(state: &Arc<AppState>, enabled: bool) -> Result<(), String> {
+    let _listener = MCP_LISTENER.lock().await;
     if !enabled {
         *state.mcp_server.write().await = None;
         return Ok(());
@@ -217,6 +224,7 @@ pub async fn mcp_set_read_only(
 /// point of a rotation.
 #[tauri::command]
 pub async fn mcp_rotate_token(state: State<'_, Arc<AppState>>) -> Result<McpStatus, String> {
+    let _listener = MCP_LISTENER.lock().await;
     let was_running = state.mcp_server.read().await.is_some();
     *state.mcp_server.write().await = None;
 

@@ -198,9 +198,9 @@ pub async fn start(
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             shutdown.cancelled().await;
         });
-        if ready_tx.send(()).is_ok() {
-            tracing::info!("MCP HTTP listening on http://{addr}/mcp");
-        }
+        // The caller logs "listening" once `start` has returned; logging here
+        // as well printed the same line twice per start.
+        let _ = ready_tx.send(());
         if let Err(e) = server.await {
             tracing::error!("MCP HTTP server stopped: {e}");
         }

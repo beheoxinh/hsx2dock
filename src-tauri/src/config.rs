@@ -237,6 +237,25 @@ pub struct NotificationPrefs {
     /// Kubernetes incident alerts from the cluster watcher.
     #[serde(default)]
     pub k8s_alerts: K8sAlertPrefs,
+    /// Compose service alerts (unhealthy, crashed, restart loop).
+    #[serde(default)]
+    pub compose_alerts: ComposeAlertPrefs,
+}
+
+/// Which Compose service problems raise a desktop notification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeAlertPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Projects whose alerts are listed but never notified.
+    #[serde(default)]
+    pub muted_projects: Vec<String>,
+}
+
+impl Default for ComposeAlertPrefs {
+    fn default() -> Self {
+        Self { enabled: true, muted_projects: Vec::new() }
+    }
 }
 
 /// Which cluster incidents raise a desktop notification.
@@ -288,6 +307,7 @@ impl Default for NotificationPrefs {
             kind_events: default_true(),
             tray_hidden: default_true(),
             k8s_alerts: K8sAlertPrefs::default(),
+            compose_alerts: ComposeAlertPrefs::default(),
         }
     }
 }

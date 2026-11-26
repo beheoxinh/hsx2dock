@@ -13,19 +13,6 @@ export interface ComposeOp {
   finished?: number;
 }
 
-const MAX_LINES = 400;
-
-/** Appends one progress line to the matching op, keeping the tail. */
-export function appendOpLine(ops: ComposeOp[], opId: string, line: string): ComposeOp[] {
-  const i = ops.findIndex((o) => o.id === opId);
-  if (i < 0) return ops;
-  const op = ops[i];
-  const lines = op.lines.length >= MAX_LINES ? [...op.lines.slice(-MAX_LINES + 1), line] : [...op.lines, line];
-  const next = [...ops];
-  next[i] = { ...op, lines };
-  return next;
-}
-
 function elapsed(op: ComposeOp): string {
   const ms = (op.finished ?? Date.now()) - op.started;
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;

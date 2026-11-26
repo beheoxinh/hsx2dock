@@ -475,7 +475,9 @@ export const ContainerGroupsBar: React.FC<ContainerGroupsBarProps> = ({
     const t = setInterval(() => {
       if (document.hidden) return;
       void loadSizes();
-    }, 30_000);
+      // The backend re-walks sizes at most every 5 min (each walk costs
+      // dockerd seconds of CPU), so asking more often only returns the cache.
+    }, 120_000);
     return () => clearInterval(t);
   }, [loadSizes, sizesMap]);
 

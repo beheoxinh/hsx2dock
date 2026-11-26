@@ -13,6 +13,11 @@ use super::models::{
 /// A value cached with the moment it was fetched, shared across clones.
 type TimedCache<T> = std::sync::Arc<tokio::sync::RwLock<Option<(std::time::Instant, T)>>>;
 
+/// How long container RW-layer sizes are reused before a background re-walk.
+const CONTAINER_SIZES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+static SIZES_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SIZES_COLD_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 pub struct DockerClient {
     docker: Docker,
@@ -159,28 +164,40 @@ impl DockerClient {
         })
     }
 
-    /// One-shot disk usage per container (bytes written to its RW layer).
-    /// `size=true` makes the daemon walk each container's layer, so this is
-    /// deliberately separate from the cheap `list_containers` the tick uses,
-    /// and cached for 60s to avoid hammering disk I/O on repeated refreshes.
+    /// Disk usage per container (bytes written to its RW layer).
+    /// `size=true` makes the daemon walk each container's layer: ~12s of
+    /// dockerd CPU with ~30 containers on fuse-overlayfs, and RSS jumps by
+    /// hundreds of MB. A 60s cache meant that walk ran every minute while the
+    /// Containers page was open (20% of a core, idle). RW-layer sizes change
+    /// slowly, so the answer is kept for [`CONTAINER_SIZES_TTL`] and served
+    /// stale-while-revalidate: only the very first call waits for a walk.
     pub async fn container_sizes(&self) -> anyhow::Result<std::collections::HashMap<String, u64>> {
-        {
-            let guard = self.sizes_cache.read().await;
-            if let Some((ts, ref map)) = *guard {
-                if ts.elapsed() < std::time::Duration::from_secs(60) {
-                    return Ok(map.clone());
-                }
+        use std::sync::atomic::Ordering;
+        let cached = self.sizes_cache.read().await.clone();
+        if let Some((ts, map)) = cached {
+            if ts.elapsed() >= CONTAINER_SIZES_TTL
+                && !SIZES_REFRESHING.swap(true, Ordering::AcqRel)
+            {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    // Bounded so a wedged daemon cannot leave the flag set.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(120), this.walk_sizes()).await;
+                    SIZES_REFRESHING.store(false, Ordering::Release);
+                });
             }
+            return Ok(map);
         }
-        // Single flight: concurrent callers with a stale cache each started
-        // their own engine-wide size walk. The write lock makes them queue
-        // behind one pass and read its result.
-        let mut slot = self.sizes_cache.write().await;
-        if let Some((ts, ref map)) = *slot {
-            if ts.elapsed() < std::time::Duration::from_secs(60) {
-                return Ok(map.clone());
-            }
+        // Cold cache: one caller walks, concurrent callers wait for it.
+        let _turn = SIZES_COLD_FLIGHT.lock().await;
+        if let Some((_, map)) = self.sizes_cache.read().await.clone() {
+            return Ok(map);
         }
+        self.walk_sizes().await
+    }
+
+    /// The expensive pass itself. The lock is taken only to store the
+    /// result, so readers keep getting the previous map during the walk.
+    async fn walk_sizes(&self) -> anyhow::Result<std::collections::HashMap<String, u64>> {
         let opts = bollard::query_parameters::ListContainersOptionsBuilder::default()
             .all(true)
             .size(true)
@@ -194,7 +211,7 @@ impl DockerClient {
                 Some((id, bytes))
             })
             .collect();
-        *slot = Some((std::time::Instant::now(), map.clone()));
+        *self.sizes_cache.write().await = Some((std::time::Instant::now(), map.clone()));
         Ok(map)
     }
 

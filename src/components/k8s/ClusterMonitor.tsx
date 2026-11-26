@@ -365,9 +365,10 @@ export const ClusterMonitor: React.FC<{
     };
     fast();
     // A window hidden to the tray polls nothing; the next visible tick catches up.
+    // 12s: each tick is three kubectl runs in the node container. The inflight flag above skips a tick while one is still running.
     const t1 = window.setInterval(() => {
       if (!document.hidden) fast();
-    }, 6000);
+    }, 12000);
     return () => {
       alive = false;
       window.clearInterval(t1);
@@ -1036,7 +1037,7 @@ export const ClusterMonitor: React.FC<{
             <span className="flex items-center gap-1.5">
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  summary.ready ? "bg-emerald-400 animate-pulse" : "bg-rose-400"
+                  summary.ready ? "bg-emerald-400" : "bg-rose-400"
                 }`}
               />
               {summary.ready ? "healthy" : "degraded"} · {summary.gitVersion || "?"}

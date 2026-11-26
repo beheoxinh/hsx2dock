@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, FileDiff, Loader2, Play, RefreshCw, RotateCcw, Save, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileDiff, Loader2, Play, RefreshCw, RotateCcw, Save, XCircle } from "lucide-react";
 import { Button } from "../ui/Button";
 import { useToast } from "../ui/Toast";
 import { api } from "../../lib/api";
@@ -7,11 +7,17 @@ import { diffCounts, diffLines, withContext } from "../../lib/textDiff";
 import { locateComposeError } from "../../lib/yamlLocate";
 import { cn } from "../../lib/utils";
 import type { ComposeValidation } from "../../types";
+import { YamlEditor, type YamlEditorHandle } from "./YamlEditor";
+
+/** How often the open file is checked for changes made outside the editor. */
+const POLL_MS = 3000;
 
 /**
  * The compose file in an editor: validate with `compose config` (unsaved
  * text goes through stdin), review the diff, save (refused when the file
  * changed on disk meanwhile or does not validate), optionally apply.
+ * While visible, the file is polled: clean editors reload silently, dirty
+ * ones get a conflict banner.
  */
 export const ConfigTab: React.FC<{
   filePath: string;
@@ -19,7 +25,9 @@ export const ConfigTab: React.FC<{
   onSaved: () => void;
   onApply: () => void;
   onDirtyChange: (dirty: boolean) => void;
-}> = ({ filePath, busy, onSaved, onApply, onDirtyChange }) => {
+  /** False while another drawer tab is shown: the editor stays mounted but must not poll. */
+  active?: boolean;
+}> = ({ filePath, busy, onSaved, onApply, onDirtyChange, active = true }) => {
   const toast = useToast();
   const [original, setOriginal] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -28,24 +36,100 @@ export const ConfigTab: React.FC<{
   const [checking, setChecking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
-  const gutterRef = useRef<HTMLDivElement>(null);
+  // Disk text that replaced the baseline while the editor holds unsaved edits.
+  const [diskConflict, setDiskConflict] = useState<string | null>(null);
+  const [reloadedNote, setReloadedNote] = useState(false);
+  const editorRef = useRef<YamlEditorHandle>(null);
+  // Mirrors of the state for the poll loop, which must see the latest text
+  // rather than the values from the render that started it.
+  const draftRef = useRef("");
+  const originalRef = useRef<string | null>(null);
+  const diskRef = useRef<string | null>(null);
+
+  const applyLoaded = useCallback((text: string) => {
+    draftRef.current = text;
+    originalRef.current = text;
+    diskRef.current = text;
+    setOriginal(text);
+    setDraft(text);
+    setValidation(null);
+    setDiskConflict(null);
+  }, []);
 
   const load = useCallback(async () => {
     try {
-      const text = await api.composeReadFile(filePath);
-      setOriginal(text);
-      setDraft(text);
+      applyLoaded(await api.composeReadFile(filePath));
       setLoadError(null);
-      setValidation(null);
     } catch (e) {
       setLoadError(String(e));
     }
-  }, [filePath]);
+  }, [filePath, applyLoaded]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  const onEdit = (text: string) => {
+    draftRef.current = text;
+    setDraft(text);
+  };
+
+  // Poll the file while the tab is visible and selected; stop when hidden,
+  // deselected or unmounted. (The drawer keeps this editor mounted on other tabs.)
+  useEffect(() => {
+    let timer: number | null = null;
+    let reading = false;
+    const tick = async () => {
+      if (reading || originalRef.current === null) return;
+      reading = true;
+      try {
+        const disk = await api.composeReadFile(filePath);
+        if (disk === diskRef.current) return;
+        diskRef.current = disk;
+        if (disk === originalRef.current) {
+          // Back at the saved text (e.g. restored outside): nothing to resolve.
+          setDiskConflict(null);
+        } else if (draftRef.current === originalRef.current) {
+          applyLoaded(disk);
+          setReloadedNote(true);
+        } else {
+          setDiskConflict(disk);
+        }
+      } catch {
+        // A missing or unreadable file is often a transient state during another
+        // program's save; the next tick retries.
+      } finally {
+        reading = false;
+      }
+    };
+    const stop = () => {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+    };
+    const start = () => {
+      if (timer === null) timer = window.setInterval(() => void tick(), POLL_MS);
+    };
+    const onVisibility = () => {
+      if (active && document.visibilityState === "visible") {
+        void tick();
+        start();
+      } else {
+        stop();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    onVisibility();
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
+  }, [filePath, applyLoaded, active]);
+
+  useEffect(() => {
+    if (!reloadedNote) return;
+    const t = window.setTimeout(() => setReloadedNote(false), 3000);
+    return () => window.clearTimeout(t);
+  }, [reloadedNote]);
 
   const dirty = original !== null && draft !== original;
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
@@ -78,7 +162,11 @@ export const ConfigTab: React.FC<{
     setSaving(true);
     try {
       await api.composeSaveFile(filePath, draft, original);
+      // Our own write is not an external change: record it as the disk state.
+      diskRef.current = draft;
+      originalRef.current = draft;
       setOriginal(draft);
+      setDiskConflict(null);
       setShowDiff(false);
       toast.success("Compose file saved", filePath);
       onSaved();
@@ -87,23 +175,6 @@ export const ConfigTab: React.FC<{
       toast.error("Save failed", String(e));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Tab") {
-      // Two spaces instead of moving focus: YAML is indented with spaces.
-      e.preventDefault();
-      const el = e.currentTarget;
-      const { selectionStart: s, selectionEnd: end } = el;
-      const next = draft.slice(0, s) + "  " + draft.slice(end);
-      setDraft(next);
-      requestAnimationFrame(() => {
-        el.selectionStart = el.selectionEnd = s + 2;
-      });
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      if (dirty) void save(false);
     }
   };
 
@@ -126,23 +197,14 @@ export const ConfigTab: React.FC<{
   }
 
   const result = validation?.result;
-  const lineCount = draft.split("\n").length;
   const errorLine =
     result && !result.ok && result.error ? locateComposeError(result.error, validation!.text)?.line ?? null : null;
 
   const goToLine = (line: number) => {
     setShowDiff(false);
-    requestAnimationFrame(() => {
-      const el = editorRef.current;
-      if (!el) return;
-      const lines = el.value.split("\n");
-      const n = Math.min(Math.max(line, 1), lines.length);
-      const start = lines.slice(0, n - 1).reduce((sum, l) => sum + l.length + 1, 0);
-      el.focus();
-      el.setSelectionRange(start, start + lines[n - 1].length);
-      // 20px per line (leading-5); keep a few lines of context above.
-      el.scrollTop = Math.max(0, (n - 4) * 20);
-    });
+    // The editor is hidden rather than unmounted while the diff shows, so it
+    // is only visible again after this frame.
+    requestAnimationFrame(() => editorRef.current?.goToLine(line));
   };
 
   return (
@@ -167,7 +229,13 @@ export const ConfigTab: React.FC<{
             </span>
           )}
         </Button>
-        <Button size="sm" variant="ghost" onClick={() => setDraft(original)} disabled={!dirty} title="Discard unsaved changes">
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => onEdit(original)}
+          disabled={!dirty}
+          title="Discard unsaved changes"
+        >
           <RotateCcw className="h-3.5 w-3.5" /> Revert
         </Button>
         <Button size="sm" variant="ghost" onClick={() => void load()} disabled={dirty} title={dirty ? "Revert first" : "Reload from disk"}>
@@ -184,6 +252,36 @@ export const ConfigTab: React.FC<{
           </Button>
         </div>
       </div>
+
+      {diskConflict !== null && (
+        <div className="flex flex-wrap items-center gap-2 border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span className="mr-auto">File changed on disk. Your unsaved edits are kept until you choose.</span>
+          <Button
+            size="sm"
+            variant="outline"
+            title="Replace your unsaved edits with the text now on disk"
+            onClick={() => {
+              applyLoaded(diskConflict);
+              setReloadedNote(true);
+            }}
+          >
+            Reload (discard mine)
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            title="Keep your edits. The disk text becomes the save baseline, so the next Save overwrites it"
+            onClick={() => {
+              originalRef.current = diskConflict;
+              setOriginal(diskConflict);
+              setDiskConflict(null);
+            }}
+          >
+            Keep mine
+          </Button>
+        </div>
+      )}
 
       {result && (
         <div
@@ -212,7 +310,7 @@ export const ConfigTab: React.FC<{
         </div>
       )}
 
-      {showDiff && dirty ? (
+      {showDiff && dirty && (
         <div className="min-h-0 flex-1 overflow-auto border border-zinc-800 bg-zinc-950 font-mono text-[11px] leading-5">
           {withContext(diff, 3).map((l, i) =>
             l === null ? (
@@ -237,35 +335,25 @@ export const ConfigTab: React.FC<{
             )
           )}
         </div>
-      ) : (
-        <div className="relative flex min-h-0 flex-1 border border-zinc-800 bg-zinc-950">
-          <div
-            ref={gutterRef}
-            aria-hidden="true"
-            className="select-none overflow-hidden border-r border-zinc-800 bg-zinc-900/50 px-2 py-2 text-right font-mono text-[11px] leading-5 text-zinc-600"
-          >
-            {Array.from({ length: lineCount }, (_, i) => (
-              <div key={i} className={cn(errorLine === i + 1 && "bg-rose-500/30 text-rose-200")}>
-                {i + 1}
-              </div>
-            ))}
-          </div>
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={onKeyDown}
-            ref={editorRef}
-            onScroll={(e) => {
-              if (gutterRef.current) gutterRef.current.scrollTop = e.currentTarget.scrollTop;
-            }}
-            spellCheck={false}
-            aria-label="Compose file"
-            className="min-h-0 flex-1 resize-none overflow-auto whitespace-pre bg-transparent px-3 py-2 font-mono text-[11px] leading-5 text-zinc-100 outline-none"
-          />
-        </div>
       )}
-      <p className="text-[10px] text-zinc-600">
-        {filePath} · Tab inserts two spaces · Ctrl+S saves · {dirty ? "unsaved changes" : "saved"}
+
+      {/* Kept mounted while the diff shows, so undo history and scroll survive. */}
+      <div className={cn("relative min-h-0 flex-1 border border-zinc-800 bg-zinc-950", showDiff && dirty && "hidden")}>
+        <YamlEditor
+          ref={editorRef}
+          value={draft}
+          onChange={onEdit}
+          onSave={() => {
+            if (dirty) void save(false);
+          }}
+          errorLine={errorLine}
+          errorMessage={result && !result.ok ? result.error ?? "" : ""}
+          ariaLabel="Compose file"
+        />
+      </div>
+      <p className="flex flex-wrap items-center gap-x-1 text-[10px] text-zinc-600">
+        <span>{filePath} · Tab indents · Ctrl+F finds · Ctrl+S saves · {dirty ? "unsaved changes" : "saved"}</span>
+        {reloadedNote && <span className="text-emerald-400">· Reloaded from disk</span>}
       </p>
     </div>
   );

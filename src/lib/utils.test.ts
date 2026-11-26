@@ -2,7 +2,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { sortNames } from "./utils.ts";
+import { retainKeys, sortNames } from "./utils.ts";
+
+test("retainKeys drops keys outside the keep set and keeps the object when nothing goes", () => {
+  const rec = { a: 1, b: 2, c: 3 };
+  const kept = retainKeys(rec, new Set(["a", "c", "zzz"]));
+  assert.deepEqual(kept, { a: 1, c: 3 });
+  assert.deepEqual(rec, { a: 1, b: 2, c: 3 });
+  assert.equal(retainKeys(rec, new Set(["a", "b", "c"])), rec);
+  assert.deepEqual(retainKeys({}, new Set()), {});
+});
 
 test("sortNames orders network names A-Z, case-insensitively and naturally", () => {
   const input = ["hsc-net", "hsc-mocknet", "Bridge", "net10", "net2"];

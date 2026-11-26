@@ -49,6 +49,18 @@ export function truncateId(id: string, len = 12): string {
  * Names A-Z, ignoring case, numbers in natural order (`net2` before `net10`).
  * Returns a new array; `undefined` gives `[]`.
  */
+/**
+ * Copy of `record` holding only the keys in `keep`. Returns the same object
+ * when nothing is dropped, so React state keeps its identity.
+ */
+export function retainKeys<T>(record: Record<string, T>, keep: ReadonlySet<string>): Record<string, T> {
+  const keys = Object.keys(record);
+  if (keys.every((k) => keep.has(k))) return record;
+  const out: Record<string, T> = {};
+  for (const k of keys) if (keep.has(k)) out[k] = record[k];
+  return out;
+}
+
 export function sortNames(names: readonly string[] | undefined): string[] {
   return [...(names ?? [])].sort(
     (a, b) => a.localeCompare(b, "en", { sensitivity: "base", numeric: true }) || (a < b ? -1 : a > b ? 1 : 0)

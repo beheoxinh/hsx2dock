@@ -962,6 +962,56 @@ pub fn catalogue() -> Vec<ToolSpec> {
             ]),
         },
         ToolSpec {
+            name: "compose_read_file",
+            title: "Read compose file",
+            description: "Return the text of a project's compose file (or its override file when \
+                          file_path names it). Pass the text back as `original` to compose_save_file.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[("file_path", string(), true, "Path to the compose file (or its directory)")]),
+        },
+        ToolSpec {
+            name: "compose_save_file",
+            title: "Save compose file",
+            description: "Replace a compose file's text. The new text must validate with \
+                          `compose config` (an override file is checked merged onto its base). With \
+                          `original`, the save is refused if the file changed on disk since it was read.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file"),
+                ("content", string(), true, "The complete new YAML"),
+                ("original", string(), false, "The text compose_read_file returned (conflict check)"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_env_get",
+            title: "Read project env",
+            description: "Key/value pairs of a project's env file (default `.env`). Values of keys \
+                          that look secret (PASSWORD, TOKEN, KEY, …) are masked unless reveal is true.",
+            access: Access::Read,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("env_file", string(), false, "Env file relative to the project directory (default .env)"),
+                ("reveal", boolean(), false, "Return secret values in clear"),
+            ]),
+        },
+        ToolSpec {
+            name: "compose_env_set",
+            title: "Set project env",
+            description: "Set and/or remove keys in a project's env file, keeping comments and the \
+                          other lines. The file is created when missing. Takes effect on the next up.",
+            access: Access::Destructive,
+            engine_only: false,
+            input_schema: obj(&[
+                ("file_path", string(), true, "Path to the compose file (or its directory)"),
+                ("env_file", string(), false, "Env file relative to the project directory (default .env)"),
+                ("set", string_map(), false, "Keys to set, as an object of string values"),
+                ("unset", string_array(), false, "Keys to remove"),
+            ]),
+        },
+        ToolSpec {
             name: "compose_project_pin",
             title: "Save compose project",
             description: "Add a compose file (or a directory holding one) to the app's Compose \

@@ -312,7 +312,7 @@ pub fn spawn_watcher(app: AppHandle) {
             let Ok(clusters) = super::kind::list_kind_clusters_core(&state).await else { continue };
             // History every other tick (once a minute).
             if ticks.is_multiple_of(2) {
-                record_history(&clusters);
+                record_history(&clusters).await;
             }
             let prefs = state.config.read().await.notifications.k8s_alerts.clone();
             let running: HashSet<String> = clusters.iter().filter(|c| c.running).map(|c| c.name.clone()).collect();
@@ -514,33 +514,73 @@ pub(crate) fn push_sample(h: &mut HistoryFile, s: HistorySample) -> bool {
     prev_bucket.is_some_and(|pb| pb != bucket) || h.minute.len().is_multiple_of(5)
 }
 
-fn record_history(clusters: &[super::kind::KindCluster]) {
+/// Appends this tick's samples and writes the files that reached a flush
+/// point. Disk reads and writes run on the blocking pool and never while the
+/// `histories` lock is held, so a slow disk cannot stall other history callers.
+async fn record_history(clusters: &[super::kind::KindCluster]) {
     let t = now_unix();
-    let mut all = histories().lock().unwrap_or_else(|e| e.into_inner());
-    for c in clusters.iter().filter(|c| c.running) {
-        let Some(cpu) = c.cpu_percent else { continue };
-        let h = all.entry(c.name.clone()).or_insert_with(|| load_history(&c.name));
-        let flush = push_sample(
-            h,
-            HistorySample {
-                t,
-                cpu_percent: cpu,
-                mem_mb: c.mem_used_mb.unwrap_or(0.0),
-                pods: c.pod_count.unwrap_or(0) as f64,
-                running_pods: c.running_pod_count.unwrap_or(0) as f64,
-            },
-        );
-        if flush {
-            let dir = history_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            if let Ok(b) = serde_json::to_vec(&*h) {
-                let tmp = dir.join(format!("{}.json.tmp", c.name));
-                if std::fs::write(&tmp, b).is_ok() {
-                    let _ = std::fs::rename(&tmp, dir.join(format!("{}.json", c.name)));
+    let running: Vec<&super::kind::KindCluster> = clusters.iter().filter(|c| c.running).collect();
+    let missing: Vec<String> = {
+        let all = histories().lock().unwrap_or_else(|e| e.into_inner());
+        running.iter().filter(|c| !all.contains_key(&c.name)).map(|c| c.name.clone()).collect()
+    };
+    let loaded: Vec<(String, HistoryFile)> = if missing.is_empty() {
+        Vec::new()
+    } else {
+        tokio::task::spawn_blocking(move || {
+            missing
+                .into_iter()
+                .map(|name| {
+                    let h = load_history(&name);
+                    (name, h)
+                })
+                .collect::<Vec<(String, HistoryFile)>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let writes: Vec<(String, Vec<u8>)> = {
+        let mut all = histories().lock().unwrap_or_else(|e| e.into_inner());
+        for (name, h) in loaded {
+            all.entry(name).or_insert(h);
+        }
+        let mut writes = Vec::new();
+        for c in running {
+            let Some(cpu) = c.cpu_percent else { continue };
+            // Not loaded (the read task failed): skip rather than overwrite the file.
+            let Some(h) = all.get_mut(&c.name) else { continue };
+            let flush = push_sample(
+                h,
+                HistorySample {
+                    t,
+                    cpu_percent: cpu,
+                    mem_mb: c.mem_used_mb.unwrap_or(0.0),
+                    pods: c.pod_count.unwrap_or(0) as f64,
+                    running_pods: c.running_pod_count.unwrap_or(0) as f64,
+                },
+            );
+            if flush {
+                if let Ok(b) = serde_json::to_vec(&*h) {
+                    writes.push((c.name.clone(), b));
                 }
             }
         }
+        writes
+    };
+    if writes.is_empty() {
+        return;
     }
+    let _ = tokio::task::spawn_blocking(move || {
+        let dir = history_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, body) in writes {
+            let tmp = dir.join(format!("{name}.json.tmp"));
+            if std::fs::write(&tmp, body).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join(format!("{name}.json")));
+            }
+        }
+    })
+    .await;
 }
 
 /// Samples for `range` (1h, 6h, 24h → minute ring; 7d → 15-minute ring).
@@ -571,8 +611,12 @@ pub fn cluster_history(cluster: String, range: String) -> Result<Vec<HistorySamp
 
 pub(crate) fn cluster_history_core(cluster: &str, range: &str) -> Result<Vec<HistorySample>, String> {
     super::kind::check_cluster_name(cluster)?;
+    // Read the file before locking, as the watcher does: the lock must not
+    // wait on disk I/O.
+    let cached = histories().lock().unwrap_or_else(|e| e.into_inner()).contains_key(cluster);
+    let loaded = (!cached).then(|| load_history(cluster));
     let mut all = histories().lock().unwrap_or_else(|e| e.into_inner());
-    let h = all.entry(cluster.to_string()).or_insert_with(|| load_history(cluster));
+    let h = all.entry(cluster.to_string()).or_insert_with(|| loaded.unwrap_or_default());
     history_range(h, range, now_unix())
 }
 
@@ -583,7 +627,11 @@ pub(crate) fn forget_cluster(cluster: &str) {
     }
     histories().lock().unwrap_or_else(|e| e.into_inner()).remove(cluster);
     let _ = std::fs::remove_file(history_dir().join(format!("{cluster}.json")));
-    watch().lock().unwrap_or_else(|e| e.into_inner()).alerts.remove(cluster);
+    let mut w = watch().lock().unwrap_or_else(|e| e.into_inner());
+    w.alerts.remove(cluster);
+    // A deleted cluster must not keep its API-failure streak (the next cluster
+    // with this name would start one failure from the alert threshold).
+    w.api_failures.remove(cluster);
 }
 
 #[cfg(test)]

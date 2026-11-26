@@ -319,7 +319,10 @@ async fn list_kind_clusters_uncached(state: &AppState) -> Result<Vec<KindCluster
 const CARD_KUBECTL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 /// A fresh one-shot `docker stats` waits for two samples; cap it per node.
 const CARD_STATS_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
-const NODE_SIZES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Each pass makes dockerd walk the node containers' RW layers; the card's
+/// disk figure barely moves, so a few minutes is plenty (60s kept dockerd
+/// busy while the Kubernetes page was open).
+const NODE_SIZES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 /// Bounds the background size pass itself, so a wedged daemon can't leave
 /// the refresh flag set forever.
 const NODE_SIZES_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1367,6 +1370,126 @@ fn remove_state_dir(dir: &std::path::Path) -> Result<(), String> {
         )),
         Err(e) => Err(format!("{first}; unshare is unavailable: {e}")),
     }
+}
+
+/// A `kind-nodes/<cluster>` state dir no container mounts any more.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrphanState {
+    pub path: String,
+    pub cluster: String,
+    /// Bytes readable by the host user (files owned by subuids may be
+    /// unreadable, so this is a lower bound when `partial`).
+    pub size: u64,
+    pub partial: bool,
+}
+
+/// Every compat root kind node state may live under: the current app dir,
+/// the pre-rename `docker-manager` dir and the `/tmp` fallback.
+fn kind_state_roots() -> Vec<std::path::PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut roots = vec![
+        home.join(".local/share").join(crate::migrate::APP_DIR).join("dtype-compat"),
+        home.join(".local/share/docker-manager/dtype-compat"),
+        std::path::PathBuf::from("/tmp").join(crate::migrate::DTYPE_COMPAT_DIR),
+    ];
+    if let Some(r) = crate::docker::engine::dtype_compat_root() {
+        roots.push(r);
+    }
+    roots.sort();
+    roots.dedup();
+    roots.into_iter().map(|r| r.join("kind-nodes")).filter(|r| r.is_dir()).collect()
+}
+
+/// A dir this young may belong to a cluster being created right now.
+const ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// State dirs not mounted by any container (running or not) and not named
+/// after a cluster that still has nodes.
+async fn find_orphan_states(state: &AppState) -> Result<Vec<(std::path::PathBuf, String)>, String> {
+    let client = local_client(state).await?;
+    let opts = bollard::query_parameters::ListContainersOptionsBuilder::default().all(true).build();
+    let containers = client.docker().list_containers(Some(opts)).await.map_err(|e| e.to_string())?;
+    let mounted: Vec<std::path::PathBuf> = containers
+        .iter()
+        .flat_map(|c| c.mounts.iter().flatten())
+        .filter_map(|m| m.source.as_deref().map(std::path::PathBuf::from))
+        .collect();
+    let live: Vec<String> = containers
+        .iter()
+        .filter_map(|c| c.labels.as_ref()?.get(CLUSTER_LABEL).cloned())
+        .collect();
+    let mut out = Vec::new();
+    for root in kind_state_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) || check_cluster_name(&name).is_err() {
+                continue;
+            }
+            if live.contains(&name) || mounted.iter().any(|m| m.starts_with(&path)) {
+                continue;
+            }
+            let young = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < ORPHAN_MIN_AGE);
+            if !young {
+                out.push((path, name));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Kind node state left behind by clusters that no longer exist.
+#[tauri::command]
+pub async fn kind_orphan_states(state: State<'_, Arc<AppState>>) -> Result<Vec<OrphanState>, String> {
+    let found = find_orphan_states(&state).await?;
+    tokio::task::spawn_blocking(move || {
+        found
+            .into_iter()
+            .map(|(path, cluster)| {
+                let (size, partial) = match crate::fsutil::dir_size(&path) {
+                    Ok(d) => (d.bytes, d.restricted_dirs > 0),
+                    Err(_) => (0, true),
+                };
+                OrphanState { path: path.display().to_string(), cluster, size, partial }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Deletes the given orphan state dirs. Each is checked again first, so a
+/// path that became used (or was never an orphan) is refused, not deleted.
+#[tauri::command]
+pub async fn kind_clean_orphan_states(
+    state: State<'_, Arc<AppState>>,
+    paths: Vec<String>,
+) -> Result<u32, String> {
+    let orphans = find_orphan_states(&state).await?;
+    let wanted: Vec<std::path::PathBuf> = orphans
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| paths.iter().any(|w| std::path::Path::new(w) == p))
+        .collect();
+    if wanted.len() != paths.len() {
+        return Err("some of these folders are no longer unused; refresh the list".into());
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut n = 0;
+        for p in wanted {
+            remove_state_dir(&p)?;
+            n += 1;
+        }
+        Ok(n)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 pub(crate) async fn delete_cluster_containers(state: &AppState, name: &str) -> Result<(), String> {

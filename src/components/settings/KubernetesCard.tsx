@@ -6,6 +6,7 @@ import { api } from "../../lib/api";
 import { useToast } from "../ui/Toast";
 import { BinaryUpdatePanel } from "./BinaryUpdatePanel";
 import { onBinaryInstalled } from "../../lib/binaryUpdates";
+import { KindOrphanCleanup } from "./KindOrphanCleanup";
 import type { KindInstallStatus } from "../../types";
 
 /**
@@ -161,6 +162,8 @@ export const KubernetesCard: React.FC<{ visible?: boolean }> = ({ visible = true
           <span>{saving ? "Saving…" : "Save defaults"}</span>
         </Button>
       </div>
+
+      <KindOrphanCleanup visible={visible} />
     </Card>
   );
 };

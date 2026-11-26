@@ -589,6 +589,8 @@ pub fn run() {
             crate::commands::kind_watch::spawn_watcher(handle.clone());
             // Gateway: drop mapped routes whose container is gone (opt-in).
             crate::commands::gateway::spawn_orphan_route_sweeper(handle.clone());
+            // Compose: container events push UI refreshes and service alerts.
+            crate::commands::compose_watch::spawn_compose_event_watch(handle.clone());
 
             // Tray + desktop notifications. AppState is managed on the builder
             // so the tray can read daemon state immediately; a missing display
@@ -658,6 +660,8 @@ pub fn run() {
             // Kind
             kind::kind_status,
             kind::install_kind,
+            kind::kind_orphan_states,
+            kind::kind_clean_orphan_states,
             kind::install_kind_update,
             kind::check_kind_update,
             kind::list_kind_clusters,
@@ -775,6 +779,22 @@ pub fn run() {
             compose::compose_read_env,
             compose::compose_save_env,
             compose::compose_open_folder,
+            compose_extra::compose_pull,
+            compose_extra::compose_build,
+            compose_extra::compose_image_updates,
+            compose_extra::compose_merged_config,
+            compose_extra::container_health,
+            compose_extra::compose_project_volumes,
+            compose_extra::volume_backup,
+            compose_extra::volume_restore,
+            compose_extra::compose_export,
+            compose_extra::compose_import,
+            compose_extra::compose_create_project,
+            compose_extra::compose_from_containers,
+            compose_watch::compose_recent_alerts,
+            compose_watch::compose_clear_alerts,
+            compose_watch::compose_watch_start,
+            compose_watch::compose_watch_stop,
             // Container groups
             groups::list_container_groups,
             groups::save_container_groups,
@@ -850,6 +870,7 @@ pub fn run() {
                 // chance to stop containers with their own stop signal.
                 if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
                     commands::kind_portforward::stop_all_forwards();
+                    commands::compose_watch::stop_all_watches();
                     let supervisor = state.caddy.clone();
                     let engine = state.engine.clone();
                     crate::runtime::runtime().block_on(async move {

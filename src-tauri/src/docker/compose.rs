@@ -50,6 +50,9 @@ pub struct ServiceSpec {
     pub healthcheck: bool,
     pub replicas: Option<u64>,
     pub container_name: String,
+    /// Declares `develop.watch` rules, so `compose watch` has work to do.
+    #[serde(default)]
+    pub watch: bool,
 }
 
 /// The parts of a project's resolved configuration the app works with.
@@ -99,6 +102,8 @@ pub fn is_available() -> bool {
 pub struct Target {
     /// `-f FILE`; when absent the project is addressed by name only.
     pub file: Option<PathBuf>,
+    /// More `-f FILE`s merged on top of `file` (an override file).
+    pub extra_files: Vec<PathBuf>,
     /// `-p NAME`.
     pub project: Option<String>,
     /// `--env-file PATH`.
@@ -116,7 +121,7 @@ impl Target {
         Self { project: Some(name.to_string()), ..Default::default() }
     }
 
-    fn global_args(&self) -> anyhow::Result<Vec<String>> {
+    pub fn global_args(&self) -> anyhow::Result<Vec<String>> {
         let mut args: Vec<String> = ["compose", "--ansi", "never", "--progress", "plain"]
             .iter()
             .map(|s| s.to_string())
@@ -127,6 +132,13 @@ impl Target {
             }
             args.push("-f".into());
             args.push(f.display().to_string());
+            for extra in &self.extra_files {
+                if !extra.is_file() {
+                    bail!("compose file not found: {}", extra.display());
+                }
+                args.push("-f".into());
+                args.push(extra.display().to_string());
+            }
         }
         if let Some(p) = &self.project {
             check_project_name(p)?;
@@ -227,6 +239,54 @@ pub fn down_args(o: &DownOptions) -> Vec<String> {
         a.push("--remove-orphans".into());
     }
     a
+}
+
+/// Options for `pull`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PullOptions {
+    /// Only these services; empty = every service with an image.
+    pub services: Vec<String>,
+    /// Keep going when one image cannot be pulled.
+    pub ignore_failures: bool,
+}
+
+/// Options for `build`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildOptions {
+    /// Only these services; empty = every service with a `build:` section.
+    pub services: Vec<String>,
+    pub no_cache: bool,
+    /// Always pull newer base images.
+    pub pull: bool,
+}
+
+pub fn pull_args(o: &PullOptions) -> anyhow::Result<Vec<String>> {
+    let mut a = vec!["pull".to_string()];
+    if o.ignore_failures {
+        a.push("--ignore-pull-failures".into());
+    }
+    for s in &o.services {
+        check_service_name(s)?;
+        a.push(s.clone());
+    }
+    Ok(a)
+}
+
+pub fn build_args(o: &BuildOptions) -> anyhow::Result<Vec<String>> {
+    let mut a = vec!["build".to_string()];
+    if o.no_cache {
+        a.push("--no-cache".into());
+    }
+    if o.pull {
+        a.push("--pull".into());
+    }
+    for s in &o.services {
+        check_service_name(s)?;
+        a.push(s.clone());
+    }
+    Ok(a)
 }
 
 /// Per-service verbs. `start`/`stop`/`restart` work by project name alone;
@@ -460,12 +520,54 @@ pub async fn logs(file: &Path, tail: usize, services: &[String]) -> anyhow::Resu
 pub async fn config(file: &Path, env_file: Option<PathBuf>) -> anyhow::Result<ComposeModel> {
     let target = Target {
         file: Some(file.to_path_buf()),
+        extra_files: override_file_for(file).into_iter().collect(),
         env_file,
         profiles: vec!["*".into()],
         ..Default::default()
     };
+    config_of(target).await
+}
+
+/// [`config`] for an explicit target (files, env file, profiles).
+pub async fn config_of(mut target: Target) -> anyhow::Result<ComposeModel> {
+    if target.profiles.is_empty() {
+        target.profiles = vec!["*".into()];
+    }
     let out = run(target, vec!["config".into(), "--format".into(), "json".into()], None).await?;
     parse_config(&out)
+}
+
+/// The merged configuration as compose resolves it (YAML, every profile, the
+/// override file and `.env` interpolation applied), for read-only display.
+pub async fn merged_yaml(mut target: Target) -> anyhow::Result<String> {
+    target.profiles = vec!["*".into()];
+    let out = run(target, vec!["config".into()], None).await?;
+    // Warnings (obsolete `version:` …) come first on stderr; keep the YAML.
+    Ok(match out.find("name:") {
+        Some(i) => out[i..].to_string(),
+        None => out,
+    })
+}
+
+/// Override files compose itself merges when it is run without `-f`, in its
+/// order of preference. Only a standard-named base file gets one.
+const OVERRIDE_FILE_NAMES: [&str; 4] = [
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+];
+
+/// The override file next to `file` that `docker compose` would merge by
+/// default. The app always passes `-f`, which turns that default off, so it
+/// adds the override back explicitly.
+pub fn override_file_for(file: &Path) -> Option<PathBuf> {
+    let name = file.file_name()?.to_str()?;
+    if !COMPOSE_FILE_NAMES.contains(&name) {
+        return None;
+    }
+    let dir = file.parent()?;
+    OVERRIDE_FILE_NAMES.iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
 
 /// Validate unsaved compose text as if it were `file` (same project
@@ -476,17 +578,40 @@ pub async fn validate_text(
     text: String,
     env_file: Option<PathBuf>,
 ) -> anyhow::Result<ComposeModel> {
-    let dir = file
+    validate_in_stack(file, text, env_file, &[]).await
+}
+
+/// Validate unsaved text of `file` as part of `stack` (every `-f` in merge
+/// order, `file` among them), so an override file is checked together with
+/// the base it extends. An empty stack means `file` alone.
+pub async fn validate_in_stack(
+    file: &Path,
+    text: String,
+    env_file: Option<PathBuf>,
+    stack: &[PathBuf],
+) -> anyhow::Result<ComposeModel> {
+    let base = stack.first().map(PathBuf::as_path).unwrap_or(file);
+    let dir = base
         .parent()
         .context("compose file has no parent directory")?
         .to_path_buf();
+    let files: Vec<String> = if stack.is_empty() {
+        vec!["-".to_string()]
+    } else {
+        stack
+            .iter()
+            .map(|f| if f == file { "-".to_string() } else { f.display().to_string() })
+            .collect()
+    };
     tokio::task::spawn_blocking(move || {
         let mut args: Vec<String> = ["compose", "--ansi", "never", "--project-directory"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         args.push(dir.display().to_string());
-        args.extend(["-f".to_string(), "-".to_string()]);
+        for f in files {
+            args.extend(["-f".to_string(), f]);
+        }
         if let Some(e) = env_file {
             args.push("--env-file".into());
             args.push(e.display().to_string());
@@ -669,6 +794,11 @@ pub fn parse_config(json: &str) -> anyhow::Result<ComposeModel> {
                 healthcheck,
                 replicas,
                 container_name: str_field(s, &["container_name"]),
+                watch: s
+                    .get("develop")
+                    .and_then(|d| d.get("watch"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|w| !w.is_empty()),
             });
         }
     }

@@ -187,6 +187,8 @@ export interface ComposeServiceSpec {
   healthcheck: boolean;
   replicas: number | null;
   container_name: string;
+  /** Declares `develop.watch` rules (so `compose watch` can run). */
+  watch?: boolean;
 }
 
 export interface ComposeModel {
@@ -211,11 +213,17 @@ export interface ComposeProjectInfo {
   /** The project's default `.env`, when it exists. */
   env_file?: string;
   config_error?: string;
+  /** Override file merged on top of `path` (`compose.override.yaml`), when present. */
+  override_file?: string;
+  /** A `compose watch` session started by the app is running. */
+  watching?: boolean;
 }
 
 export interface ComposeUpOptions {
   profiles?: string[];
   env_file?: string | null;
+  /** Leave the default override file out of this up. */
+  skip_override?: boolean;
   force_recreate?: boolean;
   remove_orphans?: boolean;
   services?: string[];
@@ -243,6 +251,97 @@ export interface ComposeEnvFile {
 export interface ComposeProgressPayload {
   op_id: string;
   line: string;
+}
+
+export interface ComposePullOptions {
+  /** Only these services; empty = all. */
+  services?: string[];
+  ignore_failures?: boolean;
+}
+
+export interface ComposeBuildOptions {
+  services?: string[];
+  no_cache?: boolean;
+  /** Always pull newer base images. */
+  pull?: boolean;
+}
+
+/** Registry check of one service image. */
+export interface ComposeImageUpdate {
+  service: string;
+  image: string;
+  status: "update" | "current" | "missing" | "local" | "error";
+  local_digest: string;
+  remote_digest: string;
+  error: string;
+}
+
+export interface HealthRun {
+  start: string;
+  end: string;
+  exit_code: number;
+  output: string;
+}
+
+export interface HealthDetails {
+  /** healthy / unhealthy / starting, empty without a healthcheck. */
+  status: string;
+  failing_streak: number;
+  test: string[];
+  interval_ms: number;
+  timeout_ms: number;
+  retries: number;
+  /** Most recent first. */
+  runs: HealthRun[];
+}
+
+export interface ComposeProjectVolume {
+  name: string;
+  driver: string;
+  size: number | null;
+  used_by: string[];
+  running_users: string[];
+}
+
+/** `compose-event`: one container event of a compose project. */
+export interface ComposeEvent {
+  project: string;
+  service: string;
+  container: string;
+  action: string;
+  exit_code: number | null;
+  time: number;
+}
+
+/** `compose-alert`: a service problem (also sent as a desktop notification). */
+export interface ComposeAlert {
+  project: string;
+  service: string;
+  container: string;
+  kind: "unhealthy" | "crashed" | "restart-loop";
+  message: string;
+  time: number;
+}
+
+/** `compose-watch-ended`: a `compose watch` session stopped. */
+export interface ComposeWatchEnded {
+  file: string;
+  op_id: string;
+  code: number | null;
+}
+
+export interface ComposeAlertPrefs {
+  enabled: boolean;
+  muted_projects: string[];
+}
+
+/** kind node state that no container uses any more. */
+export interface KindOrphanState {
+  path: string;
+  cluster: string;
+  size: number;
+  /** Some files were unreadable, so `size` is a lower bound. */
+  partial: boolean;
 }
 
 export interface DfReport {
@@ -395,6 +494,8 @@ export interface NotificationPrefs {
   tray_hidden: boolean;
   /** Kubernetes incident alerts (cluster watcher). */
   k8s_alerts?: K8sAlertPrefs;
+  /** Compose service alerts (unhealthy, crashed, restart loop). */
+  compose_alerts?: ComposeAlertPrefs;
 }
 
 /** `exec-output` payload streamed while an interactive exec session runs. */

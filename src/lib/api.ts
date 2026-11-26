@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { createCoalescedFetch } from "./coalesce";
 import type {
   ContainerOp,
   ContainerOpsSnapshot,
@@ -20,6 +21,15 @@ import type {
   ComposeValidation,
   ComposeEnvFile,
   ComposeProgressPayload,
+  ComposePullOptions,
+  ComposeBuildOptions,
+  ComposeImageUpdate,
+  HealthDetails,
+  ComposeProjectVolume,
+  ComposeEvent,
+  ComposeAlert,
+  ComposeWatchEnded,
+  KindOrphanState,
   DfReport,
   EngineInfo,
   EngineUpdateInfo,
@@ -101,6 +111,19 @@ import type {
   HistoryRange,
   HistorySample,
 } from "../types";
+
+/**
+ * The Kind cluster list is polled by the header, the dashboard and the
+ * Kubernetes page at the same 10s cadence. One shared fetch serves all of them:
+ * concurrent polls join the request in flight, and a poll within 8s of the last
+ * answer reuses it. Cluster create/delete/start/stop/worker changes call
+ * `invalidate` so the next read is fresh.
+ */
+const kindClusters = createCoalescedFetch(() => invoke<KindCluster[]>("list_kind_clusters"), 8_000);
+
+/** Runs a cluster-changing call and drops the shared list once it settles. */
+const kindChanged = <T,>(pending: Promise<T>): Promise<T> =>
+  pending.finally(() => kindClusters.invalidate());
 
 export const api = {
   // System
@@ -347,6 +370,46 @@ export const api = {
     invoke<ComposeEnvFile>("compose_read_env", { filePath, envFile: envFile ?? null }),
   composeSaveEnv: (filePath: string, envFile: string | null, content: string, original: string | null) =>
     invoke<void>("compose_save_env", { filePath, envFile, content, original }),
+  composePull: (filePath: string, options?: ComposePullOptions, opId?: string) =>
+    invoke<string>("compose_pull", { filePath, options: options ?? null, opId: opId ?? null }),
+  composeBuild: (filePath: string, options?: ComposeBuildOptions, opId?: string) =>
+    invoke<string>("compose_build", { filePath, options: options ?? null, opId: opId ?? null }),
+  /** Registry digest check per service image (cached 15 min unless `force`). */
+  composeImageUpdates: (filePath: string, force?: boolean) =>
+    invoke<ComposeImageUpdate[]>("compose_image_updates", { filePath, force: force ?? null }),
+  /** `compose config` as YAML: override file and `.env` applied. */
+  composeMergedConfig: (filePath: string, envFile?: string) =>
+    invoke<string>("compose_merged_config", { filePath, envFile: envFile ?? null }),
+  containerHealth: (id: string) => invoke<HealthDetails>("container_health", { id }),
+  composeProjectVolumes: (project: string) =>
+    invoke<ComposeProjectVolume[]>("compose_project_volumes", { project }),
+  /** Archives a volume (default folder ~/hsx2dock-backups/volumes); returns the file. */
+  volumeBackup: (volume: string, destDir?: string, opId?: string) =>
+    invoke<string>("volume_backup", { volume, destDir: destDir ?? null, opId: opId ?? null }),
+  /** Replaces a volume's content with an archive; refused while a running container uses it. */
+  volumeRestore: (volume: string, archive: string, opId?: string) =>
+    invoke<void>("volume_restore", { volume, archive, opId: opId ?? null }),
+  /** Packs compose file(s) and optionally `.env` (default folder ~/hsx2dock-backups/projects). */
+  composeExport: (filePath: string, destDir: string | null, includeEnv: boolean, maskSecrets: boolean) =>
+    invoke<string>("compose_export", { filePath, destDir, includeEnv, maskSecrets }),
+  /** Unpacks an export into `<destDir>/<project>` and pins it; returns the compose file. */
+  composeImport: (archive: string, destDir: string) =>
+    invoke<string>("compose_import", { archive, destDir }),
+  /** Writes `<dir>/compose.yaml` (+ optional `.env`), validates and pins it. */
+  composeCreateProject: (dir: string, content: string, env?: string) =>
+    invoke<string>("compose_create_project", { dir, content, env: env ?? null }),
+  /** A compose file describing existing containers (for review before saving). */
+  composeFromContainers: (ids: string[], project: string) =>
+    invoke<string>("compose_from_containers", { ids, project }),
+  composeRecentAlerts: () => invoke<ComposeAlert[]>("compose_recent_alerts"),
+  composeClearAlerts: (project?: string) =>
+    invoke<void>("compose_clear_alerts", { project: project ?? null }),
+  /** Starts `docker compose watch`; output streams as compose-progress under `opId`. */
+  composeWatchStart: (filePath: string, opId: string) =>
+    invoke<void>("compose_watch_start", { filePath, opId }),
+  composeWatchStop: (filePath: string) => invoke<void>("compose_watch_stop", { filePath }),
+  kindOrphanStates: () => invoke<KindOrphanState[]>("kind_orphan_states"),
+  kindCleanOrphanStates: (paths: string[]) => invoke<number>("kind_clean_orphan_states", { paths }),
 
   // Kind (Kubernetes IN Docker) — isolated binary + app-managed kubeconfig
   kindStatus: () => invoke<KindInstallStatus>("kind_status"),
@@ -354,12 +417,12 @@ export const api = {
   checkKindUpdate: () => invoke<KindUpdateInfo>("check_kind_update"),
   installKindUpdate: (version: string) =>
     invoke<void>("install_kind_update", { version }),
-  listKindClusters: () => invoke<KindCluster[]>("list_kind_clusters"),
+  listKindClusters: () => kindClusters.get(),
   createKindCluster: (name: string, image?: string, nodes?: number) =>
-    invoke<void>("create_kind_cluster", { name, image, nodes }),
+    kindChanged(invoke<void>("create_kind_cluster", { name, image, nodes })),
   /** Advanced create: a wizard spec, or a hand-edited kind config (wins over spec). */
   createKindClusterAdvanced: (name: string, spec: ClusterSpec, config?: string) =>
-    invoke<void>("create_kind_cluster", { name, spec, config: config ?? null }),
+    kindChanged(invoke<void>("create_kind_cluster", { name, spec, config: config ?? null })),
   previewClusterConfig: (spec: ClusterSpec, config?: string) =>
     invoke<ClusterConfigPreview>("preview_cluster_config", { spec, config: config ?? null }),
   listKindNodeImages: () => invoke<NodeImageOption[]>("list_kind_node_images"),
@@ -367,9 +430,9 @@ export const api = {
   saveClusterPreset: (preset: ClusterPreset) =>
     invoke<ClusterPreset[]>("save_cluster_preset", { preset }),
   deleteClusterPreset: (name: string) => invoke<ClusterPreset[]>("delete_cluster_preset", { name }),
-  addClusterWorker: (cluster: string) => invoke<string>("add_cluster_worker", { cluster }),
+  addClusterWorker: (cluster: string) => kindChanged(invoke<string>("add_cluster_worker", { cluster })),
   removeClusterNode: (cluster: string, node: string) =>
-    invoke<void>("remove_cluster_node", { cluster, node }),
+    kindChanged(invoke<void>("remove_cluster_node", { cluster, node })),
   // Shared local registry (kind-registry on localhost:5001)
   localRegistryStatus: () => invoke<LocalRegistryStatus>("registry_status"),
   ensureLocalRegistry: () => invoke<LocalRegistryStatus>("ensure_registry"),
@@ -433,9 +496,9 @@ export const api = {
   takeAlertFocus: () => invoke<string | null>("take_alert_focus"),
   clusterHistory: (cluster: string, range: HistoryRange) =>
     invoke<HistorySample[]>("cluster_history", { cluster, range }),
-  deleteKindCluster: (name: string) => invoke<void>("delete_kind_cluster", { name }),
-  startKindCluster: (name: string) => invoke<void>("start_kind_cluster", { name }),
-  stopKindCluster: (name: string) => invoke<void>("stop_kind_cluster", { name }),
+  deleteKindCluster: (name: string) => kindChanged(invoke<void>("delete_kind_cluster", { name })),
+  startKindCluster: (name: string) => kindChanged(invoke<void>("start_kind_cluster", { name })),
+  stopKindCluster: (name: string) => kindChanged(invoke<void>("stop_kind_cluster", { name })),
   getKindKubeconfig: (name: string) => invoke<string>("get_kind_kubeconfig", { name }),
   loadImageToCluster: (cluster: string, image: string) =>
     invoke<void>("load_image_to_cluster", { cluster, image }),
@@ -624,6 +687,13 @@ export const events = {
   /** One output line of a running compose operation started with an `opId`. */
   onComposeProgress: (cb: (payload: ComposeProgressPayload) => void): Promise<UnlistenFn> =>
     listen<ComposeProgressPayload>("compose-progress", (event) => cb(event.payload)),
+  /** Container event of a compose project (from the daemon's event stream). */
+  onComposeEvent: (cb: (e: ComposeEvent) => void): Promise<UnlistenFn> =>
+    listen<ComposeEvent>("compose-event", (event) => cb(event.payload)),
+  onComposeAlert: (cb: (a: ComposeAlert) => void): Promise<UnlistenFn> =>
+    listen<ComposeAlert>("compose-alert", (event) => cb(event.payload)),
+  onComposeWatchEnded: (cb: (e: ComposeWatchEnded) => void): Promise<UnlistenFn> =>
+    listen<ComposeWatchEnded>("compose-watch-ended", (event) => cb(event.payload)),
 
   onContainerStatsTick: (
     cb: (stats: Record<string, ContainerStats>) => void

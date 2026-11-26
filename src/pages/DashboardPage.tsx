@@ -186,6 +186,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         memSum += s.mem_usage ?? 0;
       }
       prevNet = nextNet;
+      // Hidden window: nobody sees the charts, so skip the store write (one
+      // re-render per 2s otherwise). The rate baseline above still advances.
+      if (document.hidden) return;
 
       const sample: StatSample = {
         cpu: counted ? cpuSum / counted : 0,
@@ -406,7 +409,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
           <div className="min-h-0 flex-1">
             {isRunning && samples.length === 0 ? (
-              <ChartSkeleton hint="Collecting samples…" />
+              // No running container means no stats tick will ever arrive:
+              // a pulsing "collecting" placeholder would animate forever.
+              runningCount > 0 ? (
+                <ChartSkeleton hint="Collecting samples…" />
+              ) : (
+                <ChartSkeleton hint="No running containers" pulse={false} />
+              )
             ) : (
               <motion.div
                 className="h-full"
@@ -442,7 +451,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
           <div className="min-h-0 flex-1">
             {isRunning && samples.length === 0 ? (
-              <ChartSkeleton hint="Collecting samples…" />
+              // No running container means no stats tick will ever arrive:
+              // a pulsing "collecting" placeholder would animate forever.
+              runningCount > 0 ? (
+                <ChartSkeleton hint="Collecting samples…" />
+              ) : (
+                <ChartSkeleton hint="No running containers" pulse={false} />
+              )
             ) : (
               <motion.div
                 className="h-full"
@@ -483,7 +498,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </div>
           <div className="min-h-0 flex-1">
             {isRunning && samples.length === 0 ? (
-              <ChartSkeleton hint="Collecting samples…" />
+              // No running container means no stats tick will ever arrive:
+              // a pulsing "collecting" placeholder would animate forever.
+              runningCount > 0 ? (
+                <ChartSkeleton hint="Collecting samples…" />
+              ) : (
+                <ChartSkeleton hint="No running containers" pulse={false} />
+              )
             ) : (
               <motion.div
                 className="h-full"

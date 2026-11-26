@@ -571,6 +571,7 @@ impl McpServer {
                     let req = crate::commands::compose::UpRequest {
                         profiles: opt_strings(args, "profiles"),
                         env_file: args.opt_str("env_file").ok().flatten(),
+                        skip_override: opt_flag(args, "skip_override"),
                         options: crate::docker::compose::UpOptions {
                             force_recreate: opt_flag(args, "force_recreate"),
                             remove_orphans: opt_flag(args, "remove_orphans"),
@@ -633,6 +634,70 @@ impl McpServer {
                     )
                 }
                 Err(e) => fail(e.to_string()),
+            },
+            "compose_read_file" => match args.req_str("file_path") {
+                Ok(path) => done(crate::commands::compose::compose_read_file(path).await),
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_save_file" => match (args.req_str("file_path"), args.req_str("content")) {
+                (Ok(path), Ok(content)) => {
+                    let original = match args.opt_str("original").ok().flatten() {
+                        Some(o) => Ok(o),
+                        // No conflict check asked for: compare with what is there now.
+                        None => crate::commands::compose::compose_read_file(path.clone()).await,
+                    };
+                    match original {
+                        Ok(original) => done_unit(
+                            crate::commands::compose::compose_save_file(path, content, original).await,
+                        ),
+                        Err(e) => fail(e),
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
+            },
+            "compose_env_get" => match args.req_str("file_path") {
+                Ok(path) => {
+                    let env = args.opt_str("env_file").ok().flatten();
+                    let reveal = opt_flag(args, "reveal");
+                    match crate::commands::compose::compose_read_env(path, env).await {
+                        Ok(info) => {
+                            let values: serde_json::Map<String, serde_json::Value> =
+                                crate::commands::compose_extra::env_entries(&info.content)
+                                    .into_iter()
+                                    .map(|(k, v)| {
+                                        let shown = if !reveal
+                                            && !v.is_empty()
+                                            && crate::commands::compose_extra::is_secret_key(&k)
+                                        {
+                                            "***".to_string()
+                                        } else {
+                                            v
+                                        };
+                                        (k, json!(shown))
+                                    })
+                                    .collect();
+                            ok(json!({ "path": info.path, "exists": info.exists, "values": values }))
+                        }
+                        Err(e) => fail(e),
+                    }
+                }
+                Err(e) => fail(e.to_string()),
+            },
+            "compose_env_set" => match (args.req_str("file_path"), args.req_str_map("set")) {
+                (Ok(path), Ok(set)) => {
+                    let env = args.opt_str("env_file").ok().flatten();
+                    let unset = opt_strings(args, "unset");
+                    let set: std::collections::BTreeMap<String, String> = set.into_iter().collect();
+                    let res = async {
+                        let info = crate::commands::compose::compose_read_env(path.clone(), env.clone()).await?;
+                        let next = crate::commands::compose_extra::env_apply(&info.content, &set, &unset)?;
+                        let original = info.exists.then_some(info.content);
+                        crate::commands::compose::compose_save_env(path, env, next, original).await
+                    }
+                    .await;
+                    done_unit(res)
+                }
+                (Err(e), _) | (_, Err(e)) => fail(e.to_string()),
             },
             "compose_project_pin" | "compose_project_unpin" => match args.req_str("file_path") {
                 Ok(path) => {

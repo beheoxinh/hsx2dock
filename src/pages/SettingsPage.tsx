@@ -980,7 +980,7 @@ export const SettingsPage: React.FC<{ refreshKey?: number }> = ({ refreshKey = 0
                 >
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      caddyStatus?.running ? "bg-emerald-400 animate-pulse" : "bg-zinc-500"
+                      caddyStatus?.running ? "bg-emerald-400" : "bg-zinc-500"
                     }`}
                   />
                   {caddyStatus?.running ? "Running" : "Stopped"}

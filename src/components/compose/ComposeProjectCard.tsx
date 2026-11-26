@@ -1,13 +1,21 @@
 import React from "react";
 import {
   AlertTriangle,
+  ArrowUpCircle,
+  BellRing,
   Copy,
+  Download,
   Ellipsis,
+  Eye,
+  EyeOff,
   FileKey2,
   FolderOpen,
+  GitMerge,
+  Hammer,
   HeartPulse,
   Layers,
   Loader2,
+  PackageCheck,
   PanelRightOpen,
   Pin,
   PinOff,
@@ -20,43 +28,54 @@ import {
 } from "lucide-react";
 import { ClusterOverflowMenu, type OverflowItem } from "../k8s/ClusterOverflowMenu";
 import { IconAction, IconBadge, InfoCell, PortChip, STATUS_STYLE } from "./composeUi";
+import { Sparkline } from "./Sparkline";
 import {
   projectCounts,
   projectHealth,
   projectPorts,
   projectStatus,
 } from "../../lib/composeProject";
+import type { ProjectHistory } from "../../lib/composeHistory";
 import { cn, formatBytes } from "../../lib/utils";
-import type { ComposeProjectInfo, ContainerStats } from "../../types";
+import type { ComposeImageUpdate, ComposeProjectInfo } from "../../types";
+
+/**
+ * Handlers receive their project, so the page can pass one stable function per
+ * action instead of a closure per row. Numbers are primitives so that React.memo
+ * skips the card when a stats tick did not change this project's values.
+ */
+type ProjectHandler = (p: ComposeProjectInfo) => void;
 
 export interface ComposeProjectCardProps {
   project: ComposeProjectInfo;
-  stats: Record<string, ContainerStats>;
   busy: boolean;
-  onOpen: () => void;
-  onUp: () => void;
-  onUpOptions: () => void;
-  onRestart: () => void;
-  onStop: () => void;
-  onDown: () => void;
-  onTogglePin: () => void;
-  onCopyPath: () => void;
-  onOpenFolder: () => void;
-}
-
-/** CPU and memory of the project's running containers, from the last stats tick. */
-export function projectUsage(project: ComposeProjectInfo, stats: Record<string, ContainerStats>) {
-  let cpu = 0;
-  let mem = 0;
-  let sampled = 0;
-  for (const c of project.services) {
-    const s = stats[c.id];
-    if (!s) continue;
-    sampled += 1;
-    cpu += s.cpu_percent;
-    mem += s.mem_usage;
-  }
-  return { cpu, mem, sampled };
+  /** Summed over the project's containers in the last stats tick; sampled = containers seen. */
+  cpu: number;
+  mem: number;
+  sampled: number;
+  /** CPU and memory samples recorded for this project (sparklines). */
+  history: ProjectHistory;
+  /** Unacknowledged compose alerts for this project, and the newest one's text. */
+  alertCount: number;
+  latestAlert?: string;
+  /** Services whose registry image is newer than the local one. */
+  updates: ComposeImageUpdate[];
+  onOpen: ProjectHandler;
+  onUp: ProjectHandler;
+  onUpOptions: ProjectHandler;
+  onRestart: ProjectHandler;
+  onStop: ProjectHandler;
+  onDown: ProjectHandler;
+  onPull: ProjectHandler;
+  onBuild: ProjectHandler;
+  onPullUpdates: ProjectHandler;
+  onShowAlerts: ProjectHandler;
+  onStartWatch: ProjectHandler;
+  onStopWatch: ProjectHandler;
+  onExport: ProjectHandler;
+  onTogglePin: ProjectHandler;
+  onCopyPath: ProjectHandler;
+  onOpenFolder: ProjectHandler;
 }
 
 const SOURCE_HINT: Record<string, string> = {
@@ -70,32 +89,89 @@ const SOURCE_HINT: Record<string, string> = {
  * icon badges and actions on top; an info strip with services, ports, health
  * and resource use below. Clicking the card opens the details drawer.
  */
-export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => {
-  const { project: p, stats, busy } = props;
+const ComposeProjectCardView: React.FC<ComposeProjectCardProps> = (props) => {
+  const { project: p, busy, history, cpu, mem, sampled } = props;
+  // Bind the project into a handler; the menu and buttons take no arguments.
+  const act = (fn: ProjectHandler) => () => fn(p);
   const status = projectStatus(p);
   const style = STATUS_STYLE[status];
   const { running, total } = projectCounts(p);
   const ports = projectPorts(p);
   const health = projectHealth(p);
-  const usage = projectUsage(p, stats);
   const hasFile = Boolean(p.path) && !p.config_error;
   const anyRunning = running > 0;
   const noFileHint = "This project has no readable compose file; only start/stop/restart by project name work";
+  // Build and watch only make sense when the file declares them.
+  const hasBuild = (p.declared ?? []).some((s) => s.build);
+  const hasWatch = (p.declared ?? []).some((s) => s.watch);
 
   const menu: OverflowItem[] = [
+    {
+      key: "pull",
+      label: "Pull images…",
+      icon: <Download className="h-3.5 w-3.5" />,
+      onSelect: act(props.onPull),
+      disabled: busy || !hasFile,
+      title: hasFile ? "Download newer images for the declared services" : noFileHint,
+    },
+    ...(hasBuild
+      ? [
+          {
+            key: "build",
+            label: "Build images…",
+            icon: <Hammer className="h-3.5 w-3.5" />,
+            onSelect: act(props.onBuild),
+            disabled: busy || !hasFile,
+            title: hasFile ? "Build the services that have a build section" : noFileHint,
+          },
+        ]
+      : []),
     {
       key: "options",
       label: "Up with options…",
       icon: <SlidersHorizontal className="h-3.5 w-3.5" />,
-      onSelect: props.onUpOptions,
+      onSelect: act(props.onUpOptions),
       disabled: busy || !hasFile,
       title: hasFile ? "Choose profiles, env file and recreate options" : noFileHint,
+      dividerBefore: true,
+    },
+    ...(hasWatch
+      ? [
+          p.watching
+            ? {
+                key: "watch-stop",
+                label: "Stop watch",
+                icon: <EyeOff className="h-3.5 w-3.5" />,
+                onSelect: act(props.onStopWatch),
+                disabled: busy,
+                title: "End the docker compose watch session started from here",
+                dividerBefore: true,
+              }
+            : {
+                key: "watch-start",
+                label: "Start watch",
+                icon: <Eye className="h-3.5 w-3.5" />,
+                onSelect: act(props.onStartWatch),
+                disabled: busy || !hasFile,
+                title: hasFile ? "Sync and rebuild services on file changes (docker compose watch)" : noFileHint,
+                dividerBefore: true,
+              },
+        ]
+      : []),
+    {
+      key: "export",
+      label: "Export…",
+      icon: <PackageCheck className="h-3.5 w-3.5" />,
+      onSelect: act(props.onExport),
+      disabled: !p.path,
+      title: p.path ? "Pack the compose file (and optionally .env) into an archive" : noFileHint,
+      dividerBefore: true,
     },
     {
       key: "pin",
       label: p.pinned ? "Remove from list" : "Save to list",
       icon: p.pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />,
-      onSelect: props.onTogglePin,
+      onSelect: act(props.onTogglePin),
       disabled: !p.path || p.source === "settings",
       title:
         p.source === "settings"
@@ -109,21 +185,21 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
       key: "copy",
       label: "Copy file path",
       icon: <Copy className="h-3.5 w-3.5" />,
-      onSelect: props.onCopyPath,
+      onSelect: act(props.onCopyPath),
       disabled: !p.path,
     },
     {
       key: "folder",
       label: "Open folder",
       icon: <FolderOpen className="h-3.5 w-3.5" />,
-      onSelect: props.onOpenFolder,
+      onSelect: act(props.onOpenFolder),
       disabled: !p.working_dir,
     },
     {
       key: "down",
       label: "Down (remove containers)…",
       icon: <Power className="h-3.5 w-3.5" />,
-      onSelect: props.onDown,
+      onSelect: act(props.onDown),
       disabled: busy || !hasFile || p.services.length === 0,
       danger: true,
       dividerBefore: true,
@@ -135,11 +211,11 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
     <div
       role="button"
       tabIndex={0}
-      onClick={props.onOpen}
+      onClick={act(props.onOpen)}
       onKeyDown={(e) => {
         if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
           e.preventDefault();
-          props.onOpen();
+          props.onOpen(p);
         }
       }}
       className="group cursor-pointer border border-zinc-800 bg-zinc-900/70 transition-colors hover:border-zinc-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60"
@@ -169,9 +245,53 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {props.alertCount > 0 && (
+            // Clickable badge: opens the alert list; the newest message is the hint.
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onShowAlerts(p);
+              }}
+              title={props.latestAlert ? `${props.alertCount} alert(s). Latest: ${props.latestAlert}` : "Alerts"}
+              aria-label={`${props.alertCount} compose alert(s), show list`}
+              className="inline-flex h-6 shrink-0 items-center gap-1 rounded-none border border-rose-500/50 bg-rose-500/10 px-1.5 font-mono text-[11px] text-rose-300 hover:bg-rose-500/20"
+            >
+              <BellRing className="h-3.5 w-3.5" aria-hidden="true" />
+              {props.alertCount}
+            </button>
+          )}
+          {props.updates.length > 0 && (
+            // Clicking pulls just the services that have a newer image.
+            <button
+              type="button"
+              disabled={busy}
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onPullUpdates(p);
+              }}
+              title={`Pull newer images: ${props.updates.map((u) => u.service).join(", ")}`}
+              aria-label={`${props.updates.length} image updates, pull them`}
+              className="inline-flex h-6 shrink-0 items-center gap-1 rounded-none border border-amber-500/40 bg-amber-500/10 px-1.5 text-[11px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50"
+            >
+              <ArrowUpCircle className="h-3.5 w-3.5" aria-hidden="true" />
+              {props.updates.length} image update{props.updates.length === 1 ? "" : "s"}
+            </button>
+          )}
           {p.config_error && (
             <IconBadge tone="danger" hint={`Compose file problem: ${p.config_error}`}>
               <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+            </IconBadge>
+          )}
+          {p.watching && (
+            <IconBadge tone="success" hint="compose watch is running: files are synced and services rebuilt on change">
+              {/* Static: a watch runs for hours and a pulse repaints every frame. */}
+              <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+            </IconBadge>
+          )}
+          {p.override_file && (
+            <IconBadge tone="info" hint={`Override file: ${p.override_file} is merged on Up`}>
+              <GitMerge className="h-3.5 w-3.5" aria-hidden="true" />
             </IconBadge>
           )}
           {health !== "none" && (
@@ -194,23 +314,28 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
           )}
           <span className="mx-1 h-6 w-px bg-zinc-800" aria-hidden="true" />
           {status === "running" ? (
-            <IconAction title="Restart all services" onClick={props.onRestart} disabled={busy}>
+            <IconAction title="Restart all services" onClick={act(props.onRestart)} disabled={busy} className="rounded-none">
               <RotateCw className="h-4 w-4" />
             </IconAction>
           ) : (
             <IconAction
               title={hasFile ? "Up: create and start all services" : noFileHint}
-              onClick={props.onUp}
+              onClick={act(props.onUp)}
               disabled={busy || (!hasFile && p.services.length === 0)}
-              className="text-emerald-300"
+              className="rounded-none text-emerald-300"
             >
               <Play className="h-4 w-4" />
             </IconAction>
           )}
-          <IconAction title="Stop all services (containers are kept)" onClick={props.onStop} disabled={busy || !anyRunning}>
+          <IconAction
+            title="Stop all services (containers are kept)"
+            onClick={act(props.onStop)}
+            disabled={busy || !anyRunning}
+            className="rounded-none"
+          >
             <Square className="h-4 w-4" />
           </IconAction>
-          <IconAction title="Open details" onClick={props.onOpen}>
+          <IconAction title="Open details" onClick={act(props.onOpen)} className="rounded-none">
             <PanelRightOpen className="h-4 w-4" />
           </IconAction>
           <span onClick={(e) => e.stopPropagation()}>
@@ -223,7 +348,7 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
         </div>
       </div>
 
-      <dl className="grid grid-cols-2 divide-zinc-800 sm:grid-cols-3 lg:grid-cols-[8rem_8rem_minmax(0,1fr)_7rem_7rem_7rem] lg:divide-x">
+      <dl className="grid grid-cols-2 divide-zinc-800 sm:grid-cols-3 lg:grid-cols-[8rem_8rem_minmax(0,1fr)_9rem_9rem_7rem] lg:divide-x">
         <InfoCell label="Services" title="Services with at least one running container / services in use">
           <span className={cn(status === "partial" && "text-amber-300")}>
             {running}/{total}
@@ -244,11 +369,25 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
             </span>
           )}
         </InfoCell>
-        <InfoCell label="CPU" title="Sum over the project's running containers">
-          {usage.sampled > 0 ? `${usage.cpu.toFixed(1)}%` : "—"}
+        <InfoCell label="CPU" title="Sum over the project's running containers, with the recent trend">
+          {sampled > 0 ? (
+            <span className="flex items-center gap-2">
+              {`${cpu.toFixed(1)}%`}
+              <Sparkline values={history.cpu} label="CPU history" className="text-sky-400" />
+            </span>
+          ) : (
+            "—"
+          )}
         </InfoCell>
-        <InfoCell label="Memory" title="Sum over the project's running containers">
-          {usage.sampled > 0 ? formatBytes(usage.mem) : "—"}
+        <InfoCell label="Memory" title="Sum over the project's running containers, with the recent trend">
+          {sampled > 0 ? (
+            <span className="flex items-center gap-2">
+              {formatBytes(mem)}
+              <Sparkline values={history.mem} label="Memory history" className="text-violet-400" />
+            </span>
+          ) : (
+            "—"
+          )}
         </InfoCell>
         <InfoCell label="Source" title={SOURCE_HINT[p.source ?? "labels"]}>
           <span className="text-zinc-400">{p.source === "labels" ? "labels" : p.source === "settings" ? "settings" : "saved"}</span>
@@ -257,3 +396,6 @@ export const ComposeProjectCard: React.FC<ComposeProjectCardProps> = (props) => 
     </div>
   );
 };
+
+/** Memoised: skips re-rendering when neither its project nor its values changed. */
+export const ComposeProjectCard = React.memo(ComposeProjectCardView);

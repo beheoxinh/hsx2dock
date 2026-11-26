@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  CheckCircle2,
+  Combine,
+  Database,
   FileCode2,
   FileKey2,
   GitFork,
@@ -14,17 +17,23 @@ import {
   Square,
   TerminalSquare,
   X,
+  XCircle,
 } from "lucide-react";
 import { useModal } from "../ui/ModalContext";
+import { useToast } from "../ui/Toast";
 import { GroupLogsModal } from "../groups/GroupLogsModal";
 import { ServicesTab } from "./ServicesTab";
 import { GraphTab } from "./GraphTab";
 import { ConfigTab } from "./ConfigTab";
 import { EnvTab } from "./EnvTab";
 import { TerminalTab } from "./TerminalTab";
+import { VolumesTab } from "./VolumesTab";
+import { MergedTab } from "./MergedTab";
+import { useDrawerOps } from "./useDrawerOps";
 import { ExposeDialog, ScaleDialog } from "./ComposeDialogs";
 import { IconAction, InfoCell, STATUS_STYLE } from "./composeUi";
-import { projectUsage } from "./ComposeProjectCard";
+import { api } from "../../lib/api";
+import { projectUsage } from "../../lib/composeStats";
 import { isRunning, projectCounts, projectStatus, serviceRows, type ComposeServiceRow } from "../../lib/composeProject";
 import { cn, formatBytes } from "../../lib/utils";
 import type {
@@ -35,7 +44,7 @@ import type {
   GatewayRoute,
 } from "../../types";
 
-export type DrawerTab = "services" | "logs" | "graph" | "config" | "env" | "terminal";
+export type DrawerTab = "services" | "logs" | "graph" | "volumes" | "config" | "merged" | "env" | "terminal";
 
 export interface ComposeDrawerProps {
   project: ComposeProjectInfo;
@@ -57,10 +66,17 @@ const TABS: { key: DrawerTab; label: string; icon: React.ReactNode; needsFile?: 
   { key: "services", label: "Services", icon: <ListTree className="h-3.5 w-3.5" /> },
   { key: "logs", label: "Logs", icon: <ScrollText className="h-3.5 w-3.5" /> },
   { key: "graph", label: "Graph", icon: <GitFork className="h-3.5 w-3.5" /> },
+  { key: "volumes", label: "Volumes", icon: <Database className="h-3.5 w-3.5" /> },
   { key: "config", label: "Compose file", icon: <FileCode2 className="h-3.5 w-3.5" />, needsFile: true },
+  { key: "merged", label: "Merged config", icon: <Combine className="h-3.5 w-3.5" />, needsFile: true },
   { key: "env", label: "Env", icon: <FileKey2 className="h-3.5 w-3.5" />, needsFile: true },
   { key: "terminal", label: "Terminal", icon: <TerminalSquare className="h-3.5 w-3.5" /> },
 ];
+
+/** Last path segment, for the file selector. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
 
 /** The minimal ContainerItem the shared log viewer needs. */
 function asContainerItems(rows: ComposeServiceRow[]): ContainerItem[] {
@@ -94,6 +110,16 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
   const [terminalId, setTerminalId] = useState<string | null>(null);
   const [scaleRow, setScaleRow] = useState<ComposeServiceRow | null>(null);
   const [exposeRow, setExposeRow] = useState<ComposeServiceRow | null>(null);
+  // Which file the Compose file tab edits: the base file or the override file.
+  const [cfgFile, setCfgFile] = useState<"base" | "override">("base");
+  const [hiddenOpId, setHiddenOpId] = useState<string | null>(null);
+  const toast = useToast();
+  // Pull, build and volume operations run from the drawer (see useDrawerOps).
+  const ops = useDrawerOps();
+  const anyBusy = busy || ops.busy;
+  const activeCfg: "base" | "override" = p.override_file && cfgFile === "override" ? "override" : "base";
+  const configPath = activeCfg === "override" && p.override_file ? p.override_file : p.path;
+  const shownOp = ops.latest && ops.latest.id !== hiddenOpId ? ops.latest : null;
 
   const rows = useMemo(() => serviceRows(p), [p]);
   const status = projectStatus(p);
@@ -128,6 +154,36 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [requestClose, scaleRow, exposeRow]);
+
+  // Switching files remounts the editor (key below); unsaved edits of the old file are dropped only on confirm.
+  const switchConfigFile = async (next: "base" | "override") => {
+    if (next === activeCfg) return;
+    if (dirty.config) {
+      const ok = await modal.showConfirm(
+        "The open compose file has unsaved changes. Switch files and discard them?",
+        "Unsaved changes",
+        "warning"
+      );
+      if (!ok) return;
+      setConfigDirty(false);
+    }
+    setCfgFile(next);
+  };
+
+  // The list is refreshed after each run, so the project card shows the new state too.
+  const pullService = async (row: ComposeServiceRow): Promise<boolean> => {
+    const r = await ops.run(p.name, `Pull ${row.name}`, (opId) => api.composePull(p.path, { services: [row.name] }, opId));
+    props.onRefresh();
+    if (r.ok) toast.info(`Pulled ${row.name}`, "Recreate the service to run the new image.");
+    return r.ok;
+  };
+
+  const buildService = async (row: ComposeServiceRow): Promise<boolean> => {
+    const r = await ops.run(p.name, `Build ${row.name}`, (opId) => api.composeBuild(p.path, { services: [row.name] }, opId));
+    props.onRefresh();
+    if (r.ok) toast.info(`Built ${row.name}`, "Recreate the service to run the new image.");
+    return r.ok;
+  };
 
   const setConfigDirty = useCallback((d: boolean) => setDirty((s) => (s.config === d ? s : { ...s, config: d })), []);
   const setEnvDirty = useCallback((d: boolean) => setDirty((s) => (s.env === d ? s : { ...s, env: d })), []);
@@ -244,6 +300,31 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
           })}
         </div>
 
+        {/* Output of the last drawer operation (pull, build, volume backup/restore). */}
+        {shownOp && (
+          <div className="mx-4 mt-3 shrink-0 border border-zinc-800 bg-zinc-900/60">
+            <div className="flex items-center gap-2 px-3 py-1.5 text-xs">
+              {shownOp.status === "running" ? (
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" aria-label="Running" />
+              ) : shownOp.status === "ok" ? (
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" aria-label="Done" />
+              ) : (
+                <XCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" aria-label="Failed" />
+              )}
+              <span className="min-w-0 flex-1 truncate text-zinc-200">{shownOp.title}</span>
+              <IconAction title="Hide output" onClick={() => setHiddenOpId(shownOp.id)}>
+                <X className="h-4 w-4" />
+              </IconAction>
+            </div>
+            {(shownOp.lines.length > 0 || shownOp.error) && (
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap border-t border-zinc-800 p-2 font-mono text-[11px] text-zinc-400">
+                {shownOp.lines.slice(-200).join("\n")}
+                {shownOp.error && <span className="text-rose-300">{`\n${shownOp.error}`}</span>}
+              </pre>
+            )}
+          </div>
+        )}
+
         {/* Body */}
         <div className="min-h-0 flex-1 overflow-hidden p-4">
           {tab === "services" && (
@@ -253,7 +334,10 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
                 stats={stats}
                 routes={routes}
                 hasFile={hasFile}
-                busy={busy}
+                filePath={p.path}
+                busy={anyBusy}
+                onPull={pullService}
+                onBuild={buildService}
                 onAction={(row, action) => props.onServiceAction(row, action)}
                 onScale={setScaleRow}
                 onExpose={setExposeRow}
@@ -305,6 +389,12 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
             </div>
           )}
 
+          {tab === "volumes" && (
+            <div className="h-full">
+              <VolumesTab project={p.name} busy={anyBusy} run={(title, fn) => ops.run(p.name, title, fn)} />
+            </div>
+          )}
+
           {tab === "graph" && (
             <div className="h-full overflow-auto">
               <GraphTab
@@ -321,16 +411,48 @@ export const ComposeDrawer: React.FC<ComposeDrawerProps> = (props) => {
 
           {/* Editors stay mounted once opened so drafts survive tab switches. */}
           {canEditFile && visited.has("config") && (
-            <div className={cn("h-full", tab !== "config" && "hidden")}>
-              <ConfigTab
-                filePath={p.path}
-                busy={busy}
-                onSaved={props.onRefresh}
-                onApply={props.onUp}
-                onDirtyChange={setConfigDirty}
-              />
+            <div className={cn("flex h-full flex-col gap-2", tab !== "config" && "hidden")}>
+              {p.override_file && (
+                <div role="group" aria-label="File to edit" className="flex shrink-0 items-center gap-3 text-xs">
+                  <div className="inline-flex border border-zinc-700">
+                    {(["base", "override"] as const).map((k) => {
+                      const path = k === "base" ? p.path : p.override_file!;
+                      const active = activeCfg === k;
+                      return (
+                        <button
+                          key={k}
+                          type="button"
+                          aria-pressed={active}
+                          title={path}
+                          onClick={() => void switchConfigFile(k)}
+                          className={cn(
+                            "px-3 py-1 font-mono text-[11px]",
+                            active ? "bg-indigo-500/15 text-indigo-200" : "text-zinc-400 hover:text-zinc-200"
+                          )}
+                        >
+                          {baseName(path)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span className="text-[11px] text-zinc-500">The override file is merged onto the base file.</span>
+                </div>
+              )}
+              {/* Keyed by file so each editor starts with its own clean state. */}
+              <div className="min-h-0 flex-1">
+                <ConfigTab
+                  key={configPath}
+                  filePath={configPath}
+                  busy={busy}
+                  onSaved={props.onRefresh}
+                  onApply={props.onUp}
+                  onDirtyChange={setConfigDirty}
+                  active={tab === "config"}
+                />
+              </div>
             </div>
           )}
+          {canEditFile && tab === "merged" && <MergedTab key={p.path} filePath={p.path} />}
           {canEditFile && visited.has("env") && (
             <div className={cn("h-full", tab !== "env" && "hidden")}>
               <EnvTab

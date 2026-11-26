@@ -115,6 +115,18 @@ fn set_status(id: &str, status: &str, message: Option<String>, restart: bool) {
     }
 }
 
+/// Marks a forward as failed. The entry stays listed so the UI can show the
+/// error, but `stop` is cleared: a forward whose task has returned must not
+/// keep answering Start with this stale entry.
+fn set_failed(id: &str, message: String) {
+    let mut r = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = r.get_mut(id) {
+        e.info.status = "error".into();
+        e.info.message = Some(message);
+        e.stop = None;
+    }
+}
+
 #[tauri::command]
 pub async fn start_port_forward(
     state: State<'_, Arc<AppState>>,
@@ -174,7 +186,7 @@ async fn run_forward(state: Arc<AppState>, spec: ForwardSpec, id: String, mut st
         let mut cmd = match tool_command(&state, Tool::Kubectl, &spec.cluster).await {
             Ok(c) => c,
             Err(e) => {
-                set_status(&id, "error", Some(e), false);
+                set_failed(&id, e);
                 return;
             }
         };
@@ -194,7 +206,7 @@ async fn run_forward(state: Arc<AppState>, spec: ForwardSpec, id: String, mut st
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                set_status(&id, "error", Some(e.to_string()), false);
+                set_failed(&id, e.to_string());
                 return;
             }
         };
@@ -400,5 +412,36 @@ mod tests {
         let b = pick_local_port(&spec(), &[a], |_| true).unwrap();
         assert_ne!(a, b);
         assert!(pick_local_port(&spec(), &[], |_| false).is_none());
+    }
+
+    #[test]
+    fn failed_forward_is_listed_as_error_and_can_start_again() {
+        let s = spec();
+        let id = forward_id(&s);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        registry().lock().unwrap().insert(
+            id.clone(),
+            Entry {
+                info: ForwardInfo {
+                    id: id.clone(),
+                    url: String::new(),
+                    spec: s,
+                    status: "active".into(),
+                    message: None,
+                    restarts: 0,
+                },
+                stop: Some(tx),
+            },
+        );
+        set_failed(&id, "kubectl missing".into());
+        {
+            let r = registry().lock().unwrap();
+            let e = r.get(&id).expect("failed entry stays listed");
+            assert_eq!(e.info.status, "error");
+            assert_eq!(e.info.message.as_deref(), Some("kubectl missing"));
+            // No live task behind it: Start must not see it as running.
+            assert!(e.stop.is_none());
+        }
+        registry().lock().unwrap().remove(&id);
     }
 }

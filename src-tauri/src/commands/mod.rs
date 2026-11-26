@@ -1,4 +1,6 @@
 pub mod compose;
+pub mod compose_extra;
+pub mod compose_watch;
 pub mod containers;
 pub mod endpoints;
 pub mod exec;

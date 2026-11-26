@@ -5,7 +5,7 @@ import { Switch } from "../ui/Switch";
 import { api } from "../../lib/api";
 import { useToast } from "../ui/Toast";
 import { cn } from "../../lib/utils";
-import type { K8sAlertPrefs, KindCluster, NotificationPrefs } from "../../types";
+import type { ComposeAlertPrefs, ComposeProjectInfo, K8sAlertPrefs, KindCluster, NotificationPrefs } from "../../types";
 
 /** Matches the Rust `NotificationPrefs::default()` — all notifications on. */
 const DEFAULTS: NotificationPrefs = {
@@ -57,6 +57,9 @@ const K8S_DEFAULTS: K8sAlertPrefs = {
   muted_clusters: [],
 };
 
+/** Used when the config has no `compose_alerts` yet (matches the backend defaults). */
+const COMPOSE_DEFAULTS: ComposeAlertPrefs = { enabled: true, muted_projects: [] };
+
 const K8S_ROWS: { key: keyof Omit<K8sAlertPrefs, "enabled" | "muted_clusters">; label: string; desc: string }[] = [
   { key: "crash_loop", label: "Crash loops", desc: "A pod keeps restarting in a crash loop." },
   { key: "image_pull", label: "Image pull failures", desc: "A pod cannot pull its image." },
@@ -78,6 +81,8 @@ export const NotificationsCard: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [clusters, setClusters] = useState<KindCluster[]>([]);
   const [addName, setAddName] = useState("");
+  const [projects, setProjects] = useState<ComposeProjectInfo[]>([]);
+  const [addProject, setAddProject] = useState("");
 
   useEffect(() => {
     api
@@ -88,6 +93,10 @@ export const NotificationsCard: React.FC = () => {
       .listKindClusters()
       .then(setClusters)
       .catch(() => setClusters([]));
+    api
+      .listComposeProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
   }, []);
 
   const toggle = async (key: keyof NotificationPrefs) => {
@@ -140,6 +149,28 @@ export const NotificationsCard: React.FC = () => {
 
   const removeMuted = (name: string) =>
     saveK8s({ ...k8s, muted_clusters: k8s.muted_clusters.filter((n) => n !== name) }, `Alerts unmuted for ${name}`);
+
+  const compose: ComposeAlertPrefs = { ...COMPOSE_DEFAULTS, ...(prefs?.compose_alerts ?? {}) };
+
+  /** Saves the Compose alert block; rolls back only that block on failure. */
+  const saveCompose = async (next: ComposeAlertPrefs, okTitle: string) => {
+    if (!prefs || busy) return;
+    const prevCompose = compose;
+    setPrefs({ ...prefs, compose_alerts: next });
+    try {
+      setBusy(true);
+      await api.patchAppConfig({ notifications: { ...prefs, compose_alerts: next } });
+      toast.success(okTitle);
+    } catch (e) {
+      setPrefs((cur) => (cur ? { ...cur, compose_alerts: prevCompose } : cur));
+      toast.error("Could not save Compose alert settings", String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const projectNames = [...new Set(projects.map((p) => p.name).filter(Boolean))].sort();
+  const unmutedProjects = projectNames.filter((n) => !compose.muted_projects.includes(n));
 
   const unmutedClusters = clusters.filter((c) => !k8s.muted_clusters.includes(c.name));
 
@@ -267,6 +298,81 @@ export const NotificationsCard: React.FC = () => {
               type="button"
               disabled={!mutable || busy || !addName}
               onClick={() => void addMuted()}
+              className="h-9 rounded-none border border-zinc-700 bg-zinc-800 px-4 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-3 border-t border-zinc-800 pt-4">
+        <div>
+          <h4 className="font-semibold text-white">Compose alerts</h4>
+          <p className="mt-1 text-xs text-zinc-400">
+            A container of a Compose project crashed, keeps restarting, or turned unhealthy.
+            The Compose page always lists these; this switch only controls desktop notifications.
+          </p>
+        </div>
+        <div className="rounded-none border border-zinc-800 px-3 py-2.5">
+          <Switch
+            label="Compose alerts"
+            checked={compose.enabled}
+            disabled={!mutable || busy}
+            onChange={(next) =>
+              saveCompose({ ...compose, enabled: next }, next ? "Compose alerts enabled" : "Compose alerts off")
+            }
+          />
+        </div>
+        <div className="space-y-2 rounded-none border border-zinc-800 p-3">
+          <h5 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">Muted projects</h5>
+          {compose.muted_projects.length === 0 ? (
+            <p className="text-xs text-zinc-500">No project is muted.</p>
+          ) : (
+            <ul className="divide-y divide-zinc-800 rounded-none border border-zinc-800">
+              {compose.muted_projects.map((name) => (
+                <li key={name} className="flex items-center justify-between gap-3 px-3 py-2">
+                  <span className="truncate font-mono text-sm text-zinc-200">{name}</span>
+                  <button
+                    type="button"
+                    disabled={!mutable || busy}
+                    onClick={() =>
+                      void saveCompose(
+                        { ...compose, muted_projects: compose.muted_projects.filter((n) => n !== name) },
+                        `Alerts unmuted for ${name}`
+                      )
+                    }
+                    className="rounded-none px-2 py-1 text-xs text-rose-300 hover:bg-rose-500/10 disabled:opacity-40"
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex gap-2">
+            <select
+              aria-label="Project to mute"
+              value={addProject}
+              onChange={(e) => setAddProject(e.target.value)}
+              disabled={!mutable || busy || unmutedProjects.length === 0}
+              className="h-9 min-w-0 flex-1 rounded-none border border-zinc-800 bg-zinc-950 px-3 text-sm text-white focus:border-blue-500 focus:outline-none disabled:opacity-60"
+            >
+              <option value="">{unmutedProjects.length === 0 ? "No projects to mute" : "Choose a project…"}</option>
+              {unmutedProjects.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!mutable || busy || !addProject}
+              onClick={() => {
+                const name = addProject;
+                setAddProject("");
+                void saveCompose({ ...compose, muted_projects: [...compose.muted_projects, name] }, `Alerts muted for ${name}`);
+              }}
               className="h-9 rounded-none border border-zinc-700 bg-zinc-800 px-4 text-sm text-zinc-100 hover:bg-zinc-700 disabled:opacity-40"
             >
               Add

@@ -440,9 +440,34 @@ pub(crate) fn due_orphans(
         .collect()
 }
 
+/// Remembers the sweeper's last failure so a route that cannot be removed is
+/// logged once, not every 30 s tick. A new message logs again; a success logs
+/// the recovery once.
+#[derive(Default)]
+pub(crate) struct SweepErrorLog {
+    last: Option<String>,
+}
+
+impl SweepErrorLog {
+    /// True when this failure should be logged.
+    pub(crate) fn record_failure(&mut self, msg: &str) -> bool {
+        if self.last.as_deref() == Some(msg) {
+            return false;
+        }
+        self.last = Some(msg.to_string());
+        true
+    }
+
+    /// True when this success ends a failure streak (log the recovery).
+    pub(crate) fn record_success(&mut self) -> bool {
+        self.last.take().is_some()
+    }
+}
+
 /// Background sweep for `gateway_auto_clear_orphans`, every 30 s.
 pub fn spawn_orphan_route_sweeper(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut errors = SweepErrorLog::default();
         loop {
             tokio::time::sleep(ORPHAN_TICK).await;
             let Some(state) = app.try_state::<Arc<AppState>>().map(|s| s.inner().clone()) else {
@@ -471,22 +496,30 @@ pub fn spawn_orphan_route_sweeper(app: AppHandle) {
                 continue;
             }
             match remove_routes(&state, &due).await {
-                Ok(pruned) if !pruned.removed.is_empty() => {
-                    {
-                        let mut seen = lock();
-                        for r in &pruned.removed {
-                            seen.remove(&r.id);
-                        }
+                Ok(pruned) => {
+                    if errors.record_success() {
+                        tracing::info!("Gateway: clearing orphaned routes works again");
                     }
-                    tracing::info!(
-                        "Gateway: removed {} route(s) whose container is gone: {}",
-                        pruned.removed.len(),
-                        pruned.removed.iter().map(|r| r.domain.as_str()).collect::<Vec<_>>().join(", ")
-                    );
-                    let _ = app.emit("gateway-routes-pruned", &pruned);
+                    if !pruned.removed.is_empty() {
+                        {
+                            let mut seen = lock();
+                            for r in &pruned.removed {
+                                seen.remove(&r.id);
+                            }
+                        }
+                        tracing::info!(
+                            "Gateway: removed {} route(s) whose container is gone: {}",
+                            pruned.removed.len(),
+                            pruned.removed.iter().map(|r| r.domain.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                        let _ = app.emit("gateway-routes-pruned", &pruned);
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("Gateway: clearing orphaned routes failed: {e}"),
+                Err(e) => {
+                    if errors.record_failure(&e) {
+                        tracing::warn!("Gateway: clearing orphaned routes failed: {e}");
+                    }
+                }
             }
         }
     });
@@ -549,5 +582,16 @@ mod orphan_tests {
         assert!(due_orphans(&mut seen, &ids, t0 + Duration::from_secs(160), grace).is_empty());
         let due = due_orphans(&mut seen, &ids, t0 + Duration::from_secs(171), grace);
         assert_eq!(due, HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn a_repeating_sweep_error_logs_once_and_recovery_logs_once() {
+        let mut log = SweepErrorLog::default();
+        assert!(log.record_failure("registry down"), "first failure is logged");
+        assert!(!log.record_failure("registry down"), "same error is not logged again");
+        assert!(log.record_failure("disk full"), "a changed error is logged");
+        assert!(log.record_success(), "recovery is logged");
+        assert!(!log.record_success(), "steady success is silent");
+        assert!(log.record_failure("registry down"), "a new failure streak logs again");
     }
 }
